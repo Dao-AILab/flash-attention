@@ -9,9 +9,11 @@ from torch.distributed import ProcessGroup
 # version of PyTorch. The following 4 lines are for backward compatibility with
 # older PyTorch.
 if "all_gather_into_tensor" not in dir(torch.distributed):
-    torch.distributed.all_gather_into_tensor = torch.distributed._all_gather_base
+    if hasattr(torch.distributed, "_all_gather_base"):
+        torch.distributed.all_gather_into_tensor = torch.distributed._all_gather_base
 if "reduce_scatter_tensor" not in dir(torch.distributed):
-    torch.distributed.reduce_scatter_tensor = torch.distributed._reduce_scatter_base
+    if hasattr(torch.distributed, "_reduce_scatter_base"):
+        torch.distributed.reduce_scatter_tensor = torch.distributed._reduce_scatter_base
 
 
 # Raw operation, does not support autograd, but does support async

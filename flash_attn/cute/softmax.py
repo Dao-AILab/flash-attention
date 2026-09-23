@@ -2,17 +2,151 @@
 
 import math
 import operator
-from typing import Tuple
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32
+from cutlass import Float32, Boolean
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.utils import AuxData
+
+
+@cute.jit
+def load_learnable_sink(
+    learnable_sink: cute.Tensor,
+    head_idx,
+    packed_row,
+    qhead_per_kvhead: cutlass.Constexpr[int],
+    pack_gqa: cutlass.Constexpr[bool],
+    qhead_per_kvhead_valid: cutlass.Constexpr[Optional[int]] = None,
+) -> Float32:
+    """Load the sink logit for one output row; see `apply_learnable_sink`.
+
+    With pack_gqa the M tile interleaves the Q heads of one KV head, so `head_idx` is the KV
+    head and the Q head is `packed_row % qhead_per_kvhead`; otherwise `head_idx` is already
+    the Q head and `packed_row` is ignored.
+    Padded Q heads get -inf (no sink); see `pack_gqa.qheads_first_tma_view`.
+    """
+    if cutlass.const_expr(not pack_gqa):
+        return Float32(learnable_sink[head_idx])
+    if cutlass.const_expr(qhead_per_kvhead_valid is None):
+        qhead_per_kvhead_valid = qhead_per_kvhead
+    qhead = packed_row % qhead_per_kvhead
+    sink_val = -Float32.inf
+    if qhead < qhead_per_kvhead_valid:
+        sink_val = Float32(learnable_sink[head_idx * qhead_per_kvhead_valid + qhead])
+    return sink_val
+
+
+@cute.jit
+def apply_learnable_sink(
+    row_max: Float32,
+    row_sum: Float32,
+    sink_val: Float32,
+    scale_log2: Float32,
+    max_offset: Float32 = 0.0,
+    empty_row_sum: Float32 = 1.0,
+) -> tuple[Float32, Float32]:
+    """Fold a learnable sink logit into the final (unscaled row_max, row_sum) softmax stats.
+
+    A learnable sink is one extra softmax column per Q head with logit `sink_val` (natural-log
+    units, not multiplied by softmax_scale) and no value vector: it enlarges the normalizer
+    and the LSE but contributes nothing to O. Kernels fold it in at the end of the KV loop.
+    The stats are an *unscaled* row max and a row sum of exp2(score*scale_log2 - max*scale_log2)
+    terms, so the sink enters as exp2(sink*LOG2_E - row_max*scale_log2 + max_offset). A fully
+    masked row (row_max == -inf) has the sink as its only column, so its stats become
+    row_max = sink/scale (i.e. row_max*scale_log2 == sink*LOG2_E) and row_sum = empty_row_sum,
+    giving O = 0 and lse = sink. Backward: dsink[h] = -sum_rows exp(sink[h] - lse[row,h]) * dpsum[row,h].
+
+    `max_offset` is the fp8 exponent offset and `empty_row_sum == 2**max_offset` (0 and 1 for
+    bf16/fp16). `Softmax.finalize` (SM80/SM90) applies the same fold in the scaled domain.
+    """
+    if row_max == -Float32.inf:
+        row_max = sink_val * (utils.LOG2_E / scale_log2)
+        row_sum = empty_row_sum
+    else:
+        row_sum += cute.math.exp2(
+            sink_val * utils.LOG2_E - row_max * scale_log2 + max_offset, fastmath=True
+        )
+    return row_max, row_sum
+
+
+@cute.jit
+def call_score_mod(
+    score_mod: cutlass.Constexpr,
+    score,
+    batch_idx,
+    head_idx,
+    q_idx,
+    kv_idx,
+    seqlen_info,
+    aux_data: AuxData,
+):
+    aux_tensors = aux_data.tensors if aux_data.tensors is not None else ()
+    # Compatibility shim for pre-aux_scalars score_mod callables.
+    if cutlass.const_expr(aux_data.scalars is not None):
+        return score_mod(
+            score,
+            batch_idx,
+            head_idx,
+            q_idx=q_idx,
+            kv_idx=kv_idx,
+            seqlen_info=seqlen_info,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_data.scalars,
+        )
+    return score_mod(
+        score,
+        batch_idx,
+        head_idx,
+        q_idx=q_idx,
+        kv_idx=kv_idx,
+        seqlen_info=seqlen_info,
+        aux_tensors=aux_tensors,
+    )
+
+
+@cute.jit
+def call_score_mod_bwd(
+    score_mod_bwd: cutlass.Constexpr,
+    grad,
+    score,
+    batch_idx,
+    head_idx,
+    q_idx,
+    kv_idx,
+    seqlen_info,
+    aux_data: AuxData,
+):
+    aux_tensors = aux_data.tensors if aux_data.tensors is not None else ()
+    # Compatibility shim for pre-aux_scalars score_mod_bwd callables.
+    if cutlass.const_expr(aux_data.scalars is not None):
+        return score_mod_bwd(
+            grad,
+            score,
+            batch_idx,
+            head_idx,
+            q_idx=q_idx,
+            kv_idx=kv_idx,
+            seqlen_info=seqlen_info,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_data.scalars,
+        )
+    return score_mod_bwd(
+        grad,
+        score,
+        batch_idx,
+        head_idx,
+        q_idx=q_idx,
+        kv_idx=kv_idx,
+        seqlen_info=seqlen_info,
+        aux_tensors=aux_tensors,
+    )
 
 
 @dataclass
@@ -131,12 +265,13 @@ class Softmax(ParamsBase):
         row_scale = cute.make_fragment_like(row_max, Float32)
 
         for r in cutlass.range(cute.size(row_sum), unroll_full=True):
+            row_max_scaled = row_max[r] * scale_log2
             if cutlass.const_expr(sink_val is not None):
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
                 LOG2_E = math.log2(math.e)
-                row_sum[r] += cute.math.exp2(
-                    sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True
-                )
+                if row_max[r] == -Float32.inf:
+                    row_max_scaled = sink_val_cur * LOG2_E
+                row_sum[r] += cute.math.exp2(sink_val_cur * LOG2_E - row_max_scaled, fastmath=True)
 
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
@@ -146,7 +281,7 @@ class Softmax(ParamsBase):
             row_sum_cur = row_sum[r]
             LN2 = math.log(2.0)
             row_sum[r] = (
-                (row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
+                (row_max_scaled + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
                 if not acc_O_mn_row_is_zero_or_nan
                 else -Float32.inf
             )
@@ -169,12 +304,14 @@ class Softmax(ParamsBase):
 @dataclass
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
+    max_offset: cutlass.Constexpr[int] = 0
 
     @staticmethod
     def create(
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
+        max_offset: cutlass.Constexpr[int] = 0,
     ):
         num_rows = 1
         arch = 100
@@ -188,7 +325,51 @@ class SoftmaxSm100(Softmax):
             arch,
             softmax_scale,
             rescale_threshold=rescale_threshold,
+            max_offset=max_offset,
         )
+
+    @cute.jit
+    def compute_row_max_local(self, acc_S_row: cute.TensorSSA, is_first: Boolean) -> Float32:
+        if cutlass.const_expr(is_first):
+            row_max_new = self._compute_row_max(acc_S_row)
+        else:
+            row_max_old = self.row_max[0]
+            row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
+        return row_max_new
+
+    @cute.jit
+    def update_row_max_from_local(
+        self,
+        row_max_new: Float32,
+        is_first: Boolean,
+    ) -> Tuple[Float32, Float32]:
+        if cutlass.const_expr(is_first):
+            row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+            acc_scale = 0.0
+        else:
+            row_max_old = self.row_max[0]
+            row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+            acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
+            acc_scale = cute.math.exp2(acc_scale_)
+            if cutlass.const_expr(self.rescale_threshold > 0.0):
+                if acc_scale_ >= -self.rescale_threshold:
+                    row_max_new = row_max_old
+                    row_max_safe = row_max_old
+                    acc_scale = 1.0
+        self.row_max[0] = row_max_new
+        return row_max_safe, acc_scale
+
+    @cute.jit
+    def update_row_max_precomputed(
+        self, hw_row_max: Float32, is_first: int
+    ) -> Tuple[Float32, Float32]:
+        """Row max already reduced in hardware (SM103 tcgen05.ld.red): skip the
+        software fmax tree — the TMEM controller computed the max during the S load."""
+        if cutlass.const_expr(is_first):
+            row_max_new = hw_row_max
+        else:
+            row_max_new = cute.arch.fmax(hw_row_max, self.row_max[0])
+        return self.update_row_max_from_local(row_max_new, is_first)
 
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
@@ -227,11 +408,13 @@ class SoftmaxSm100(Softmax):
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         row_max_scaled = row_max * self.scale_log2
+        max_offset = Float32(self.max_offset)
+        bias = max_offset - row_max_scaled
         for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
             acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
                 (acc_S_row[i], acc_S_row[i + 1]),
                 (self.scale_log2, self.scale_log2),
-                (-row_max_scaled, -row_max_scaled),
+                (bias, bias),
             )
 
     @cute.jit
@@ -239,10 +422,9 @@ class SoftmaxSm100(Softmax):
         self,
         acc_S_row: cute.Tensor,
         acc_S_row_converted: cute.Tensor,
-        e2e: cutlass.Constexpr[bool] = False,
-        e2e_freq: cutlass.Constexpr[int] = 16,
-        e2e_res: cutlass.Constexpr[int] = 4,
-        e2e_frg_limit: cutlass.Constexpr[int] = 1,
+        ex2_emu_freq: cutlass.Constexpr[int] = 0,
+        ex2_emu_res: cutlass.Constexpr[int] = 4,
+        ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         frg_tile = 32
@@ -257,12 +439,14 @@ class SoftmaxSm100(Softmax):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 # acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
                 # acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
-                if cutlass.const_expr(not e2e):
+                if cutlass.const_expr(ex2_emu_freq == 0):
                     acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
                     acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
                 else:
                     if cutlass.const_expr(
-                        k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
+                        k % ex2_emu_freq < ex2_emu_freq - ex2_emu_res
+                        or j >= frg_cnt - 1
+                        or j < ex2_emu_start_frg
                     ):
                         acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
                         acc_S_row_frg[k + 1, j] = cute.math.exp2(
@@ -349,7 +533,7 @@ def apply_score_mod_inner(
     softmax_scale,
     vec_size: cutlass.Constexpr,
     qk_acc_dtype: cutlass.Constexpr,
-    aux_tensors,
+    aux_data: AuxData,
     fastdiv_mods,
     seqlen_info: SeqlenInfoQK,
     constant_q_idx: cutlass.Constexpr,
@@ -368,6 +552,7 @@ def apply_score_mod_inner(
         vec_size: Vector size for processing elements
         qk_acc_dtype: Data type for accumulator
         aux_tensors: Optional aux_tensors for FlexAttention
+        aux_scalars: Optional runtime scalar captures for FlexAttention
         fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
         seqlen_info: Sequence length info
         constant_q_idx: If provided, use this constant for all q_idx values
@@ -397,7 +582,7 @@ def apply_score_mod_inner(
     q_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     # For Pack-GQA with non-constant q_idx, we need per-element head indices
-    # since a thread my process multiple query head indices
+    # since a thread may process multiple query head indices
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
         head_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
@@ -414,7 +599,7 @@ def apply_score_mod_inner(
                 head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
 
             # If we will do loads we mod, in order to not read OOB
-            if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
+            if cutlass.const_expr(aux_data.tensors is not None and fastdiv_mods is not None):
                 if cutlass.const_expr(constant_q_idx is None):
                     seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
                     q_idx_floored = floor_if_packed(
@@ -449,18 +634,15 @@ def apply_score_mod_inner(
         else:
             head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size,))
 
-        aux_args = []
-        if cutlass.const_expr(aux_tensors is not None):
-            aux_args = aux_tensors
-
-        post_mod_scores = score_mod(
+        post_mod_scores = call_score_mod(
+            score_mod,
             score_ssa,
             batch_idx_ssa,
             head_idx_ssa,
-            q_idx=q_idx_ssa,
-            kv_idx=kv_idx_ssa,
-            seqlen_info=seqlen_info,
-            aux_tensors=aux_args,
+            q_idx_ssa,
+            kv_idx_ssa,
+            seqlen_info,
+            aux_data,
         )
 
         # Write back modified scores
@@ -480,7 +662,7 @@ def apply_score_mod_bwd_inner(
     softmax_scale,
     vec_size: cutlass.Constexpr,
     qk_acc_dtype: cutlass.Constexpr,
-    aux_tensors,
+    aux_data: AuxData,
     fastdiv_mods,
     seqlen_info,
     constant_q_idx: cutlass.Constexpr,
@@ -500,6 +682,7 @@ def apply_score_mod_bwd_inner(
         vec_size: Vector size for processing elements
         qk_acc_dtype: Data type for accumulator
         aux_tensors: Optional aux_tensors for FlexAttention
+        aux_scalars: Optional runtime scalar captures for FlexAttention
         fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
         seqlen_info: Sequence length info
         constant_q_idx: If provided, use this constant for all q_idx values
@@ -516,15 +699,15 @@ def apply_score_mod_bwd_inner(
         q_idx_pos = cutlass.const_expr(0)
         kv_idx_pos = cutlass.const_expr(1)
     n_vals = cutlass.const_expr(cute.size(grad_tensor.shape))
-    grad_vec = cute.make_fragment(vec_size, qk_acc_dtype)
-    score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
-    kv_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    grad_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
+    score_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
+    kv_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
-    q_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    q_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     # For Pack-GQA with non-constant q_idx, we need per-element head indices
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
-        head_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+        head_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
         for j in cutlass.range(vec_size, unroll_full=True):
@@ -538,7 +721,7 @@ def apply_score_mod_bwd_inner(
                 head_offset = q_idx_packed - q_idx_logical * qhead_per_kvhead
                 head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
 
-            if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
+            if cutlass.const_expr(aux_data.tensors is not None and fastdiv_mods is not None):
                 if cutlass.const_expr(constant_q_idx is None):
                     seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
                     q_idx_floored = floor_if_packed(
@@ -571,19 +754,16 @@ def apply_score_mod_bwd_inner(
         else:
             head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size,))
 
-        aux_args = []
-        if cutlass.const_expr(aux_tensors is not None):
-            aux_args = aux_tensors
-
-        grad_out_ssa = score_mod_bwd(
+        grad_out_ssa = call_score_mod_bwd(
+            score_mod_bwd,
             grad_ssa,
             score_ssa,
             batch_idx_ssa,
             head_idx_ssa,
-            q_idx=q_idx_ssa,
-            kv_idx=kv_idx_ssa,
-            seqlen_info=seqlen_info,
-            aux_tensors=aux_args,
+            q_idx_ssa,
+            kv_idx_ssa,
+            seqlen_info,
+            aux_data,
         )
 
         grad_vec.store(grad_out_ssa)

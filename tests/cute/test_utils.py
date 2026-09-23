@@ -6,6 +6,20 @@ from flash_attn.cute import utils as cute_utils
 from flash_attn.cute.utils import hash_callable
 
 
+def with_positional_default(value):
+    def inner(arg=value):
+        return arg
+
+    return inner
+
+
+def with_keyword_default(value):
+    def inner(*, arg=value):
+        return arg
+
+    return inner
+
+
 class TestHashCallable:
     """Tests for hash_callable function."""
 
@@ -160,6 +174,19 @@ class TestHashCallable:
         assert call_tracker["sha256"] == 0, "sha256 should not be called"
         assert result == "wrapped-fast-hash"
 
+    def test_vec_size_affects_hash(self):
+        def mask_mod(_b, _h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        base_hash = hash_callable(mask_mod, set_cute_hash=False)
+        mask_mod.__vec_size__ = 16
+        vec16_hash = hash_callable(mask_mod, set_cute_hash=False)
+        mask_mod.__vec_size__ = 32
+        vec32_hash = hash_callable(mask_mod, set_cute_hash=False)
+
+        assert base_hash != vec16_hash
+        assert vec16_hash != vec32_hash
+
     def test_closure_values_affect_hash(self):
         """Functions with different closure values should have different hashes."""
         value1 = 10
@@ -177,6 +204,33 @@ class TestHashCallable:
         hash1 = hash_callable(func1)
         hash2 = hash_callable(func2)
         assert hash1 != hash2
+
+    def test_positional_default_values_affect_hash(self):
+        """Defaults can specialize generated callables without creating a closure."""
+        func1 = with_positional_default(1)
+        func1_equivalent = with_positional_default(1)
+        func2 = with_positional_default(2)
+        assert func1.__closure__ is None
+
+        assert hash_callable(func1, set_cute_hash=False) == hash_callable(
+            func1_equivalent, set_cute_hash=False
+        )
+        assert hash_callable(func1, set_cute_hash=False) != hash_callable(
+            func2, set_cute_hash=False
+        )
+
+    def test_keyword_default_values_affect_hash(self):
+        func1 = with_keyword_default(1)
+        func1_equivalent = with_keyword_default(1)
+        func2 = with_keyword_default(2)
+        assert func1.__closure__ is None
+
+        assert hash_callable(func1, set_cute_hash=False) == hash_callable(
+            func1_equivalent, set_cute_hash=False
+        )
+        assert hash_callable(func1, set_cute_hash=False) != hash_callable(
+            func2, set_cute_hash=False
+        )
 
 
 class TestHashCallableIntegration:
@@ -210,4 +264,3 @@ class TestHashCallableIntegration:
         # getsource should never be called because __cute_hash__ is set
         assert call_count[0] == 0, f"getsource was called {call_count[0]} times"
         assert hash1 == hash2 == hash3 == "inductor-generated-hash"
-

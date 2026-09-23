@@ -1,25 +1,182 @@
 # Copyright (c) 2025, Tri Dao.
 
+from dataclasses import dataclass
+from typing import Union, Tuple
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import cpasync
+
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
 
 
+def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
+    """Reshape a tensor to fold qhead_per_kvhead into the seqlen dimension (mode 0).
+
+    The head dimension is at mode ``head_idx``.  Modes before it (1..head_idx-1)
+    are kept as-is (e.g. headdim for Q/O tensors), and modes after it are kept
+    as-is (e.g. batch).
+
+    For Q/O tensors (head_idx=2):
+        (seqlen_q, headdim, nheads, batch, ...) -> ((qhead_per_kvhead, seqlen_q), headdim, nheads_kv, batch, ...)
+    For LSE tensors (head_idx=1):
+        (seqlen_q, nheads, batch, ...) -> ((qhead_per_kvhead, seqlen_q), nheads_kv, batch, ...)
+    """
+    head_stride = T.stride[head_idx]
+    shape_packed = (
+        (qhead_per_kvhead, T.shape[0]),
+        *[T.shape[i] for i in range(1, head_idx)],
+        nheads_kv,
+        *[T.shape[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    stride_packed = (
+        (head_stride, T.stride[0]),
+        *[T.stride[i] for i in range(1, head_idx)],
+        head_stride * qhead_per_kvhead,
+        *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+
+
+def select_modes(T, order):
+    """``T`` with its modes permuted to ``order`` (a full permutation), same data."""
+    assert sorted(order) == list(range(cute.rank(T))), f"{order} is not a permutation of modes"
+    return cute.make_tensor(T.iterator, cute.select(T.layout, mode=order))
+
+
+def _heads_first_order(T, head_idx):
+    """Mode permutation swapping the seqlen mode (0) with the head mode; its own inverse."""
+    return [head_idx, *range(1, head_idx), 0, *range(head_idx + 1, cute.rank(T))]
+
+
+def sparse_mla_qhead_tile(qhead_per_kvhead: int, min_tile: int = 128) -> int:
+    """Rows one token's Q heads occupy in a sparse-MLA tile: the real head count padded to
+    ``min_tile`` (128 in forward and dQ/dQv, 64 in backward) or to 128 when it exceeds it."""
+    assert 0 < qhead_per_kvhead <= 128, (
+        f"sparse MLA: MQA with 1 to 128 heads, got {qhead_per_kvhead}"
+    )
+    return min_tile if qhead_per_kvhead <= min_tile else 128
+
+
+def qheads_first_tma_view(T, qhead_per_kvhead_valid, head_idx):
+    """Return a heads-first TMA source with a dynamic extent equal to the real head count.
+
+    .. note:: In-kernel Q-head padding (sparse MLA).
+        MQA only. Each tile covers one token and one top-k gather list: 128 heads in
+        forward and dQ/dQv, 64 or 128 in backward (``sparse_mla_qhead_tile``). The heads-first view
+        ``(nheads, ..., seqlen, ...)`` has a dynamic head extent so CuTe can tile it
+        without requiring divisibility. TMA zero-fills out-of-bounds loads and drops
+        out-of-bounds stores, avoiding padded operand copies in global memory.
+        ``regroup_padded_qheads`` folds the TMA coordinate tensor into the packed
+        ``(qhead, seqlen)`` layout. Non-TMA LSE, row_max, and learnable-sink accesses
+        need head guards: the hierarchical packed layout wraps padded heads into
+        the next token. The caller allocates dPsum/scaleP at tile width with finite
+        padding. TMA loads zero padded Q rows in forward and dO/P rows in backward.
+        These rows produce dS = 0 and contribute nothing to dK/dV.
+    """
+    T = select_modes(T, _heads_first_order(T, head_idx))
+    shape = (cutlass.Int32(qhead_per_kvhead_valid), *T.shape[1:])
+    return cute.make_tensor(T.iterator, cute.make_layout(shape, stride=T.stride))
+
+
+def regroup_padded_qheads(tma_tensor, qhead_per_kvhead, head_idx):
+    """Fold a ``qheads_first_tma_view`` coordinate tensor into the pack-GQA layout
+    ``((qhead_per_kvhead, seqlen), ..., 1, ...)``: ``pack_gqa_layout`` with the tile's head
+    count, after undoing the heads-first permutation.
+
+    Not ``pack_gqa_layout`` itself: its KV-head stride ``head_stride * qhead_per_kvhead``
+    scales a TMA basis stride, which the DSL fails to lower (ICE). The size-1 KV-head mode
+    reuses the head basis instead.
+    """
+    T = tma_tensor
+    order = _heads_first_order(T, head_idx)
+    shape = [T.shape[i] for i in order]
+    stride = [T.stride[i] for i in order]
+    shape[0], stride[0] = (qhead_per_kvhead, shape[0]), (stride[head_idx], stride[0])
+    shape[head_idx] = 1
+    return cute.make_tensor(T.iterator, cute.make_layout(tuple(shape), stride=tuple(stride)))
+
+
+def make_packgqa_tiled_tma_atom(
+    op: cute.atom.CopyOp,
+    gmem_tensor: cute.Tensor,
+    smem_layout: Union[cute.Layout, cute.ComposedLayout],
+    cta_tiler: Tuple[int, int],
+    qhead_per_kvhead: int,
+    head_idx: int,
+):
+    # This packing and unpacking of the layout is so that we keep the same TMA dimension as usual.
+    # e.g. for (seqlen, d, nheads, b) layout, we still have 4D TMA after packing to
+    # ((nheads, seqlen), d, b).
+    # If we instead pack directly to ((qhead_per_kvhead, seqlen), d, nheads_kv, b) we'd have 5D TMA.
+    # Pack headdim and seqlen dim into 1: (seqlen, d, nheads, b) -> ((nheads, seqlen), d, b)
+    gmem_tensor = layout_utils.select(
+        gmem_tensor, [head_idx, *range(head_idx), *range(head_idx + 1, cute.rank(gmem_tensor))]
+    )
+    gmem_tensor = cute.group_modes(gmem_tensor, 0, 2)
+    assert cta_tiler[0] % qhead_per_kvhead == 0, (
+        "CTA tile size in the seqlen dimension must be divisible by qhead_per_kvhead"
+    )
+    tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+        op,
+        gmem_tensor,
+        smem_layout,
+        ((qhead_per_kvhead, cta_tiler[0] // qhead_per_kvhead), cta_tiler[1]),  # No mcast
+    )
+    # Unpack from ((nheads, seqlen), d, b) -> ((qhead_per_kvhead, seqlen), d, nheads_kv, b)
+    T = tma_tensor
+    shape_packed = (
+        (qhead_per_kvhead, T.shape[0][1]),
+        *[T.shape[i] for i in range(1, head_idx)],
+        T.shape[0][0] // qhead_per_kvhead,
+        *[T.shape[i] for i in range(head_idx, len(T.shape))],
+    )
+    stride_packed = (
+        *[T.stride[i] for i in range(head_idx)],
+        T.stride[0][0] * qhead_per_kvhead,
+        *[T.stride[i] for i in range(head_idx, len(T.shape))],
+    )
+    tma_tensor = cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+    return tma_atom, tma_tensor
+
+
+def unpack_gqa_layout(T, qhead_per_kvhead, head_idx):
+    """Reverse of pack_gqa_layout: unfold qhead_per_kvhead from the seqlen dimension (mode 0).
+
+    The head dimension is at mode ``head_idx``.  Modes before it (1..head_idx-1)
+    are kept as-is (e.g. headdim for Q/O tensors), and modes after it are kept
+    as-is (e.g. batch).
+
+    For Q/O tensors (head_idx=2):
+        ((qhead_per_kvhead, seqlen_q), headdim, nheads_kv, batch, ...) -> (seqlen_q, headdim, nheads, batch, ...)
+    For LSE tensors (head_idx=1):
+        ((qhead_per_kvhead, seqlen_q), nheads_kv, batch, ...) -> (seqlen_q, nheads, batch, ...)
+    """
+    seqlen_stride = T.stride[0][1]
+    head_stride = T.stride[0][0]
+    shape_unpacked = (
+        T.shape[0][1],
+        *[T.shape[i] for i in range(1, head_idx)],
+        T.shape[head_idx] * qhead_per_kvhead,
+        *[T.shape[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    stride_unpacked = (
+        seqlen_stride,
+        *[T.stride[i] for i in range(1, head_idx)],
+        head_stride,
+        *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    return cute.make_tensor(T.iterator, cute.make_layout(shape_unpacked, stride=stride_unpacked))
+
+
+@dataclass
 class PackGQA:
-    def __init__(
-        self,
-        m_block_size: cutlass.Constexpr[int],
-        head_dim_padded: cutlass.Constexpr[int],
-        check_hdim_oob: cutlass.Constexpr[bool],
-        qhead_per_kvhead: cutlass.Constexpr[bool],
-    ):
-        self.m_block_size = m_block_size
-        self.head_dim_padded = head_dim_padded
-        self.check_hdim_oob = check_hdim_oob
-        self.qhead_per_kvhead = qhead_per_kvhead
+    m_block_size: cutlass.Constexpr[int]
+    head_dim_padded: cutlass.Constexpr[int]
+    check_hdim_oob: cutlass.Constexpr[bool]
+    qhead_per_kvhead: cutlass.Constexpr[bool]
 
     @cute.jit
     def compute_ptr(
@@ -32,7 +189,7 @@ class PackGQA:
         num_threads: cutlass.Constexpr[int],
     ):
         num_ptr_per_thread = cute.ceil_div(cute.size(cRows), threads_per_row)
-        tPrPtr = cute.make_fragment(num_ptr_per_thread, cutlass.Int64)
+        tPrPtr = cute.make_rmem_tensor(num_ptr_per_thread, cutlass.Int64)
         for i in cutlass.range_constexpr(num_ptr_per_thread):
             row = i * num_threads + cRows[tidx % threads_per_row][0]
             idx = block * self.m_block_size + row
@@ -78,11 +235,17 @@ class PackGQA:
                 mQ_cur_copy = cute.tiled_divide(mQ_cur, (elems_per_load,))
                 for k in cutlass.range_constexpr(cute.size(tQsQ.shape[2])):
                     ki = tQcQ[0, 0, k][1] // elems_per_load
+                    pred = None
+                    if cutlass.const_expr(self.check_hdim_oob):
+                        # Slicing one K group drops tiled-copy predicate broadcasting,
+                        # so expand its transaction predicate to the copy operand.
+                        pred = cute.make_fragment_like(tQsQ[None, m, k], cutlass.Boolean)
+                        pred.fill(tQpQ[0, m, k])
                     cute.copy(
                         gmem_thr_copy,
                         mQ_cur_copy[None, ki],
                         tQsQ[None, m, k],
-                        pred=tQpQ[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                        pred=pred,
                     )
             # We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
 
@@ -157,9 +320,13 @@ class PackGQA:
                 mO_cur_copy = cute.tiled_divide(mO_cur, (elems_per_load,))
                 for k in cutlass.range_constexpr(cute.size(tOrO.shape[2])):
                     ki = tOcO[0, 0, k][1] // elems_per_load
+                    pred = None
+                    if cutlass.const_expr(self.check_hdim_oob):
+                        pred = cute.make_fragment_like(tOrO[None, m, k], cutlass.Boolean)
+                        pred.fill(tOpO[0, m, k])
                     cute.copy(
                         gmem_thr_copy,
                         tOrO[None, m, k],
                         mO_cur_copy[None, ki],
-                        pred=tOpO[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                        pred=pred,
                     )

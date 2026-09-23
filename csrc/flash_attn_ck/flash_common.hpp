@@ -9,6 +9,11 @@
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <string>
+
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+#endif
 
 #ifdef OLD_GENERATOR_PATH
 #include <ATen/CUDAGeneratorImpl.h>

@@ -1,9 +1,13 @@
 import math
+from contextlib import nullcontext
+from functools import wraps
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from torch._guards import active_fake_mode
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 class IndexFirstAxis(torch.autograd.Function):
@@ -63,8 +67,15 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
     all_masks = (attention_mask + unused_mask) if unused_mask is not None else attention_mask
     seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
     used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    in_fake_mode = active_fake_mode() is not None
+    if not in_fake_mode:
+        indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
+        max_seqlen_in_batch = seqlens_in_batch.max().item()
+    else:
+        # torch.nonzero and .item() are not supported in FakeTensorMode
+        batch_size, seqlen = attention_mask.shape
+        indices = torch.arange(batch_size * seqlen, device=hidden_states.device)
+        max_seqlen_in_batch = seqlen
     cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
     return (
         index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices),
@@ -80,20 +91,23 @@ def pad_input(hidden_states, indices, batch, seqlen):
     return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
 
-def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", zero_lengths=False):
+def generate_random_padding_mask(
+    max_seqlen, batch_size, device, mode="random", zero_lengths=False, min_seqlen=None
+):
     assert mode in ["full", "random", "third"]
+    min_seqlen = min_seqlen if min_seqlen is not None else 0 if zero_lengths else 1
     if mode == "full":
         lengths = torch.full((batch_size, 1), max_seqlen, device=device, dtype=torch.int32)
     elif mode == "random":
         lengths = torch.randint(
-            max(0 if zero_lengths else 1, max_seqlen - 20),
+            max(min_seqlen, max_seqlen - 20),
             max_seqlen + 1,
             (batch_size, 1),
             device=device,
         )
     else:
         lengths = torch.randint(
-            max(0 if zero_lengths else 1, max_seqlen // 3),
+            max(min_seqlen, max_seqlen // 3),
             max_seqlen + 1,
             (batch_size, 1),
             device=device,
@@ -332,33 +346,48 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    return_lse=False,
+    gather_kv_indices=None,
 ):
+    assert v is not None
+    has_qk = q is not None and k is not None
+    assert has_qk or qv is not None
     if causal:
         window_size = (window_size[0], 0)
-    dtype_og = q.dtype
+    dtype_og = v.dtype
+    q_shape = q.shape if q is not None else qv.shape
     if upcast:
-        q, k, v = q.float(), k.float(), v.float()
-        qv = qv.float() if qv is not None else None
+        q, k, v, qv, learnable_sink = [
+            t.float() if t is not None else None for t in (q, k, v, qv, learnable_sink)
+        ]
     if q_descale is not None:
-        q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q.shape[2] // k.shape[2])
-        q = (q.float() * q_descale).to(q.dtype)
-        qv = (qv.float() * q_descale).to(qv.dtype) if qv is not None else None
+        q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q_shape[2] // v.shape[2])
+        q, qv = [(t.float() * q_descale).to(t.dtype) if t is not None else None for t in (q, qv)]
     if k_descale is not None:
         k = (k.float() * rearrange(k_descale, "b h -> b 1 h 1")).to(dtype=k.dtype)
     if v_descale is not None:
         v = (v.float() * rearrange(v_descale, "b h -> b 1 h 1")).to(dtype=v.dtype)
-    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
-    k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
-    v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
-    d = q.shape[-1]
+    seqlen_q, seqlen_k = q_shape[1], v.shape[1]
+    k, v = [
+        repeat(t, "b s h d -> b s (h g) d", g=q_shape[2] // t.shape[2]) if t is not None else None
+        for t in (k, v)
+    ]
+    d = q_shape[-1]  # == dv for qv
     dv = v.shape[-1]
-    softmax_scale = 1.0 / math.sqrt(d if qv is None else d + dv)
-    if not reorder_ops:
-        scores = torch.einsum("bthd,bshd->bhts", q * softmax_scale, k)
-    else:
-        scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+    softmax_scale = 1.0 / math.sqrt(d if qv is None or q is None else d + dv)
+    if has_qk:
+        scores = torch.einsum(
+            "bthd,bshd->bhts",
+            q if reorder_ops else q * softmax_scale,
+            k * softmax_scale if reorder_ops else k,
+        )
     if qv is not None:
-        scores = scores + torch.einsum("bthd,bshd->bhts", qv * softmax_scale, v)
+        qv_scores = torch.einsum(
+            "bthd,bshd->bhts",
+            qv if reorder_ops else qv * softmax_scale,
+            v * softmax_scale if reorder_ops else v,
+        )
+        scores = qv_scores if not has_qk else scores + qv_scores
     if softcap > 0:
         scores = torch.tanh(scores / softcap) * softcap
     if key_padding_mask is not None:
@@ -373,7 +402,7 @@ def attention_ref(
             query_padding_mask,
             key_padding_mask,
             key_leftpad=key_leftpad,
-            device=q.device,
+            device=v.device,
         )
     if attention_chunk > 0:
         chunk_mask = construct_chunk_mask(
@@ -383,15 +412,29 @@ def attention_ref(
             query_padding_mask,
             key_padding_mask,
             key_leftpad=key_leftpad,
-            device=q.device,
+            device=v.device,
         )
         local_mask = (
             torch.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
         )
+    if gather_kv_indices is not None:
+        batch = q_shape[0]
+        # -1 is a sentinel for invalid top-k slots; route sentinels (and any
+        # out-of-range index) to a dummy extra column so they never unmask a
+        # real key
+        gather_idx = gather_kv_indices.long()
+        gather_idx = gather_idx.masked_fill((gather_idx < 0) | (gather_idx >= seqlen_k), seqlen_k)
+        topk_index_mask = torch.full(
+            (batch, seqlen_q, seqlen_k + 1), False, device="cuda"
+        ).scatter_(-1, gather_idx, True)[..., :seqlen_k]
+        scores.masked_fill_(rearrange(~topk_index_mask, "b t s -> b 1 t s"), float("-inf"))
     if local_mask is not None:
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
+    # After all masks are applied, before softmax:
+    # scores shape: [b, h, t, s]
+    lse = torch.logsumexp(scores, dim=-1)  # [b, h, t]
     if learnable_sink is None:
         attention = torch.softmax(scores, dim=-1).to(v.dtype)
     else:
@@ -403,6 +446,8 @@ def attention_ref(
         normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + torch.exp(
             learnable_sink - logits_or_sinks_max
         )
+        # LSE with sink: log(Z) = log(normalizer) + max
+        lse = (torch.log(normalizer.squeeze(-1)) + logits_or_sinks_max.squeeze(-1)).to(dtype_og)
         attention = (unnormalized_scores / normalizer).to(v.dtype)
     if query_padding_mask is not None:
         attention = attention.masked_fill(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
@@ -420,4 +465,28 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    if return_lse:
+        return output.to(dtype_og), attention.to(dtype_og), lse.to(dtype_og)
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+
+
+def maybe_fake_tensor_mode(fake: bool = True):
+    """
+    One way to populate/pre-compile cache is to use torch fake tensor mode,
+    which does not allocate actual GPU tensors but retains tensor shape/dtype
+    metadata for cute.compile.
+    """
+
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            with FakeTensorMode() if fake else nullcontext():
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def is_fake_mode() -> bool:
+    return active_fake_mode() is not None

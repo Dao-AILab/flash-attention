@@ -14,7 +14,7 @@ from cutlass.cute.runtime import from_dlpack
 import numpy as np
 import torch
 
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from mask_mod_definitions import (
     get_mask_pair,
     random_doc_id_tensor,

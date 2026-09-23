@@ -31,7 +31,7 @@ def load_checkpoint(path, device='cpu'):
         path /= 'last.ckpt'
     # dst = f'cuda:{torch.cuda.current_device()}'
     log.info(f'Loading checkpoint from {str(path)}')
-    state_dict = torch.load(path, map_location=device)
+    state_dict = torch.load(path, map_location=device, weights_only=True)
     # T2T-ViT checkpoint is nested in the key 'state_dict_ema'
     if state_dict.keys() == {'state_dict_ema'}:
         state_dict = state_dict['state_dict_ema']

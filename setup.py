@@ -2,13 +2,16 @@
 
 import sys
 import functools
+import importlib.util
 import warnings
 import os
 import re
 import ast
 import glob
 import shutil
+import tempfile
 from pathlib import Path
+from typing import Literal, Optional
 from packaging.version import parse, Version
 import platform
 
@@ -60,10 +63,12 @@ BASE_WHEEL_URL = (
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
+USE_SYSTEM_AITER = os.getenv("FLASH_ATTENTION_USE_SYSTEM_AITER", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
-SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if USE_TRITON_ROCM else False
+ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
+if IS_ROCM:
+    ROCM_BACKEND = "triton" if os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE" else "ck"
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
 @functools.lru_cache(maxsize=None)
@@ -190,40 +195,113 @@ def append_nvcc_threads(nvcc_extra_args):
     return nvcc_extra_args + ["--threads", NVCC_THREADS]
 
 
-def rename_cpp_to_cu(cpp_files):
+def rename_cpp_to_cu(cpp_files, generated_rdna_bfloat16_override=None):
     for entry in cpp_files:
-        shutil.copy(entry, os.path.splitext(entry)[0] + ".cu")
+        dst = os.path.splitext(entry)[0] + ".cu"
+        if (
+            generated_rdna_bfloat16_override is not None
+            and Path(entry).parent.name == "build"
+            and Path(entry).name.startswith(("fmha_fwd", "fmha_bwd"))
+            and re.search(r"_gfx1[12][^/]*\.cpp$", Path(entry).name)
+        ):
+            with open(entry, "r", encoding="utf-8") as src, open(dst, "w", encoding="utf-8") as out:
+                out.write(
+                    "#undef CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\n"
+                    f"#define CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT {generated_rdna_bfloat16_override}\n"
+                )
+                out.write(src.read())
+        else:
+            shutil.copy(entry, dst)
 
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx950", "gfx942"]
+    allowed_archs = ["native", "gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
         arch in allowed_archs for arch in archs
-    ), f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
+    ), f"Invalid archs: {archs}. Allowed: {allowed_archs}"
+
+    if "native" in archs and len(archs) > 1:
+        raise ValueError(
+            f"'native' cannot be combined with explicit archs: {archs}. "
+            "Use either GPU_ARCHS='native' or GPU_ARCHS='gfx942;gfx950'."
+        )
+
+
+def get_ck_tile_bfloat16_supported_modes(ck_dir):
+    config_path = Path(this_dir) / ck_dir / "include" / "ck_tile" / "core" / "config.hpp"
+    try:
+        config_text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        # Old vendored CK revisions support up to mode 4.
+        return {"0", "1", "2", "3", "4"}
+
+    supported_modes = set(
+        re.findall(
+            r"^#define\s+CK_TILE_FLOAT_TO_BFLOAT16_[A-Z0-9_]+\s+(\d+)\s*$",
+            config_text,
+            re.MULTILINE,
+        )
+    )
+    if not supported_modes:
+        raise RuntimeError(f"Failed to detect CK tile BF16 conversion modes from {config_path}.")
+
+    return supported_modes
 
 
 cmdclass = {}
 ext_modules = []
 
+def check_system_aiter():
+    """Check an installed aiter provides the Triton kernels, without importing it: find_spec() on a
+    dotted name imports the parent, and importing aiter JIT-builds against a GPU the build has not got.
+    """
+    spec = importlib.util.find_spec("aiter")
+    locations = list(spec.submodule_search_locations or []) if spec is not None else []
+    kernels = os.path.join("ops", "triton", "_triton_kernels", "flash_attn_triton_amd")
+    if any(os.path.isdir(os.path.join(root, kernels)) for root in locations):
+        return
+    raise RuntimeError(
+        "FLASH_ATTENTION_USE_SYSTEM_AITER=TRUE was set, but no installed aiter provides "
+        f"aiter.{kernels.replace(os.sep, '.')}. Install a compatible aiter, or unset "
+        "FLASH_ATTENTION_USE_SYSTEM_AITER to build the bundled third_party/aiter."
+    )
+
+
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-if os.path.isdir(".git"):
-    if not SKIP_CK_BUILD:
-        subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
-        subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
+if IS_ROCM:
+    if ROCM_BACKEND == "triton":
+        if USE_SYSTEM_AITER:
+            check_system_aiter()
+        else:
+            if os.path.isdir(".git"):
+                subprocess.run(["git", "submodule", "update", "--init", "third_party/aiter"], check=True)
+            else:
+                assert os.path.isdir("third_party/aiter"), (
+                    "third_party/aiter is missing, please use source distribution or git clone"
+                )
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
+                check=True,
+            )
+    elif ROCM_BACKEND == "ck":
+        if os.path.isdir(".git"):
+            subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
+        else:
+            assert os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py"), (
+                "csrc/composable_kernel is missing, please use source distribution or git clone"
+            )
 else:
-    if IS_ROCM:
-        if not SKIP_CK_BUILD:
-            assert (
-                os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py")
-            ), "csrc/composable_kernel is missing, please use source distribution or git clone"
+    # CUDA: cutlass submodule
+    if os.path.isdir(".git"):
+        subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
     else:
-        assert (
-            os.path.exists("csrc/cutlass/include/cutlass/cutlass.h")
-        ), "csrc/cutlass is missing, please use source distribution or git clone"
+        assert os.path.exists("csrc/cutlass/include/cutlass/cutlass.h"), (
+            "csrc/cutlass is missing, please use source distribution or git clone"
+        )
 
 if not SKIP_CUDA_BUILD and not IS_ROCM:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -252,9 +330,17 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
+    # PyTorch 2.13+ requires C++20 for extensions that include ATen headers
+    # (ATen raises "bit-field default initializer error" for 2.13,
+    # "#error C++20 or later ... required" for 2.14+). Because we pass an
+    # explicit -std flag below, PyTorch's build machinery cannot upgrade the
+    # standard for us, so select it from the installed torch version. Older
+    # torch keeps C++17 to avoid requiring a newer toolchain unnecessarily.
+    cxx_standard = "c++20" if (TORCH_MAJOR, TORCH_MINOR) >= (2, 13) else "c++17"
+
     nvcc_flags = [
     "-O3",
-    "-std=c++17",
+    f"-std={cxx_standard}",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -273,11 +359,18 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     # "-DFLASHATTENTION_DISABLE_LOCAL",
     ]
 
-    compiler_c17_flag=["-O3", "-std=c++17"]
+    compiler_cxx_flag = ["-O3", f"-std={cxx_standard}"]
     # Add Windows-specific flags
     if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
         nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
-        compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
+        compiler_cxx_flag = ["-O2", f"/std:{cxx_standard}", "/Zc:__cplusplus"]
+
+    # Opt-in: disable building dropout and its dependent headers (ATen philox/RNG
+    # headers) from the FA2 build. This flag must be shared across both cxx and nvcc
+    # compilers, as FA2 is defined in both flash_api.cpp (cxx) and CUDA kernels.
+    feature_flags = []
+    if os.getenv("FLASH_ATTENTION_DISABLE_DROPOUT", "FALSE") == "TRUE":
+        feature_flags.append("-DFLASHATTENTION_DISABLE_DROPOUT")
 
     ext_modules.append(
         CUDAExtension(
@@ -356,10 +449,34 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_split_hdim192_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim32_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim32_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim64_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim64_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim96_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim96_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim128_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim128_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim192_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim192_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim256_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim256_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim32_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim32_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim64_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim64_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim96_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim96_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim128_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim128_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim192_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim192_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim256_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim256_bf16_causal_sm80.cu",
             ],
             extra_compile_args={
-                "cxx": compiler_c17_flag,
-                "nvcc": append_nvcc_threads(nvcc_flags + cc_flag),
+                "cxx": compiler_cxx_flag + feature_flags,
+                "nvcc": append_nvcc_threads(nvcc_flags + cc_flag + feature_flags),
             },
             include_dirs=[
                 Path(this_dir) / "csrc" / "flash_attn",
@@ -374,7 +491,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
     # Skips CK C++ extension compilation if using Triton Backend
-    if not SKIP_CK_BUILD:
+    if ROCM_BACKEND == "ck":
         ck_dir = "csrc/composable_kernel"
 
         #use codegen get code dispatch
@@ -382,10 +499,35 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             os.makedirs("build")
 
         optdim = os.getenv("OPT_DIM", "32,64,128,256")
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        archs = [arch.lower() for arch in os.getenv("GPU_ARCHS", "native").split(";")]
+        validate_and_update_archs(archs)
+
+        if archs != ["native"]:
+            kernel_targets = archs
+        else:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "GPU_ARCHS not set and no GPU detected. "
+                    "Please set GPU_ARCHS (e.g. GPU_ARCHS='gfx942') to cross-compile."
+                )
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            gcn_arch = getattr(props, "gcnArchName", None)
+            if not gcn_arch:
+                raise RuntimeError(
+                    "GPU_ARCHS not set and current device does not expose gcnArchName. "
+                    "This usually means the active PyTorch build is not ROCm. "
+                    "Please set GPU_ARCHS explicitly."
+                )
+            detected_arch = gcn_arch.split(":")[0]
+            kernel_targets = [detected_arch.lower()]
+            validate_and_update_archs(kernel_targets)
+
+        # NOTE: --targets requires CK >= 859acb5 (the submodule version pinned in this repo).
+        # If generate.py fails with an unknown argument error, ensure the
+        # composable_kernel submodule is up to date.
+        targets_arg = ",".join(kernel_targets)
+        for direction in ["fwd", "fwd_appendkv", "fwd_splitkv", "bwd"]:
+            subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", direction, "--output_dir", "build", "--receipt", "2", "--optdim", optdim, "--targets", targets_arg], check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -395,14 +537,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             generator_flag = ["-DOLD_GENERATOR_PATH"]
 
         check_if_rocm_home_none("flash_attn")
-        archs = os.getenv("GPU_ARCHS", "native").split(";")
-        validate_and_update_archs(archs)
-
-        if archs != ['native']:
-            cc_flag = [f"--offload-arch={arch}" for arch in archs]
-        else:
-            arch = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
-            cc_flag = [f"--offload-arch={arch}"]
+        cc_flag = [f"--offload-arch={arch}" for arch in kernel_targets]
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -426,17 +561,9 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if detect_hipify_v2():
             maybe_hipify_v2_flag = ["-DHIPIFY_V2"]
 
-        rename_cpp_to_cu(sources)
-
-        renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
-                        "csrc/flash_attn_ck/flash_common.cu",
-                        "csrc/flash_attn_ck/mha_bwd.cu",
-                        "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
-                        "csrc/flash_attn_ck/mha_fwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
-
         cc_flag += ["-O3","-std=c++20",
+                    "-Wno-unknown-warning-option",
+                    "-fbracket-depth=1024",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
                     "-fgpu-flush-denormals-to-zero",
                     "-DCK_ENABLE_BF16",
@@ -451,7 +578,30 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                     # "-DFLASHATTENTION_DISABLE_BACKWARD",
                     "-D__HIP_PLATFORM_HCC__=1"]
 
-        cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"]
+        supported_ck_tile_bfloat16_modes = get_ck_tile_bfloat16_supported_modes(ck_dir)
+        has_gfx11_or_gfx12_target = any(
+            arch.startswith(("gfx11", "gfx12")) for arch in kernel_targets
+        )
+        rdna_bfloat16_default = "5" if "5" in supported_ck_tile_bfloat16_modes else "0"
+
+        ck_tile_float_to_bfloat16_default = os.environ.get("CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT")
+        if ck_tile_float_to_bfloat16_default is None:
+            ck_tile_float_to_bfloat16_default = "3"
+
+        generated_rdna_bfloat16_override = None
+        if has_gfx11_or_gfx12_target:
+            generated_rdna_bfloat16_override = rdna_bfloat16_default
+        cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={ck_tile_float_to_bfloat16_default}"]
+
+        rename_cpp_to_cu(sources, generated_rdna_bfloat16_override=generated_rdna_bfloat16_override)
+
+        renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
+                        "csrc/flash_attn_ck/flash_common.cu",
+                        "csrc/flash_attn_ck/mha_bwd.cu",
+                        "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
+                        "csrc/flash_attn_ck/mha_fwd.cu",
+                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
+                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()
@@ -516,9 +666,14 @@ def get_wheel_url():
         # We're using the CUDA version used to build torch, not the one currently installed
         # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
         torch_cuda_version = parse(torch.version.cuda)
-        # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.3
+        # For CUDA 11 we compile for 11.8, for CUDA 12 for 12.3, and for CUDA 13 for 13.0
         # to save CI time. Minor versions should be compatible.
-        torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.3")
+        if torch_cuda_version.major == 11:
+            torch_cuda_version = parse("11.8")
+        elif torch_cuda_version.major == 12:
+            torch_cuda_version = parse("12.3")
+        else:
+            torch_cuda_version = parse("13.0")
         # cuda_version = f"{cuda_version_raw.major}{cuda_version_raw.minor}"
         cuda_version = f"{torch_cuda_version.major}"
 
@@ -592,6 +747,48 @@ class NinjaBuildExtension(BuildExtension):
 
         super().__init__(*args, **kwargs)
 
+    def build_extensions(self) -> None:
+        original_spawn = None
+        if sys.platform == "win32" and self.compiler.compiler_type == "msvc":
+            original_spawn = self.compiler.spawn
+
+            def spawn(cmd):
+                if not cmd or Path(str(cmd[0])).name.lower() != "link.exe":
+                    return original_spawn(cmd)
+                cmd = [str(arg) for arg in cmd]
+                if len(subprocess.list2cmdline(cmd)) <= 32767:
+                    return original_spawn(cmd)
+                # Temporary workaround adapted from https://github.com/pypa/distutils/pull/406
+                # until setuptools/distutils ships response-file handling for long MSVC links.
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    rsp_path = Path(tmpdir) / "cmdline.txt"
+                    rsp_path.write_text(
+                        "\n".join(subprocess.list2cmdline([arg]) for arg in cmd[1:]) + "\n",
+                        encoding="ascii",
+                    )
+                    return original_spawn([cmd[0], f"@{rsp_path}"])
+
+            self.compiler.spawn = spawn
+
+        try:
+            super().build_extensions()
+        finally:
+            if original_spawn is not None:
+                self.compiler.spawn = original_spawn
+
+
+# Build install_requires based on platform
+if ROCM_BACKEND == "triton":
+    # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
+    install_requires = [
+        "einops",
+        "triton>=3.6.0" if sys.platform != "win32" else "triton-windows>=3.6.0",
+    ]
+else:
+    install_requires = [
+        "torch",
+        "einops",
+    ]
 
 setup(
     name=PACKAGE_NAME,
@@ -606,6 +803,8 @@ setup(
             "docs",
             "benchmarks",
             "flash_attn.egg-info",
+            "flash_attn.cute",
+            "flash_attn.cute.*",
         )
     ),
     author="Tri Dao",
@@ -626,10 +825,7 @@ setup(
         "bdist_wheel": CachedWheelsCommand,
     },
     python_requires=">=3.9",
-    install_requires=[
-        "torch",
-        "einops",
-    ],
+    install_requires=install_requires,
     setup_requires=[
         "packaging",
         "psutil",

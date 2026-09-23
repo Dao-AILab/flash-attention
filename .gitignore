@@ -1,6 +1,11 @@
 *.ncu-rep
+*.sass
+*.ptx
+*.cubin
+*.plk
 .DS_store
 .vscode
+worktrees/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -31,6 +36,10 @@ var/
 
 # Dev
 venv
+agent_space/
+benchmarks/results/
 
 # compile-time generated file
 flash_attn_config.py
+# but keep the committed package shim that re-exports it
+!hopper/flash_attn_3/flash_attn_config.py

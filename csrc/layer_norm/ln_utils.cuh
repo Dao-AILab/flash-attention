@@ -699,7 +699,7 @@ struct Stats<T, 1, WARPS_M, WARPS_N> {
             elts, warp_norm_factor, valid_elts_in_warp_fn, num_valid_elts
         );
 
-        //Each warp warp leader stores its stats
+        // Each warp leader stores its stats
         const auto lane = warp_stats_.reducer_.lane_;
         if( lane == 0 ) {
             smem[warp_n] = warp_stats;

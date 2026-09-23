@@ -5,12 +5,20 @@ from typing import Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 import os
+import warnings
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
+    try:
+        import flash_attn_2_cuda
+    except ImportError:
+        warnings.warn("flash_attn_2_cuda (which has ROCm/HIP kernels) not found, falling back to Triton implementation")
+        USE_TRITON_ROCM = True
+
 if USE_TRITON_ROCM:
-    from .flash_attn_triton_amd import flash_attn_2 as flash_attn_gpu
+    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2 as flash_attn_gpu
 else:
     import flash_attn_2_cuda as flash_attn_gpu
 
@@ -101,7 +109,7 @@ def _flash_attn_forward(
         window_size_right,
         softcap,
         return_softmax,
-        None,
+        None,  # unused generator slot, kept for backwards-compat arg positioning
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -163,6 +171,7 @@ def _flash_attn_varlen_forward(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    num_splits: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
@@ -186,7 +195,8 @@ def _flash_attn_varlen_forward(
         window_size_right,
         softcap,
         return_softmax,
-        None,
+        None,  # unused generator slot, kept for backwards-compat arg positioning
+        num_splits,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -214,6 +224,7 @@ def _flash_attn_varlen_forward_fake(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    num_splits: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     paged_kv = block_table is not None
@@ -284,7 +295,7 @@ def _flash_attn_backward(
         window_size_right,
         softcap,
         deterministic,
-        None,
+        None,  # unused generator slot, kept for backwards-compat arg positioning
         rng_state,
     )
     return softmax_d
@@ -389,7 +400,7 @@ def _flash_attn_varlen_backward(
         window_size_right,
         softcap,
         deterministic,
-        None,
+        None,  # unused generator slot, kept for backwards-compat arg positioning
         rng_state,
     )
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():

@@ -1,18 +1,13 @@
-import itertools
 from typing import Optional
-from einops import rearrange
 import pytest
 
 import torch
 import torch.nn.functional as F
 from flash_attn.cute import flash_attn_varlen_func
 
-IS_SM90 = torch.cuda.get_device_capability()[0] == 9
-
-
 @pytest.mark.parametrize("B", [1, 7, 20])
 @pytest.mark.parametrize("H", [1, 4, 6])
-@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("D", [64, 128, 256])
 @pytest.mark.parametrize("min_seq_len", [1, 32, 128])
 @pytest.mark.parametrize("max_seq_len", [8, 64, 2048])
 @pytest.mark.parametrize("causal", [True, False])
@@ -43,9 +38,6 @@ def test_varlen(
         dtype=dtype
     )
 
-    # SM90 backward pass doesn't support varlen yet
-    skip_backward = IS_SM90
-
     ok = check_varlen_vs_torch_flash(
         q, k, v,
         cu_seqlens_q, cu_seqlens_k,
@@ -53,9 +45,57 @@ def test_varlen(
         softmax_scale=softmax_scale,
         causal=causal,
         mha_type=mha_type,
-        skip_backward=skip_backward,
     )
     assert ok
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (10, 11),
+    reason="SM100/SM110-only test",
+)
+@pytest.mark.parametrize("seqlens", ((128, 256), (129, 257)))
+@pytest.mark.parametrize("causal", (False, True))
+def test_hd256_varlen_epilogue(seqlens, causal):
+    """HD256 uses aligned stores for full tiles and predicates ragged tails."""
+    torch.manual_seed(20260814)
+    num_heads_q, num_heads_kv, head_dim = 4, 1, 256
+    total = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        (0, seqlens[0], total),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    q = torch.randn(
+        total,
+        num_heads_q,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
+    )
+    k = torch.randn(
+        total,
+        num_heads_kv,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
+    )
+    v = torch.randn_like(k, requires_grad=True)
+
+    assert check_varlen_vs_torch_flash(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        total_q=total,
+        total_k=total,
+        causal=causal,
+        mha_type="mqa",
+    )
+
 
 def check_varlen_vs_torch_flash(
     q, k, v,
@@ -71,7 +111,6 @@ def check_varlen_vs_torch_flash(
     softcap=0.0,
     atol=3e-2,
     rtol=3e-2,
-    skip_backward=False,
 ):
     assert q.requires_grad and k.requires_grad and v.requires_grad, "Set requires_grad=True on inputs"
 
@@ -127,10 +166,6 @@ def check_varlen_vs_torch_flash(
     ok_fwd = torch.allclose(out_fa.float(), out_t.float(), atol=atol, rtol=rtol)
     if not ok_fwd:
         return False
-
-    # Skip backward if not supported (e.g., SM90 varlen)
-    if skip_backward:
-        return True
 
     # Use the same upstream gradient to compare backward paths
     grad_out = torch.randn_like(out_fa)

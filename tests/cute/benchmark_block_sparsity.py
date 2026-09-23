@@ -39,7 +39,7 @@ class BenchmarkConfig:
     mask_name: str
     tile_m: int = 128
     tile_n: int = 128
-    use_fast_sampling: bool = False
+    use_fast_sampling: bool = True
     aux_tensors_cute: Optional[list] = None
 
 
@@ -162,7 +162,7 @@ def benchmark_cute_block_sparsity(
             blocksparse_tensors,
             config.seqlen_q,
             config.seqlen_k,
-            config.aux_tensors_cute,
+            aux_tensors=config.aux_tensors_cute,
         )
 
         def generate_tensors():
@@ -336,7 +336,7 @@ def main():
                     mask_name=config.mask_name,
                     tile_m=config.tile_m,
                     tile_n=config.tile_n,
-                    use_fast_sampling=False,
+                    use_fast_sampling=True,
                     aux_tensors_cute=[doc_ids_cute],
                 )
             )
