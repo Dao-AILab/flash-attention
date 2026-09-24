@@ -832,7 +832,7 @@ def _flash_attn_fwd(
     ) and torch.is_tensor(max_seqlen_k):
         max_seqlen_k = None
     if max_seqlen_q is None:
-        max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
+        max_seqlen_q = seqlen_q if cu_seqlens_q is None else cu_seqlens_q.diff().max().item()
     if max_seqlen_k is None:
         # Bound each sequence by its page-table row, not the shared pool.
         max_seqlen_k = (
