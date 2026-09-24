@@ -474,17 +474,13 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         if (return_dropout_randval) {p.zero_();}
     }
 
-    // Only the paged path dispatches fmha_fwd_splitkv. The dense path goes to fmha_fwd, which
-    // ignores num_splits, so running the heuristic for it would size the split accumulators
-    // (allocated next to the splitkv call) for splits that are never performed, and a cap on
-    // the requested value would reject a number that cannot affect the result on that path.
+    // Only the paged path dispatches fmha_fwd_splitkv; fmha_fwd ignores num_splits.
     if (paged_KV)
     {
         num_splits = flash::override_num_splits_if_necessary(
             batch_size, num_heads, num_heads_k, max_seqlen_q, max_seqlen_k, head_size, 0, num_splits);
         TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
-        // The CK splitkv combine kernel silently returns wrong results above 8 splits
-        // (see override_num_splits_if_necessary), so reject rather than corrupt.
+        // Above 8 the combine kernel silently returns wrong results.
         TORCH_CHECK(num_splits <= 8, "num_splits greater than 8 is not supported");
     }
     else

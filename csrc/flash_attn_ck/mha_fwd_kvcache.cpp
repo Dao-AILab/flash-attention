@@ -477,8 +477,7 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
     num_splits = flash::override_num_splits_if_necessary(
         batch_size, num_heads, num_heads_k, seqlen_q, seqlen_k, head_size_8x, 0, num_splits);
     TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
-    // The CK splitkv combine kernel silently returns wrong results above 8 splits
-    // (see override_num_splits_if_necessary), so reject rather than corrupt.
+    // Above 8 the combine kernel silently returns wrong results.
     TORCH_CHECK(num_splits <= 8, "num_splits greater than 8 is not supported");
 
     // Keep references to these tensors to extend their lifetime
