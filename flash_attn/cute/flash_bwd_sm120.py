@@ -12,6 +12,9 @@ from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 
 
 class FlashAttentionBackwardSm120(FlashAttentionBackwardSm80):
+    # Marker for SM120-only correctness paths shared with the SM80 kernel.
+    arch: int = 120
+
     @staticmethod
     def can_implement(
         dtype,
