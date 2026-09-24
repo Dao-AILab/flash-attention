@@ -696,7 +696,7 @@ struct CollectiveMainloopFwdSm80 {
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         static constexpr int kHeadDim = get<2>(TileShape_MNK{});
         int const seqlen_k_new = seqlen_info.seqlen_k_new;
-        using Rotary_t = Rotary<kBlockN, kHeadDim, NumMmaThreads, Element>;
+        using Rotary_t = Rotary<kBlockN, kHeadDim, NumMmaThreads, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
         Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
                         params.ptr_rotary_sin, params.stride_rotary_sin,
                         params.is_rotary_interleaved, thread_idx, seqlen_k_new,
