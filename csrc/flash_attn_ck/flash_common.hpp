@@ -76,6 +76,13 @@ inline int num_splits_heuristic_ck(int batch_nheads_mblocks, int num_SMs, int nu
     return 1;
 }
 
-int override_num_splits_if_necessary(int batch, int nhead, int max_seqlen_q, int hdim_v, float p_drop, int num_splits);
+int override_num_splits_if_necessary(int batch,
+                                     int nhead,
+                                     int nhead_k,
+                                     int max_seqlen_q,
+                                     int max_seqlen_k,
+                                     int hdim_v,
+                                     float p_drop,
+                                     int num_splits);
 
 } // namespace flash
