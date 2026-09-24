@@ -104,7 +104,8 @@ def apply_rotary_emb(
     Arguments:
         x: (batch_size, seqlen, nheads, headdim) if cu_seqlens is None
             else (total_seqlen, nheads, headdim)
-        cos, sin: (seqlen_rotary, rotary_dim / 2)
+        cos, sin: (seqlen_rotary, rotary_dim / 2) or
+            (seqlen_rotary, nheads, rotary_dim / 2)
         interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
             of 1st half and 2nd half (GPT-NeoX style).
         inplace: if True, apply rotary embedding in-place.
@@ -146,7 +147,7 @@ def _apply_rotary_emb_qkv(
         conjugate=conjugate,
         seqlen_offsets=seqlen_offsets
     )
-    if cos_k is None and sin_k is None and qkv.is_contiguous():
+    if cos_k is None and sin_k is None and cos.ndim == 2 and qkv.is_contiguous():
         # Call 1 kernel instead of 2 kernels
         # We need qkv to be contiguous so that when we reshape to combine (3, nheads)
         # dimensions, we get the same tensor
@@ -248,8 +249,11 @@ def apply_rotary_emb_qkv_(
         qkv: (batch_size, seqlen, 3, nheads, headdim) or (batch_size, seqlen, num_heads_q + 2 * num_heads_k, headdim).
             If qkv has shape (batch_size, seqlen, num_heads_q + 2 * num_heads_k, headdim) (e.g. MQA / GQA),
             then num_heads_q must be provided.
-        cos, sin: (seqlen, rotary_dim / 2)
-        cos_k, sin_k: (seqlen, rotary_dim / 2), optional
+        cos, sin: (seqlen, rotary_dim / 2) or
+            (seqlen, num_heads_q, rotary_dim / 2)
+        cos_k, sin_k: (seqlen, rotary_dim / 2) or
+            (seqlen, num_heads_k, rotary_dim / 2), optional. When cos and sin are
+            per-head, cos_k and sin_k must be provided for MQA / GQA.
         interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead of
             1st half and 2nd half (GPT-NeoX style).
         seqlen_offsets: (batch_size,) or int. Each sequence in Q and K is shifted by this amount.
@@ -315,7 +319,8 @@ def apply_rotary_emb_kv_(
     """
     Arguments:
         kv: (batch_size, seqlen, 2, nheads, headdim)
-        cos, sin: (seqlen, rotary_dim / 2)
+        cos, sin: (seqlen, rotary_dim / 2) or
+            (seqlen, nheads, rotary_dim / 2)
         interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead of
             1st half and 2nd half (GPT-NeoX style).
         seqlen_offsets: (batch_size,) or int. Each sequence in Q and K is shifted by this amount.
