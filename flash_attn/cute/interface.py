@@ -178,25 +178,15 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
 
 
 def _fit_sm90_fwd_tile_to_block_sparsity(cfg, sparse_block_size_q, sparse_block_size_kv):
-    """Shrink the SM90 forward tile so that it tiles the block-sparse block size.
+    """Shrink SM90 forward tiles to fit explicit sparse blocks.
 
-    A sparse Q block may span several m tiles (q_subtile_factor), but SM90 has no KV
-    subtiling, so tile_n must equal the sparse KV block. Only shrink: a smaller tile never
-    needs more smem or registers. Sizes that still don't fit are rejected later by
-    normalize_block_sparse_config.
+    Sparse Q blocks may span multiple M tiles, but SM90 requires tile_n to match the
+    sparse KV block. Unsupported sizes are rejected by normalize_block_sparse_config.
     """
     tile_m, tile_n = cfg.m_block_size, cfg.n_block_size
-    if (
-        sparse_block_size_q is not None
-        and sparse_block_size_q % tile_m != 0
-        and sparse_block_size_q % 64 == 0
-    ):
+    if sparse_block_size_q % tile_m != 0 and sparse_block_size_q % 64 == 0:
         tile_m = 64
-    if (
-        sparse_block_size_kv is not None
-        and sparse_block_size_kv < tile_n
-        and sparse_block_size_kv % 16 == 0
-    ):
+    if sparse_block_size_kv < tile_n and sparse_block_size_kv % 16 == 0:
         tile_n = sparse_block_size_kv
     return FwdConfig(tile_m, tile_n, cfg.mma_pv_is_rs, cfg.intra_wg_overlap)
 
