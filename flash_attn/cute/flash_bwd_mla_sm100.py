@@ -226,6 +226,11 @@ class FlashAttentionSparseMLABackwardSm100:
 
         # redundant names for ease-of-use
         self.num_stages_V = 2
+        # mma_inner(swap_AB_stage=True) (the load-P dP gemm, V @ dO^T) indexes
+        # the stationary dO split by the V ring index, which equals the hdimv
+        # split only while the V ring has exactly one stage per split. Keep
+        # that coupling explicit: a deeper V ring must also pass the split.
+        assert self.num_stages_V == self.num_hdimv_splits
         self.num_stages_dO = 2
         self.num_stages_P = 1
         self.num_stages_Pt = 1
@@ -237,7 +242,16 @@ class FlashAttentionSparseMLABackwardSm100:
 
         self.num_stages_dP = 1
         self.num_stages_dPt = 1
-        self.num_stages_dV = 2  # == hdimv splits, for Umma <-> Async
+        # dV accumulator ring (Umma <-> Async), one 128-column stage per hdimv
+        # split. At 64 heads a third stage fits in TMEM (3 x 128 + 32 + 32 = 448)
+        # and lets leg1(g+1) start while the epilogue still drains group g: the
+        # (group, split) -> stage map becomes (2g + s) mod 3 and is carried by the
+        # pipeline states' .index on both sides (see AI/SPARSE_MLA_64H.md).
+        self.num_stages_dV = 3 if self.tile_m == 64 else 2
+        # TMA-warp <-> epilogue guard of the dV staging; resolved to num_stages_dV
+        # or 0 in _get_shared_storage_cls once the smem layouts exist.
+        self.num_stages_dV_epi = self.num_stages_dV
+        self.dv_staging_aliases_operand = True
         # Per hdimv split: 2 warpgroup halves x 2 subtile parities.
         self.num_epi_stages_dV = 4
 
@@ -256,15 +270,19 @@ class FlashAttentionSparseMLABackwardSm100:
         # ==== dtype info ====
         self.dtype_acc = Float32
 
+        # dV gemms through the DSL gemm (False) or the inline-PTX gemm (True)
+        self.use_ptx_gemm_dV = False
+
         # ==== TMEM info ====
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
         self.tmem_cols_dP = self.tile_m // self.cta_group_size
         self.tmem_cols_dVi = (self.hdimv // self.num_hdimv_splits) // self.cta_group_size
         self.tmem_offset_dV0 = 0
-        self.tmem_offset_dV1 = self.tmem_offset_dV0 + self.tmem_cols_dVi
-        self.tmem_offsets_dV = [self.tmem_offset_dV0, self.tmem_offset_dV1]
-        self.tmem_offset_dP = self.tmem_offset_dV1 + self.tmem_cols_dVi
+        self.tmem_offsets_dV = [
+            self.tmem_offset_dV0 + i * self.tmem_cols_dVi for i in range(self.num_stages_dV)
+        ]
+        self.tmem_offset_dP = self.tmem_offset_dV0 + self.num_stages_dV * self.tmem_cols_dVi
         self.total_tmem = self.tmem_offset_dP + self.tmem_cols_dP
         if self.recompute_P:
             # S^T accumulator: same footprint as dP^T (one (128,128) fp32
@@ -332,7 +350,14 @@ class FlashAttentionSparseMLABackwardSm100:
         operand_elems = cute.cosize(self.sQvt_layout_staged)
         assert self.num_stages_Qvt == self.num_hdimv_splits
         stage_elems = operand_elems // self.num_hdimv_splits
-        if staging_elems == stage_elems:
+        # pipeline_dV_epi (TMA warp -> epilogue) guards the dO/dOt/Qvt operand stage
+        # against the dV staging drain. It is only needed when the staging aliases an
+        # operand stage (128 heads); when the staging is appended after the operands
+        # (64 heads) the guard would only serialize the dO(g+1) loads behind the dV
+        # scatter of group g, so it is compiled out (see AI/SPARSE_MLA_64H.md).
+        self.dv_staging_aliases_operand = staging_elems == stage_elems
+        self.num_stages_dV_epi = self.num_stages_dV if self.dv_staging_aliases_operand else 0
+        if self.dv_staging_aliases_operand:
             self.sdV_split_offsets = [split * stage_elems for split in range(self.num_hdimv_splits)]
             sQv_elems = operand_elems
         else:
@@ -423,7 +448,7 @@ class FlashAttentionSparseMLABackwardSm100:
             mbar_ptr_dSt: mbar_ptr_dSt_struct
             mbar_ptr_dPt: mbar_ptr_dPt_struct
             mbar_ptr_dV: mbar_ptr_dV_struct
-            mbar_ptr_dV_epi: mbar_ptr_dV_struct
+            mbar_ptr_dV_epi: mbar_struct(self.num_stages_dV_epi)
             mbar_ptr_scaleP: mbar_ptr_scaleP_struct
             mbar_ptr_dPsum: mbar_ptr_dPsum_struct
             mbar_ptr_St: mbar_ptr_St_struct
@@ -1025,8 +1050,10 @@ class FlashAttentionSparseMLABackwardSm100:
         # UmmaAsync: dPt, dV
         pipeline_dPt = make_pipeline(UmmaAsync, storage.mbar_ptr_dPt, self.num_stages_dPt, mma_warp, sm_threads_cluster)
         pipeline_dV = make_pipeline(UmmaAsync, storage.mbar_ptr_dV, self.num_stages_dV, mma_warp, epi_threads_cluster)
-        # Async: dV_epi
-        pipeline_dV_epi = make_pipeline(Async, storage.mbar_ptr_dV_epi, self.num_stages_dV, tma_warp, store_warp)
+        # Async: dV_epi (only when the dV staging aliases an operand stage, see _get_shared_storage_cls)
+        pipeline_dV_epi = None
+        if const_expr(self.num_stages_dV_epi > 0):
+            pipeline_dV_epi = make_pipeline(Async, storage.mbar_ptr_dV_epi, self.num_stages_dV_epi, tma_warp, store_warp)
 
         pipeline_V         = make_pipeline(AsyncUmma, storage.mbar_ptr_V,         self.num_stages_V, relay_warps_cluster,  mma_warp)
         pipeline_V_cpasync = make_pipeline(Async,     storage.mbar_ptr_V_cpasync, self.num_stages_V, cpasync_load_threads, relay_threads)
@@ -1134,11 +1161,12 @@ class FlashAttentionSparseMLABackwardSm100:
         acc_shape_dPt = thr_mma_VdO.partition_shape_C(self.mma_tiler_VdO[:2])
         acc_shape_dVi = thr_mma_PtdOt.partition_shape_C(self.mma_tiler_PtdOt[:2])
         tdPtdP_fake = thr_mma_VdO.make_fragment_C(acc_shape_dPt)
-        tdVtdV0_fake = thr_mma_PtdOt.make_fragment_C(acc_shape_dVi)
-        tdVtdV1_fake = thr_mma_PtdOt.make_fragment_C(acc_shape_dVi)
-        # tdPtdP = cute.make_tensor(tdPtdP.iterator + self.tmem_offset_dP, tdPtdP.layout)
-        # tdVtdV0 = cute.make_tensor(tdVtdV0.iterator + self.tmem_offset_dV0, tdVtdV0.layout)
-        # tdVtdV1 = cute.make_tensor(tdVtdV1.iterator + self.tmem_offset_dV1, tdVtdV1.layout)
+        # (MMA, MMA_M, MMA_N, STAGE): the dV accumulator ring; a stage is selected
+        # with a dynamic index (the pipeline state's .index) on both sides.
+        tdVtdV_fake = thr_mma_PtdOt.make_fragment_C(
+            cute.append(acc_shape_dVi, self.num_stages_dV)
+        )
+        assert cute.size(tdVtdV_fake.shape[3]) == self.num_stages_dV
 
         block_info = BlockInfo(
             self.tile_m * self.cta_group_size,
@@ -1307,8 +1335,7 @@ class FlashAttentionSparseMLABackwardSm100:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.dtype_acc)
             tdPtdP = cute.make_tensor(tmem_ptr + self.tmem_offset_dP, tdPtdP_fake.layout)
-            tdVtdV0 = cute.make_tensor(tmem_ptr + self.tmem_offset_dV0, tdVtdV0_fake.layout)
-            tdVtdV1 = cute.make_tensor(tmem_ptr + self.tmem_offset_dV1, tdVtdV1_fake.layout)
+            tdVtdV = cute.make_tensor(tmem_ptr + self.tmem_offset_dV0, tdVtdV_fake.layout)
             tdStS = None
             if const_expr(self.recompute_P):
                 # S^T accumulator shares the dP^T fragment layout
@@ -1321,8 +1348,7 @@ class FlashAttentionSparseMLABackwardSm100:
                 sdSt,
                 sQvt,
                 tdPtdP,
-                tdVtdV0,
-                tdVtdV1,
+                tdVtdV,
                 tiled_mma_VdO,
                 tiled_mma_PtdOt,
                 tiled_mma_dStQvt,
@@ -1398,14 +1424,12 @@ class FlashAttentionSparseMLABackwardSm100:
 
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.dtype_acc)
-            tdVtdV0 = cute.make_tensor(tmem_ptr + self.tmem_offset_dV0, tdVtdV0_fake.layout)
-            tdVtdV1 = cute.make_tensor(tmem_ptr + self.tmem_offset_dV1, tdVtdV1_fake.layout)
+            tdVtdV = cute.make_tensor(tmem_ptr + self.tmem_offset_dV0, tdVtdV_fake.layout)
             self.dVacc_store(
                 mIndexTopk,
                 mdV,
                 sdVs,
-                tdVtdV0,
-                tdVtdV1,
+                tdVtdV,
                 thr_mma_PtdOt,
                 pipeline_dV,
                 pipeline_dV_epi,
@@ -1718,7 +1742,7 @@ class FlashAttentionSparseMLABackwardSm100:
         pipeline_P: pipeline.PipelineAsync,  # TmaAsync
         pipeline_dOt_Qvt: pipeline.PipelineAsync,  # TmaUmma
         pipeline_Pt: pipeline.PipelineAsync,  # AsyncUmma
-        pipeline_dV_epi: pipeline.PipelineAsync,  # Async
+        pipeline_dV_epi: Optional[pipeline.PipelineAsync],  # Async (None when compiled out)
         pipeline_scaleP: pipeline.PipelineAsync,  # TmaAsync
         pipeline_dPsum: pipeline.PipelineAsync,  # TmaAsync
         thr_mma_VdO: cute.ThrMma,
@@ -1753,7 +1777,9 @@ class FlashAttentionSparseMLABackwardSm100:
         producer_state_dO = pipeline.make_pipeline_state(Producer, stages=self.num_stages_dO)
         producer_state_P = pipeline.make_pipeline_state(Producer, stages=self.num_stages_P)
         producer_state_dOt_Qvt = pipeline.make_pipeline_state(Producer, stages=self.num_stages_dOt)
-        producer_state_dV_epi = pipeline.make_pipeline_state(Producer, stages=self.num_stages_dV)
+        producer_state_dV_epi = None
+        if const_expr(pipeline_dV_epi is not None):
+            producer_state_dV_epi = pipeline.make_pipeline_state(Producer, stages=self.num_stages_dV_epi)
         producer_state_scaleP = pipeline.make_pipeline_state(
             Producer, stages=self.num_stages_scaleP
         )
@@ -1959,8 +1985,9 @@ class FlashAttentionSparseMLABackwardSm100:
                     pipeline_Pt.producer_acquire(producer_state_P)
                     producer_state_P = load_P(producer_state_P, block=n_block)
                     for split in cutlass.range_constexpr(self.num_hdimv_splits):
-                        pipeline_dV_epi.producer_acquire(producer_state_dV_epi)
-                        producer_state_dV_epi.advance()
+                        if const_expr(pipeline_dV_epi is not None):
+                            pipeline_dV_epi.producer_acquire(producer_state_dV_epi)
+                            producer_state_dV_epi.advance()
                         producer_state_dOt_Qvt = load_dOt(producer_state_dOt_Qvt, block=split)
                     for split in cutlass.range_constexpr(self.num_hdimv_splits):
                         producer_state_dOt_Qvt = load_Qvt(producer_state_dOt_Qvt, block=split)
@@ -1968,10 +1995,12 @@ class FlashAttentionSparseMLABackwardSm100:
                     # 6 loads/group through the 2-stage multiplex buffer, in mma
                     # consumption order: dO (dP gemm), dOt (dV += P^T@dO),
                     # Qvt (dV += dS^T@Qv). dO is the first writer of each
-                    # 32 KiB half per group, so the dV-staging guard sits here.
+                    # 32 KiB half per group, so the dV-staging guard sits here
+                    # (compiled out when the staging does not alias the operands).
                     for split in cutlass.range_constexpr(self.num_hdimv_splits):
-                        pipeline_dV_epi.producer_acquire(producer_state_dV_epi)
-                        producer_state_dV_epi.advance()
+                        if const_expr(pipeline_dV_epi is not None):
+                            pipeline_dV_epi.producer_acquire(producer_state_dV_epi)
+                            producer_state_dV_epi.advance()
                         producer_state_dOt_Qvt = load_dO(producer_state_dOt_Qvt, block=split)
                     for split in cutlass.range_constexpr(self.num_hdimv_splits):
                         producer_state_dOt_Qvt = load_dOt(producer_state_dOt_Qvt, block=split)
@@ -2028,8 +2057,7 @@ class FlashAttentionSparseMLABackwardSm100:
         sdSt: cute.Tensor,
         sQvt: cute.Tensor,
         tdPtdP: cute.Tensor,
-        tdVtdV0: cute.Tensor,
-        tdVtdV1: cute.Tensor,
+        tdVtdV: cute.Tensor,  # (MMA, MMA_M, MMA_N, STAGE) dV accumulator ring
         tiled_mma_VdO: cute.TiledMma,
         tiled_mma_PtdOt: cute.TiledMma,
         tiled_mma_dStQvt: cute.TiledMma,
@@ -2062,8 +2090,6 @@ class FlashAttentionSparseMLABackwardSm100:
         # Consumes: V, dO, P.T, dO.T, dS.T, Qv.T (, QvB, Kr, Qr)
         lane_idx = cute.arch.lane_idx()
 
-        tdVtdVs = [tdVtdV0, tdVtdV1]
-
         # Set accumulate = True for dS^T@Qv since we are accumulating on the P^T@dO result
         tiled_mma_dStQvt.set(tcgen05.Field.ACCUMULATE, True)
 
@@ -2089,8 +2115,8 @@ class FlashAttentionSparseMLABackwardSm100:
                 gemm_S_rope = partial(fa_sm100_utils.gemm, tiled_mma_VdO, tdStS)
 
         use_ptx_gemm_VdO = False
-        use_ptx_gemm_PtdOt = False
-        use_ptx_gemm_dStQvt = False
+        use_ptx_gemm_PtdOt = self.use_ptx_gemm_dV
+        use_ptx_gemm_dStQvt = self.use_ptx_gemm_dV
 
         # GEMM functions
         if const_expr(use_ptx_gemm_VdO):
@@ -2107,48 +2133,27 @@ class FlashAttentionSparseMLABackwardSm100:
                 tiled_mma_VdO,
                 tdPtdP,
             )
+        # The dV gemms take their accumulator per call (the ring stage selected by
+        # the pipeline state in mma_dV_leg1/leg2): acc= for the DSL path,
+        # acc_tmem_addr= for the PTX path.
         if const_expr(use_ptx_gemm_PtdOt):
-            gemm_PtdOt = [
-                partial(
-                    fa_sm100_utils.gemm_ptx_partial,
-                    tiled_mma_PtdOt.op,
-                    self.tmem_offsets_dV[split],
-                    zero_init=True,
-                    cta_group=self.cta_group_size,
-                )
-                for split in range(self.num_hdimv_splits)
-            ]
+            gemm_PtdOt = partial(
+                fa_sm100_utils.gemm_ptx_partial,
+                tiled_mma_PtdOt.op,
+                zero_init=True,
+                cta_group=self.cta_group_size,
+            )
         else:
-            gemm_PtdOt = [
-                partial(
-                    fa_sm100_utils.gemm,
-                    tiled_mma_PtdOt,
-                    tdVtdVs[split],
-                    zero_init=True,
-                )
-                for split in range(self.num_hdimv_splits)
-            ]
+            gemm_PtdOt = partial(fa_sm100_utils.gemm, tiled_mma_PtdOt, zero_init=True)
         if const_expr(use_ptx_gemm_dStQvt):
-            gemm_dStQvt = [
-                partial(
-                    fa_sm100_utils.gemm_ptx_partial,
-                    tiled_mma_dStQvt.op,
-                    self.tmem_offsets_dV[split],
-                    zero_init=False,
-                    cta_group=self.cta_group_size,
-                )
-                for split in range(self.num_hdimv_splits)
-            ]
+            gemm_dStQvt = partial(
+                fa_sm100_utils.gemm_ptx_partial,
+                tiled_mma_dStQvt.op,
+                zero_init=False,
+                cta_group=self.cta_group_size,
+            )
         else:
-            gemm_dStQvt = [
-                partial(
-                    fa_sm100_utils.gemm,
-                    tiled_mma_dStQvt,
-                    tdVtdVs[split],
-                    zero_init=False,
-                )
-                for split in range(self.num_hdimv_splits)
-            ]
+            gemm_dStQvt = partial(fa_sm100_utils.gemm, tiled_mma_dStQvt, zero_init=False)
 
         Consumer, Producer = pipeline.PipelineUserType.Consumer, pipeline.PipelineUserType.Producer
         consumer_state_V = pipeline.make_pipeline_state(Consumer, stages=self.num_stages_V)
@@ -2220,14 +2225,14 @@ class FlashAttentionSparseMLABackwardSm100:
                         # 2. dV = P^T @ dO
                         # mma inner waits for dOt
                         consumer_state_Pt, consumer_state_dOt_Qvt = self.mma_dV_leg1(
-                            mma_PtdOt, pipeline_Pt, pipeline_dV,
+                            mma_PtdOt, pipeline_Pt, pipeline_dV, tdVtdV,
                             consumer_state_Pt, consumer_state_dOt_Qvt, producer_state_dV,
                         )
 
                         # 3. dV += dS^T @ Qv
                         # mma inner waits for Qvt
                         consumer_state_dSt, consumer_state_dOt_Qvt, producer_state_dV = self.mma_dV_leg2(
-                            mma_dStQvt, pipeline_dSt, pipeline_dV,
+                            mma_dStQvt, pipeline_dSt, pipeline_dV, tdVtdV,
                             consumer_state_dSt, consumer_state_dOt_Qvt, producer_state_dV,
                         )
                 else:
@@ -2250,10 +2255,10 @@ class FlashAttentionSparseMLABackwardSm100:
                         pipeline_dPt, pipeline_dOt_Qvt, pipeline_V,
                     )
                     mma_dV_leg1 = partial(
-                        self.mma_dV_leg1, mma_PtdOt, pipeline_Pt, pipeline_dV
+                        self.mma_dV_leg1, mma_PtdOt, pipeline_Pt, pipeline_dV, tdVtdV
                     )
                     mma_dV_leg2 = partial(
-                        self.mma_dV_leg2, mma_dStQvt, pipeline_dSt, pipeline_dV
+                        self.mma_dV_leg2, mma_dStQvt, pipeline_dSt, pipeline_dV, tdVtdV
                     )
 
                     for _ in cutlass.range(num_n_block_groups, unroll=1):
@@ -2291,6 +2296,14 @@ class FlashAttentionSparseMLABackwardSm100:
         if const_expr(self.recompute_P):
             pipeline_St.producer_tail(producer_state_St)
 
+    def dv_acc_kwargs(self, tdVtdV: cute.Tensor, stage_idx: Int32) -> dict:
+        """Accumulator argument for one dV gemm: ring stage `stage_idx` of the
+        (MMA, MMA_M, MMA_N, STAGE) TMEM tensor (DSL gemm), or its column offset
+        for the PTX gemm."""
+        if self.use_ptx_gemm_dV:
+            return dict(acc_tmem_addr=self.tmem_offset_dV0 + stage_idx * self.tmem_cols_dVi)
+        return dict(acc=tdVtdV[None, None, None, stage_idx])
+
     @cute.jit
     def mma_inner(
         self,
@@ -2301,15 +2314,13 @@ class FlashAttentionSparseMLABackwardSm100:
         tCrB,
         sB,
         consumer_state: pipeline.PipelineState,
-        acc_stage: Optional[Int32] = None,
+        acc: Optional[cute.Tensor] = None,
+        acc_tmem_addr: Optional[Int32] = None,
         a_stage: Int32 = 0,
         zero_init: Optional[bool] = None,
         swap_AB_stage: bool = False,
         use_ptx: bool = True,
     ):
-        if const_expr(acc_stage is not None):
-            gemm = gemm[acc_stage]
-
         smem_stage = consumer_state.index
 
         if const_expr(not swap_AB_stage):
@@ -2327,6 +2338,12 @@ class FlashAttentionSparseMLABackwardSm100:
         kwargs = dict(tCrA=tCrA_cur, tCrB=tCrB_cur)
         if const_expr(use_ptx):
             kwargs |= dict(sA=sA_cur, sB=sB_cur)
+        # accumulator selected per call (dV ring stage); gemms with a fixed
+        # accumulator bind it in their partial instead
+        if const_expr(acc is not None):
+            kwargs["acc"] = acc
+        if const_expr(acc_tmem_addr is not None):
+            kwargs["acc_tmem_addr"] = acc_tmem_addr
         if const_expr(zero_init is not None):
             kwargs["zero_init"] = zero_init
 
@@ -2425,17 +2442,24 @@ class FlashAttentionSparseMLABackwardSm100:
         mma_PtdOt,
         pipeline_Pt: pipeline.PipelineAsync,
         pipeline_dV: pipeline.PipelineAsync,
+        tdVtdV: cute.Tensor,
         consumer_state_Pt: pipeline.PipelineState,
         consumer_state_dOt_Qvt: pipeline.PipelineState,
         producer_state_dV: pipeline.PipelineState,
     ):
-        # dV = P^T @ dO (shared by the default and recompute mainloops)
+        # dV = P^T @ dO (shared by the default and recompute mainloops).
+        # Split s of this group accumulates into ring stage
+        # producer_state_dV.index + s (mod num_stages_dV): the stage the acquire
+        # below waits for, and the one leg2 commits.
         pipeline_Pt.consumer_wait(consumer_state_Pt)
         producer_acquire_state_dV = producer_state_dV.clone()
         for split in cutlass.range_constexpr(self.num_hdimv_splits):
             pipeline_dV.producer_acquire(producer_acquire_state_dV)
+            consumer_state_dOt_Qvt = mma_PtdOt(
+                consumer_state_dOt_Qvt,
+                **self.dv_acc_kwargs(tdVtdV, producer_acquire_state_dV.index),
+            )
             producer_acquire_state_dV.advance()
-            consumer_state_dOt_Qvt = mma_PtdOt(consumer_state_dOt_Qvt, acc_stage=split)
         pipeline_Pt.consumer_release(consumer_state_Pt)
         consumer_state_Pt.advance()
         return consumer_state_Pt, consumer_state_dOt_Qvt
@@ -2446,14 +2470,19 @@ class FlashAttentionSparseMLABackwardSm100:
         mma_dStQvt,
         pipeline_dSt: pipeline.PipelineAsync,
         pipeline_dV: pipeline.PipelineAsync,
+        tdVtdV: cute.Tensor,
         consumer_state_dSt: pipeline.PipelineState,
         consumer_state_dOt_Qvt: pipeline.PipelineState,
         producer_state_dV: pipeline.PipelineState,
     ):
-        # dV += dS^T @ Qv (shared by the default and recompute mainloops)
+        # dV += dS^T @ Qv (shared by the default and recompute mainloops); same
+        # ring stage as leg1's split s, committed to the epilogue here.
         pipeline_dSt.consumer_wait(consumer_state_dSt)
         for split in cutlass.range_constexpr(self.num_hdimv_splits):
-            consumer_state_dOt_Qvt = mma_dStQvt(consumer_state_dOt_Qvt, acc_stage=split)
+            consumer_state_dOt_Qvt = mma_dStQvt(
+                consumer_state_dOt_Qvt,
+                **self.dv_acc_kwargs(tdVtdV, producer_state_dV.index),
+            )
             pipeline_dV.producer_commit(producer_state_dV)
             producer_state_dV.advance()
         pipeline_dSt.consumer_release(consumer_state_dSt)
@@ -2864,11 +2893,10 @@ class FlashAttentionSparseMLABackwardSm100:
         mIndexTopk: cute.Tensor,
         mdV: cute.Tensor,
         sdVs: list[cute.Tensor],
-        tdVtdV0: cute.Tensor,
-        tdVtdV1: cute.Tensor,
+        tdVtdV: cute.Tensor,  # (MMA, MMA_M, MMA_N, STAGE) dV accumulator ring
         thr_mma_PtdOt: cute.ThrMma,
         pipeline_dV: pipeline.PipelineAsync,  # UmmaAsync
-        pipeline_dV_epi: pipeline.PipelineAsync,  # Async
+        pipeline_dV_epi: Optional[pipeline.PipelineAsync],  # Async (None when compiled out)
         topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
@@ -2879,8 +2907,11 @@ class FlashAttentionSparseMLABackwardSm100:
         # produces: -
         # consumes: dV
 
-        tdVtdV0 = tdVtdV0[(None, None), 0, 0]
-        tdVtdV1 = tdVtdV1[(None, None), 0, 0]
+        # ((M, N), STAGE): keep the ring's stage mode; a stage is picked per split
+        # with consumer_state_dV.index (the same (2g + s) mod num_stages_dV map
+        # the mma warp commits in).
+        tdVtdV = tdVtdV[(None, None), 0, 0, None]  # (M, N, STAGE), N = (128, 2)
+        tdVtdV_stage0 = tdVtdV[None, None, 0]
 
         num_epi_warps = self.num_epilogue_threads // 32
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -2897,11 +2928,10 @@ class FlashAttentionSparseMLABackwardSm100:
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
             self.dtype_acc,
         )
-        tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tdVtdV0)
+        tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tdVtdV_stage0)
         thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
-        tdVtdV0_t2r = thr_copy_t2r.partition_S(tdVtdV0)
-        tdVtdV1_t2r = thr_copy_t2r.partition_S(tdVtdV1)
-        tdVtdVs_t2r = [tdVtdV0_t2r, tdVtdV1_t2r]
+        # (T2R, T2R_M, T2R_N, STAGE)
+        tdVtdV_t2r_all = thr_copy_t2r.partition_S(tdVtdV)
 
         cdVmma = cute.make_identity_tensor(self.mma_tiler_PtdOt[:2])
         tdVcdVmma = thr_mma_PtdOt.partition_C(cdVmma)[(None, None), 0, 0]
@@ -2953,7 +2983,8 @@ class FlashAttentionSparseMLABackwardSm100:
                     rIdxTopK[j] = mIndexTopk_cur[n_idx]
 
                 for split in cutlass.range_constexpr(self.num_hdimv_splits):
-                    tdVtdV_t2r = tdVtdVs_t2r[split]
+                    # ring stage of (group, split), selected dynamically
+                    tdVtdV_t2r = tdVtdV_t2r_all[None, None, None, consumer_state_dV.index]
 
                     pipeline_dV.consumer_wait(consumer_state_dV)
 
@@ -3021,9 +3052,10 @@ class FlashAttentionSparseMLABackwardSm100:
                     self.epi_barrier.arrive_and_wait()
                     pipeline_dV.consumer_release(consumer_state_dV)
 
-                    if leader_warp:
-                        with cute.arch.elect_one():
-                            pipeline_dV_epi.consumer_release(consumer_state_dV)
+                    if const_expr(pipeline_dV_epi is not None):
+                        if leader_warp:
+                            with cute.arch.elect_one():
+                                pipeline_dV_epi.consumer_release(consumer_state_dV)
 
                     consumer_state_dV.advance()
 

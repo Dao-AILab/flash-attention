@@ -3612,7 +3612,8 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
 # 24 heads: padded per-head preprocess tiles must not spill into the next packed sequence.
-@pytest.mark.parametrize("nheads", [128, 24])
+# 64 heads: the native 64-row (tile_m == 64) backward specialization.
+@pytest.mark.parametrize("nheads", [128, 64, 24])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dtype):
     """Varlen counterpart of test_flash_attn_mla_sparse_bwd_sentinel.
@@ -3630,7 +3631,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dt
     torch.random.manual_seed(0)
     nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
-    seqlens = [512, 4, 1024] if nheads == 128 else [130, 4, 258]
+    seqlens = [512, 4, 1024] if nheads in (128, 64) else [130, 4, 258]
     total = sum(seqlens)
     cu_bounds = [0] + list(itertools.accumulate(seqlens))
     cu_seqlens = torch.tensor(cu_bounds, dtype=torch.int32, device=device)
@@ -3895,8 +3896,10 @@ def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, nheads, share
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("token_chunk", [None, 200])
+# both backward head tiles: 128 (2 x 64-row halves) and the native 64-row specialization
+@pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_fully_masked_rows(token_chunk, recompute_p, dtype):
+def test_flash_attn_mla_sparse_bwd_fully_masked_rows(nheads, token_chunk, recompute_p, dtype):
     """Rows whose every top-k slot is the -1 sentinel (fully masked).
 
     The forward must emit out = 0 / lse = -inf for those rows, and the
@@ -3915,7 +3918,7 @@ def test_flash_attn_mla_sparse_bwd_fully_masked_rows(token_chunk, recompute_p, d
     device = "cuda"
     torch.random.manual_seed(0)
     batch_size, seqlen_q, seqlen_k = 1, 512, 512
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
     masked_rows = slice(150, 260)  # straddles the chunk boundary at 200
 
@@ -3962,8 +3965,9 @@ def test_flash_attn_mla_sparse_bwd_fully_masked_rows(token_chunk, recompute_p, d
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("recompute_p", [False, True])
+@pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_token_chunk_rect(recompute_p, dtype):
+def test_flash_attn_mla_sparse_bwd_token_chunk_rect(nheads, recompute_p, dtype):
     """Rectangular causal chunked backward with seqlen_q > seqlen_k.
 
     With bottom-right-aligned causal masking, query rows before
@@ -3980,7 +3984,7 @@ def test_flash_attn_mla_sparse_bwd_token_chunk_rect(recompute_p, dtype):
     device = "cuda"
     torch.random.manual_seed(0)
     batch_size, seqlen_q, seqlen_k = 1, 512, 256
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
     token_chunk = 200  # chunk 0: k_end = -56 (skip_main); chunk 1: 144; chunk 2: 256
     n_masked = seqlen_q - seqlen_k  # rows [0, 256) have an empty causal window
@@ -4023,8 +4027,9 @@ def test_flash_attn_mla_sparse_bwd_token_chunk_rect(recompute_p, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
+@pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_token_chunk_varlen(shared_kv, recompute_p, dtype):
+def test_flash_attn_mla_sparse_bwd_token_chunk_varlen(nheads, shared_kv, recompute_p, dtype):
     """Varlen token-chunked sparse-MLA backward, causal, with non-causal
     indices and both docs split across chunk boundaries.
 
@@ -4045,7 +4050,7 @@ def test_flash_attn_mla_sparse_bwd_token_chunk_varlen(shared_kv, recompute_p, dt
         pytest.skip()
     device = "cuda"
     torch.random.manual_seed(0)
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
     doc_lens = (600, 424)
     total = sum(doc_lens)
@@ -4231,8 +4236,9 @@ def test_flash_attn_mla_sparse_bwd_preprocess_tile_tail(varlen, recompute_p, dty
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_learnable_sink(varlen, shared_kv, causal, dtype):
+def test_flash_attn_mla_sparse_bwd_learnable_sink(nheads, varlen, shared_kv, causal, dtype):
     """Sparse-MLA backward with a learnable sink, across every gather_bwd mode.
 
     The sink only enters through lse (lse = log(exp(sink) + sum_j exp(s_j))),
@@ -4255,7 +4261,7 @@ def test_flash_attn_mla_sparse_bwd_learnable_sink(varlen, shared_kv, causal, dty
         pytest.skip()
     device = "cuda"
     torch.random.manual_seed(0)
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
     token_chunk = 200
     if varlen:
@@ -5603,8 +5609,9 @@ def _self_last_permutation(idx):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_topk_order_invariance(causal, dtype):
+def test_flash_attn_mla_sparse_topk_order_invariance(nheads, causal, dtype):
     """The sparse-MLA training forward must not care about the ORDER of the per-row top-k
     indices beyond bf16 rounding noise.
 
@@ -5623,7 +5630,7 @@ def test_flash_attn_mla_sparse_topk_order_invariance(causal, dtype):
         pytest.skip()
     device = "cuda"
     torch.random.manual_seed(0)
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     total, topk_len = 512, 256
     softmax_scale = (hdim + hdimv) ** -0.5
     beta = 0.25  # self-key boost: q_t += beta * k_t, qv_t += beta * v_t (~50% self weight)
