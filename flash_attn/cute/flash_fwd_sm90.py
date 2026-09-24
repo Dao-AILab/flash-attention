@@ -1157,9 +1157,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         )
                         O_should_accumulate = True
                     n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
-                # The remaining iterations have no masking (but may still need mask_mod).
-                # mask_fn is bound with mask_causal/mask_local, so passing it here would re-apply
-                # the causal/local mask to every block even though it is all-true.
+                # Interior blocks need no causal/local masking, but custom mask_mod still applies.
                 n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
                     seqlen, m_block, n_block_min
                 )
