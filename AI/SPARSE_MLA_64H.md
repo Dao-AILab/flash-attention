@@ -12,7 +12,8 @@ Sections are added per change; this file is the target of the one-line pointers 
 `flash_bwd_mla_sm100.py`, `flash_fwd_mla_sm100_h64.py` and `interface.py`.
 
 Contents: C8 (dV accumulator hand-off pipelining), C1 (fused dK_rope), F1 (1-CTA forward),
-C6-dq (1-CTA dQ/dQv kernel with a whole-row gather).
+C6-dq (1-CTA dQ/dQv kernel with a whole-row gather), F3 (Q in TMEM, `.ws` TS dual GEMM,
+three latent stages).
 
 ## C8: pipelining the dV accumulator hand-off (`FlashAttentionSparseMLABackwardSm100`)
 
@@ -530,3 +531,140 @@ preprocess_tile_tail`) fake and GPU; `agent_space/dsa-64h-design/runs/C6_dq/chec
 batched + varlen; bitwise compare against the padded kernel); 128-head outputs bitwise
 unchanged (out / dq / dqv sha256 identical to the integration branch, dk / dv within the fp32
 atomic band); `runs/C6_dq/gates.md`, `reports/C6dq_report.md`.
+## F3: Q in TMEM, `.ws` TS dual GEMM, three latent stages (`FlashAttentionMLAForwardSm100H64`)
+
+How the 64-head forward keeps the token's Q tile in tensor memory instead of shared memory,
+what that buys (a third latent stage), how the S GEMM and the softmax change, what it costs,
+and where the design's time goes.
+Code: `flash_fwd_mla_sm100_h64.py` (same class and constructor as F1), `blackwell_helpers.py`
+(`gemm_ws_ts_ptx_partial`, `utccp_128x256b_ptx`, `tcgen05_fence_after_thread_sync`),
+`topk_gather_kv.py` (`CpasyncGatherKVManagerH64.load_X(identity_rows=True)`), `interface.py`
+(the H64 dispatch additionally requires a caller-provided `out` to be 32-B aligned).
+
+### Why
+
+With Q in shared memory (F1: sQv 64 KiB + sQ 8 KiB) only two 72 KiB latent stages fit under the
+232,448 B cap, and F1 measured that with two stages nothing hides the ~1,800-cycle refill of the
+stage that PV(a) just released (`ledger.md` L17, L20 of WP-F1). The 72 KiB of Q are the only
+buffer that can become a third stage.
+
+### Design
+
+- **Q staging through the ring.** Once per tile the gather warps write the token's Q tile as a
+  pseudo-block of the KV ring: the 64 head rows of Qv (1024 B each) into a latent stage with
+  the stage's own K-major SW128 layout, the 64 rows of Q_rope into the rope tile
+  (`load_X(identity_rows=True)`: row r of the tile <- row r of the (64, dims) Q tile, no top-k
+  index, no validity predicate, the same 36 `cp.async.cg` per thread as a KV block, the same part
+  and full barriers so every barrier phase advances once per ring slot). No TMA warp: warp 8 is
+  idle like warp 11.
+- **Q -> TMEM (`tcgen05.cp`).** The MMA warp waits for the pseudo-block, then issues 16 UTCCP
+  `128x256b` copies from the **(128 rows, 256) SW128 re-view** of the latent stage (rows 64-127 of
+  the view = the second 64 x 64 column tile of each pair = the upper dim half of the same 64
+  rows; k-block kb -> TMEM columns Qv + 8 kb) and 2 from the (128, 32) SW64 re-view of the rope
+  tile, commits, releases the stage and the rope tile (the commit tracks the copies) and waits
+  on a private mbarrier before the first S GEMM. TMEM image: lane l < 64 holds Q[l, 128 t + 0..63]
+  at columns 32 t .. 32 t + 31, lane 64 + l holds Q[l, 128 t + 64..127]; rope: lane l dims 0-31,
+  lane 64 + l dims 32-63 (bf16 pairs per 32-bit column; measured bit-exact,
+  `agent_space/dsa-64h-design/dsl-probes/probe_ws_ts_qtmem.py`).
+- **Rope tiles are SW64.** A 64 x 64 bf16 K-major SW128 tile (F1) has no (128 rows, 32) re-view;
+  the rope tile is now two 64 x 32 SW64 column tiles (`make_smem_layout_b(tiled_mma(64, 64),
+  (64, 64, 32), bf16, 2)`: the "2 stages" are the two dim halves), whose (128, 32) SW64 view
+  pairs view rows 64-127 with dims 32-63. The gather writes it through the same composed
+  (row, dim) view as before (the swizzle is the tensor's). There is **one** rope tile: a block's
+  rope rows are written after the rope GEMM of the previous block released the tile
+  (`pipeline_K`, released by a `tcgen05.commit` after the rope GEMM), so the gather issues the
+  latent parts first and the rope rows last, and the rope GEMM is the last instruction of S(n).
+- **S = Q K^T is the `.ws` TS "dual GEMM"** (`gemm_ws_ts_ptx_partial`): M = 64 heads, N = 128,
+  K = 16 per instruction, A from TMEM, B = the (128, 256) view of the latent stage (16 k-steps,
+  issued part by part as the stage lands) then the (128, 32) view of the rope tile (2 k-steps).
+  For `.ws` M = 64 the instruction reads A row r of the first N/2 accumulator columns from TMEM
+  lane r and of the second N/2 from lane 64 + r; with the two dim halves of Q in the two lane
+  halves and the B view pairing view rows 64-127 with the upper dim half of the same keys, one
+  instruction computes two independent 64 x 64 x 16 products: lane half 0 of the 64-column S
+  accumulator holds the partial sum over the lower dim halves, lane half 1 over the upper
+  halves (measured: each half matches its half-dimension fp64 reference to 2.6e-7, the sum to
+  2.6e-7). The idesc is the SS one (0x4200490); the TS form is the instruction text
+  `[tmem_acc], [tmem_a + 8 kb], desc_b, idesc, p, 0`. The TS k-step costs 44 cycles at N = 128
+  (vs 32 for F1's SS N = 64 k-step over half the keys: the same 1,408 tensor cycles per block for
+  S plus the rope), and reads 4 KiB of B per k-step instead of 4 KiB of A + B.
+- **Lane-half sum in the softmax warps.** Thread t (lane t) loads its lane half's partials of
+  keys 0-31 and 32-63 (two `tcgen05.ld 32x32b.x32`), hands the half it does not own to its
+  partner t ^ 64 through a 16 KiB exchange buffer (thread-contiguous per value) and adds the
+  partner's half after a pairwise `bar.sync id, 64` of warps w and w ^ 2; thread t then owns
+  keys 0-31 of row t and thread t + 64 keys 32-63, exactly F1's ownership, so the bitmask,
+  running max (whose 2-thread exchange also uses the pair barrier), exp2, P store and stats
+  code carry over. The sum is one fp32 add per key (the two halves are exact fp32 partial sums).
+- **Pipelines.** `pipeline_KV` 3 stages (the full barrier now also covers the rope rows; the
+  latent parts have their own barriers), `pipeline_K` (rope tile, 1 stage, empty side only),
+  `pipeline_S` **1 stage**, `pipeline_P` **1 buffer**, O0/O1, sm_stats, bitmask as F1. MMA order per
+  tile: Q -> TMEM; S(0); S(1); PV(0); for n = 2 .. N-1: S(n), PV(n-1); PV(N-1). S(n+1) only needs
+  the softmax's t2r of S(n) (the S stage is released right after the loads), so the softmax step
+  of block n runs under S(n+1) and PV(n), and a released stage has two block periods to refill.
+- **TMEM** (every region 32-column aligned): O0 0-127, O1 128-255, S 256-319 (64 x 128 fp32 dual
+  GEMM = 64 columns), Qv 320-447, Q_rope 448-463: 464 of 512. A second S stage (64 more columns)
+  does not fit, which forces the single-S order above.
+- **Shared memory** = 232,448 B, the cap: barriers + stats 3,072 (incl. `clc_response` at a 16-B
+  alignment: the scheduler reads it with one 16-B load), sV 3 x 65,536, sK 8,192 (SW64 rope
+  tile), sP 8,192, sX 16,384 (exchange). Shared-KV specialization 224,256 B (no rope tile, TMEM 448).
+- **Epilogue.** As F1 (O and o_lo streamed 32 TMEM columns at a time, thread-wise stores) but
+  with 256-bit `st.global.v8` stores (one request per 32-B sector), which shortens the per-tile
+  drain from ~14.7k to ~10.7k cycles. The 32-B alignment promise on the O / o_lo pointers and
+  strides is guaranteed for interface-allocated outputs (torch allocations, 1024-B rows); a
+  caller-provided `out` that is not 32-B aligned keeps the padded 2-CTA kernel.
+
+### Test contract
+
+Unchanged from F1 (recompute-P forward vs load-P forward up to bf16 rounding at 64 heads, bitwise
+at 128), extended to `test_flash_attn_mla_sparse_bwd_learnable_sink[64-*]`: that test was widened
+to 64 heads while both forward paths still ran the padded kernel, so its bitwise comparison of the
+load-P and recompute-P modes could not hold once the 64-head kernel existed (it failed on the
+integration base before F3). Cross-kernel modes now agree up to bf16 rounding (out rel-L2 < 5e-3,
+lse max-abs < 1e-4, dsink rel-L2 < 1e-2; measured ~1e-3 / ~2e-6 / ~3e-3), same-kernel modes stay bitwise.
+
+### Cost (GB200, GLM-5.2 shape, GPU 1, `agent_space/dsa-64h-design/benchmark.csv`)
+
+| T = S | forward (training, with o_lo) | forward (inference) | train step (with C8 + C1) | peak / saved GiB |
+|---|---|---|---|---|
+| 16384 | 4.77 ms (F1 5.05-5.12, padded 2-CTA kernel 7.40) | 4.12 (F1 4.3-4.5) | 25.93 | 4.17 / 2.00 (same) |
+| 65536 | 20.42 ms (F1 21.35-21.47, padded 28.5) | 17.50 (F1 18.7) | 118.40 (bwd 99.68) | 13.69 / 8.02 (same) |
+
+Same-GPU ABAB against the F1 tip (four legs, back to back): 64k training forward 20.35 / 20.33 vs
+21.37 / 21.53 ms (-5.2 %), inference 17.52 vs 18.65 (-6.1 %); 16k 4.70 / 4.94 vs 4.96 / 5.10.
+
+Numerics (`runs/F3_fwd_qtmem/check_fwd_h64_v3.json`): out rel-L2 vs fp64 0.181-0.207 % on the five
+`check_fwd_h64` cases (F1 0.181-0.207 %, bf16 floor 0.154-0.166 %), lse max-abs 1.1-1.4e-6,
+deterministic, no NaN, fully masked rows -> 0 / -inf, batched, varlen, shared-KV and top-k 1024
+all as F1. Harness accuracy vs fp64 identical to F1 to the printed digit on all 11 cases (out
+0.1896 % iid, 0.1660 % peaked; dq_latent 0.2259 %; lse max-abs 2.3e-6 .. 1.3e-5). Sparse-MLA test
+subset 182 passed (fake + GPU), absorbed suite 1040 passed on the GPU; `out`/`dq`/`dqv` of the 128-head
+recompute path and of the 64-head load-P path bitwise equal to the base commit.
+
+ncu at T = S = 16384 (`agent_space/dsa-64h-design/profile/F3_fwd_h64_T16k/`, vs the F1 v17 run): 4.08 ms
+(4.85), tensor pipe active 48.7 % (40.1 %) with 26 tensor instructions per 64-key block (18 TS +
+8 SS; 44 at half the N in F1) plus 18 `tcgen05.cp` per tile, issue active 33.5 % (23 %), `mio_throttle`
+0.85 stalls per issue (0.05) on the exchange stores / loads, the gather's `cp.async` issue and the
+P store: the shared-memory instruction queue is saturated. Local loads 2.0 M (238 M in F1).
+
+### Where the time goes (in-kernel `%clock64`, CTA 0, T = S = 8192, `runs/F3_fwd_qtmem/clock_probe_t8k_v2b.json`, `decode_f3.py`)
+
+Block period ~2,400 cycles = the softmax step (S seen -> P committed ~2,250: t2r 108, exchange
+stores 271, pair barrier 21, exchange loads + adds 313, mask + row-max exchange 350, stats 45,
+exp2 296, P acquire 140, P store + fence 361, commit 66), while the MMA chain alone would allow
+~1,350 (S issue 809 incl. part waits, PV ~700). The barriers are cheap and the exchange is
+conflict-free; every **shared-memory** phase of the step is 3-10x its instruction count. That is
+the shared-memory port: per 64-key block it carries the fill (72 KiB), the S B-operand reads
+(72 KiB: the whole stage once through the (128, 256) view), the PV reads (V 64 KiB + P 16 KiB),
+the P store (8 KiB) and the exchange (16 KiB written + 16 KiB read) = **264 KiB**, a floor of
+2,060 cycles at 128 B/clk and ~2,400 at a realistic 85 %; the measured period sits on it. F1
+carried 306 KiB per block (Qv read from shared memory on every S k-step, 64 KiB, and no
+exchange) at 2,750 cycles per block. The remaining per-tile cost is the O drain (~10.7k cycles,
+~7k exposed: the next tile's S(0), S(1) and first softmax overlap it, its PV(0) waits for the
+O release), ~8 % at 64k.
+
+Consequences for the design family "gather once, two MMAs over the same stage, lane-half
+exchange": the port floor is ~2,100-2,400 cycles per 64-key block, i.e. 15-17 ms at 64k (the
+public head-64 sparse-attention forward that uses the same recipe, with a TMA-store epilogue
+and no o_lo, measures 15.1 ms on the same shape). Below that needs less shared-memory traffic
+per key, not more overlap: candidates are
+P as a TMEM A operand of a TS PV (saves the P store and reads, adds a bf16 exchange: net -8 KiB
+per block) and a TMA-store epilogue staged through the exchange buffer (drain 10.7k -> ~5k).

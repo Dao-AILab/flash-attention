@@ -738,7 +738,6 @@ class dQdQvGemmKernelH64:
         # TMA load warp: dS, one 64 x 64 tile per k-tile                      #
         # ------------------------------------------------------------------ #
         if warp_idx == self.tma_warp_id:
-
             producer_state_dS = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, stages=self.num_stages_dS
             )

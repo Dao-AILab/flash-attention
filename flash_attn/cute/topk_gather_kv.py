@@ -429,11 +429,15 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         K_or_V: str,
         buf: cutlass.Constexpr[int],
         col_blocks: Optional[tuple] = None,
+        identity_rows: cutlass.Constexpr[bool] = False,
     ):
         """Issue the cp.async copies of one 64-key stage of ``mX`` (``(seqlen_k, head_dim)``) into the
-        K-major SW128 stage tensor ``sX`` (the MMA layout of a 64 x head_dim tile), whole rows, or only
-        the 128-B column blocks ``col_blocks = (c0, c1)`` of every row (the caller lands a stage in
-        parts, each followed by its own ``cp.async.mbarrier.arrive.noinc``)."""
+        K-major swizzled stage tensor ``sX`` (the MMA layout of a 64 x head_dim tile; the swizzle is
+        the tensor's), whole rows, or only the 128-B column blocks ``col_blocks = (c0, c1)`` of every
+        row (the caller lands a stage in parts, each followed by its own
+        ``cp.async.mbarrier.arrive.noinc``). With ``identity_rows`` the stage is the 64 rows of ``mX``
+        itself (row ``r`` of the tile <- ``mX[r]``, no top-k index, no validity predicate): the 64-head
+        forward stages the token's Q tile through the KV ring this way (see AI/SPARSE_MLA_64H.md)."""
         assert K_or_V in ("K", "V")
         head_dim = self.hdim if const_expr(K_or_V == "K") else self.hdim_v
         sX_nd_layout = cute.make_ordered_layout((self.tile_n, head_dim), order=(0, 1))
@@ -443,20 +447,28 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         tXsX = self.gmem_thr_copy_KV.partition_D(sX_nd)
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
 
-        topk_idx = self.rTopk[buf]
+        use_pred = const_expr(not self.disable_bitmask and not identity_rows)
         tPrXPtr = cute.make_rmem_tensor((1,), cutlass.Int64)
         tPrRowValid = cute.make_rmem_tensor((1,), cutlass.Int32)
-        tPrXPtr[0] = utils.elem_pointer(mX, (topk_idx, 0)).toint()
-        if const_expr(not self.disable_bitmask):
-            tPrRowValid[0] = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
+        if const_expr(not identity_rows):
+            topk_idx = self.rTopk[buf]
+            tPrXPtr[0] = utils.elem_pointer(mX, (topk_idx, 0)).toint()
+            if const_expr(use_pred):
+                tPrRowValid[0] = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
+        rows_per_copy = self.num_threads // self.gmem_threads_per_row
 
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
             # row 16*m + t//8: its index sits in lane m of this thread's 8-thread group
-            if const_expr(not self.disable_bitmask):
+            if const_expr(use_pred):
                 row_valid = utils.shuffle_sync(tPrRowValid[0], m, width=self.gmem_threads_per_row)
                 should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], Boolean)
                 should_load.fill(Boolean(row_valid))
-            x_ptr_i64 = utils.shuffle_sync(tPrXPtr[0], m, width=self.gmem_threads_per_row)
+            if const_expr(identity_rows):
+                x_ptr_i64 = utils.elem_pointer(
+                    mX, (rows_per_copy * m + self.thread_idx // self.gmem_threads_per_row, 0)
+                ).toint()
+            else:
+                x_ptr_i64 = utils.shuffle_sync(tPrXPtr[0], m, width=self.gmem_threads_per_row)
             x_gmem_ptr = cute.make_ptr(
                 mX.element_type, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
             )
@@ -477,5 +489,5 @@ class CpasyncGatherKVManagerH64(ParamsBase):
                     self.gmem_tiled_copy_KV,
                     mX_cur_copy_ki,
                     tXsX_k,
-                    pred=should_load if const_expr(not self.disable_bitmask) else None,
+                    pred=should_load if const_expr(use_pred) else None,
                 )

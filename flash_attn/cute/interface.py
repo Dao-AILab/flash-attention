@@ -723,10 +723,16 @@ def _flash_attn_fwd(
     if qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
         assert num_head_kv == 1, "sparse MLA requires a single KV head"
         # 64 heads with no P/row_max to store run the native 1-CTA 64-row kernel: AI/SPARSE_MLA_64H.md.
+        # Its epilogue stores O / o_lo with 32-B accesses, so a caller-provided out must be 32-B aligned.
+        out_aligned_32 = out is None or (
+            out.data_ptr() % 32 == 0
+            and all((s * out.element_size()) % 32 == 0 for s in out.stride()[:-1])
+        )
         use_mla_fwd_h64 = (
             qhead_per_kvhead == 64
             and (gather_bwd_recompute_p or not requires_grad)
             and arch // 10 in (10, 11)
+            and out_aligned_32
         )
         qhead_per_kvhead = sparse_mla_qhead_tile(
             qhead_per_kvhead, min_tile=64 if use_mla_fwd_h64 else 128
