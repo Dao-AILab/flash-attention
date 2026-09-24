@@ -2614,8 +2614,6 @@ def _flash_attn_bwd(
                     "SM100 backward with head_dim=256 does not support block sparsity"
                 assert dlse is None, \
                     "SM100 backward with head_dim=256 does not support dlse"
-                assert seqused_q is None and seqused_k is None, \
-                    "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
 
                 dq_tile_mn = (128, 128)
                 dkdv_tile_mn = (128, 64)
