@@ -2883,6 +2883,8 @@ def _flash_attn_bwd_sparse_mla(
     pad_qheads = qhead_tile != qhead_per_kvhead
     if recompute_p and pad_qheads:
         raise ValueError("gather_bwd_recompute_p requires 64 or 128 Q heads")
+    # 64-head recompute-P: the main kernel also computes and scatters dK_rope (AI/SPARSE_MLA_64H.md).
+    fuse_dk_rope = recompute_p and q is not None and k is not None and qhead_tile == 64
     assert gather_kv_length % 128 == 0, f"sparse MLA bwd: {gather_kv_length=} must be divisible by 128"
     assert deterministic is False, "sparse MLA bwd: deterministic mode not yet supported"
     assert seqused_q is None and seqused_k is None, "sparse MLA bwd: seqused_q,k not yet supported"
@@ -3068,9 +3070,11 @@ def _flash_attn_bwd_sparse_mla(
             q_tensor,
             k_tensor,
             lse_log2_tensor,
+            dk_tensor,
          ) = [
             to_cute_tensor(t)
-            for t in (v, qv, dout, p, scale_p, dpsum, ds, dv, gather_kv_indices, q_kernel, k_kernel, lse_log2)
+            for t in (v, qv, dout, p, scale_p, dpsum, ds, dv, gather_kv_indices, q_kernel, k_kernel, lse_log2,
+                      dk if fuse_dk_rope else None)
         ]
 
         fa_bwd_obj = FlashAttentionSparseMLABackwardSm100(
@@ -3097,6 +3101,7 @@ def _flash_attn_bwd_sparse_mla(
             q_tensor,
             k_tensor,
             lse_log2_tensor,
+            dk_tensor,
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
             seqused_q_tensor,
@@ -3146,6 +3151,7 @@ def _flash_attn_bwd_sparse_mla(
         # would unmask entries the forward masked (in load-p mode those entries
         # carry p = 0 and the relaxation is harmless).
         v_mk, dv_mk, k_mk = v, dv, k_kernel
+        dk_mk = dk if fuse_dk_rope else None
         cu_seqlens_k_mk = cu_seqlens_k
         skip_main = False
         if can_chunk and causal:
@@ -3159,6 +3165,7 @@ def _flash_attn_bwd_sparse_mla(
                     v_mk = v[:, :k_end]
                     dv_mk = dv[:, :k_end]
                     k_mk = k_kernel[:, :k_end] if k_kernel is not None else None
+                    dk_mk = dk[:, :k_end] if fuse_dk_rope else None
             else:
                 # Per doc, keep only the keys the forward's causal limit could
                 # reach from queries before tok1 (bottom-right alignment). Only
@@ -3204,6 +3211,7 @@ def _flash_attn_bwd_sparse_mla(
                 q_c if recompute_p else None,
                 k_mk,
                 lse_log2_c,
+                dk_mk,
                 cu_seqlens_q_c,
                 cu_seqlens_k_mk,
                 seqused_q,
@@ -3214,7 +3222,7 @@ def _flash_attn_bwd_sparse_mla(
             ds_c, k_sq, v_sq, dq_c, dqv_c, idx_c, cu_seqlens_q_c, cu_seqlens_k,
         )
 
-        if k is not None:
+        if k is not None and not fuse_dk_rope:
             _sparse_mla_dk(ds_c, idx_c, q_c, dk_sq, cu_seqlens_q_c, cu_seqlens_k)
 
     # return dk, dv in float32: all-reduce across sequence-parallel ranks must happen

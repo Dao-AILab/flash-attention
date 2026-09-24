@@ -3480,18 +3480,23 @@ def check_canary(name, parent, pad_words):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# recompute_p at 64 heads: dK_rope is scattered by the main kernel's epilogue
+# (fused), at 128 heads and in load-p mode by the separate dk kernel.
+@pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize("nheads", [128, 64, 96, 24, 1])
 # 130 rows: a partial last preprocess tile when padded heads use per-head packing.
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(130, 258), (512, 512), (1024, 1024)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_kv, causal, dtype):
+def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_kv, causal, recompute_p, dtype):
     """Sparse-MLA backward with -1-padded gather_kv_indices, the padding any
     causal top-k selector produces for early queries.
 
     nheads < 128 covers in-kernel head padding (pack_gqa.qheads_first_tma_view):
     96 pads to 128 with a partial second CTA, 24 and 1 pad to the 64-head bwd tile.
+    recompute_p (64 / 128 heads only) runs the canaries against the recompute-P
+    backward, whose 64-head main kernel scatters dK_rope itself.
 
     Regression test for unguarded sentinel scatters: the dV/dK backward
     epilogues used to atomically accumulate at row -1 — out of bounds of the
@@ -3504,6 +3509,8 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
     """
     if not IS_SM100:
         pytest.skip()
+    if recompute_p and nheads not in (64, 128):
+        pytest.skip("gather_bwd_recompute_p requires 64 or 128 Q heads")
     device = "cuda"
     torch.random.manual_seed(0)
     batch_size = 2
@@ -3538,7 +3545,8 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
             )
 
     out, lse = flash_attn_func(
-        q, k, v, qv=qv, gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True
+        q, k, v, qv=qv, gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True,
+        gather_bwd_recompute_p=recompute_p,
     )
 
     g = torch.randn_like(out)
@@ -3558,12 +3566,13 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
         dk_parent, dk_buf = plant_canary((batch_size, seqlen_k, nheads_kv, hdim), hdim, device)
     with torch.no_grad():
         fq, fk, fqv = (None, None, q) if shared_kv else (q, k, qv)
-        out2, lse2, p2, row_max2, _ = _flash_attn_fwd(
-            fq, fk, v, qv=fqv, causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True
+        out2, lse2, p2, row_max2, o_lo2 = _flash_attn_fwd(
+            fq, fk, v, qv=fqv, causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True,
+            gather_bwd_recompute_p=recompute_p,
         )
         dq2, dk2, dv2, dqv2, _ = _flash_attn_bwd_sparse_mla(
             fq, fk, v, fqv, out2, g, lse2, p2, row_max2, gather_kv_indices,
-            causal=causal, dk=dk_buf, dv=dv_buf,
+            causal=causal, dk=dk_buf, dv=dv_buf, recompute_p=recompute_p, o_lo=o_lo2,
         )
 
     if is_fake_mode():
@@ -3609,13 +3618,15 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# recompute_p at 64 heads: dK_rope is scattered by the main kernel's epilogue (fused).
+@pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
 # 24 heads: padded per-head preprocess tiles must not spill into the next packed sequence.
 # 64 heads: the native 64-row (tile_m == 64) backward specialization.
 @pytest.mark.parametrize("nheads", [128, 64, 24])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dtype):
+def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, recompute_p, dtype):
     """Varlen counterpart of test_flash_attn_mla_sparse_bwd_sentinel.
 
     The varlen kernels are separate compile-time specializations, and the dK
@@ -3627,6 +3638,8 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dt
     """
     if not IS_SM100:
         pytest.skip()
+    if recompute_p and nheads not in (64, 128):
+        pytest.skip("gather_bwd_recompute_p requires 64 or 128 Q heads")
     device = "cuda"
     torch.random.manual_seed(0)
     nheads_kv, hdim, hdimv = 1, 64, 512
@@ -3674,6 +3687,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dt
         q, k, v, qv=qv, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
         max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
         gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True,
+        gather_bwd_recompute_p=recompute_p,
     )
 
     g = torch.randn_like(out)
@@ -3691,17 +3705,18 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dt
         dk_parent, dk_buf = plant_canary((total, nheads_kv, hdim), hdim, device)
     with torch.no_grad():
         fq, fk, fqv = (None, None, q) if shared_kv else (q, k, qv)
-        out2, lse2, p2, row_max2, _ = _flash_attn_fwd(
+        out2, lse2, p2, row_max2, o_lo2 = _flash_attn_fwd(
             fq, fk, v, qv=fqv, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
             causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True,
+            gather_bwd_recompute_p=recompute_p,
         )
         dq2, dk2, dv2, dqv2, _ = _flash_attn_bwd_sparse_mla(
             fq, fk, v, fqv, out2, g, lse2, p2, row_max2, gather_kv_indices,
             causal=causal,
             cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
-            dk=dk_buf, dv=dv_buf,
+            dk=dk_buf, dv=dv_buf, recompute_p=recompute_p, o_lo=o_lo2,
         )
 
     if is_fake_mode():
