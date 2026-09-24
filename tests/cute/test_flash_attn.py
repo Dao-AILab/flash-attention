@@ -3307,8 +3307,9 @@ def test_flash_attn_mla_absorbed(
     torch.cuda.synchronize()
     batch_size = 12 if seqlen_q <= 512 else 3 if seqlen_q <= 2048 else 1
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    # 24 heads pad to the 64-head bwd tile and exercise the sink reduction on padded dpsum.
-    nheads_vals = [128, 24] if kv_sparsity else [16, 128]
+    # 24 heads pad to the 64-head bwd tile and exercise the sink reduction on padded dpsum;
+    # 64 heads run the native 1-CTA forward + recompute-P backward (AI/SPARSE_MLA_64H.md).
+    nheads_vals = [128, 64, 24] if kv_sparsity else [16, 128]
     seqlen_k_base = max(min(seqlen_k // 256 * 256, 1024), 256)
     gather_kv_lengths = [seqlen_k_base - 128, seqlen_k_base] if kv_sparsity else [0]
     seqlen_k_og = seqlen_k
@@ -3375,6 +3376,7 @@ def test_flash_attn_mla_absorbed(
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         num_splits_vals = [1]
         pack_gqa_vals = [True]
+        recompute_p = bool(kv_sparsity) and nheads == 64
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out, lse = flash_attn_func(
                 q,
@@ -3388,6 +3390,7 @@ def test_flash_attn_mla_absorbed(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 deterministic=deterministic,
+                gather_bwd_recompute_p=recompute_p,
             )
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
@@ -3417,6 +3420,7 @@ def test_flash_attn_mla_absorbed(
                     learnable_sink=learnable_sink,
                     pack_gqa=pack_gqa,
                     num_splits=num_splits,
+                    gather_bwd_recompute_p=recompute_p,
                 )
                 assert torch.equal(out, out2), f"non-deterministic with max diff = {(out - out2).abs().max().item()} on {iter=}"
         
@@ -3838,6 +3842,13 @@ def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, nheads, share
         q, k, v, qv=qv, gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True,
         gather_bwd_recompute_p=True,
     )
+    # inference forward (no grad-requiring inputs): stores neither p/row_max nor o_lo
+    q_inf, v_inf = q.detach(), v.detach()
+    k_inf = v_inf if shared_kv else k.detach()  # shared KV: k and v must be the same tensor
+    out_inf, lse_inf = flash_attn_func(
+        q_inf, k_inf, v_inf, qv=None if shared_kv else qv.detach(),
+        gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True, return_lse=True,
+    )
     g = torch.randn_like(out)
     grads = torch.autograd.grad(out, grad_inputs, g, retain_graph=True)
     grads_again = torch.autograd.grad(out, grad_inputs, g)
@@ -3864,8 +3875,18 @@ def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, nheads, share
         return
 
     assert (gather_kv_indices == -1).any(), "test must exercise sentinel slots"
-    assert torch.equal(out, out_default), "recompute fwd out must be bitwise-identical"
-    assert torch.equal(lse, lse_default), "recompute fwd lse must be bitwise-identical"
+    if nheads == 128:
+        assert torch.equal(out, out_default), "recompute fwd out must be bitwise-identical"
+        assert torch.equal(lse, lse_default), "recompute fwd lse must be bitwise-identical"
+    else:
+        # 64 heads: the recompute-P and inference forwards run the native 1-CTA 64-row kernel, the
+        # load-P forward the padded 2-CTA kernel (AI/SPARSE_MLA_64H.md); the three agree up to
+        # bf16 output rounding (out rel_l2 ~1e-3 measured, lse to ~1e-6; inference additionally
+        # uses the lazy running max). No bitwise relation holds between the two kernels.
+        for name, o, lse_o in (("load-P", out_default, lse_default), ("inference", out_inf, lse_inf)):
+            rel = (out.float() - o.float()).norm() / o.float().norm()
+            assert rel < 5e-3, f"recompute vs {name} fwd out rel_l2 {rel} beyond bf16 rounding"
+            assert (lse - lse_o).abs().max() < 1e-4, f"recompute vs {name} fwd lse differ"
 
     # dq/dqv (pure GEMM consumers of identical dS tiles) are bitwise-stable
     # across retain_graph reruns and across chunking; dk/dv accumulate with
@@ -4264,7 +4285,11 @@ def test_flash_attn_mla_sparse_bwd_learnable_sink(nheads, varlen, shared_kv, cau
     it). Runs default (load-p), recompute_p, recompute_p + token_chunk and
     load-p + token_chunk with -1-padded indices (non-causal indices under
     causal=True, so the causal key limit must also be applied) and checks:
-      1. out, lse and dsink are bitwise-identical across the four modes;
+      1. out, lse and dsink are bitwise-identical across the modes that run the
+         same forward kernel: all four at 128 heads; at 64 heads the two
+         recompute-P modes run the native 1-CTA kernel and the two load-P modes
+         the padded 2-CTA kernel (AI/SPARSE_MLA_64H.md), and the two kernels
+         agree up to bf16 output rounding;
       2. chunked dq/dqv are bitwise-equal to unchunked (dk/dv within
          fp32-atomic accumulation noise);
       3. every grad including dsink is within the standard tolerance of the
@@ -4340,11 +4365,27 @@ def test_flash_attn_mla_sparse_bwd_learnable_sink(nheads, varlen, shared_kv, cau
     for mode, (out_m, lse_m, grads_m) in results.items():
         for name, t in zip(names, grads_m):
             assert not t.isnan().any(), f"{name} has NaN in mode {mode}"
-        # Same forward kernel math in every mode (recompute_p only skips the
-        # p/row_max stores), and dsink is a function of (dpsum, lse, sink) only.
-        assert torch.equal(out_m, out), f"out not bitwise-identical in mode {mode}"
-        assert torch.equal(lse_m, lse), f"lse not bitwise-identical in mode {mode}"
-        assert torch.equal(grads_m[-1], grads[-1]), f"dsink not bitwise-identical in mode {mode}"
+        if nheads == 128 or not modes[mode][0]:
+            # Same forward kernel math (recompute_p only skips the p/row_max
+            # stores), and dsink is a function of (dpsum, lse, sink) only.
+            assert torch.equal(out_m, out), f"out not bitwise-identical in mode {mode}"
+            assert torch.equal(lse_m, lse), f"lse not bitwise-identical in mode {mode}"
+            assert torch.equal(grads_m[-1], grads[-1]), f"dsink not bitwise-identical in mode {mode}"
+        else:
+            # 64 heads, recompute-P: the native 1-CTA forward vs the default's padded 2-CTA
+            # forward (AI/SPARSE_MLA_64H.md). out, lse and hence dpsum / dsink agree up to bf16
+            # output rounding (measured: out rel_l2 <= 1.3e-3, lse max-abs 1e-6, dsink rel_l2
+            # <= 3e-3); no bitwise relation holds between the two kernels.
+            rel = (out_m.float() - out.float()).norm() / out.float().norm()
+            assert rel < 5e-3, f"out rel_l2 {rel} in mode {mode} beyond bf16 rounding"
+            assert (lse_m - lse).abs().max() < 1e-4, f"lse differs in mode {mode}"
+            rel = (grads_m[-1].float() - grads[-1].float()).norm() / grads[-1].float().norm().clamp_min(1e-12)
+            assert rel < 1e-2, f"dsink rel_l2 {rel} in mode {mode} beyond bf16 rounding"
+    # the two recompute-P modes share one forward kernel: bitwise among themselves at every head count
+    out_rc, lse_rc, grads_rc = results["recompute_p"]
+    out_rck, lse_rck, grads_rck = results["recompute_p+chunk"]
+    for name, a, b in (("out", out_rc, out_rck), ("lse", lse_rc, lse_rck), ("dsink", grads_rc[-1], grads_rck[-1])):
+        assert torch.equal(a, b), f"{name} recompute_p+chunk not bitwise vs recompute_p"
     for chunked, unchunked in (("recompute_p+chunk", "recompute_p"), ("load_p+chunk", "default")):
         for i, (name, a, b) in enumerate(zip(names[:-1], results[chunked][2], results[unchunked][2])):
             if i in atomic_grads:

@@ -55,6 +55,7 @@ from flash_attn.cute.flash_bwd_postprocess import (
 )
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
+from flash_attn.cute.flash_fwd_mla_sm100_h64 import FlashAttentionMLAForwardSm100H64
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
 from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
@@ -717,9 +718,18 @@ def _flash_attn_fwd(
     # the kernel takes the real count and rounds the same way, the interface needs the tile
     # width for its grid math.
     nheads_per_kv = qhead_per_kvhead
+    use_mla_fwd_h64 = False
     if qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
         assert num_head_kv == 1, "sparse MLA requires a single KV head"
-        qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead)
+        # 64 heads with no P/row_max to store run the native 1-CTA 64-row kernel: AI/SPARSE_MLA_64H.md.
+        use_mla_fwd_h64 = (
+            qhead_per_kvhead == 64
+            and (gather_bwd_recompute_p or not requires_grad)
+            and arch // 10 in (10, 11)
+        )
+        qhead_per_kvhead = sparse_mla_qhead_tile(
+            qhead_per_kvhead, min_tile=64 if use_mla_fwd_h64 else 128
+        )
         pack_gqa = True
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
@@ -1367,7 +1377,10 @@ def _flash_attn_fwd(
             if qv is not None:
                 paged_kv_cpasync = page_table is not None and page_size != tile_n
                 has_qk = q is not None
-                fa_fwd = FlashAttentionMLAForwardSm100(
+                mla_fwd_cls = (
+                    FlashAttentionMLAForwardSm100H64 if use_mla_fwd_h64 else FlashAttentionMLAForwardSm100
+                )
+                fa_fwd = mla_fwd_cls(
                     is_causal=causal,
                     use_cpasync_load_KV=sparse_kv or paged_kv_cpasync,
                     topk_length=gather_kv_length,
