@@ -1015,6 +1015,64 @@ def test_sm100_block_sparse_sink_all_masked():
     assert torch.allclose(lse, expected, atol=0.0, rtol=0.0)
 
 
+def test_sm100_block_sparse_empty_tile_writes_real_zeros():
+    """Regression for #2906: an empty block-sparse Q tile must write real zeros,
+    not scale unread TMEM residue (0.0 * inf = NaN)."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-only test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, nheads, headdim = 2, 16, 128
+    tile_m, tile_n = 128, 128
+    sparse_tile_m = 2 * tile_m  # SM100 block-sparse metadata is 2-CTA-grouped
+    num_m_groups = 32
+    seqlen_q = num_m_groups * sparse_tile_m
+    seqlen_k = tile_n
+
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, seqlen_q, nheads, headdim, dtype=dtype, device=device)
+    # K == 0 ⇒ uniform attention; V at bf16-max then overflows the O accumulator.
+    k = torch.zeros(batch_size, seqlen_k, nheads, headdim, dtype=dtype, device=device)
+    v = torch.full(
+        (batch_size, seqlen_k, nheads, headdim),
+        torch.finfo(torch.bfloat16).max,
+        dtype=dtype,
+        device=device,
+    )
+
+    full_cnt = torch.zeros((batch_size, nheads, num_m_groups), dtype=torch.int32, device=device)
+    full_idx = torch.zeros((batch_size, nheads, num_m_groups, 1), dtype=torch.int32, device=device)
+    mask_cnt = torch.zeros_like(full_cnt)
+    mask_idx = torch.zeros_like(full_idx)
+    full_cnt[:, :, 0] = 1  # only the first Q tile of each (batch, head) is live
+
+    sparse = BlockSparseTensorsTorch(
+        mask_block_cnt=mask_cnt,
+        mask_block_idx=mask_idx,
+        full_block_cnt=full_cnt,
+        full_block_idx=full_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        window_size_left=None,
+        window_size_right=None,
+        learnable_sink=None,
+        tile_mn=(tile_m, tile_n),
+        pack_gqa=False,
+        block_sparse_tensors=sparse,
+    )
+    empty = out[:, sparse_tile_m:]
+    assert torch.equal(empty, torch.zeros_like(empty)), (
+        "empty block-sparse tile must write real zeros, not NaN leaked from a "
+        "reused tcgen05 buffer"
+    )
+
+
 def make_empty_block_sparse_tensors(sparse_block_size_kv: int) -> BlockSparseTensorsTorch:
     """Build shape-only metadata for block-sparse dispatch helper tests."""
     return BlockSparseTensorsTorch(
