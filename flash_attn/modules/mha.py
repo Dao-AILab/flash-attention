@@ -461,7 +461,7 @@ class MHA(nn.Module):
             self.Wq = nn.Linear(embed_dim, embed_dim, bias=qkv_proj_bias, **factory_kwargs)
             self.Wkv = nn.Linear(embed_dim, kv_dim, bias=qkv_proj_bias, **factory_kwargs)
         if self.dwconv:
-            if self.num_heads_kv == self.num_heads:
+            if not self.cross_attn and self.num_heads_kv == self.num_heads:
                 self.dwconv_qkv = nn.Conv1d(
                     qkv_dim, qkv_dim, kernel_size=3, padding=2, groups=qkv_dim
                 )
@@ -670,8 +670,6 @@ class MHA(nn.Module):
                 qkv = self.Wqkv(x)
                 q = qkv[..., : self.num_heads * self.head_dim]
                 kv = qkv[..., self.num_heads * self.head_dim :]
-            q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
-            kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
             if self.dwconv:
                 q = rearrange(
                     self.dwconv_q(rearrange(q, "b s d -> b d s"))[..., :-2], "b d s -> b s d"
@@ -679,6 +677,8 @@ class MHA(nn.Module):
                 kv = rearrange(
                     self.dwconv_kv(rearrange(kv, "b s d -> b d s"))[..., :-2], "b d s -> b s d"
                 ).contiguous()
+            q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
+            kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
             if (
                 inference_params is None
                 or inference_params.seqlen_offset == 0
