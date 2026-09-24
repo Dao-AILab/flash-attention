@@ -276,3 +276,218 @@ class CpasyncGatherKVManager(ParamsBase):
                     tXsX_k,
                     pred=should_load if const_expr(not self.disable_bitmask) else None,
                 )
+
+
+@dataclass
+class CpasyncGatherKVManagerH64(ParamsBase):
+    """Gather producer of the native 64-head sparse-MLA forward (see AI/SPARSE_MLA_64H.md).
+
+    One stage = 64 top-k keys x whole rows: the ``hdim_v`` latent row and the ``hdim`` rope row of
+    the same key (two tables, one index) as 16-B ``cp.async.cg`` copies from 128 threads, 8 threads
+    per 128-B chunk, a warp covering 4 rows x 128 B per instruction: 4 rows x (8 latent + 1 rope) =
+    36 copies per thread per stage. Index ownership follows ``load_X``'s shuffle source: lane ``m``
+    of each 8-thread group (``m < 4``) holds the index of row ``16 * m + t // 8``; lanes 4-7 load the
+    same rows again (a duplicate 4-B read instead of a predicate). Indices are loaded two blocks
+    ahead into two register sets (``buf`` 0 / 1), for both the interleaved order (copies) and the
+    natural order (bitmask), so a block's issue never waits on its own index load. Rows whose index
+    is -1 or >= ``seqlen_k_limit`` are zero-filled (predicated ``cp.async``) and cleared in the
+    2-word validity bitmask (warps 0-1, bit = lane = key within the 32-key half).
+    """
+
+    mIndexTopk: cute.Tensor
+    sBitmask: Optional[cute.Tensor]
+
+    thread_idx: Int32
+    warp_idx: Int32
+
+    seqlen_k_limit: Int32
+    tile_n: cutlass.Constexpr[int]
+    num_threads: cutlass.Constexpr[int]
+    hdim: cutlass.Constexpr[int]
+    hdim_v: cutlass.Constexpr[int]
+    gmem_threads_per_row: cutlass.Constexpr[int]
+    async_copy_elems: cutlass.Constexpr[int]
+
+    gmem_tiled_copy_KV: cute.TiledCopy
+    gmem_thr_copy_KV: cute.TiledCopy
+
+    # two register sets each (index of block n+2 loaded while block n is in flight)
+    rTopk: cute.Tensor  # interleaved ownership: the row this thread's 8-group copies
+    rTopk_NonInterleaved: cute.Tensor  # natural ownership: row = thread_idx % tile_n (bitmask)
+
+    pipeline_bitmask: Optional[pipeline.PipelineAsync]
+    cpasync_barrier: Optional[pipeline.NamedBarrier]
+
+    disable_bitmask: cutlass.Constexpr[Boolean]
+
+    @staticmethod
+    def create(
+        mIndexTopk: cute.Tensor,
+        thread_idx: Int32,
+        warp_idx: Int32,
+        seqlen_k_limit: Int32,
+        tile_n: cutlass.Constexpr[int],
+        hdim: cutlass.Constexpr[int],
+        hdim_v: cutlass.Constexpr[int],
+        num_threads: cutlass.Constexpr[int],
+        dtype: Type[cutlass.Numeric],
+        cpasync_barrier: Optional[pipeline.NamedBarrier] = None,
+        disable_bitmask: cutlass.Constexpr[Boolean] = False,
+        sBitmask: Optional[cute.Tensor] = None,
+        pipeline_bitmask: Optional[pipeline.PipelineAsync] = None,
+    ):
+        assert num_threads == 128, "H64 gather: 128 producer threads"
+        assert tile_n == 64, "H64 gather: 64-key stages"
+        assert hdim % 64 == 0 and hdim_v % 64 == 0, "rows are whole 128-B chunks"
+        universal_copy_bits = 128
+        async_copy_elems = universal_copy_bits // dtype.width
+        gmem_k_block_size = 128 // (dtype.width // 8)  # one 128-B swizzle row of the SW128 tile
+        gmem_threads_per_row = gmem_k_block_size // async_copy_elems
+        rows_per_copy = num_threads // gmem_threads_per_row
+        assert tile_n % rows_per_copy == 0
+        # load_X shuffles row 16*m + t//8's pointer from lane m of the 8-thread group
+        assert tile_n // rows_per_copy <= gmem_threads_per_row
+        assert tile_n % cute.arch.WARP_SIZE == 0
+        atom_async_copy = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            dtype,
+            num_bits_per_copy=universal_copy_bits,
+        )
+        thr_layout = cute.make_ordered_layout(
+            (rows_per_copy, gmem_threads_per_row),
+            order=(1, 0),
+        )
+        val_layout = cute.make_layout((1, async_copy_elems))
+        gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
+        gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
+
+        rTopk = cute.make_rmem_tensor((2,), Int32)
+        rTopk_NonInterleaved = cute.make_rmem_tensor((2,), Int32)
+
+        return CpasyncGatherKVManagerH64(
+            mIndexTopk,
+            sBitmask,
+            thread_idx,
+            warp_idx,
+            seqlen_k_limit,
+            tile_n,
+            num_threads,
+            hdim,
+            hdim_v,
+            gmem_threads_per_row,
+            async_copy_elems,
+            gmem_tiled_copy_KV,
+            gmem_thr_copy_KV,
+            rTopk,
+            rTopk_NonInterleaved,
+            pipeline_bitmask,
+            cpasync_barrier,
+            disable_bitmask,
+        )
+
+    @cute.jit
+    def load_index_topk(self, n_block: Int32, buf: cutlass.Constexpr[int]):
+        """Load this thread's two indices of block ``n_block`` into register set ``buf``."""
+        rows_per_copy = self.num_threads // self.gmem_threads_per_row
+        row_groups = self.tile_n // rows_per_copy
+        lane_in_group = self.thread_idx % self.gmem_threads_per_row
+        row = (
+            lane_in_group % row_groups
+        ) * rows_per_copy + self.thread_idx // self.gmem_threads_per_row
+        self.rTopk[buf] = self.mIndexTopk[n_block * self.tile_n + row]
+        if const_expr(not self.disable_bitmask):
+            row_natural = self.thread_idx % self.tile_n
+            self.rTopk_NonInterleaved[buf] = self.mIndexTopk[n_block * self.tile_n + row_natural]
+
+    @cute.jit
+    def compute_bitmask(self, producer_state_bitmask, buf: cutlass.Constexpr[int]):
+        """One validity word per 32 keys, written by warps 0 .. tile_n // 32 - 1 (bit = lane)."""
+        assert self.pipeline_bitmask is not None, "pipeline_bitmask not provided"
+        assert self.cpasync_barrier is not None, "cpasync barrier not provided"
+        lane_idx = cute.arch.lane_idx()
+        topk_idx = self.rTopk_NonInterleaved[buf]
+        is_valid = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
+        bitmask = Uint32(0)
+        if is_valid:
+            bitmask = Uint32(1 << lane_idx)
+        # indices within a block are exclusive -> OR == add
+        bitmask = warp_reduce(bitmask, operator.add)
+
+        self.pipeline_bitmask.producer_acquire(producer_state_bitmask)
+        if lane_idx == 0 and self.warp_idx < self.tile_n // cute.arch.WARP_SIZE:
+            self.sBitmask[self.warp_idx, producer_state_bitmask.index] = bitmask
+        self.cpasync_barrier.arrive_and_wait()
+        self.pipeline_bitmask.producer_commit(producer_state_bitmask)
+        producer_state_bitmask.advance()
+        return producer_state_bitmask
+
+    @cute.jit
+    def load_X(
+        self,
+        mX: cute.Tensor,
+        sX: cute.Tensor,
+        K_or_V: str,
+        buf: cutlass.Constexpr[int],
+        col_blocks: Optional[tuple] = None,
+        identity_rows: cutlass.Constexpr[bool] = False,
+    ):
+        """Issue the cp.async copies of one 64-key stage of ``mX`` (``(seqlen_k, head_dim)``) into the
+        K-major swizzled stage tensor ``sX`` (the MMA layout of a 64 x head_dim tile; the swizzle is
+        the tensor's), whole rows, or only the 128-B column blocks ``col_blocks = (c0, c1)`` of every
+        row (the caller lands a stage in parts, each followed by its own
+        ``cp.async.mbarrier.arrive.noinc``). With ``identity_rows`` the stage is the 64 rows of ``mX``
+        itself (row ``r`` of the tile <- ``mX[r]``, no top-k index, no validity predicate): the 64-head
+        forward stages the token's Q tile through the KV ring this way (see AI/SPARSE_MLA_64H.md)."""
+        assert K_or_V in ("K", "V")
+        head_dim = self.hdim if const_expr(K_or_V == "K") else self.hdim_v
+        sX_nd_layout = cute.make_ordered_layout((self.tile_n, head_dim), order=(0, 1))
+        sX_nd = cute.composition(sX, sX_nd_layout)
+
+        cX = cute.make_identity_tensor((self.tile_n, head_dim))
+        tXsX = self.gmem_thr_copy_KV.partition_D(sX_nd)
+        tXcX = self.gmem_thr_copy_KV.partition_S(cX)
+
+        use_pred = const_expr(not self.disable_bitmask and not identity_rows)
+        tPrXPtr = cute.make_rmem_tensor((1,), cutlass.Int64)
+        tPrRowValid = cute.make_rmem_tensor((1,), cutlass.Int32)
+        if const_expr(not identity_rows):
+            topk_idx = self.rTopk[buf]
+            tPrXPtr[0] = utils.elem_pointer(mX, (topk_idx, 0)).toint()
+            if const_expr(use_pred):
+                tPrRowValid[0] = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
+        rows_per_copy = self.num_threads // self.gmem_threads_per_row
+
+        for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
+            # row 16*m + t//8: its index sits in lane m of this thread's 8-thread group
+            if const_expr(use_pred):
+                row_valid = utils.shuffle_sync(tPrRowValid[0], m, width=self.gmem_threads_per_row)
+                should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], Boolean)
+                should_load.fill(Boolean(row_valid))
+            if const_expr(identity_rows):
+                x_ptr_i64 = utils.elem_pointer(
+                    mX, (rows_per_copy * m + self.thread_idx // self.gmem_threads_per_row, 0)
+                ).toint()
+            else:
+                x_ptr_i64 = utils.shuffle_sync(tPrXPtr[0], m, width=self.gmem_threads_per_row)
+            x_gmem_ptr = cute.make_ptr(
+                mX.element_type, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+            )
+            mX_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
+            mX_cur_copy = cute.tiled_divide(mX_cur, (self.async_copy_elems,))
+
+            num_col_blocks = cute.size(tXsX, mode=[2])
+            ks = list(range(num_col_blocks)) if col_blocks is None else list(range(*col_blocks))
+            assert len(ks) > 0 and ks[0] >= 0 and ks[-1] < num_col_blocks, (
+                f"bad col_blocks {col_blocks}"
+            )
+            for k in ks:
+                ki = tXcX[0, 0, k][1] // self.async_copy_elems
+                mX_cur_copy_ki = mX_cur_copy[None, ki]
+                tXsX_k = tXsX[None, m, k]
+                mX_cur_copy_ki = cute.make_tensor(mX_cur_copy_ki.iterator, tXsX_k.layout)
+                cute.copy(
+                    self.gmem_tiled_copy_KV,
+                    mX_cur_copy_ki,
+                    tXsX_k,
+                    pred=should_load if const_expr(use_pred) else None,
+                )
