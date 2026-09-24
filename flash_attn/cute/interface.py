@@ -61,6 +61,7 @@ from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksTo
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
 from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
+from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100_h64 import dQdQvGemmKernelH64
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
 # SM100 head_dim=256 2CTA kernel imports
@@ -3272,7 +3273,9 @@ def _compile_sparse_mla_dq_dqv(
     mCuSeqlensQ = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_q else None 
     mCuSeqlensK = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_k else None 
     
-    dq_dqv_gemm = dQdQvGemmKernel(
+    # 64 Q heads: 1-CTA 64-row kernel with a whole-row gather (AI/SPARSE_MLA_64H.md).
+    dq_dqv_cls = dQdQvGemmKernelH64 if nheads == 64 else dQdQvGemmKernel
+    dq_dqv_gemm = dq_dqv_cls(
         acc_dtype=Float32,
         nheads=nheads,
         head_dim_k=head_dim,

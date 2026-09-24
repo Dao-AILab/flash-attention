@@ -11,7 +11,8 @@ dispatches on the head count as before.
 Sections are added per change; this file is the target of the one-line pointers in
 `flash_bwd_mla_sm100.py`, `flash_fwd_mla_sm100_h64.py` and `interface.py`.
 
-Contents: C8 (dV accumulator hand-off pipelining), C1 (fused dK_rope), F1 (1-CTA forward).
+Contents: C8 (dV accumulator hand-off pipelining), C1 (fused dK_rope), F1 (1-CTA forward),
+C6-dq (1-CTA dQ/dQv kernel with a whole-row gather).
 
 ## C8: pipelining the dV accumulator hand-off (`FlashAttentionSparseMLABackwardSm100`)
 
@@ -434,3 +435,98 @@ refill lands under PV1's operand fetch and the shared-memory contention costs mo
 ~340 cycles per pair the earlier start saves. The refill has to leave the critical path (third
 stage), not start earlier under the GEMMs. Evidence:
 `agent_space/dsa-64h-design/runs/F1_fwd_h64/ledger.md` L20, `patches/commits/stage5/`.
+
+## C6-dq: 1-CTA dQ/dQv kernel with a whole-row gather (`dQdQvGemmKernelH64`)
+
+Why the sparse-MLA backward's dQ/dQv gather GEMM runs a dedicated kernel at exactly 64 Q heads
+per KV head, what it does differently from the padded 2-CTA kernel, what it costs, how it is
+tested. Code: `flash_bwd_mla_dq_dqv_sm100_h64.py` (`dQdQvGemmKernelH64`), `topk_gather_kv.py`
+(`CpasyncGatherKVManagerH64`, shared with the F1 forward), `interface.py`
+(`_compile_sparse_mla_dq_dqv` picks the class when `nheads == 64`; the compile key already
+contains the head count, so the binaries are distinct). `dQdQvGemmKernel` (128 rows, cluster
+(1,2)) is unchanged and still serves every other head count.
+
+### Problem
+
+`dQdQvGemmKernel` computes, per token, `dQv = dS @ V[idx]` and `dQ = dS @ K_rope[idx]` with a
+fixed 128-row M tile (`sparse_mla_qhead_tile` with `min_tile=128`): at 64 heads half of every
+MMA row is padding, and the cluster of two CTAs splits the 512 latent dims, so each CTA
+gathers its 256-dim half of every key in 512-B pieces (2 stages of 128 keys) and CTA 0 also
+gathers the 128-B rope rows; dS is TMA-multicast to both CTAs. The fill-ceiling study found
+that producer shape (128-key stages of 256/512-B pieces, indices loaded just before use) is
+what limits the kernel: 20.6 ms per 64k backward at 46 % tensor-pipe busy, 1168 gather bytes
+per (token, key) plus 384 B of dS per pair.
+
+### Change (64 heads only)
+
+- **Tiles.** One token per CTA, cluster (1,1), CLC persistent scheduling. M = 64 = the head
+  count (no padding); K tile 64 keys (32 per token for top-k 2048).
+- **GEMMs.** Plain `tcgen05.mma.cta_group::1` M=64 bf16 -> fp32 (`cute.gemm`): `dQv` as two
+  N=256 tiles (dims 0-255 and 256-511) and `dQ` as one N=64 tile, A = the dS tile (64 heads x
+  64 keys, K-major SW128, TMA-loaded per k-tile, 4 stages), B = the gathered stage re-viewed
+  MN-major (dims contiguous per key row). The second dQv N tile accumulates in the idle lane
+  half of the M=64 layout (TMEM address + 16 lanes), the way the DSL itself interleaves N tiles
+  at M=64, so TMEM is dQ 64 + dQv 256 = 320 of 512 columns (single accumulator stage: two
+  would need 640). The plain M=64 instruction runs at 50 % of peak (128 cycles for N=256,
+  32 for N=64): 288 cycles per k-block, 36.9k per token — the MMA floor is 8.2 ms per 64k
+  backward, so this kernel is not MMA-bound only as long as the gather is slower.
+- **Gather.** `CpasyncGatherKVManagerH64` (the F1 forward's producer): each 64-key stage is
+  the whole 1152-B row of every key (latent 1024 B + rope 128 B) fetched once per CTA by 128
+  threads as 16-B `cp.async.cg` copies (36 per thread per stage), the indices of block n+2
+  loaded into a second register set while block n is in flight, completion signalled by
+  `cp.async.mbarrier.arrive.noinc` on the KV pipeline's full barrier. Rows with index -1 or
+  >= seqlen_k are zero-filled by the predicated copy every stage (verified with non-zero dS
+  on those slots: their contribution is exactly zero, so there is no stale-smem 0 x NaN
+  hazard and no explicit zero-fill is needed; there is no causal limit here, out-of-limit
+  slots carry dS = 0). The gather writes the stage through its K-major (keys x dims) view and
+  the MMAs read it through the MN-major view of each 256-dim N tile (tile 1 at +16384
+  elements, stages stepped by the whole 32768-element latent stage) — the same bytes and
+  the same SW128 swizzle, as in the F1 forward.
+- **Shared memory** 205,824 B (shared-KV specialization 181,248 B): dS 4 x 8,192; rope
+  2 x 8,192; latent 2 x 65,536; epilogue tiles dQ 8,192 + dQv 2 x 8,192 (dedicated: the
+  next token's gather never waits for the epilogue, unlike the padded kernel whose epilogue
+  tiles alias the operand stages); barriers 1,024. Two whole-row stages: a third 72-KiB stage
+  does not fit beside a 2-stage dS ring (3 x 73,728 + 2 x 8,192 = 237,568 > 232,448).
+- **Epilogue.** TMEM -> registers (`tcgen05.ld.16x256b`, the M=64 layout's 16-lane groups)
+  -> bf16 -> smem tile -> TMA store, one 64 x 64 subtile at a time through the 2-stage dQv
+  ring (`PipelineTmaStore`) and the dQ tile; dq/dqv bf16 in `(token, head, dim)` as before.
+- **Registers.** No per-role `setmaxnreg`: with `min_blocks_per_mp=1` every role runs at the
+  168 registers ptxas assigns to 352 threads (the kernel needs 49, 0 B local). The padded
+  kernel's budgets (KV 224 / epilogue 128 / others 112 over 11 warps) were never honoured
+  (no launch attribute) and trap (`setmaxnreg.inc 128` below the launch count) or hang (the
+  gather warps' `inc 224` waits for registers the incomplete warpgroup never releases) once
+  they are; evidence `agent_space/dsa-64h-design/runs/C6_dq/ledger.md` L1-L2 and
+  `reports/C9_minblocks_report.md`.
+
+### Effect (GB200, 64 heads, W = 2048, bf16, causal, `gather_bwd_recompute_p=True`, `gather_bwd_token_chunk=4096`)
+
+`time_bwd.py`, same GPU and session as the integration branch (C8 + C1 + F1), which uses the
+padded kernel for dq/dqv:
+
+| T = S | dq_dqv padded -> C6-dq | backward kernel sum | GLM-5.2 harness train step |
+|---|---|---|---|
+| 16k | 4.43 -> **2.72 ms** (-38.5 %) | 21.57 -> 19.87 ms | 26.72 -> **24.96 ms** |
+| 64k | 20.62 -> **12.23 ms** (-40.7 %) | 98.40 -> 90.10 ms | 119.84 -> **112.52 ms** (main 148.9; FlashMLA + cuDNN 129.3) |
+
+Peak memory and saved activations unchanged (13.69 / 8.02 GiB at 64k). ncu at 16k chunk 2
+(`profile/C6dq_dqdqv_h64_T16k/`): 693 us per launch (padded kernel 1,113), tensor pipe 75 %
+busy = exactly the plain-M=64 issue time, gather 1161 B per (token, key) at 48 B/clk/SM (the
+2-stage producer's ceiling is ~54), dS 128 B per pair (was 384). The kernel is MMA / fill
+co-bound: the `.ws` M=64 N=256 form (80 % rate) and a third latent stage are the next levers,
+each worth ~10-15 %.
+
+### Numerics
+
+dq and dqv are **bitwise identical** to the padded kernel's on the same inputs (batched and
+varlen): both accumulate the same 16-key k-blocks in the same order in fp32 and round once to
+bf16. The token-chunk, retain-graph and sentinel tests therefore keep their bitwise dq/dqv
+assertions unchanged, and the harness accuracy columns equal the integration branch's.
+
+### Validation
+
+Sparse-MLA subset (`mla_sparse or mla_sink or topk_order_invariance or precise_dpsum or
+preprocess_tile_tail`) fake and GPU; `agent_space/dsa-64h-design/runs/C6_dq/check_dq_dqv.py`
+(fp32 reference, sentinels + out-of-range slots, non-zero dS on invalid slots, shared-KV,
+batched + varlen; bitwise compare against the padded kernel); 128-head outputs bitwise
+unchanged (out / dq / dqv sha256 identical to the integration branch, dk / dv within the fp32
+atomic band); `runs/C6_dq/gates.md`, `reports/C6dq_report.md`.
