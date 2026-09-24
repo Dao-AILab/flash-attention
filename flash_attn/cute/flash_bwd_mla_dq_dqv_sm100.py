@@ -83,6 +83,8 @@ class dQdQvGemmKernel:
         self.kv_load_warp_ids = (4, 5, 6, 7)
         self.mma_warp_id = 8
         self.tma_warp_id = 9
+        # Warps that wait on the TmemPtr barrier for the TMEM allocation.
+        self.tmem_alloc_warp_ids = (self.mma_warp_id, *self.epilogue_warp_ids)
         self.sched_warp_id = 10
         self.threads_per_cta = 32 * len(
             (
@@ -569,7 +571,7 @@ class dQdQvGemmKernel:
         # ------------------------------------------------------------------ #
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=self.tmem_alloc_sync_bar_id,
-            num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_ids)),
+            num_threads=32 * len(self.tmem_alloc_warp_ids),
         )
         # ---- Tensor memory dealloc barrier init ----
         tmem = utils.TmemAllocator(
@@ -693,6 +695,11 @@ class dQdQvGemmKernel:
             clc_response_ptr,
         )
         work_tile = tile_sched.initial_work_tile_info()
+
+        # bar.sync is .aligned: all TmemPtr participants must wait at this one site.
+        tmem.allocate(self.num_tmem_alloc_cols)
+        if warp_idx in self.tmem_alloc_warp_ids:
+            tmem.wait_for_alloc()
 
         # ------------------------------------------------------------------ #
         # TMA load warp                                                      #
@@ -864,7 +871,6 @@ class dQdQvGemmKernel:
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             # --- Retrieve TMEM ptr and make accumulator tensors
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
             if const_expr(self.compute_dQ):
@@ -958,11 +964,7 @@ class dQdQvGemmKernel:
         # ------------------------------------------------------------------ #
         if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_epi)
-            # ---- Alloc tensor memory buffer ----
-            tmem.allocate(self.num_tmem_alloc_cols)
-
             # ---- Retrieving tensor memory ptr and make accumulator tensor ----
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
             if const_expr(self.compute_dQ):

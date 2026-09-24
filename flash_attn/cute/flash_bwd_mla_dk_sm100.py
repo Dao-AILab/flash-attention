@@ -111,6 +111,8 @@ class dKGemmKernel:
         self.epilogue_warp_id = [0, 1, 2, 3]
         self.mma_warp_id = 4
         self.tma_warp_id = 5
+        # Warps that wait on the TmemPtr barrier for the TMEM allocation.
+        self.tmem_alloc_warp_ids = (self.mma_warp_id, *self.epilogue_warp_id)
         self.sched_warp_id = 6
         self.threads_per_cta = 32 * len(
             [
@@ -525,7 +527,7 @@ class dKGemmKernel:
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=self.tmem_alloc_sync_bar_id,
-            num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_id)),
+            num_threads=32 * len(self.tmem_alloc_warp_ids),
         )
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
@@ -676,6 +678,11 @@ class dKGemmKernel:
         )
         work_tile = tile_sched.initial_work_tile_info()
 
+        # bar.sync is .aligned: all TmemPtr participants must wait at this one site.
+        tmem.allocate(self.num_tmem_alloc_cols)
+        if warp_idx in self.tmem_alloc_warp_ids:
+            tmem.wait_for_alloc()
+
         #
         # Specialized TMA load warp
         #
@@ -783,7 +790,6 @@ class dKGemmKernel:
             #
             # Retrieving tensor memory ptr and make accumulator tensor
             #
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtdK_base = cute.make_tensor(tmem_ptr, tCtdK_fake.layout)
@@ -869,14 +875,8 @@ class dKGemmKernel:
         #
         elif warp_idx < self.mma_warp_id:
             #
-            # Alloc tensor memory buffer
-            #
-            tmem.allocate(self.num_tmem_alloc_cols)
-
-            #
             # Retrieving tensor memory ptr and make accumulator tensor
             #
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtdK_base = cute.make_tensor(tmem_ptr, tCtdK_fake.layout)
