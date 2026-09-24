@@ -349,7 +349,7 @@ inference (`requires_grad=False`) forwards with exactly 64 Q heads; the load-P t
 forward at 64 heads keeps the padded 2-CTA kernel. Fewer than 64 heads keep the 2-CTA kernel
 too (padding 1..63 heads to the 64-row tile is a follow-up). 128-head forwards are unchanged
 (no source of the 2-CTA kernel is touched; `out`/`dq`/`dqv` are bitwise identical to the base
-commit in the A/B of `agent_space/dsa-64h-design/runs/F1_fwd_h64/ab128/`).
+commit in the A/B).
 
 ### Test contract
 
@@ -362,10 +362,10 @@ max-abs < 1e-4; measured ~1.1e-3 and ~1e-6). `test_flash_attn_mla_absorbed` runs
 sparse cases on the recompute-P path so the kernel is exercised against `attention_ref` with
 the standard tolerances plus the 10x determinism check; `precise_dpsum[64, recompute_p=True]`
 and `preprocess_tile_tail[recompute_p=True]` cover the o_lo residual, varlen, odd sequence
-lengths and top-k 128 (2 blocks). Bit-exact gather validation (sentinels, causal limit,
-zero-fill on dirty stages): `agent_space/dsa-64h-design/runs/F1_fwd_h64/gather_validate.py`.
+lengths and top-k 128 (2 blocks). The gather manager was validated bit-exactly against a
+reference gather (sentinels, causal limit, zero-fill on dirty stages) before the kernel port.
 
-### Numerics (GB200, random bf16 inputs, fp64 reference; `runs/F1_fwd_h64/check_fwd_h64.json`)
+### Numerics (GB200, random bf16 inputs, fp64 reference)
 
 | case | out rel-L2: H64 recompute / 2-CTA load-P / H64 inference / bf16 floor | lse max-abs vs fp64 | H64 vs load-P out rel-L2 |
 |---|---|---|---|
@@ -380,7 +380,7 @@ Deterministic (bitwise across launches), no NaN; fully masked rows give out = 0,
 ### Cost
 
 GLM-5.2 shape (64 heads, top-k 2048, bf16, causal, one document, varlen API), GB200, medians of 20
-steps, same GPU back to back (`agent_space/dsa-64h-design/benchmark.csv`):
+steps, same GPU back to back:
 
 | T = S | forward (training, with o_lo) | forward (inference) | train step | peak / saved GiB |
 |---|---|---|---|---|
@@ -394,8 +394,7 @@ above: -3.5 % / -2.1 % training forward, +2 % / +1 % inference forward against t
 kernel measured back to back on the same GPU.)
 
 Per block pair (CTA 0 of a T = S = 8192 run, `%clock64` stamps under a probe-only constructor
-argument, instrumented build; `agent_space/dsa-64h-design/runs/F1_fwd_h64/clock_probe_t8k_v13c.json`,
-`..._inf_v16.json`, `pair_analysis.py`): the pair period is the **refill chain of stage a**:
+argument of an instrumented build): the pair period is the **refill chain of stage a**:
 `S(a)` issue 1,160 + wait for part 0 of stage b ~320 + `S(b)` issue ~1,300 + wait P(a) ~210 +
 `PV(a)` ~750 + refill of stage a ~1,770 (the gather sees the release after ~190, needs ~800-1,000
 cycles to issue the 36 `cp.async` per thread and part 0 lands ~450-760 later) = ~5,500 cycles
@@ -414,9 +413,8 @@ limit: `mufu_bench.py` measures 32 independent `ex2.approx` at 9.3 cycles per wa
 because ptxas places every bf16 pack right behind its MUFU pair and recycles one temporary
 register pair; scalar fmas cut it to ~500, emulating half of the exp2 on the FMA pipe to ~575.
 Per tile the epilogue adds ~15k cycles (store-bound, see above), of which ~3-4k are exposed,
-plus ~3k of tile start. ncu of this kernel at T = S = 16384 (`profile/F1v17_fwd_h64_T16k/`;
-the parted-fill version without the P double buffer: `profile/F1v10_fwd_h64_T16k/`): 4.85 ms
-(5.08), tensor pipe active 40 % (38 %), issue slots 23 %, 0.27 eligible warps per scheduler
+plus ~3k of tile start. ncu of this kernel at T = S = 16384 (in parentheses: the parted-fill
+version without the P double buffer): 4.85 ms (5.08), tensor pipe active 40 % (38 %), issue slots 23 %, 0.27 eligible warps per scheduler
 cycle, shared-memory data pipe 66 % of peak, the gather's `cp.async` issue `lg_throttle`d
 (0.43 per issue), L2 hit 89 %, gather 1152 B per (token, key), 23.07 M tensor instructions
 (44 per block, the minimum). With two latent stages nothing can hide the refill of the stage
@@ -434,8 +432,7 @@ the whole kernel slower (uninstrumented 8k kernel 2.45 -> 2.58 ms; training forw
 16k, +0.7 % at 64k; inference +5 % / +1 %), with identical numerics: on all 152 SMs the earlier
 refill lands under PV1's operand fetch and the shared-memory contention costs more than the
 ~340 cycles per pair the earlier start saves. The refill has to leave the critical path (third
-stage), not start earlier under the GEMMs. Evidence:
-`agent_space/dsa-64h-design/runs/F1_fwd_h64/ledger.md` L20, `patches/commits/stage5/`.
+stage), not start earlier under the GEMMs.
 
 ## C6-dq: 1-CTA dQ/dQv kernel with a whole-row gather (`dQdQvGemmKernelH64`)
 
@@ -496,12 +493,11 @@ per (token, key) plus 384 B of dS per pair.
   kernel's budgets (KV 224 / epilogue 128 / others 112 over 11 warps) were never honoured
   (no launch attribute) and trap (`setmaxnreg.inc 128` below the launch count) or hang (the
   gather warps' `inc 224` waits for registers the incomplete warpgroup never releases) once
-  they are; evidence `agent_space/dsa-64h-design/runs/C6_dq/ledger.md` L1-L2 and
-  `reports/C9_minblocks_report.md`.
+  they are.
 
 ### Effect (GB200, 64 heads, W = 2048, bf16, causal, `gather_bwd_recompute_p=True`, `gather_bwd_token_chunk=4096`)
 
-`time_bwd.py`, same GPU and session as the integration branch (C8 + C1 + F1), which uses the
+Measured on the same GPU and session as the integration branch (C8 + C1 + F1), which uses the
 padded kernel for dq/dqv:
 
 | T = S | dq_dqv padded -> C6-dq | backward kernel sum | GLM-5.2 harness train step |
@@ -509,8 +505,8 @@ padded kernel for dq/dqv:
 | 16k | 4.43 -> **2.72 ms** (-38.5 %) | 21.57 -> 19.87 ms | 26.72 -> **24.96 ms** |
 | 64k | 20.62 -> **12.23 ms** (-40.7 %) | 98.40 -> 90.10 ms | 119.84 -> **112.52 ms** (main 148.9; FlashMLA + cuDNN 129.3) |
 
-Peak memory and saved activations unchanged (13.69 / 8.02 GiB at 64k). ncu at 16k chunk 2
-(`profile/C6dq_dqdqv_h64_T16k/`): 693 us per launch (padded kernel 1,113), tensor pipe 75 %
+Peak memory and saved activations unchanged (13.69 / 8.02 GiB at 64k). ncu at 16k chunk 2:
+693 us per launch (padded kernel 1,113), tensor pipe 75 %
 busy = exactly the plain-M=64 issue time, gather 1161 B per (token, key) at 48 B/clk/SM (the
 2-stage producer's ceiling is ~54), dS 128 B per pair (was 384). The kernel is MMA / fill
 co-bound: the `.ws` M=64 N=256 form (80 % rate) and a third latent stage are the next levers,
@@ -526,11 +522,11 @@ assertions unchanged, and the harness accuracy columns equal the integration bra
 ### Validation
 
 Sparse-MLA subset (`mla_sparse or mla_sink or topk_order_invariance or precise_dpsum or
-preprocess_tile_tail`) fake and GPU; `agent_space/dsa-64h-design/runs/C6_dq/check_dq_dqv.py`
+preprocess_tile_tail`) fake and GPU
 (fp32 reference, sentinels + out-of-range slots, non-zero dS on invalid slots, shared-KV,
 batched + varlen; bitwise compare against the padded kernel); 128-head outputs bitwise
 unchanged (out / dq / dqv sha256 identical to the integration branch, dk / dv within the fp32
-atomic band); `runs/C6_dq/gates.md`, `reports/C6dq_report.md`.
+atomic band).
 ## F3: Q in TMEM, `.ws` TS dual GEMM, three latent stages (`FlashAttentionMLAForwardSm100H64`)
 
 How the 64-head forward keeps the token's Q tile in tensor memory instead of shared memory,
@@ -564,8 +560,7 @@ buffer that can become a third stage.
   tile, commits, releases the stage and the rope tile (the commit tracks the copies) and waits
   on a private mbarrier before the first S GEMM. TMEM image: lane l < 64 holds Q[l, 128 t + 0..63]
   at columns 32 t .. 32 t + 31, lane 64 + l holds Q[l, 128 t + 64..127]; rope: lane l dims 0-31,
-  lane 64 + l dims 32-63 (bf16 pairs per 32-bit column; measured bit-exact,
-  `agent_space/dsa-64h-design/dsl-probes/probe_ws_ts_qtmem.py`).
+  lane 64 + l dims 32-63 (bf16 pairs per 32-bit column; measured bit-exact).
 - **Rope tiles are SW64.** A 64 x 64 bf16 K-major SW128 tile (F1) has no (128 rows, 32) re-view;
   the rope tile is now two 64 x 32 SW64 column tiles (`make_smem_layout_b(tiled_mma(64, 64),
   (64, 64, 32), bf16, 2)`: the "2 stages" are the two dim halves), whose (128, 32) SW64 view
@@ -621,7 +616,7 @@ load-P and recompute-P modes could not hold once the 64-head kernel existed (it 
 integration base before F3). Cross-kernel modes now agree up to bf16 rounding (out rel-L2 < 5e-3,
 lse max-abs < 1e-4, dsink rel-L2 < 1e-2; measured ~1e-3 / ~2e-6 / ~3e-3), same-kernel modes stay bitwise.
 
-### Cost (GB200, GLM-5.2 shape, GPU 1, `agent_space/dsa-64h-design/benchmark.csv`)
+### Cost (GB200, GLM-5.2 shape, GPU 1)
 
 | T = S | forward (training, with o_lo) | forward (inference) | train step (with C8 + C1) | peak / saved GiB |
 |---|---|---|---|---|
@@ -631,7 +626,7 @@ lse max-abs < 1e-4, dsink rel-L2 < 1e-2; measured ~1e-3 / ~2e-6 / ~3e-3), same-k
 Same-GPU ABAB against the F1 tip (four legs, back to back): 64k training forward 20.35 / 20.33 vs
 21.37 / 21.53 ms (-5.2 %), inference 17.52 vs 18.65 (-6.1 %); 16k 4.70 / 4.94 vs 4.96 / 5.10.
 
-Numerics (`runs/F3_fwd_qtmem/check_fwd_h64_v3.json`): out rel-L2 vs fp64 0.181-0.207 % on the five
+Numerics: out rel-L2 vs fp64 0.181-0.207 % on the five
 `check_fwd_h64` cases (F1 0.181-0.207 %, bf16 floor 0.154-0.166 %), lse max-abs 1.1-1.4e-6,
 deterministic, no NaN, fully masked rows -> 0 / -inf, batched, varlen, shared-KV and top-k 1024
 all as F1. Harness accuracy vs fp64 identical to F1 to the printed digit on all 11 cases (out
@@ -639,13 +634,13 @@ all as F1. Harness accuracy vs fp64 identical to F1 to the printed digit on all 
 subset 182 passed (fake + GPU), absorbed suite 1040 passed on the GPU; `out`/`dq`/`dqv` of the 128-head
 recompute path and of the 64-head load-P path bitwise equal to the base commit.
 
-ncu at T = S = 16384 (`agent_space/dsa-64h-design/profile/F3_fwd_h64_T16k/`, vs the F1 v17 run): 4.08 ms
+ncu at T = S = 16384 (vs the F1 v17 run): 4.08 ms
 (4.85), tensor pipe active 48.7 % (40.1 %) with 26 tensor instructions per 64-key block (18 TS +
 8 SS; 44 at half the N in F1) plus 18 `tcgen05.cp` per tile, issue active 33.5 % (23 %), `mio_throttle`
 0.85 stalls per issue (0.05) on the exchange stores / loads, the gather's `cp.async` issue and the
 P store: the shared-memory instruction queue is saturated. Local loads 2.0 M (238 M in F1).
 
-### Where the time goes (in-kernel `%clock64`, CTA 0, T = S = 8192, `runs/F3_fwd_qtmem/clock_probe_t8k_v2b.json`, `decode_f3.py`)
+### Where the time goes (in-kernel `%clock64`, CTA 0, T = S = 8192)
 
 Block period ~2,400 cycles = the softmax step (S seen -> P committed ~2,250: t2r 108, exchange
 stores 271, pair barrier 21, exchange loads + adds 313, mask + row-max exchange 350, stats 45,
