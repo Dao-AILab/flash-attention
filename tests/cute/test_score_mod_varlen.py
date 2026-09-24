@@ -86,6 +86,7 @@ from score_mod_definitions import (
 
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
+IS_SM120 = torch.cuda.get_device_capability()[0] == 12
 
 # =============================================================================
 # Test pairs
@@ -1350,6 +1351,67 @@ def _check_grad(name, cute_grad, ref_fp32, pt_grad, dtype, rtol=3, extra=1e-3):
     assert cute_err <= rtol * pt_err + atol, (
         f"{name} CuTE err {cute_err:.2e} exceeds {rtol}*PT err {pt_err:.2e} + {atol:.2e}"
     )
+
+
+@pytest.mark.skipif(not IS_SM120, reason="SM120-only score_mod backward coverage")
+@pytest.mark.parametrize("use_autograd", [True, False])
+def test_sm120_varlen_score_mod_backward(use_autograd):
+    """Cover logical head and query-position aux reads for varlen attention."""
+    torch.random.manual_seed(42)
+    dtype = torch.bfloat16
+    dim = 64
+    seqlens_q = [65, 17, 129]
+    seqlens_k = [65, 17, 129]
+    num_q_heads = 4
+    num_kv_heads = 4
+
+    q = torch.randn(sum(seqlens_q), num_q_heads, dim, device="cuda", dtype=dtype)
+    k = torch.randn(sum(seqlens_k), num_kv_heads, dim, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    head_bias = torch.randn(num_q_heads, device="cuda", dtype=dtype) * 0.2
+    pos_bias = torch.arange(max(seqlens_q), device="cuda", dtype=dtype) * 0.01
+    aux_tensors = [head_bias, pos_bias]
+    eager_score_mod = dual_buffer_factory(head_bias, pos_bias)
+
+    _, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd_varlen(
+        q,
+        k,
+        v,
+        score_mod_dual_buffer,
+        score_mod_bwd_dual_buffer,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        aux_tensors=aux_tensors,
+        pack_gqa=False,
+        use_autograd=use_autograd,
+    )
+    _, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_varlen_ref_bwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        eager_score_mod,
+        grad_out,
+        dtype=torch.float32,
+    )
+    _, dq_pt, dk_pt, dv_pt = run_flex_varlen_ref_bwd(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, eager_score_mod, grad_out, dtype=dtype
+    )
+
+    _check_grad("dQ", dq_cute, dq_ref_fp32, dq_pt, dtype)
+    _check_grad("dK", dk_cute, dk_ref_fp32, dk_pt, dtype)
+    _check_grad("dV", dv_cute, dv_ref_fp32, dv_pt, dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
