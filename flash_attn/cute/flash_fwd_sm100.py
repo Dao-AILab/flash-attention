@@ -1619,7 +1619,7 @@ class FlashAttentionForwardSm100:
                 )
                 if const_expr(self.is_split_kv and block_info.pack_split_idx):
                     split_idx = split_idx & 0xFFFF
-                if self.process_work_tile(seqlen, n_block_min, n_block_max):
+                if self.process_work_tile(block_info, seqlen, n_block_min, n_block_max):
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                     page_idx = (
                         mPageTable[batch_idx, n_block_first]
@@ -1844,7 +1844,7 @@ class FlashAttentionForwardSm100:
                     num_splits=num_splits,
                 )
                 block_iter_count = n_block_max - n_block_min
-                process_tile = self.process_work_tile(seqlen, n_block_min, n_block_max)
+                process_tile = self.process_work_tile(block_info, seqlen, n_block_min, n_block_max)
 
             if process_tile and is_leader_cta:
                 for stage in cutlass.range_constexpr(self.q_stage):
@@ -2224,7 +2224,7 @@ class FlashAttentionForwardSm100:
                 has_work = tile_block_count > Int32(0)
             else:
                 tile_block_count = n_block_max - n_block_min
-                has_work = self.process_work_tile(seqlen, n_block_min, n_block_max)
+                has_work = self.process_work_tile(block_info, seqlen, n_block_min, n_block_max)
 
             softmax_step = partial(
                 self.softmax_step,
@@ -2670,7 +2670,7 @@ class FlashAttentionForwardSm100:
                 has_work = total_block_count > Int32(0)
             else:
                 total_block_count = n_block_max - n_block_min
-                has_work = self.process_work_tile(seqlen, n_block_min, n_block_max)
+                has_work = self.process_work_tile(block_info, seqlen, n_block_min, n_block_max)
 
             if has_work:
                 # Ignore first signal from softmax as no correction is required
@@ -3108,7 +3108,7 @@ class FlashAttentionForwardSm100:
                 split_idx = split_idx & 0xFFFF
 
             if const_expr(self.use_block_sparsity) or self.process_work_tile(
-                seqlen, n_block_min, n_block_max
+                block_info, seqlen, n_block_min, n_block_max
             ):
                 if const_expr(self.is_split_kv):
                     mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
@@ -3385,12 +3385,13 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def process_work_tile(
         self,
+        block_info: BlockInfo,
         seqlen_info: SeqlenInfoQK,
         n_block_min: Int32,
         n_block_max: Int32,
     ):
         is_varlen_q = seqlen_info.has_cu_seqlens_q or seqlen_info.has_seqused_q
-        process_work_tile_k = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+        process_work_tile_k = block_info.has_kv_work(n_block_min, n_block_max)
         if const_expr(is_varlen_q and not self.use_varlen_scheduler):
             process_work_tile_q = seqlen_info.seqlen_q > 0
         else:
