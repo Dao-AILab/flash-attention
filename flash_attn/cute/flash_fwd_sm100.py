@@ -335,6 +335,13 @@ class FlashAttentionForwardSm100:
         elif not self.use_tma_KV:
             self.load_warp_ids = (14, 15)
             self.empty_warp_ids = ()
+        # Warps that wait on the TmemPtr barrier for the TMEM allocation.
+        self.tmem_alloc_warp_ids = (
+            self.mma_warp_id,
+            *self.softmax0_warp_ids,
+            *self.softmax1_warp_ids,
+            *self.correction_warp_ids,
+        )
 
         if self.use_correction_warps_for_epi:
             self.empty_warp_ids = self.empty_warp_ids + self.epilogue_warp_ids
@@ -962,12 +969,7 @@ class FlashAttentionForwardSm100:
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
-            num_threads=cute.arch.WARP_SIZE * len(
-                (self.mma_warp_id,
-                 *self.softmax0_warp_ids,
-                 *self.softmax1_warp_ids,
-                 *self.correction_warp_ids)
-            ),
+            num_threads=cute.arch.WARP_SIZE * len(self.tmem_alloc_warp_ids),
         )
         # Tensor memory dealloc barrier init
         tmem = cutlass.utils.TmemAllocator(
@@ -1313,14 +1315,16 @@ class FlashAttentionForwardSm100:
                 tile_scheduler=tile_scheduler,
             )
 
+        # bar.sync is .aligned: all TmemPtr participants must wait at this one site.
+        tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
+        if warp_idx in self.tmem_alloc_warp_ids:
+            tmem.wait_for_alloc()
+
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
-            # Alloc tensor memory buffer
-            tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.mma(
                 tiled_mma_qk,
@@ -1378,8 +1382,6 @@ class FlashAttentionForwardSm100:
         ):
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
-            # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
@@ -1423,8 +1425,6 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
-            # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.correction_loop(
                 thr_mma_qk,
