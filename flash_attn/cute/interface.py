@@ -16,6 +16,8 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
+from cutlass.base_dsl.arch import Arch
+from cutlass.cutlass_dsl import BaseDSL
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
@@ -64,6 +66,9 @@ from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
 # SM100 head_dim=256 2CTA kernel imports
 from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
+from flash_attn.cute.sm100_hd256_2cta_fmha_forward_fp8 import (
+    BlackwellFusedMultiHeadAttentionForwardFP8,
+)
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
 
 from flash_attn.cute.utils import AuxData
@@ -558,6 +563,25 @@ def _compute_blocks_to_batch(cu_total_blocks, num_blocks, device):
 
 
 _compute_blocks_to_batch.compile_cache = get_jit_cache("blocks_to_batch")
+
+
+def _hd256_fp8_dispatch(
+    use_dedicated_hd256_kernel: bool, arch: int, q_dtype: torch.dtype, dense: bool
+) -> Tuple[bool, bool]:
+    """Select the dedicated dense E4M3 hd256 forward kernel on SM100 / SM103.
+
+    Returns ``(use_kernel, use_ldred_rowmax)``; ``use_ldred_rowmax`` enables the SM103
+    ``tcgen05.ld.red`` row max, which needs an SM103-family compilation target
+    (``CUTE_DSL_ARCH`` can override it).
+    """
+    if not (
+        use_dedicated_hd256_kernel
+        and arch // 10 == 10
+        and q_dtype == torch.float8_e4m3fn
+        and dense
+    ):
+        return False, False
+    return True, BaseDSL._get_dsl().get_arch_enum().is_family_of(Arch.sm_103f)
 
 
 def _flash_attn_fwd(
@@ -1176,6 +1200,24 @@ def _flash_attn_fwd(
         and (cu_seqlens_q is None or host_max_seqlen_q is not None)
     )
 
+    use_hd256_fp8, hd256_fp8_ldred = _hd256_fp8_dispatch(
+        use_dedicated_hd256_kernel,
+        arch,
+        q_dtype,
+        dense=(
+            qv is None
+            and not local
+            and cu_seqlens_q is None
+            and cu_seqlens_k is None
+            and seqused_q is None
+            and seqused_k is None
+            and page_table is None
+            and q_descale is None
+            and k_descale is None
+            and v_descale is None
+        ),
+    )
+
     # CuTe keeps stride-zero modes static when marking layouts dynamic.
     tensor_broadcast_patterns = tuple(
         get_broadcast_dims(tensor) if tensor is not None else None
@@ -1230,6 +1272,8 @@ def _flash_attn_fwd(
         tile_m,
         tile_n,
         q_stage,
+        use_hd256_fp8,
+        hd256_fp8_ldred,
         num_threads,
         is_split_kv,
         pack_gqa,
@@ -1423,11 +1467,12 @@ def _flash_attn_fwd(
                     # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
                     pack_gqa = False
 
-                flash_fwd_obj_cls = (
-                    BlackwellFusedMultiHeadAttentionForward
-                    if use_dedicated_hd256_kernel
-                    else FlashAttentionForwardSm100
-                )
+                if use_hd256_fp8:
+                    flash_fwd_obj_cls = BlackwellFusedMultiHeadAttentionForwardFP8
+                elif use_dedicated_hd256_kernel:
+                    flash_fwd_obj_cls = BlackwellFusedMultiHeadAttentionForward
+                else:
+                    flash_fwd_obj_cls = FlashAttentionForwardSm100
 
                 fa_fwd_kwargs = dict(
                     qhead_per_kvhead=qhead_per_kvhead,
@@ -1450,7 +1495,9 @@ def _flash_attn_fwd(
                     use_clc_scheduler=use_clc_scheduler,
                     seqlen_k_per_split=seqlen_k_per_split,
                 )
-                if not use_dedicated_hd256_kernel:
+                if use_hd256_fp8:
+                    fa_fwd_kwargs["use_ldred_rowmax"] = hd256_fp8_ldred
+                elif not use_dedicated_hd256_kernel:
                     fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
                 fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
         elif arch // 10 == 12:

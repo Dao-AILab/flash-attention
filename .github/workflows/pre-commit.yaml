@@ -7,6 +7,7 @@ on:
       - 'flash_attn/cute/flash_bwd_preprocess.py'
       - 'flash_attn/cute/flash_bwd_postprocess.py'
       - 'flash_attn/cute/softmax.py'
+      - 'flash_attn/cute/sm100_hd256_2cta_fmha_forward_fp8.py'
       - '.pre-commit-config.yaml'
   push:
     branches:
@@ -16,6 +17,7 @@ on:
       - 'flash_attn/cute/flash_bwd_preprocess.py'
       - 'flash_attn/cute/flash_bwd_postprocess.py'
       - 'flash_attn/cute/softmax.py'
+      - 'flash_attn/cute/sm100_hd256_2cta_fmha_forward_fp8.py'
       - '.pre-commit-config.yaml'
 
 jobs:

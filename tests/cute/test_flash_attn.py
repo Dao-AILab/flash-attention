@@ -28,6 +28,7 @@ from flash_attn.cute.testing import (
     maybe_fake_tensor_mode,
     is_fake_mode,
 )
+import flash_attn.cute.interface as fa_interface
 from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -1092,6 +1093,224 @@ def test_flash_attn_varlen_pack_gqa_padded_head_dim():
     reference = torch.cat(references)
 
     torch.testing.assert_close(out, reference, atol=0.025, rtol=0.025)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 forward is SM100-only")
+@pytest.mark.parametrize(
+    "batch_size,seqlen_q,seqlen_k,nheads,nheads_kv,causal,softmax_scale,dtype",
+    [
+        # Each row exercises a distinct part of the FP8 hd256 kernel (see interface dispatch).
+        (2, 129, 257, 4, 4, False, None, torch.float8_e4m3fn),  # unaligned tails
+        (2, 64, 4096, 8, 1, False, None, torch.float8_e4m3fn),  # seqlen_q <= 128, 32-block KV walk
+        (2, 1024, 1024, 4, 1, True, None, torch.float8_e4m3fn),  # causal, aligned diagonal
+        (4, 2049, 4096, 8, 2, True, 0.125, torch.float8_e4m3fn),  # causal GQA, several rounds
+        (2, 1025, 1024, 8, 2, False, None, torch.float8_e4m3fn),  # aligned seqlen_k
+        (1, 8192, 8192, 4, 1, True, None, torch.float8_e4m3fn),  # causal, reversed waves
+        (1, 8193, 513, 4, 1, True, None, torch.float8_e4m3fn),  # rows without valid keys
+        (1, 129, 257, 4, 1, True, None, torch.float8_e5m2),  # E5M2 keeps the generic kernel
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_hd256_output(
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, causal, softmax_scale, dtype
+):
+    torch.manual_seed(0)
+    d = 256
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
+    k, v = [
+        torch.randn(
+            batch_size, seqlen_k, nheads_kv, d, device="cuda", dtype=torch.bfloat16
+        ).to(dtype)
+        for _ in range(2)
+    ]
+    out, lse = flash_attn_func(
+        q, k, v, causal=causal, softmax_scale=softmax_scale, return_lse=True
+    )
+    if is_fake_mode():
+        return
+
+    assert out.shape == q.shape and out.dtype == torch.bfloat16
+    assert lse.shape == (batch_size, nheads, seqlen_q) and lse.dtype == torch.float32
+    # Compare the quantized inputs, as in test_flash_attn_output. Scaling Q by
+    # two exactly represents the non-default scale in attention_ref, which
+    # otherwise always uses 1 / sqrt(d).
+    q_ref, k_ref, v_ref = [t.to(torch.bfloat16) for t in (q, k, v)]
+    if softmax_scale is not None:
+        q_ref = q_ref * (softmax_scale * math.sqrt(d))
+    out_ref, _, lse_ref = attention_ref(
+        q_ref.float(), k_ref.float(), v_ref.float(), causal=causal, return_lse=True
+    )
+    out_pt, _ = attention_ref(
+        q_ref, k_ref, v_ref, causal=causal, upcast=False, reorder_ops=True,
+        intermediate_dtype=dtype,
+    )
+    check_tensor_vs_ref("out", out, out_ref.to(torch.bfloat16), out_pt)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 forward is SM100-only")
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen_q,seqlen_k,nheads,nheads_kv,causal",
+    [
+        (2, 513, 1024, 4, 2, False),  # aligned seqlen_k
+        (2, 513, 257, 4, 1, True),  # causal, unaligned seqlen_k
+        (1, 2048, 2048, 4, 4, False),  # aligned diagonal
+        (1, 8192, 8193, 1, 1, True),  # causal, unaligned seqlen_k, several waves
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_hd256_matches_generic(
+    monkeypatch, batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, causal, return_lse
+):
+    """The FP8 hd256 kernel reproduces the generic hd256 kernel bit for bit."""
+    torch.manual_seed(0)
+    dtype = torch.float8_e4m3fn
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, 256, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
+    k, v = [
+        torch.randn(
+            batch_size, seqlen_k, nheads_kv, 256, device="cuda", dtype=torch.bfloat16
+        ).to(dtype)
+        for _ in range(2)
+    ]
+    out = flash_attn_func(q, k, v, causal=causal, return_lse=return_lse)
+    monkeypatch.setattr(fa_interface, "_hd256_fp8_dispatch", lambda *args, **kwargs: (False, False))
+    ref = flash_attn_func(q, k, v, causal=causal, return_lse=return_lse)
+    if is_fake_mode():
+        return
+    # flash_attn_func returns (out, lse) with lse None when return_lse=False.
+    out = out if isinstance(out, tuple) else (out,)
+    ref = ref if isinstance(ref, tuple) else (ref,)
+    assert len(out) == len(ref)
+    for a, b in zip(out, ref):
+        assert (a is None) == (b is None)
+        if a is not None:
+            assert torch.equal(a, b)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 forward is SM100-only")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_hd256_dispatches(monkeypatch):
+    """A dense E4M3 hd256 call builds the FP8 kernel (guards against a silent fallback)."""
+    constructed = []
+    real_cls = fa_interface.BlackwellFusedMultiHeadAttentionForwardFP8
+
+    def recording_cls(*args, **kwargs):
+        constructed.append(kwargs.get("use_ldred_rowmax"))
+        return real_cls(*args, **kwargs)
+
+    monkeypatch.setattr(fa_interface, "BlackwellFusedMultiHeadAttentionForwardFP8", recording_cls)
+    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", JITCache())
+    dtype = torch.float8_e4m3fn
+    q = torch.randn(2, 129, 4, 256, device="cuda", dtype=torch.bfloat16).to(dtype)
+    k = torch.randn(2, 257, 4, 256, device="cuda", dtype=torch.bfloat16).to(dtype)
+    v = torch.randn(2, 257, 4, 256, device="cuda", dtype=torch.bfloat16).to(dtype)
+    flash_attn_func(q, k, v)
+    assert constructed == [fa_interface._hd256_fp8_dispatch(True, 100, dtype, True)[1]]
+
+
+def test_flash_attn_fp8_hd256_dispatch_rule():
+    """CPU-only check of the FP8 hd256 dispatch predicate."""
+
+    def select(dtype=torch.float8_e4m3fn, dense=True, arch=103, hd256=True):
+        return fa_interface._hd256_fp8_dispatch(hd256, arch, dtype, dense)[0]
+
+    assert select()
+    assert select(arch=100)
+    assert not select(arch=90)
+    assert not select(arch=120)
+    assert not select(dtype=torch.float8_e5m2)
+    assert not select(dtype=torch.bfloat16)
+    assert not select(dense=False)
+    assert not select(hd256=False)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 forward is SM100-only")
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(513, 257), (8193, 513)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_hd256_uniform_scores(seqlen_q, seqlen_k):
+    """Uniform scores give exact outputs and analytic LSE, including empty rows."""
+    dtype = torch.float8_e4m3fn
+    q = torch.zeros(1, seqlen_q, 4, 256, device="cuda", dtype=torch.bfloat16).to(dtype)
+    k = torch.zeros(1, seqlen_k, 1, 256, device="cuda", dtype=torch.bfloat16).to(dtype)
+    v = torch.ones(1, seqlen_k, 1, 256, device="cuda", dtype=torch.bfloat16).to(dtype)
+    out, lse = flash_attn_func(q, k, v, causal=True, return_lse=True)
+    if is_fake_mode():
+        return
+
+    valid_keys = (
+        torch.arange(seqlen_q, device="cuda") + seqlen_k - seqlen_q + 1
+    ).clamp(min=0, max=seqlen_k)
+    expected_out = (valid_keys > 0).to(torch.bfloat16)[None, :, None, None].expand_as(out)
+    expected_lse = valid_keys.float().log()[None, None, :].expand_as(lse)
+    torch.testing.assert_close(out, expected_out, atol=0, rtol=0)
+    torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 forward is SM100-only")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_hd256_preallocated_graph():
+    """Graph replay must read updated FP8 inputs and preserve output padding."""
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d = 2, 1025, 257, 4, 1, 256
+    dtype = torch.float8_e4m3fn
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
+    k, v = [
+        torch.randn(
+            batch_size, seqlen_k, nheads_kv, d, device="cuda", dtype=torch.bfloat16
+        ).to(dtype)
+        for _ in range(2)
+    ]
+    # Eight BF16 padding elements preserve the required 16-byte alignment.
+    storage = torch.full(
+        (batch_size, seqlen_q, nheads, d + 8), 123.0, device="cuda", dtype=torch.bfloat16
+    )
+    out = storage[..., :d]
+    lse = torch.empty(batch_size, nheads, seqlen_q, device="cuda", dtype=torch.float32)
+
+    def run():
+        return _flash_attn_fwd(q, k, v, out=out, lse=lse, return_lse=True)[:2]
+
+    result, result_lse = run()
+    if is_fake_mode():
+        return
+
+    assert result.data_ptr() == out.data_ptr()
+    assert result_lse.data_ptr() == lse.data_ptr()
+    expected, expected_lse = flash_attn_func(q, k, v, return_lse=True)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
+    initial_out = out.clone()
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured_out, captured_lse = run()
+    graph.replay()
+    torch.testing.assert_close(captured_out, expected, atol=0, rtol=0)
+    torch.testing.assert_close(captured_lse, expected_lse, atol=0, rtol=0)
+
+    for tensor in (q, k, v):
+        tensor.copy_(torch.randn(tensor.shape, device="cuda", dtype=torch.bfloat16).to(dtype))
+    saved_inputs = [tensor.clone() for tensor in (q, k, v)]
+    expected, expected_lse = flash_attn_func(q, k, v, return_lse=True)
+    graph.replay()
+    torch.testing.assert_close(captured_out, expected, atol=0, rtol=0)
+    torch.testing.assert_close(captured_lse, expected_lse, atol=0, rtol=0)
+    assert not torch.equal(captured_out, initial_out)
+    for actual, saved in zip((q, k, v), saved_inputs):
+        assert torch.equal(actual.view(torch.uint8), saved.view(torch.uint8))
+    assert torch.equal(storage[..., d:], torch.full_like(storage[..., d:], 123.0))
 
 
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
