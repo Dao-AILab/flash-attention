@@ -77,7 +77,7 @@ class FlashAttentionBackwardSm90:
     ):
         self.dtype = dtype
         # Swapped dK/dV accumulators put head_dim on WGMMA's 64-row M axis.
-        hdim_multiple_of = 64 if dKV_swapAB else 16
+        hdim_multiple_of = 64 if dKV_swapAB else 32
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
         self.same_hdim_kv = head_dim == head_dim_v
