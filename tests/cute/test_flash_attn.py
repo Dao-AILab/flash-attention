@@ -108,6 +108,22 @@ def test_flash_attn_sm120_rejects_splitkv():
         flash_attn_func(q, k, v, num_splits=3)
 
 
+@pytest.mark.skipif(not IS_SM120, reason="SM120 shared-memory capacity")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_sm120_backward_rejects_smem_overflow(dtype, causal):
+    q, k, v = [
+        torch.randn(1, 128, 2, 192, device="cuda", dtype=dtype, requires_grad=True)
+        for _ in range(3)
+    ]
+    out, _ = flash_attn_func(q, k, v, causal=causal)
+    with pytest.raises(
+        ValueError,
+        match="SM120 backward requires 115712 bytes of shared memory, but the limit is 101376 bytes",
+    ):
+        torch.autograd.grad(out, (q, k, v), torch.randn_like(out))
+
+
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
     reason="SM100/SM110 runtime layout-cache test",

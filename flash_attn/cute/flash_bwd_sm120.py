@@ -12,6 +12,21 @@ from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 
 
 class FlashAttentionBackwardSm120(FlashAttentionBackwardSm80):
+    def _get_shared_storage_cls(self):
+        shared_storage = super()._get_shared_storage_cls()
+        smem_usage = shared_storage.size_in_bytes()
+        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
+        # Use the actual allocation, including P/dS, LSE/dPsum, and alignment
+        # padding, rather than just the Q/K/V/dO tiles in can_implement().
+        if smem_usage > smem_capacity:
+            raise ValueError(
+                f"SM120 backward requires {smem_usage} bytes of shared memory, "
+                f"but the limit is {smem_capacity} bytes "
+                f"(tile={self.m_block_size}x{self.n_block_size}, "
+                f"padded head dimensions={self.head_dim_padded}/{self.head_dim_v_padded})."
+            )
+        return shared_storage
+
     @staticmethod
     def can_implement(
         dtype,
