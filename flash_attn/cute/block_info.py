@@ -67,6 +67,18 @@ class BlockInfo:
             n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
         return n_block_min, n_block_max
 
+    def has_kv_work(self, n_block_min: Int32, n_block_max: Int32):
+        """Whether a (tile, split) owns KV blocks.
+
+        With SplitKV, ceil-divided ranges can leave a split with no blocks, and the count
+        from get_n_block_min_max can be negative. Every warp role must skip such a split
+        with this same predicate. Without SplitKV this is always True: callers handle an
+        empty range themselves (e.g. with one fully masked iteration).
+        """
+        if const_expr(not self.is_split_kv):
+            return True
+        return n_block_min < n_block_max
+
     @cute.jit
     def get_m_block_min_max(self, seqlen_info: SeqlenInfoQK, n_block: Int32) -> Tuple[Int32, Int32]:
         m_block_max = cute.ceil_div(seqlen_info.seqlen_q, self.tile_m)

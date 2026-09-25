@@ -398,6 +398,11 @@ def _get_fwd_config(
     )
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
+    if arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256:
+        # The dedicated hd256 kernel never packs GQA and runs one 2CTA cluster per
+        # 2 * tile_m Q rows of each Q head: count its CTAs.
+        num_clusters_m = cute.ceil_div(max_seqlen_q, 2 * tile_m)
+        total_mblocks = 2 * batch_size * num_head_kv * qhead_per_kvhead * num_clusters_m
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = None
     if arch // 10 == 12:
