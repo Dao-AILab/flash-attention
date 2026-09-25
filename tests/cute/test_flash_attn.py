@@ -671,9 +671,10 @@ def test_flash_attn_output(
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         # num_splits_vals = [1, 3]
         pack_gqa_vals = [True] if has_qv else [False, True, None] if not TEST_BWD_ONLY else [False]
-        # SplitKV is not supported for hdim >= 192
+        # SplitKV is not supported for hdim >= 192, except the SM100 hd256 kernel
         # pack_gqa_vals = [False]
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY and not has_qv else [1]
+        split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
+        num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY and not has_qv else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             # SplitKV not supported on SM90/SM120 - skip this iteration
             if (IS_SM90 or IS_SM120) and num_splits > 1:
@@ -1123,8 +1124,12 @@ def test_flash_attn_hd256_sm100_noncontiguous_transpose():
 @pytest.mark.parametrize("layout", ["padded", "transposed"])
 @pytest.mark.parametrize("max_mode", ["int", "none", "cuda"])
 @pytest.mark.parametrize("use_seqused_q", [False, True])
+# num_splits=0 lets the heuristic choose.
+@pytest.mark.parametrize("num_splits", [1, 3, 0])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_hd256_varlen_output_alignment(dtype, paged, layout, max_mode, use_seqused_q):
+def test_flash_attn_hd256_varlen_output_alignment(
+    dtype, paged, layout, max_mode, use_seqused_q, num_splits
+):
     """Preserve aligned strided outputs and guards across a nonzero packed-Q offset."""
     if not (IS_SM100 or IS_SM110):
         pytest.skip("SM100/SM110-specific hd256 output alignment test")
@@ -1176,6 +1181,7 @@ def test_flash_attn_hd256_varlen_output_alignment(dtype, paged, layout, max_mode
         cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
         max_seqlen_q=max_q, max_seqlen_k=max_k,
         seqused_q=seqused_q, seqused_k=seqused_k, page_table=page_table, causal=True,
+        num_splits=num_splits,
     )[0]
     if is_fake_mode():
         return
@@ -1564,8 +1570,9 @@ def test_flash_attn_varlen_output(
         pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
         # pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
-        # SplitKV is not supported for hdim >= 192
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
+        # SplitKV is not supported for hdim >= 192, except the SM100 hd256 kernel
+        split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
+        num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         precompute_metadata_vals = [False, True]
         for pack_gqa, num_splits, precompute_metadata in itertools.product(
             pack_gqa_vals, num_splits_vals, precompute_metadata_vals
@@ -2858,9 +2865,10 @@ def test_flash_attn_paged_deepseek(seqlen_q, page_size):
     assert torch.equal(out, out_ref)
 
 
+@pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("seqlen_q", [128, 512, 2048])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_paged_hd256_sm100_tma(seqlen_q):
+def test_flash_attn_paged_hd256_sm100_tma(seqlen_q, num_splits):
     """TMA paged KV in the SM100 hd256 2CTA forward kernel.
 
     Verifies paged KV (page_table + TMA) matches the non-paged varlen reference
@@ -2884,7 +2892,7 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q):
     cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
     cu_seqlens_k = cu_seqlens_q.clone()
 
-    # Non-paged reference (varlen).
+    # Non-paged, unsplit reference (varlen).
     out_ref, _ = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
@@ -2911,13 +2919,13 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q):
         q, k_paged, v_paged,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
-        page_table=page_table,
+        page_table=page_table, num_splits=num_splits,
     )
     out_paged_1, _ = flash_attn_varlen_func(
         q, k_paged, v_paged,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
-        page_table=page_table,
+        page_table=page_table, num_splits=num_splits,
     )
 
     if is_fake_mode():
@@ -2925,7 +2933,9 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q):
 
     print(f"Paged vs non-paged max diff: {(out_paged_0 - out_ref).abs().max().item()}")
     print(f"Paged determinism diff: {(out_paged_1 - out_paged_0).abs().max().item()}")
-    assert torch.allclose(out_paged_0, out_ref, atol=1e-3, rtol=1e-3), "Paged output does not match non-paged reference"
+    # SplitKV rounds the fp32 combine to bf16 once more than the unsplit path.
+    atol = 1e-3 if num_splits == 1 else 4e-3
+    assert torch.allclose(out_paged_0, out_ref, atol=atol, rtol=1e-3), "Paged output does not match non-paged reference"
     assert torch.equal(out_paged_1, out_paged_0), "Paged output is not deterministic"
 
 
@@ -3059,10 +3069,11 @@ def test_flash_attn_paged_hd256_sm100_tma_shuffled():
     )
 
 
+@pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("seqlen_q", [1, 120])
 @pytest.mark.parametrize("max_seqlen_k_mode", ["batch_max", "page_aligned"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q):
+def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q, num_splits):
     """Check paged seqused_k against dense varlen for batch-max and capacity extents."""
     if not IS_SM100:
         pytest.skip("SM100-specific paged hd256 test")
@@ -3130,6 +3141,7 @@ def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q)
         page_table=page_table,
         seqused_k=seqused_k,
         causal=True,
+        num_splits=num_splits,
     )
 
     # With seqused_k at the allocated capacity every position is legitimately
@@ -3145,6 +3157,7 @@ def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q)
         page_table=page_table,
         seqused_k=seqused_full,
         causal=True,
+        num_splits=num_splits,
     )
     out_no_seqused, _ = flash_attn_varlen_func(
         q, k_paged, v_paged,
@@ -3152,6 +3165,7 @@ def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q)
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k_alloc,
         page_table=page_table,
         causal=True,
+        num_splits=num_splits,
     )
 
     if is_fake_mode():
@@ -3164,7 +3178,9 @@ def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q)
     assert out_paged.abs().max().item() < 10.0, (
         "Paged seqused_k output has poison-scale magnitudes: KV past seqused_k leaked"
     )
-    assert torch.allclose(out_paged, out_ref, atol=1e-3, rtol=1e-3), (
+    # SplitKV rounds the fp32 combine to bf16 once more than the unsplit reference.
+    atol = 1e-3 if num_splits == 1 else 4e-3
+    assert torch.allclose(out_paged, out_ref, atol=atol, rtol=1e-3), (
         "Paged seqused_k output does not match the dense varlen reference"
     )
     assert torch.equal(out_full_seqused, out_no_seqused), (
