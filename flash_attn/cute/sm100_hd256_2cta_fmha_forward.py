@@ -40,20 +40,9 @@ from flash_attn.cute.utils import (
     as_bshkrd_tensor,
     AuxData,
     domain_offset_aligned,
-    elem_pointer,
 )
 from flash_attn.cute.copy_utils import tiled_copy_2d
 from flash_attn.cute.pack_gqa import PackGQA
-
-
-def pack_gqa_rows(t: cute.Tensor, h_r: int, head_mode: int) -> cute.Tensor:
-    """(s, ..., ((h_r, h_k), b), ...) -> ((h_r, s), ..., ((1, h_k), b), ...)."""
-    shape, stride = list(t.shape), list(t.stride)
-    (_, h_k), b = shape[head_mode]
-    (h_r_stride, h_k_stride), b_stride = stride[head_mode]
-    shape[0], stride[0] = (h_r, shape[0]), (h_r_stride, stride[0])
-    shape[head_mode], stride[head_mode] = ((1, h_k), b), ((0, h_k_stride), b_stride)
-    return cute.make_tensor(t.iterator, cute.make_layout(tuple(shape), stride=tuple(stride)))
 
 
 class BlackwellFusedMultiHeadAttentionForward:
@@ -349,16 +338,25 @@ class BlackwellFusedMultiHeadAttentionForward:
         q_norm = as_bshkrd_tensor(q_tensor, h_k, h_r, varlen_q)
         o_norm = as_bshkrd_tensor(o_tensor, h_k, h_r, varlen_q)
 
+        def rows_and_h_r(rows, row_stride, h_r_stride):
+            """PackGQA moves h_r from the head mode into the rows: s -> (h_r, s)."""
+            if cutlass.const_expr(self.pack_gqa):
+                return (self.qhead_per_kvhead, rows), (h_r_stride, row_stride), 1, 0
+            return rows, row_stride, h_r, h_r_stride
+
         # Forward layout: (s, d, ((h_r, h_k), b)). Stride picks from canonical
         # positions 1=S, 4=D, 3=H_r, 2=H_k, 0=B.
+        q_rows, q_row_stride, q_h_r, q_h_r_stride = rows_and_h_r(
+            s_q_total, q_norm.stride[1], q_norm.stride[3]
+        )
         q = cute.make_tensor(
             q_norm.iterator,
             cute.make_layout(
-                (s_q_total, d, ((h_r, h_k), b)),
+                (q_rows, d, ((q_h_r, h_k), b)),
                 stride=(
-                    q_norm.stride[1],
+                    q_row_stride,
                     q_norm.stride[4],
-                    ((q_norm.stride[3], q_norm.stride[2]), q_norm.stride[0]),
+                    ((q_h_r_stride, q_norm.stride[2]), q_norm.stride[0]),
                 ),
             ),
         )
@@ -411,11 +409,14 @@ class BlackwellFusedMultiHeadAttentionForward:
             page_table = None
             max_seqlen_k_paged = None
         # (s, d, ((h_r, h_k), b))
-        o_shape = (s_q_total, d, ((h_r, h_k), b))
+        o_rows, o_row_stride, o_h_r, o_h_r_stride = rows_and_h_r(
+            s_q_total, o_norm.stride[1], o_norm.stride[3]
+        )
+        o_shape = (o_rows, d, ((o_h_r, h_k), b))
         o_stride = (
-            o_norm.stride[1],
+            o_row_stride,
             o_norm.stride[4],
-            ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0]),
+            ((o_h_r_stride, o_norm.stride[2]), o_norm.stride[0]),
         )
         if cutlass.const_expr(self.is_split_kv):
             # (s, d, ((h_r, h_k), b), num_splits)
@@ -425,8 +426,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         o = cute.make_tensor(o_norm.iterator, o_layout)
         if cutlass.const_expr(lse_tensor is not None):
             # (s, ((h_r, h_k), b)), plus a trailing num_splits mode for SplitKV
-            lse_shape = (s_lse64, ((h_r, h_k), b_lse))
-            lse_stride = (1, ((s_lse64, h_r64 * s_lse64), stride_b_lse))
+            lse_rows, lse_row_stride, lse_h_r, lse_h_r_stride = rows_and_h_r(s_lse64, 1, s_lse64)
+            lse_shape = (lse_rows, ((lse_h_r, h_k), b_lse))
+            lse_stride = (lse_row_stride, ((lse_h_r_stride, h_r64 * s_lse64), stride_b_lse))
             if cutlass.const_expr(self.is_split_kv):
                 lse_layout = cute.make_layout(
                     (*lse_shape, num_splits), stride=(*lse_stride, lse_split_stride)
@@ -436,12 +438,6 @@ class BlackwellFusedMultiHeadAttentionForward:
             lse = cute.make_tensor(lse_tensor.iterator, lse_layout)
         else:
             lse = None
-        if cutlass.const_expr(self.pack_gqa):
-            q = pack_gqa_rows(q, self.qhead_per_kvhead, head_mode=2)
-            o = pack_gqa_rows(o, self.qhead_per_kvhead, head_mode=2)
-            o_shape = o.shape[:3]
-            if cutlass.const_expr(lse is not None):
-                lse = pack_gqa_rows(lse, self.qhead_per_kvhead, head_mode=1)
 
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q.element_type
@@ -1677,12 +1673,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             q_handle = load_q_producer.acquire_and_advance()
             q_handles.append(q_handle)
             sQ_stage = sQ[None, None, None, q_handle.index]
-            sQ_mk = cute.make_tensor(
-                sQ_stage.iterator,
-                cute.make_layout(
-                    (sQ_stage.shape[0][0], (sQ_stage.shape[0][1], sQ_stage.shape[2])),
-                    stride=(sQ_stage.stride[0][0], (sQ_stage.stride[0][1], sQ_stage.stride[2])),
-                ),
+            sQ_mk = cute.composition(
+                sQ_stage, cute.make_layout((self.cta_tiler[0], self.qk_mma_tiler[2]))
             )
             mQ_k = cute.domain_offset((0, iter * self.qk_mma_tiler[2]), mQ)
             pack_gqa.load_Q(mQ_k, sQ_mk, gmem_tiled_copy_q, lane, block, seqlen_q)
@@ -2035,15 +2027,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.autovec_copy(tSMrO, tTMEM_LOADgO[None, i, 0])
                     else:
                         # One thread owns one row; a flat row indexes the (h_r, s) mode.
-                        row_ptr = elem_pointer(
-                            gO_staged, (tTMEM_LOADcO_i[0][0], tTMEM_LOADcO_i[0][1])
-                        )
-                        gO_row = cute.make_tensor(
-                            cute.make_ptr(
-                                self.o_dtype, row_ptr.toint(), cute.AddressSpace.gmem, assumed_align=16
-                            ),
-                            tSMrO.layout,
-                        )
+                        row, col = tTMEM_LOADcO_i[0][0], tTMEM_LOADcO_i[0][1]
+                        n = cute.size(tSMrO)
+                        gO_row = cute.local_tile(gO_staged[row, None], (n,), (col // n,))
                         cute.autovec_copy(tSMrO, gO_row)
         o_handle.release()
         return mma_o_consumer, sum_consumer
