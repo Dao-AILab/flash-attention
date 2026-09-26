@@ -1,7 +1,7 @@
 """HD256 varlen API, cache, and CUDA-graph regression tests on SM100/SM110.
 
 None and fresh CUDA scalar maxima must share a device-driven specialization
-without host reads; Python integers retain rectangular scheduling.
+without host reads; Python integers retain rectangular scheduling in the backward.
 Set FLASH_ATTENTION_HD256_STRESS=1 for additional randomized cases.
 """
 
@@ -284,7 +284,7 @@ def test_hd256_seqused_backward(
 
 
 # ---------------------------------------------------------------------------
-# Compile-key behaviour: none/cuda share one specialization, int selects another.
+# Compile-key behaviour: none/cuda share one specialization; int adds a backward one.
 # ---------------------------------------------------------------------------
 
 
@@ -318,8 +318,10 @@ def test_hd256_varlen_maxima_compile_keys(causal, monkeypatch):
 
     by_mode["int"] = run("int")
     torch.cuda.synchronize()
-    assert (len(fwd_cache.cache), len(bwd_cache.cache)) == (2, 2), (
-        "explicit int maxima should select a distinct specialization"
+    # The forward reads lengths on device and does not specialize on the maxima; the hd256
+    # backward still selects a separate specialization for explicit int maxima.
+    assert (len(fwd_cache.cache), len(bwd_cache.cache)) == (1, 2), (
+        "explicit int maxima should select a distinct backward specialization only"
     )
     assert all(
         not torch.is_tensor(value)
