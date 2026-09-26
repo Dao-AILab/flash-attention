@@ -399,10 +399,10 @@ def _get_fwd_config(
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     if arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256:
-        # The dedicated hd256 kernel never packs GQA and runs one 2CTA cluster per
-        # 2 * tile_m Q rows of each Q head: count its CTAs.
-        num_clusters_m = cute.ceil_div(max_seqlen_q, 2 * tile_m)
-        total_mblocks = 2 * batch_size * num_head_kv * qhead_per_kvhead * num_clusters_m
+        # The dedicated hd256 kernel runs one 2CTA cluster per 2 * tile_m rows: count its CTAs.
+        num_clusters_m = cute.ceil_div(seqlen_q_packgqa, 2 * tile_m)
+        num_heads_m = num_head_kv * (1 if pack_gqa else qhead_per_kvhead)
+        total_mblocks = 2 * batch_size * num_heads_m * num_clusters_m
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = None
     if arch // 10 == 12:
@@ -838,6 +838,9 @@ def _flash_attn_fwd(
         max_seqlen_k = None
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
+    if use_dedicated_hd256_kernel and 128 % qhead_per_kvhead != 0 and max_seqlen_q > 128:
+        # hd256 gathers packed Q with cp.async when 128 % h_r != 0; only worth it for short queries.
+        pack_gqa = False
     if max_seqlen_k is None:
         # Bound each sequence by its page-table row, not the shared pool.
         max_seqlen_k = (
@@ -1420,8 +1423,6 @@ def _flash_attn_fwd(
                     # The paged-KV extent/page-table contract is normalized
                     # up front (see the page_table block above), so it holds by
                     # construction here.
-                    # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
-                    pack_gqa = False
 
                 flash_fwd_obj_cls = (
                     BlackwellFusedMultiHeadAttentionForward
