@@ -1119,6 +1119,63 @@ def test_flash_attn_hd256_sm100_noncontiguous_transpose():
     )
 
 
+@pytest.mark.parametrize("mode", ["dense", "varlen", "varlen_seqused", "paged"])
+@pytest.mark.parametrize("nheads,nheads_kv", [(8, 2), (16, 1), (24, 4), (160, 1)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_splits", [1, 3])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hd256_pack_gqa(mode, nheads, nheads_kv, causal, num_splits):
+    """PackGQA only regroups Q rows into tiles, so O and LSE match the unpacked kernel bitwise."""
+    if not (IS_SM100 or IS_SM110):
+        pytest.skip("SM100/SM110-specific hd256 pack_gqa test")
+    torch.random.manual_seed(0)
+    d, dtype, page_size = 256, torch.bfloat16, 128
+    q_lens, k_lens = (1, 50, 0, 70), (512, 257, 128, 700)
+    kwargs = {"causal": causal, "num_splits": num_splits, "return_lse": True}
+    if mode == "dense":
+        q = torch.randn(2, 7, nheads, d, device="cuda", dtype=dtype)
+        k = torch.randn(2, 300, nheads_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn_like(k)
+    elif mode == "paged":
+        q = torch.randn(2, 3, nheads, d, device="cuda", dtype=dtype)
+        k = torch.randn(11, page_size, nheads_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn_like(k)
+        kwargs["page_table"] = torch.randperm(11, device="cuda")[:8].view(2, 4).to(torch.int32)
+    else:
+        cu_q = torch.tensor([0, *itertools.accumulate(q_lens)], device="cuda", dtype=torch.int32)
+        cu_k = torch.tensor([0, *itertools.accumulate(k_lens)], device="cuda", dtype=torch.int32)
+        q = torch.randn(sum(q_lens), nheads, d, device="cuda", dtype=dtype)
+        k = torch.randn(sum(k_lens), nheads_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn_like(k)
+        seqused_q = (
+            torch.tensor([1, 40, 0, 60], device="cuda", dtype=torch.int32)
+            if mode == "varlen_seqused"
+            else None
+        )
+        kwargs.update(
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            seqused_q=seqused_q,
+            # varlen_seqused also covers the max_seqlen_q=None varlen-scheduler grid.
+            max_seqlen_q=max(q_lens) if mode == "varlen" else None,
+            max_seqlen_k=max(k_lens),
+        )
+
+    fn = flash_attn_func if mode == "dense" else flash_attn_varlen_func
+    out, lse = fn(q, k, v, pack_gqa=True, **kwargs)
+    out_ref, lse_ref = fn(q, k, v, pack_gqa=False, **kwargs)
+
+    if is_fake_mode():
+        return
+
+    if mode == "varlen_seqused":
+        # Rows past seqused_q are left unwritten.
+        rows = torch.cat([torch.arange(s, s + n) for s, n in zip(cu_q[:-1].tolist(), seqused_q.tolist())])
+        out, out_ref, lse, lse_ref = out[rows], out_ref[rows], lse[:, rows], lse_ref[:, rows]
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("layout", ["padded", "transposed"])
