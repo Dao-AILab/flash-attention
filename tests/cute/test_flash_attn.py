@@ -2741,14 +2741,15 @@ def _generate_block_kvcache(
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
 
 
-def _run_fp8_paged_decode(q, k, v, page_size=128):
+def _run_fp8_paged_decode(q, k, v, page_size=128, num_splits=1):
     """Run a single-sequence FP8 paged decode with unit descales."""
     seqlen_k, nheads_kv, d = k.shape
+    dv = v.shape[-1]
     num_pages = math.ceil(seqlen_k / page_size)
     k_cache = torch.zeros(num_pages, page_size, nheads_kv, d, device=k.device, dtype=k.dtype)
-    v_cache = torch.zeros_like(k_cache)
+    v_cache = torch.zeros(num_pages, page_size, nheads_kv, dv, device=v.device, dtype=v.dtype)
     k_cache.view(-1, nheads_kv, d)[:seqlen_k].copy_(k)
-    v_cache.view(-1, nheads_kv, d)[:seqlen_k].copy_(v)
+    v_cache.view(-1, nheads_kv, dv)[:seqlen_k].copy_(v)
     page_table = torch.arange(num_pages, dtype=torch.int32, device=k.device).unsqueeze(0)
     descale = torch.ones(1, nheads_kv, dtype=torch.float32, device=k.device)
     return _flash_attn_fwd(
@@ -2760,6 +2761,7 @@ def _run_fp8_paged_decode(q, k, v, page_size=128):
         page_table=page_table,
         softmax_scale=d**-0.5,
         causal=True,
+        num_splits=num_splits,
         q_descale=descale,
         k_descale=descale,
         v_descale=descale,
@@ -2811,6 +2813,31 @@ def test_flash_attn_fp8_paged_decode_preserves_tail_mass():
 
     ref = _fp8_decode_reference(q, k, v)
     torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.1)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
+@pytest.mark.parametrize("num_splits", [0, 3])
+@pytest.mark.parametrize("seqlen_k", [8192, 20000])
+@pytest.mark.parametrize("page_size", [16, 128])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_paged_decode_diff_headdim_splitkv(page_size, seqlen_k, num_splits):
+    """FP8 SplitKV decode with (d, dv) = (192, 128) once seqlen_k spans >= 64 KV tiles.
+
+    Diff-headdim SplitKV used to drop to tile_n=64, which is wrong for FP8 inputs.
+    """
+    torch.manual_seed(0)
+    q = torch.randn(1, 16, 192, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    k = torch.randn(seqlen_k, 2, 192, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    v = torch.randn(seqlen_k, 2, 128, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+
+    out = _run_fp8_paged_decode(q, k, v, page_size=page_size, num_splits=num_splits)
+    if is_fake_mode():
+        return
+
+    ref = _fp8_decode_reference(q, k, v)
+    assert not out.isnan().any()
+    cosine = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0)
+    assert cosine > 0.99, f"FP8 diff-headdim SplitKV decode is wrong: {cosine=}"
 
 
 @pytest.mark.parametrize("page_size", [16, 64, 256])
