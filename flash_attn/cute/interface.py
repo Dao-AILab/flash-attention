@@ -1952,7 +1952,7 @@ def _flash_attn_bwd(
     m_block_size: int = 64,
     n_block_size: int = 128,
     num_threads: int = 256,
-    pack_gqa: bool = False,
+    pack_gqa: Optional[bool] = None,
     num_stages_Q: int = 2,
     num_stages_dO: int = 2,
     SdP_swapAB: bool = False,
@@ -2231,10 +2231,34 @@ def _flash_attn_bwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
+    # PackGQA in the backward folds the qhead_per_kvhead query heads of a kv-group into the
+    # seqlen_q dimension (mirroring the forward) so a single kv-head tile processes all of its
+    # query heads. This is currently only implemented for the SM100/SM110 (Blackwell) kernel and
+    # only for the dense, non-causal/local path that the kernel + dQ postprocess support. SM80,
+    # SM90, SM120 and the dedicated hd=256 2CTA kernel do not implement backward packing, so they
+    # always fall back to the standard (unpacked) GQA path. When pack_gqa is None we only turn it
+    # on where it is supported; an explicit pack_gqa=True is honored only on supported configs.
+    pack_gqa_bwd_supported = (
+        arch // 10 in (10, 11)
+        and not use_dedicated_hd256_kernel
+        and qhead_per_kvhead > 1
+        and m_block_size % qhead_per_kvhead == 0
+        and not causal
+        and not local
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and block_sparse_tensors is None
+        and aux_tensors is None
+        and learnable_sink is None
+        and not deterministic
+    )
     if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1
-    # pack_gqa backward not yet supported in bwd
-    pack_gqa = False
+        pack_gqa = pack_gqa_bwd_supported
+    else:
+        pack_gqa = bool(pack_gqa) and pack_gqa_bwd_supported
+
     
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
@@ -2305,7 +2329,9 @@ def _flash_attn_bwd(
     # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
     # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
     # hd=256 2CTA backward has its own internal postprocess for dK/dV.
-    dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
+    # PackGQA processes all query heads of a kv-group within one kv-head tile, so dK/dV
+    # accumulate directly and the accum+postprocess reduction is not needed.
+    dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel and not pack_gqa
     if dKV_postprocess:
         # Same rounding as the kernel's tile_hdimv and the postprocess (64 with dKV_swapAB on
         # SM90): the GQA epilogue reduces tile_n * tile_hdimv fp32 values per block.
@@ -2344,6 +2370,18 @@ def _flash_attn_bwd(
                 dtype=torch.float32,
                 device=device,
             )
+
+    # PackGQA: the SM100 backward and dQ postprocess view dq_accum as one packed buffer per
+    # kv-head (qhead_per_kvhead * seqlen_q_rounded contiguous rows). The preprocess that zeros
+    # dq_accum keeps the unpacked (batch, num_head, seqlen_q_rounded * head_dim_rounded) layout,
+    # so we only reinterpret the same contiguous memory for the kernel + postprocess.
+    dq_accum_kernel = dq_accum
+    if pack_gqa and dq_accum is not None:
+        dq_accum_kernel = dq_accum.view(
+            batch_size,
+            num_head_kv,
+            qhead_per_kvhead * seqlen_q_rounded * head_dim_rounded,
+        )
 
     dtype = torch2cute_dtype_map[q.dtype]
 
@@ -2544,7 +2582,7 @@ def _flash_attn_bwd(
             to_cute_tensor(t) for t in (q, k, v, dout, dq, dk, dv)
         ]
         lse_log2_tensor, dpsum_tensor = [to_cute_tensor(t) for t in (lse_log2, dpsum)]
-        dq_accum_tensor = to_cute_tensor(dq_accum) if dq_accum is not None else None
+        dq_accum_tensor = to_cute_tensor(dq_accum_kernel) if dq_accum_kernel is not None else None
         if dKV_postprocess:
             dk_accum_tensor, dv_accum_tensor = [
                 to_cute_tensor(t) for t in (dk_accum, dv_accum)
@@ -2649,6 +2687,7 @@ def _flash_attn_bwd(
                     is_causal=causal,
                     is_local=local,
                     qhead_per_kvhead=qhead_per_kvhead,
+                    pack_gqa=pack_gqa,
                     tile_m=m_block_size,
                     tile_n=n_block_size,
                     cluster_size=cluster_size,
@@ -2713,7 +2752,7 @@ def _flash_attn_bwd(
             *compile_args, options="--enable-tvm-ffi"
         )
     if not fake_mode:
-        dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
+        dq_accum = dq if use_dedicated_hd256_kernel else dq_accum_kernel
         call_args = [
             q.detach(),
             k.detach(),
@@ -2773,21 +2812,63 @@ def _flash_attn_bwd(
             num_threads_post_dQ = 128
             num_threads_post_dKV = 128
 
-        _bwd_postprocess_convert(
-            dq_accum, dq, softmax_scale,
-            cu_seqlens_q, seqused_q,
-            arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
-            AtomLayoutMdQ, dQ_swapAB,
-            use_2cta_instrs=use_2cta_instrs, cluster_size=1,
-            cu_total_m_blocks=cu_total_m_blocks_q,
-            sink_tensors=(
-                LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
-                if learnable_sink is not None
-                else None
-            ),
-            fake_mode=fake_mode,
-            hdim_multiple_of=hdim_multiple_of,
-        )
+        if pack_gqa:
+            # PackGQA dQ: dq_accum is packed per kv-head (qhead_per_kvhead * seqlen_q_rounded
+            # contiguous rows). Run the standard postprocess treating it as a dense problem with
+            # num_head_kv heads and packed seqlen, producing a packed dq buffer laid out as
+            # row = seqpos * qhead_per_kvhead + qhead_offset (head-fastest, matching the kernel's
+            # packed m-loop), then scatter back to the dense (batch, seqlen_q, num_head, head_dim)
+            # dq tensor with a torch view+permute. This keeps the postprocess kernel unchanged.
+            packed_seqlen_q = qhead_per_kvhead * seqlen_q_rounded
+            dq_packed = torch.empty(
+                batch_size, packed_seqlen_q, num_head_kv, head_dim,
+                dtype=dq.dtype, device=device,
+            )
+            _bwd_postprocess_convert(
+                dq_accum, dq_packed, softmax_scale,
+                cu_seqlens_q, seqused_q,
+                arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
+                AtomLayoutMdQ, dQ_swapAB,
+                use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+                cu_total_m_blocks=cu_total_m_blocks_q,
+                sink_tensors=(
+                    LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
+                    if learnable_sink is not None
+                    else None
+                ),
+                fake_mode=fake_mode,
+                hdim_multiple_of=hdim_multiple_of,
+            )
+            if not fake_mode:
+                # row r -> (seqpos = r // qhead, qhead_offset = r % qhead): split the packed
+                # seqlen into (seqlen_q, qhead) with seqpos outermost, then interleave qhead
+                # into the head dimension as kv_head * qhead + qhead_offset == original q head.
+                # reshape (not view) since the row slice is non-contiguous when seqlen_q is not
+                # a multiple of m_block_size.
+                dq_unpacked = dq_packed[:, : seqlen_q * qhead_per_kvhead].reshape(
+                    batch_size, seqlen_q, qhead_per_kvhead, num_head_kv, head_dim
+                )
+                dq.copy_(
+                    dq_unpacked.permute(0, 1, 3, 2, 4).reshape(
+                        batch_size, seqlen_q, num_head, head_dim
+                    )
+                )
+        else:
+            _bwd_postprocess_convert(
+                dq_accum, dq, softmax_scale,
+                cu_seqlens_q, seqused_q,
+                arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
+                AtomLayoutMdQ, dQ_swapAB,
+                use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+                cu_total_m_blocks=cu_total_m_blocks_q,
+                sink_tensors=(
+                    LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
+                    if learnable_sink is not None
+                    else None
+                ),
+                fake_mode=fake_mode,
+                hdim_multiple_of=hdim_multiple_of,
+            )
 
         if dKV_postprocess:
             # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
@@ -3491,6 +3572,9 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.aux_scalars = aux_scalars
         ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
         ctx.gather_bwd_token_chunk = gather_bwd_token_chunk
+        # Forward the user's PackGQA preference; the backward independently re-gates it to the
+        # configs the SM100 bwd kernel supports (so an unsupported request falls back cleanly).
+        ctx.pack_gqa = pack_gqa
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -3545,6 +3629,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 aux_tensors=aux_tensors,
                 aux_scalars=ctx.aux_scalars,
                 block_sparse_tensors=ctx.block_sparse_tensors_bwd,
+                pack_gqa=ctx.pack_gqa,
                 dlse=dlse,
                 learnable_sink=learnable_sink,
             )
