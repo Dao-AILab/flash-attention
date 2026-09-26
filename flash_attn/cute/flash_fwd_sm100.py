@@ -84,8 +84,8 @@ from flash_attn.cute.utils import AuxData
 #   ex2_emu_start_frg: int — fragment index to start emulation from
 #   num_regs_softmax: int — register count for softmax warps (multiple of 8)
 #   num_regs_correction: int — register count for correction warps (multiple of 8)
-#   num_regs_other is derived: 512 - num_regs_softmax * 2 - num_regs_correction
-#                  (hd256 exception: num_regs_other is fixed at 32, not derived)
+#   num_regs_other: remaining register budget, shared by the non-softmax/correction WGs
+#                   (the dedicated hd256 kernel fixes this at 32)
 
 # Note [Low Precision Scaling]
 # P is in (0, 1] and is cast to the input dtype before P @ V, so scaling it by 2^max_offset
@@ -389,7 +389,11 @@ class FlashAttentionForwardSm100:
             else:
                 self.num_regs_softmax = 184
                 self.num_regs_correction = 64
-            self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
+            # Divide the remaining register budget among the other WGs.
+            self.num_regs_other = (
+                (512 - self.num_regs_softmax * self.q_stage - self.num_regs_correction)
+                // (3 - self.q_stage) // 8 * 8
+            )
 
         self.buffer_align_bytes = 1024
 
@@ -1176,8 +1180,8 @@ class FlashAttentionForwardSm100:
         )
 
         block_info = BlockInfo(
-            # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
-            self.cta_tiler[0],
+            # A 2CTA pair shares one cluster-wide K/V range.
+            self.cta_tiler[0] * self.cta_group_size,
             self.cta_tiler[1],
             self.is_causal,
             self.is_local,
@@ -1433,7 +1437,11 @@ class FlashAttentionForwardSm100:
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_correction)
+            # setmaxnreg.dec cannot exceed the launch register count.
+            if const_expr(self.num_regs_correction > 65536 // self.threads_per_cta):
+                cute.arch.setmaxregister_increase(self.num_regs_correction)
+            else:
+                cute.arch.setmaxregister_decrease(self.num_regs_correction)
             # sync with mma warp before retrieving tmem ptr
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
