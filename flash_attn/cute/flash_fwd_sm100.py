@@ -255,6 +255,8 @@ class FlashAttentionForwardSm100:
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
+            # Reuse Q storage for O to leave room for more KV stages.
+            self.head_dim_padded == 256 or
             (self.head_dim_v_padded >= 128 and self.is_split_kv)
         )
 
@@ -329,8 +331,8 @@ class FlashAttentionForwardSm100:
         self.use_tma_Q = not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
         self.use_s_ping_pong = use_s_ping_pong
         if self.use_s_ping_pong:
-            assert self.q_stage == 1, "S ping-pong requires q_stage == 1 (decode)"
-            assert self.head_dim_padded in (64, 128) and self.n_block_size == 128
+            assert self.q_stage == 1, "S ping-pong requires q_stage == 1 (one Q tile per CTA)"
+            assert self.head_dim_padded in (64, 128, 256) and self.n_block_size == 128
         # S/P/O pipeline depth: two ping-pong TMEM slots for S/P, else one per Q stage
         self.s_p_o_stage = 2 if self.use_s_ping_pong else self.q_stage
 
