@@ -3321,8 +3321,9 @@ def test_flash_attn_mla_absorbed(
     torch.cuda.synchronize()
     batch_size = 12 if seqlen_q <= 512 else 3 if seqlen_q <= 2048 else 1
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    # 24 heads pad to the 64-head bwd tile and exercise the sink reduction on padded dpsum.
-    nheads_vals = [128, 24] if kv_sparsity else [16, 128]
+    # 24 heads pad to the 64-head bwd tile and exercise the sink reduction on padded dpsum;
+    # 64 heads run the native 1-CTA forward + recompute-P backward (AI/SPARSE_MLA_64H.md).
+    nheads_vals = [128, 64, 24] if kv_sparsity else [16, 128]
     seqlen_k_base = max(min(seqlen_k // 256 * 256, 1024), 256)
     gather_kv_lengths = [seqlen_k_base - 128, seqlen_k_base] if kv_sparsity else [0]
     seqlen_k_og = seqlen_k
@@ -3389,6 +3390,7 @@ def test_flash_attn_mla_absorbed(
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         num_splits_vals = [1]
         pack_gqa_vals = [True]
+        recompute_p = bool(kv_sparsity) and nheads == 64
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out, lse = flash_attn_func(
                 q,
@@ -3402,6 +3404,7 @@ def test_flash_attn_mla_absorbed(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 deterministic=deterministic,
+                gather_bwd_recompute_p=recompute_p,
             )
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
@@ -3431,6 +3434,7 @@ def test_flash_attn_mla_absorbed(
                     learnable_sink=learnable_sink,
                     pack_gqa=pack_gqa,
                     num_splits=num_splits,
+                    gather_bwd_recompute_p=recompute_p,
                 )
                 assert torch.equal(out, out2), f"non-deterministic with max diff = {(out - out2).abs().max().item()} on {iter=}"
         
@@ -3494,18 +3498,23 @@ def check_canary(name, parent, pad_words):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# recompute_p at 64 heads: dK_rope is scattered by the main kernel's epilogue
+# (fused), at 128 heads and in load-p mode by the separate dk kernel.
+@pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize("nheads", [128, 64, 96, 24, 1])
 # 130 rows: a partial last preprocess tile when padded heads use per-head packing.
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(130, 258), (512, 512), (1024, 1024)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_kv, causal, dtype):
+def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_kv, causal, recompute_p, dtype):
     """Sparse-MLA backward with -1-padded gather_kv_indices, the padding any
     causal top-k selector produces for early queries.
 
     nheads < 128 covers in-kernel head padding (pack_gqa.qheads_first_tma_view):
     96 pads to 128 with a partial second CTA, 24 and 1 pad to the 64-head bwd tile.
+    recompute_p (64 / 128 heads only) runs the canaries against the recompute-P
+    backward, whose 64-head main kernel scatters dK_rope itself.
 
     Regression test for unguarded sentinel scatters: the dV/dK backward
     epilogues used to atomically accumulate at row -1 — out of bounds of the
@@ -3518,6 +3527,8 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
     """
     if not IS_SM100:
         pytest.skip()
+    if recompute_p and nheads not in (64, 128):
+        pytest.skip("gather_bwd_recompute_p requires 64 or 128 Q heads")
     device = "cuda"
     torch.random.manual_seed(0)
     batch_size = 2
@@ -3552,7 +3563,8 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
             )
 
     out, lse = flash_attn_func(
-        q, k, v, qv=qv, gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True
+        q, k, v, qv=qv, gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True,
+        gather_bwd_recompute_p=recompute_p,
     )
 
     g = torch.randn_like(out)
@@ -3572,12 +3584,13 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
         dk_parent, dk_buf = plant_canary((batch_size, seqlen_k, nheads_kv, hdim), hdim, device)
     with torch.no_grad():
         fq, fk, fqv = (None, None, q) if shared_kv else (q, k, qv)
-        out2, lse2, p2, row_max2, _ = _flash_attn_fwd(
-            fq, fk, v, qv=fqv, causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True
+        out2, lse2, p2, row_max2, o_lo2 = _flash_attn_fwd(
+            fq, fk, v, qv=fqv, causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True,
+            gather_bwd_recompute_p=recompute_p,
         )
         dq2, dk2, dv2, dqv2, _ = _flash_attn_bwd_sparse_mla(
             fq, fk, v, fqv, out2, g, lse2, p2, row_max2, gather_kv_indices,
-            causal=causal, dk=dk_buf, dv=dv_buf,
+            causal=causal, dk=dk_buf, dv=dv_buf, recompute_p=recompute_p, o_lo=o_lo2,
         )
 
     if is_fake_mode():
@@ -3623,12 +3636,15 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# recompute_p at 64 heads: dK_rope is scattered by the main kernel's epilogue (fused).
+@pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
 # 24 heads: padded per-head preprocess tiles must not spill into the next packed sequence.
-@pytest.mark.parametrize("nheads", [128, 24])
+# 64 heads: the native 64-row (tile_m == 64) backward specialization.
+@pytest.mark.parametrize("nheads", [128, 64, 24])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dtype):
+def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, recompute_p, dtype):
     """Varlen counterpart of test_flash_attn_mla_sparse_bwd_sentinel.
 
     The varlen kernels are separate compile-time specializations, and the dK
@@ -3640,11 +3656,13 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dt
     """
     if not IS_SM100:
         pytest.skip()
+    if recompute_p and nheads not in (64, 128):
+        pytest.skip("gather_bwd_recompute_p requires 64 or 128 Q heads")
     device = "cuda"
     torch.random.manual_seed(0)
     nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
-    seqlens = [512, 4, 1024] if nheads == 128 else [130, 4, 258]
+    seqlens = [512, 4, 1024] if nheads in (128, 64) else [130, 4, 258]
     total = sum(seqlens)
     cu_bounds = [0] + list(itertools.accumulate(seqlens))
     cu_seqlens = torch.tensor(cu_bounds, dtype=torch.int32, device=device)
@@ -3687,6 +3705,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dt
         q, k, v, qv=qv, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
         max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
         gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True,
+        gather_bwd_recompute_p=recompute_p,
     )
 
     g = torch.randn_like(out)
@@ -3704,17 +3723,18 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dt
         dk_parent, dk_buf = plant_canary((total, nheads_kv, hdim), hdim, device)
     with torch.no_grad():
         fq, fk, fqv = (None, None, q) if shared_kv else (q, k, qv)
-        out2, lse2, p2, row_max2, _ = _flash_attn_fwd(
+        out2, lse2, p2, row_max2, o_lo2 = _flash_attn_fwd(
             fq, fk, v, qv=fqv, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
             causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True,
+            gather_bwd_recompute_p=recompute_p,
         )
         dq2, dk2, dv2, dqv2, _ = _flash_attn_bwd_sparse_mla(
             fq, fk, v, fqv, out2, g, lse2, p2, row_max2, gather_kv_indices,
             causal=causal,
             cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
-            dk=dk_buf, dv=dv_buf,
+            dk=dk_buf, dv=dv_buf, recompute_p=recompute_p, o_lo=o_lo2,
         )
 
     if is_fake_mode():
@@ -3836,6 +3856,13 @@ def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, nheads, share
         q, k, v, qv=qv, gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True,
         gather_bwd_recompute_p=True,
     )
+    # inference forward (no grad-requiring inputs): stores neither p/row_max nor o_lo
+    q_inf, v_inf = q.detach(), v.detach()
+    k_inf = v_inf if shared_kv else k.detach()  # shared KV: k and v must be the same tensor
+    out_inf, lse_inf = flash_attn_func(
+        q_inf, k_inf, v_inf, qv=None if shared_kv else qv.detach(),
+        gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True, return_lse=True,
+    )
     g = torch.randn_like(out)
     grads = torch.autograd.grad(out, grad_inputs, g, retain_graph=True)
     grads_again = torch.autograd.grad(out, grad_inputs, g)
@@ -3862,8 +3889,18 @@ def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, nheads, share
         return
 
     assert (gather_kv_indices == -1).any(), "test must exercise sentinel slots"
-    assert torch.equal(out, out_default), "recompute fwd out must be bitwise-identical"
-    assert torch.equal(lse, lse_default), "recompute fwd lse must be bitwise-identical"
+    if nheads == 128:
+        assert torch.equal(out, out_default), "recompute fwd out must be bitwise-identical"
+        assert torch.equal(lse, lse_default), "recompute fwd lse must be bitwise-identical"
+    else:
+        # 64 heads: the recompute-P and inference forwards run the native 1-CTA 64-row kernel, the
+        # load-P forward the padded 2-CTA kernel (AI/SPARSE_MLA_64H.md); the three agree up to
+        # bf16 output rounding (out rel_l2 ~1e-3 measured, lse to ~1e-6; inference additionally
+        # uses the lazy running max). No bitwise relation holds between the two kernels.
+        for name, o, lse_o in (("load-P", out_default, lse_default), ("inference", out_inf, lse_inf)):
+            rel = (out.float() - o.float()).norm() / o.float().norm()
+            assert rel < 5e-3, f"recompute vs {name} fwd out rel_l2 {rel} beyond bf16 rounding"
+            assert (lse - lse_o).abs().max() < 1e-4, f"recompute vs {name} fwd lse differ"
 
     # dq/dqv (pure GEMM consumers of identical dS tiles) are bitwise-stable
     # across retain_graph reruns and across chunking; dk/dv accumulate with
@@ -3909,8 +3946,10 @@ def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, nheads, share
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("token_chunk", [None, 200])
+# both backward head tiles: 128 (2 x 64-row halves) and the native 64-row specialization
+@pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_fully_masked_rows(token_chunk, recompute_p, dtype):
+def test_flash_attn_mla_sparse_bwd_fully_masked_rows(nheads, token_chunk, recompute_p, dtype):
     """Rows whose every top-k slot is the -1 sentinel (fully masked).
 
     The forward must emit out = 0 / lse = -inf for those rows, and the
@@ -3929,7 +3968,7 @@ def test_flash_attn_mla_sparse_bwd_fully_masked_rows(token_chunk, recompute_p, d
     device = "cuda"
     torch.random.manual_seed(0)
     batch_size, seqlen_q, seqlen_k = 1, 512, 512
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
     masked_rows = slice(150, 260)  # straddles the chunk boundary at 200
 
@@ -3976,8 +4015,9 @@ def test_flash_attn_mla_sparse_bwd_fully_masked_rows(token_chunk, recompute_p, d
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("recompute_p", [False, True])
+@pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_token_chunk_rect(recompute_p, dtype):
+def test_flash_attn_mla_sparse_bwd_token_chunk_rect(nheads, recompute_p, dtype):
     """Rectangular causal chunked backward with seqlen_q > seqlen_k.
 
     With bottom-right-aligned causal masking, query rows before
@@ -3994,7 +4034,7 @@ def test_flash_attn_mla_sparse_bwd_token_chunk_rect(recompute_p, dtype):
     device = "cuda"
     torch.random.manual_seed(0)
     batch_size, seqlen_q, seqlen_k = 1, 512, 256
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
     token_chunk = 200  # chunk 0: k_end = -56 (skip_main); chunk 1: 144; chunk 2: 256
     n_masked = seqlen_q - seqlen_k  # rows [0, 256) have an empty causal window
@@ -4037,8 +4077,9 @@ def test_flash_attn_mla_sparse_bwd_token_chunk_rect(recompute_p, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
+@pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_token_chunk_varlen(shared_kv, recompute_p, dtype):
+def test_flash_attn_mla_sparse_bwd_token_chunk_varlen(nheads, shared_kv, recompute_p, dtype):
     """Varlen token-chunked sparse-MLA backward, causal, with non-causal
     indices and both docs split across chunk boundaries.
 
@@ -4059,7 +4100,7 @@ def test_flash_attn_mla_sparse_bwd_token_chunk_varlen(shared_kv, recompute_p, dt
         pytest.skip()
     device = "cuda"
     torch.random.manual_seed(0)
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
     doc_lens = (600, 424)
     total = sum(doc_lens)
@@ -4245,8 +4286,9 @@ def test_flash_attn_mla_sparse_bwd_preprocess_tile_tail(varlen, recompute_p, dty
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_learnable_sink(varlen, shared_kv, causal, dtype):
+def test_flash_attn_mla_sparse_bwd_learnable_sink(nheads, varlen, shared_kv, causal, dtype):
     """Sparse-MLA backward with a learnable sink, across every gather_bwd mode.
 
     The sink only enters through lse (lse = log(exp(sink) + sum_j exp(s_j))),
@@ -4257,7 +4299,11 @@ def test_flash_attn_mla_sparse_bwd_learnable_sink(varlen, shared_kv, causal, dty
     it). Runs default (load-p), recompute_p, recompute_p + token_chunk and
     load-p + token_chunk with -1-padded indices (non-causal indices under
     causal=True, so the causal key limit must also be applied) and checks:
-      1. out, lse and dsink are bitwise-identical across the four modes;
+      1. out, lse and dsink are bitwise-identical across the modes that run the
+         same forward kernel: all four at 128 heads; at 64 heads the two
+         recompute-P modes run the native 1-CTA kernel and the two load-P modes
+         the padded 2-CTA kernel (AI/SPARSE_MLA_64H.md), and the two kernels
+         agree up to bf16 output rounding;
       2. chunked dq/dqv are bitwise-equal to unchunked (dk/dv within
          fp32-atomic accumulation noise);
       3. every grad including dsink is within the standard tolerance of the
@@ -4269,7 +4315,7 @@ def test_flash_attn_mla_sparse_bwd_learnable_sink(varlen, shared_kv, causal, dty
         pytest.skip()
     device = "cuda"
     torch.random.manual_seed(0)
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
     token_chunk = 200
     if varlen:
@@ -4333,11 +4379,27 @@ def test_flash_attn_mla_sparse_bwd_learnable_sink(varlen, shared_kv, causal, dty
     for mode, (out_m, lse_m, grads_m) in results.items():
         for name, t in zip(names, grads_m):
             assert not t.isnan().any(), f"{name} has NaN in mode {mode}"
-        # Same forward kernel math in every mode (recompute_p only skips the
-        # p/row_max stores), and dsink is a function of (dpsum, lse, sink) only.
-        assert torch.equal(out_m, out), f"out not bitwise-identical in mode {mode}"
-        assert torch.equal(lse_m, lse), f"lse not bitwise-identical in mode {mode}"
-        assert torch.equal(grads_m[-1], grads[-1]), f"dsink not bitwise-identical in mode {mode}"
+        if nheads == 128 or not modes[mode][0]:
+            # Same forward kernel math (recompute_p only skips the p/row_max
+            # stores), and dsink is a function of (dpsum, lse, sink) only.
+            assert torch.equal(out_m, out), f"out not bitwise-identical in mode {mode}"
+            assert torch.equal(lse_m, lse), f"lse not bitwise-identical in mode {mode}"
+            assert torch.equal(grads_m[-1], grads[-1]), f"dsink not bitwise-identical in mode {mode}"
+        else:
+            # 64 heads, recompute-P: the native 1-CTA forward vs the default's padded 2-CTA
+            # forward (AI/SPARSE_MLA_64H.md). out, lse and hence dpsum / dsink agree up to bf16
+            # output rounding (measured: out rel_l2 <= 1.3e-3, lse max-abs 1e-6, dsink rel_l2
+            # <= 3e-3); no bitwise relation holds between the two kernels.
+            rel = (out_m.float() - out.float()).norm() / out.float().norm()
+            assert rel < 5e-3, f"out rel_l2 {rel} in mode {mode} beyond bf16 rounding"
+            assert (lse_m - lse).abs().max() < 1e-4, f"lse differs in mode {mode}"
+            rel = (grads_m[-1].float() - grads[-1].float()).norm() / grads[-1].float().norm().clamp_min(1e-12)
+            assert rel < 1e-2, f"dsink rel_l2 {rel} in mode {mode} beyond bf16 rounding"
+    # the two recompute-P modes share one forward kernel: bitwise among themselves at every head count
+    out_rc, lse_rc, grads_rc = results["recompute_p"]
+    out_rck, lse_rck, grads_rck = results["recompute_p+chunk"]
+    for name, a, b in (("out", out_rc, out_rck), ("lse", lse_rc, lse_rck), ("dsink", grads_rc[-1], grads_rck[-1])):
+        assert torch.equal(a, b), f"{name} recompute_p+chunk not bitwise vs recompute_p"
     for chunked, unchunked in (("recompute_p+chunk", "recompute_p"), ("load_p+chunk", "default")):
         for i, (name, a, b) in enumerate(zip(names[:-1], results[chunked][2], results[unchunked][2])):
             if i in atomic_grads:
@@ -5617,8 +5679,9 @@ def _self_last_permutation(idx):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_topk_order_invariance(causal, dtype):
+def test_flash_attn_mla_sparse_topk_order_invariance(nheads, causal, dtype):
     """The sparse-MLA training forward must not care about the ORDER of the per-row top-k
     indices beyond bf16 rounding noise.
 
@@ -5637,7 +5700,7 @@ def test_flash_attn_mla_sparse_topk_order_invariance(causal, dtype):
         pytest.skip()
     device = "cuda"
     torch.random.manual_seed(0)
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     total, topk_len = 512, 256
     softmax_scale = (hdim + hdimv) ** -0.5
     beta = 0.25  # self-key boost: q_t += beta * k_t, qv_t += beta * v_t (~50% self weight)

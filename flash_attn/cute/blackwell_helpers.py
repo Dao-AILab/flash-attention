@@ -614,6 +614,277 @@ def gemm_ptx_partial(
 
 
 @cute.jit
+def gemm_ws_ptx_partial(
+    op: cute.nvgpu.tcgen05.mma.MmaOp,
+    acc_tmem_addr: Int32,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    sA: cute.Tensor,
+    sB: cute.Tensor,
+    zero_init: bool | Boolean = False,
+    k_range: Optional[tuple] = None,
+) -> None:
+    """Issue one K tile with the weight-stationary form `tcgen05.mma.ws.cta_group::1` (SS only).
+
+    Same argument conventions and descriptor construction as `gemm_ptx_partial` (SS, cta_group::1), so it
+    can be used through the same `partial(...)` / `mma_inner` pattern. Differences: only M == 64 with N in
+    {64, 128, 256} is supported (N = 32 / 192 trap), and the accumulator layout is the "2x2" datapath layout:
+    a 64 x N fp32 tile occupies 128 lanes x N/2 columns, row r in lane r (first N/2 columns) and in lane
+    r + 64 (second N/2 columns) -- the per-CTA layout of the cta_group::2 M=128 form
+    (`((64,(N/2,2)),1,1):((65536,(1,4194304)),0,0)`), so the 2-CTA kernels' per-CTA TMEM partitions apply
+    unchanged. The trailing `0` operand is the (absent) zero-column-mask descriptor.
+    `k_range=(k0, k1)` issues only k-blocks k0 .. k1-1 of the tile (a caller streaming an operand that
+    lands in parts); `zero_init` then applies to k-block k0.
+    See AI/SPARSE_MLA_64H.md.
+    """
+    assert op.a_src == cute.nvgpu.tcgen05.OperandSource.SMEM, "gemm_ws_ptx_partial: SS form only"
+    assert op.shape_mnk[0] == 64 and op.shape_mnk[1] in (64, 128, 256), (
+        f"gemm_ws_ptx_partial: unsupported .ws shape {op.shape_mnk} (need M == 64, N in {{64, 128, 256}})"
+    )
+    idesc: int = const_expr(sm100_desc.mma_op_to_idesc(op))
+    kind = _tcgen05_mma_kind(op)
+    smem_desc_base_a: int = const_expr(
+        sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, op.a_dtype.width, sA.layout[0]),
+            sA.iterator.type.swizzle_type,
+            sm100_desc.Major.K
+            if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+            else sm100_desc.Major.MN,
+        )
+    )
+    smem_desc_base_b: int = const_expr(
+        sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, op.b_dtype.width, sB.layout[0]),
+            sB.iterator.type.swizzle_type,
+            sm100_desc.Major.K
+            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+            else sm100_desc.Major.MN,
+        )
+    )
+    smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+    num_k = cute.size(tCrA.shape[2])
+    assert num_k == cute.size(tCrB.shape[2]), "gemm_ws_ptx_partial: A and B k-block counts differ"
+    ks = list(range(num_k)) if k_range is None else list(range(k_range[0], k_range[1]))
+    assert len(ks) > 0 and ks[0] >= 0 and ks[-1] < num_k, (
+        f"gemm_ws_ptx_partial: bad k_range {k_range}"
+    )
+    offset_a = [cute.crd2idx((0, 0, k), tCrA.layout) for k in range(num_k)]
+    offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(num_k)]
+    smem_desc_start_a_lo = Int32(
+        smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
+    )
+    smem_desc_start_b_lo = Int32(
+        smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
+    )
+    pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+            Int32(not zero_init).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .pred leader_thread;\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .b32 idesc;\n\t"
+        ".reg .b32 tmem_acc;\n\t"
+        ".reg .b32 smem_desc_a_lo_start, smem_desc_b_lo_start;\n\t"
+        ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+        ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
+        ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t"
+        f"mov.b32 idesc, {hex(idesc)};\n\t"
+        "mov.b32 tmem_acc, $3;\n\t"
+        "mov.b32 smem_desc_a_lo_start, $0;\n\t"
+        "mov.b32 smem_desc_b_lo_start, $1;\n\t"
+        f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
+        f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+        "setp.ne.b32 p, $2, 0;\n\t"
+        + "".join(
+            (
+                f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
+                f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                f"@leader_thread tcgen05.mma.ws.cta_group::1.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str if i == 0 else '1'}, 0;\n\t"
+            )
+            for i, k in enumerate(ks)
+        )
+        + "}\n",
+        "r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def gemm_ws_ts_ptx_partial(
+    op: cute.nvgpu.tcgen05.mma.MmaOp,
+    acc_tmem_addr: Int32,
+    a_tmem_addr: Int32,
+    tCrB: cute.Tensor,
+    sB: cute.Tensor,
+    zero_init: bool | Boolean = False,
+    k_range: Optional[tuple] = None,
+) -> None:
+    """Issue one K tile of `tcgen05.mma.ws.cta_group::1` with the A operand in TMEM (TS form).
+
+    Same conventions as `gemm_ws_ptx_partial` for the accumulator (the "2x2" layout: 128 lanes x N/2
+    columns), `op` (M == 64, N in {64, 128, 256}; supplies the idesc and the B major-ness, its A source
+    is irrelevant), `tCrB` / `sB` (B smem descriptor iterator and tensor) and `k_range`. The A operand
+    of k-block kb is read from TMEM columns `a_tmem_addr + 8 kb` (bf16 pairs, K = 16 per k-block) of
+    all 128 lanes: lanes 0-63 feed the rows of the first N/2 accumulator columns, lanes 64-127 those
+    of the second N/2, so the two lane halves may hold different K slices of the same 64 rows (the
+    "dual GEMM" of the 64-head forward). See AI/SPARSE_MLA_64H.md (F3).
+    """
+    assert op.shape_mnk[0] == 64 and op.shape_mnk[1] in (64, 128, 256), (
+        f"gemm_ws_ts_ptx_partial: unsupported .ws shape {op.shape_mnk} (need M == 64, N in {{64, 128, 256}})"
+    )
+    idesc: int = const_expr(sm100_desc.mma_op_to_idesc(op))
+    kind = _tcgen05_mma_kind(op)
+    smem_desc_base_b: int = const_expr(
+        sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, op.b_dtype.width, sB.layout[0]),
+            sB.iterator.type.swizzle_type,
+            sm100_desc.Major.K
+            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+            else sm100_desc.Major.MN,
+        )
+    )
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+    num_k = cute.size(tCrB.shape[2])
+    ks = list(range(num_k)) if k_range is None else list(range(k_range[0], k_range[1]))
+    assert len(ks) > 0 and ks[0] >= 0 and ks[-1] < num_k, (
+        f"gemm_ws_ts_ptx_partial: bad k_range {k_range}"
+    )
+    offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(num_k)]
+    smem_desc_start_b_lo = Int32(
+        smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
+    )
+    pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+            Int32(not zero_init).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(a_tmem_addr)).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .pred leader_thread;\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .b32 idesc;\n\t"
+        ".reg .b32 tmem_acc, tmem_a;\n\t"
+        ".reg .b32 smem_desc_b_lo_start, smem_desc_b_lo, smem_desc_b_hi;\n\t"
+        ".reg .b64 smem_desc_b;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t"
+        f"mov.b32 idesc, {hex(idesc)};\n\t"
+        "mov.b32 tmem_acc, $2;\n\t"
+        "mov.b32 tmem_a, $3;\n\t"
+        "mov.b32 smem_desc_b_lo_start, $0;\n\t"
+        f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+        "setp.ne.b32 p, $1, 0;\n\t"
+        + "".join(
+            (
+                f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                f"@leader_thread tcgen05.mma.ws.cta_group::1.kind::{kind} [tmem_acc], [tmem_a + {hex(8 * k)}], smem_desc_b, idesc, {pred_str if i == 0 else '1'}, 0;\n\t"
+            )
+            for i, k in enumerate(ks)
+        )
+        + "}\n",
+        "r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def utccp_128x256b_ptx(
+    tmem_addr: Int32,
+    tCrB: cute.Tensor,
+    sB: cute.Tensor,
+    k_range: Optional[tuple] = None,
+) -> None:
+    """`tcgen05.cp.cta_group::1.128x256b` of the k-blocks of a K-major (128 rows, K) smem view into TMEM.
+
+    `sB` is the (128 rows x K) K-major swizzled smem tensor (one MMA tile, e.g. the B-operand view of an
+    M=64 N=128 op) and `tCrB` its smem descriptor iterator (`make_fragment_B`, k-block offsets in 16-B
+    units); k-block kb (16 bf16 of every row) lands in TMEM columns `tmem_addr + 8 kb .. + 7` of lanes
+    0-127 (row r -> lane r, bf16 pairs per 32-bit column). Issued by one elected thread of the calling
+    warp; completion is tracked by a later `tcgen05.commit` of the same thread. This is how the 64-head
+    forward moves Q into TMEM as the A operand of `gemm_ws_ts_ptx_partial`: a (128, K/2) view of the
+    64-row K-major staging puts the lower dim half of each 128-dim chunk in lanes 0-63 and the upper
+    half in lanes 64-127. See AI/SPARSE_MLA_64H.md (F3).
+    """
+    smem_desc_base: int = const_expr(
+        sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, sB.element_type.width, sB.layout[0]),
+            sB.iterator.type.swizzle_type,
+            sm100_desc.Major.K,
+        )
+    )
+    smem_desc_base_lo, smem_desc_hi = i64_to_i32x2(smem_desc_base)
+    num_k = cute.size(tCrB.shape[2])
+    ks = list(range(num_k)) if k_range is None else list(range(k_range[0], k_range[1]))
+    assert len(ks) > 0 and ks[0] >= 0 and ks[-1] < num_k, (
+        f"utccp_128x256b_ptx: bad k_range {k_range}"
+    )
+    offset = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(num_k)]
+    smem_desc_start_lo = Int32(
+        smem_desc_base_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
+    )
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_lo)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .pred leader_thread;\n\t"
+        ".reg .b32 smem_desc_lo_start, smem_desc_lo, smem_desc_hi, tmem_dst;\n\t"
+        ".reg .b64 smem_desc;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t"
+        "mov.b32 smem_desc_lo_start, $0;\n\t"
+        "mov.b32 tmem_dst, $1;\n\t"
+        f"mov.b32 smem_desc_hi, {hex(smem_desc_hi)};\n\t"
+        + "".join(
+            (
+                f"add.u32 smem_desc_lo, smem_desc_lo_start, {hex(offset[k])};\n\t"
+                f"mov.b64 smem_desc, {{smem_desc_lo, smem_desc_hi}};\n\t"
+                f"@leader_thread tcgen05.cp.cta_group::1.128x256b [tmem_dst + {hex(8 * k)}], smem_desc;\n\t"
+            )
+            for k in ks
+        )
+        + "}\n",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def tcgen05_fence_after_thread_sync() -> None:
+    """`tcgen05.fence::after_thread_sync`: order tcgen05 operations issued after a barrier wait behind
+    the other threads' tcgen05 operations that preceded their arrival."""
+    llvm.inline_asm(
+        None,
+        [],
+        "tcgen05.fence::after_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
 def gemm_ptx_partial1(
     op: cute.nvgpu.tcgen05.mma.MmaOp,
     acc_tmem_addr: cutlass.Constexpr[int],

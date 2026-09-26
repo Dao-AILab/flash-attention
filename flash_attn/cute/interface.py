@@ -55,11 +55,13 @@ from flash_attn.cute.flash_bwd_postprocess import (
 )
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
+from flash_attn.cute.flash_fwd_mla_sm100_h64 import FlashAttentionMLAForwardSm100H64
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
 from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
 from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
+from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100_h64 import dQdQvGemmKernelH64
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
 # SM100 head_dim=256 2CTA kernel imports
@@ -740,9 +742,24 @@ def _flash_attn_fwd(
     # the kernel takes the real count and rounds the same way, the interface needs the tile
     # width for its grid math.
     nheads_per_kv = qhead_per_kvhead
+    use_mla_fwd_h64 = False
     if qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
         assert num_head_kv == 1, "sparse MLA requires a single KV head"
-        qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead)
+        # 64 heads with no P/row_max to store run the native 1-CTA 64-row kernel: AI/SPARSE_MLA_64H.md.
+        # Its epilogue stores O / o_lo with 32-B accesses, so a caller-provided out must be 32-B aligned.
+        out_aligned_32 = out is None or (
+            out.data_ptr() % 32 == 0
+            and all((s * out.element_size()) % 32 == 0 for s in out.stride()[:-1])
+        )
+        use_mla_fwd_h64 = (
+            qhead_per_kvhead == 64
+            and (gather_bwd_recompute_p or not requires_grad)
+            and arch // 10 in (10, 11)
+            and out_aligned_32
+        )
+        qhead_per_kvhead = sparse_mla_qhead_tile(
+            qhead_per_kvhead, min_tile=64 if use_mla_fwd_h64 else 128
+        )
         pack_gqa = True
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
@@ -1390,7 +1407,10 @@ def _flash_attn_fwd(
             if qv is not None:
                 paged_kv_cpasync = page_table is not None and page_size != tile_n
                 has_qk = q is not None
-                fa_fwd = FlashAttentionMLAForwardSm100(
+                mla_fwd_cls = (
+                    FlashAttentionMLAForwardSm100H64 if use_mla_fwd_h64 else FlashAttentionMLAForwardSm100
+                )
+                fa_fwd = mla_fwd_cls(
                     is_causal=causal,
                     use_cpasync_load_KV=sparse_kv or paged_kv_cpasync,
                     topk_length=gather_kv_length,
@@ -2904,6 +2924,8 @@ def _flash_attn_bwd_sparse_mla(
     pad_qheads = qhead_tile != qhead_per_kvhead
     if recompute_p and pad_qheads:
         raise ValueError("gather_bwd_recompute_p requires 64 or 128 Q heads")
+    # 64-head recompute-P: the main kernel also computes and scatters dK_rope (AI/SPARSE_MLA_64H.md).
+    fuse_dk_rope = recompute_p and q is not None and k is not None and qhead_tile == 64
     assert gather_kv_length % 128 == 0, f"sparse MLA bwd: {gather_kv_length=} must be divisible by 128"
     assert deterministic is False, "sparse MLA bwd: deterministic mode not yet supported"
     assert seqused_q is None and seqused_k is None, "sparse MLA bwd: seqused_q,k not yet supported"
@@ -3089,9 +3111,11 @@ def _flash_attn_bwd_sparse_mla(
             q_tensor,
             k_tensor,
             lse_log2_tensor,
+            dk_tensor,
          ) = [
             to_cute_tensor(t)
-            for t in (v, qv, dout, p, scale_p, dpsum, ds, dv, gather_kv_indices, q_kernel, k_kernel, lse_log2)
+            for t in (v, qv, dout, p, scale_p, dpsum, ds, dv, gather_kv_indices, q_kernel, k_kernel, lse_log2,
+                      dk if fuse_dk_rope else None)
         ]
 
         fa_bwd_obj = FlashAttentionSparseMLABackwardSm100(
@@ -3118,6 +3142,7 @@ def _flash_attn_bwd_sparse_mla(
             q_tensor,
             k_tensor,
             lse_log2_tensor,
+            dk_tensor,
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
             seqused_q_tensor,
@@ -3167,6 +3192,7 @@ def _flash_attn_bwd_sparse_mla(
         # would unmask entries the forward masked (in load-p mode those entries
         # carry p = 0 and the relaxation is harmless).
         v_mk, dv_mk, k_mk = v, dv, k_kernel
+        dk_mk = dk if fuse_dk_rope else None
         cu_seqlens_k_mk = cu_seqlens_k
         skip_main = False
         if can_chunk and causal:
@@ -3180,6 +3206,7 @@ def _flash_attn_bwd_sparse_mla(
                     v_mk = v[:, :k_end]
                     dv_mk = dv[:, :k_end]
                     k_mk = k_kernel[:, :k_end] if k_kernel is not None else None
+                    dk_mk = dk[:, :k_end] if fuse_dk_rope else None
             else:
                 # Per doc, keep only the keys the forward's causal limit could
                 # reach from queries before tok1 (bottom-right alignment). Only
@@ -3225,6 +3252,7 @@ def _flash_attn_bwd_sparse_mla(
                 q_c if recompute_p else None,
                 k_mk,
                 lse_log2_c,
+                dk_mk,
                 cu_seqlens_q_c,
                 cu_seqlens_k_mk,
                 seqused_q,
@@ -3235,7 +3263,7 @@ def _flash_attn_bwd_sparse_mla(
             ds_c, k_sq, v_sq, dq_c, dqv_c, idx_c, cu_seqlens_q_c, cu_seqlens_k,
         )
 
-        if k is not None:
+        if k is not None and not fuse_dk_rope:
             _sparse_mla_dk(ds_c, idx_c, q_c, dk_sq, cu_seqlens_q_c, cu_seqlens_k)
 
     # return dk, dv in float32: all-reduce across sequence-parallel ranks must happen
@@ -3272,7 +3300,9 @@ def _compile_sparse_mla_dq_dqv(
     mCuSeqlensQ = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_q else None 
     mCuSeqlensK = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_k else None 
     
-    dq_dqv_gemm = dQdQvGemmKernel(
+    # 64 Q heads: 1-CTA 64-row kernel with a whole-row gather (AI/SPARSE_MLA_64H.md).
+    dq_dqv_cls = dQdQvGemmKernelH64 if nheads == 64 else dQdQvGemmKernel
+    dq_dqv_gemm = dq_dqv_cls(
         acc_dtype=Float32,
         nheads=nheads,
         head_dim_k=head_dim,
