@@ -1161,6 +1161,18 @@ def _flash_attn_fwd(
             cu_total_m_blocks.device,
         )
 
+    # At two or fewer tiles per CTA a fixed map pairs a long causal tile with a short
+    # one; past that the dynamic schedule rebalances better.
+    nb_tile = -(-max_seqlen_q // (tile_m * q_stage)) * num_head * batch_size
+    causal_fits_static_schedule = (
+        causal
+        and not local
+        and not is_split_kv
+        and cu_seqlens_q is None
+        and seqused_q is None
+        and nb_tile <= 2 * torch.cuda.get_device_properties(q.device).multi_processor_count
+    )
+
     # Tensor max_seqlen values (e.g. HF varlen) must not leak into the compile key:
     # tensor identity changes on every call and defeats the JIT cache.
     is_static_persistent = (
@@ -1174,7 +1186,7 @@ def _flash_attn_fwd(
         and max_m_blocks_leq_one
         and not is_split_kv
         and (cu_seqlens_q is None or host_max_seqlen_q is not None)
-    )
+    ) or causal_fits_static_schedule
 
     # CuTe keeps stride-zero modes static when marking layouts dynamic.
     tensor_broadcast_patterns = tuple(
