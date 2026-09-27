@@ -329,9 +329,8 @@ class FlashAttentionForwardSm100:
         if self.use_s_ping_pong:
             assert self.q_stage == 1, "S ping-pong requires q_stage == 1 (decode)"
             assert self.head_dim_padded in (64, 128) and self.n_block_size == 128
-        # Depth of the S/P/O handshake pipelines 
+        # S/P/O pipeline depth: two ping-pong TMEM slots for S/P, else one per Q stage
         self.s_p_o_stage = 2 if self.use_s_ping_pong else self.q_stage
-        self.sScale_size = self.s_p_o_stage * self.m_block_size * 2
 
         if self.q_stage == 1:
             if not self.use_tma_KV or not self.use_tma_Q:
@@ -787,7 +786,7 @@ class FlashAttentionForwardSm100:
             tmem_holding_buf: Int32
             # Smem tensors
             # store row max and row sum
-            sScale: cute.struct.MemRange[Float32, self.sScale_size]
+            sScale: cute.struct.MemRange[Float32, self.s_p_o_stage * self.m_block_size * 2]
             # Scheduler buffers placed here to utilize padding before sO's 1024-byte
             # alignment. This avoids adding bytes at the end when we're at the smem limit.
             # PipelineClcFetchAsync / PipelineAsync both expect
@@ -1074,9 +1073,7 @@ class FlashAttentionForwardSm100:
             defer_sync=True,
         )
         # MMA warp uses this to signal to the correction warps that O is ready.
-        # Ping-pong: committed after EVERY PV (index pv_count & 1) and awaited by
-        # correction before each rescale's O read as well as the tile-end read;
-        # otherwise committed once per tile per stage and awaited at tile end.
+        # Ping-pong commits it after every PV (slot pv_count & 1); otherwise once per tile per stage.
         pipeline_o_acc = pipeline_custom.PipelineUmmaAsync.create(
             barrier_storage=storage.mbar_O_full.data_ptr(),
             num_stages=self.s_p_o_stage,
@@ -1153,7 +1150,7 @@ class FlashAttentionForwardSm100:
         else:
             sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype), sO_layout.outer)
 
-        sScale = storage.sScale.get_tensor(cute.make_layout(self.sScale_size))
+        sScale = storage.sScale.get_tensor(cute.make_layout(self.s_p_o_stage * self.m_block_size * 2))
 
         thr_mma_qk = tiled_mma_qk.get_slice(mma_tile_coord_v)
         thr_mma_pv = tiled_mma_pv.get_slice(mma_tile_coord_v)
@@ -1678,7 +1675,6 @@ class FlashAttentionForwardSm100:
                             else:
                                 load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
                             kv_producer_state.advance()
-                    # Append the final V after all K/V pairs have bene staged. 
                     if const_expr(self.use_s_ping_pong):
                         if issue_kv_for_this_warp:
                             page_idx_v = (
@@ -1882,111 +1878,43 @@ class FlashAttentionForwardSm100:
 
             if process_tile and is_leader_cta:
                 if const_expr(self.use_s_ping_pong):
-                    # Wait for Q
+                    # Software pipeline: QK(0); [QK(i+1), PV(i)] for i in 0..n-2; PV(n-1).
+                    # Block i uses S/P slot i & 1; the slot's barrier phase flips on each reuse.
                     pipeline_q.consumer_wait_w_index_phase(0, mma_q_consumer_phase)
-                    # Wait for K(0)
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                    Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                    sK_cur = sK[None, None, None, Ki_index]
-                    if const_expr(self.uneven_kv_smem):
-                        sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                    # Issue QK(0).
-                    if (mma_pv_count & 1) == 0:
-                        gemm_Si[0](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
-                        pipeline_s_p_o.producer_commit_w_index(0)
-                    else:
-                        gemm_Si[1](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
-                        pipeline_s_p_o.producer_commit_w_index(1)
+                    sK_cur = self.kv_smem_stage(sK, mma_kv_consumer_state)
+                    self.mma_ping_pong_qk(gemm_Si, pipeline_s_p_o, sK_cur, mma_pv_count)
                     mma_q_consumer_phase ^= 1
-                    # Release K(0)
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
-                    # Advance to K(1)
-                    mma_kv_consumer_state.advance()  
+                    mma_kv_consumer_state.advance()
+                    # O hasn't been accumulated yet, its first MMA calculation doesn't need to accumulate
                     O_should_accumulate = False
                     for i in cutlass.range(block_iter_count - 1, unroll=1):
-                        # Wait for K(i+1)
                         pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                        Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                        sK_cur = sK[None, None, None, Ki_index]
-                        if const_expr(self.uneven_kv_smem):
-                            sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                        # Issue QK(i+1). Even global block count writes to TMEM slot 0 (0-127) and odd writes to TMEM slot 1 (128-255)
-                        if ((mma_pv_count + 1) & 1) == 0:
-                            gemm_Si[0](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
-                            pipeline_s_p_o.producer_commit_w_index(0)
-                        else:
-                            gemm_Si[1](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
-                            pipeline_s_p_o.producer_commit_w_index(1)
-                        # Release K(i+1)
+                        sK_cur = self.kv_smem_stage(sK, mma_kv_consumer_state)
+                        self.mma_ping_pong_qk(gemm_Si, pipeline_s_p_o, sK_cur, mma_pv_count + 1)
                         pipeline_kv.consumer_release(mma_kv_consumer_state)
-                        # Advance to V(i)
-                        mma_kv_consumer_state.advance() 
-                        # Wait for V(i) 
-                        pipeline_kv.consumer_wait(mma_kv_consumer_state) 
-                        Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                        tOrVi = tOrV[None, None, None, Vi_index]
-                        sV_cur = sV[None, None, None, Vi_index]
-                        if const_expr(self.uneven_kv_smem):
-                            sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                        # Phase for this block's slot. Each slot is reused every second block, and its barrier phase flips on each reuse. 
-                        pv_phase = (mma_pv_count >> 1) & 1
-                        # Issue PV(i)
-                        if (mma_pv_count & 1) == 0:
-                            pipeline_s_p_o.producer_acquire_w_index_phase(0, pv_phase)
-                            gemm_Pi[0](
-                                tCrB=tOrVi,
-                                sB=sV_cur,
-                                zero_init=not O_should_accumulate,
-                                mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(0) if self.split_P_arrive > 0 else None,
-                                mbar_phase=pv_phase,
-                            )
-                        else:
-                            pipeline_s_p_o.producer_acquire_w_index_phase(1, pv_phase)
-                            gemm_Pi[1](
-                                tCrB=tOrVi,
-                                sB=sV_cur,
-                                zero_init=not O_should_accumulate,
-                                mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(1) if self.split_P_arrive > 0 else None,
-                                mbar_phase=pv_phase,
-                            )
-                        pipeline_o_acc.producer_commit_w_index(mma_pv_count & 1)
+                        mma_kv_consumer_state.advance()
+                        pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                        tOrVi = tOrV[None, None, None, mma_kv_consumer_state.index]
+                        sV_cur = self.kv_smem_stage(sV, mma_kv_consumer_state)
+                        self.mma_ping_pong_pv(
+                            gemm_Pi, pipeline_s_p_o, pipeline_p_lastsplit, pipeline_o_acc,
+                            tOrVi, sV_cur, O_should_accumulate, mma_pv_count,
+                        )
                         mma_pv_count += 1
-                        # Release V(i)
                         pipeline_kv.consumer_release(mma_kv_consumer_state)
-                        # Advance to K(i+2)
-                        mma_kv_consumer_state.advance()  
+                        mma_kv_consumer_state.advance()
                         O_should_accumulate = True
-                    # Release Q
                     for stage in cutlass.range(self.q_stage):
                         pipeline_q.consumer_release_w_index(stage)
-                    # wait for final V 
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                    Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                    tOrVi = tOrV[None, None, None, Vi_index]
-                    sV_cur = sV[None, None, None, Vi_index]
-                    if const_expr(self.uneven_kv_smem):
-                        sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                    pv_phase = (mma_pv_count >> 1) & 1
-                    # Issue last PV 
-                    if (mma_pv_count & 1) == 0:
-                        pipeline_s_p_o.producer_acquire_w_index_phase(0, pv_phase)
-                        gemm_Pi[0](
-                            tCrB=tOrVi,
-                            sB=sV_cur,
-                            zero_init=not O_should_accumulate,
-                            mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(0) if self.split_P_arrive > 0 else None,
-                            mbar_phase=pv_phase,
-                        )
-                    else:
-                        pipeline_s_p_o.producer_acquire_w_index_phase(1, pv_phase)
-                        gemm_Pi[1](
-                            tCrB=tOrVi,
-                            sB=sV_cur,
-                            zero_init=not O_should_accumulate,
-                            mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(1) if self.split_P_arrive > 0 else None,
-                            mbar_phase=pv_phase,
-                        )
-                    pipeline_o_acc.producer_commit_w_index(mma_pv_count & 1)
+                    tOrVi = tOrV[None, None, None, mma_kv_consumer_state.index]
+                    sV_cur = self.kv_smem_stage(sV, mma_kv_consumer_state)
+                    self.mma_ping_pong_pv(
+                        gemm_Pi, pipeline_s_p_o, pipeline_p_lastsplit, pipeline_o_acc,
+                        tOrVi, sV_cur, O_should_accumulate, mma_pv_count,
+                    )
                     mma_pv_count += 1
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
@@ -2141,6 +2069,66 @@ class FlashAttentionForwardSm100:
         # pipeline_s_p_o.producer_acquire_w_index_phase(self.q_stage - 1, P_full_O_rescaled_phase)
         # We don't need pipeline_o_acc.producer_tail() since we don't call
         # pipeline_o_acc.producer_acquire() inside the loop.
+
+    @cute.jit
+    def kv_smem_stage(self, sX: cute.Tensor, kv_state: pipeline.PipelineState):
+        """K or V smem for the stage kv_state points at."""
+        sX_cur = sX[None, None, None, kv_state.index]
+        if const_expr(self.uneven_kv_smem):
+            sX_cur = self.offset_kv_smem(sX_cur, kv_state.index, kv_state.phase)
+        return sX_cur
+
+    @cute.jit
+    def mma_ping_pong_qk(
+        self,
+        gemm_Si: list,
+        pipeline_s_p_o: pipeline.PipelineAsync,
+        sK_cur: cute.Tensor,
+        block_count: Int32,
+    ):
+        """Issue QK for the block with global count block_count into S slot block_count & 1."""
+        if (block_count & 1) == 0:
+            gemm_Si[0](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
+            pipeline_s_p_o.producer_commit_w_index(0)
+        else:
+            gemm_Si[1](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
+            pipeline_s_p_o.producer_commit_w_index(1)
+
+    @cute.jit
+    def mma_ping_pong_pv(
+        self,
+        gemm_Pi: list,
+        pipeline_s_p_o: pipeline.PipelineAsync,
+        pipeline_p_lastsplit: pipeline.PipelineAsync,
+        pipeline_o_acc: pipeline.PipelineAsync,
+        tOrVi: cute.Tensor,
+        sV_cur: cute.Tensor,
+        O_should_accumulate: Boolean,
+        pv_count: Int32,
+    ):
+        """Issue PV for the block with global count pv_count from P slot pv_count & 1."""
+        pv_phase = (pv_count >> 1) & 1
+        if (pv_count & 1) == 0:
+            pipeline_s_p_o.producer_acquire_w_index_phase(0, pv_phase)
+            gemm_Pi[0](
+                tCrB=tOrVi,
+                sB=sV_cur,
+                zero_init=not O_should_accumulate,
+                mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(0) if self.split_P_arrive > 0 else None,
+                mbar_phase=pv_phase,
+            )
+        else:
+            pipeline_s_p_o.producer_acquire_w_index_phase(1, pv_phase)
+            gemm_Pi[1](
+                tCrB=tOrVi,
+                sB=sV_cur,
+                zero_init=not O_should_accumulate,
+                mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(1) if self.split_P_arrive > 0 else None,
+                mbar_phase=pv_phase,
+            )
+        # QK(i+1) is issued before PV(i), so S(i+1) being ready no longer implies O(i) is done:
+        # the correction warps wait on O_full before every O read.
+        pipeline_o_acc.producer_commit_w_index(pv_count & 1)
 
     # for both softmax0 and softmax1 warp group
     @cute.jit
@@ -2547,7 +2535,6 @@ class FlashAttentionForwardSm100:
 
         # This is equivalent to pipeline_sm_stats.producer_tail
         if const_expr(self.use_s_ping_pong):
-            # Pre-acquire the next block's stats slot 
             pipeline_sm_stats.producer_acquire_w_index_phase(
                 s_p_o_consumer_count & 1, 1 ^ ((s_p_o_consumer_count >> 1) & 1)
             )
@@ -2884,6 +2871,7 @@ class FlashAttentionForwardSm100:
                         # pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                         if should_rescale:
                             if const_expr(self.use_s_ping_pong):
+                                # Ping-pong issues QK(i+1) before PV(i), so S_i+1 does not imply O_i is done
                                 pipeline_o_acc.consumer_wait_w_index_phase(
                                     o_acc_consumer_count & 1, (o_acc_consumer_count >> 1) & 1
                                 )

@@ -81,8 +81,7 @@ BIN_BATCH_SEARCH_THRESH = 256  # above this batch size SingleTileVarlenScheduler
 # Where the cu hint applies, use an O(1) flat-block -> batch lookup instead of the binary search.
 USE_BLOCKS_TO_BATCH: bool = True
 
-# Enable the S ping-pong only when each split's mainloop is at least this many
-# n_blocks: 16 for hdim=64 and 64 for hdim=128 
+# Enable the S ping-pong only when each split's mainloop is at least this many n_blocks.
 S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT = {64: 16, 128: 64}
 
 
@@ -1208,15 +1207,14 @@ def _flash_attn_fwd(
             0,
             min(
                 max_seqlen_k,
-                (window_size_right or max_seqlen_k)
-                + (window_size_left or max_seqlen_k)
+                (max_seqlen_k if window_size_right is None else window_size_right)
+                + (max_seqlen_k if window_size_left is None else window_size_left)
                 + 1
                 + tile_m,
             ),
         )
     )
-    s_ping_pong_num_n_blocks = (s_ping_pong_seqlen_k_loaded + tile_n - 1) // tile_n
-    num_n_blocks_per_split = (s_ping_pong_num_n_blocks + num_splits - 1) // num_splits
+    num_n_blocks_per_split = cute.ceil_div(cute.ceil_div(s_ping_pong_seqlen_k_loaded, tile_n), num_splits)
     use_s_ping_pong = (
         not requested_disable_s_ping_pong
         and arch in (100, 110)
