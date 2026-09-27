@@ -325,7 +325,8 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
 
     # NOTE: We should revisit this heuristic after persistence is supported for split KV.
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
-    return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
+    # More tiles than SMs means no split, not zero splits.
+    return max(1, min(num_SMs // total_mblocks, max_splits, num_n_blocks))
 
 
 def _get_fwd_config(
