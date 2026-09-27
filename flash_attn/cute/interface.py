@@ -409,7 +409,8 @@ def _get_fwd_config(
         )
     )
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
-    total_mblocks = batch_size * num_head_kv * num_m_blocks
+    # Without PackGQA every Q head gets its own m blocks.
+    total_mblocks = batch_size * num_head_kv * (1 if pack_gqa else qhead_per_kvhead) * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = None
     if arch // 10 == 12:
