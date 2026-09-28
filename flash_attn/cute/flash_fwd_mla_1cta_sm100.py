@@ -115,6 +115,7 @@ class FlashAttentionMLAForward1CtaSm100:
         is_fp8: bool = False,
         is_topk_gather: bool = False,
         topk_length: int = 0,
+        rescale_threshold: float = 8.0,
         num_stages_V: Optional[int] = None,
         num_stages_K: Optional[int] = None,
         num_stages_P: Optional[int] = None,
@@ -372,7 +373,9 @@ class FlashAttentionMLAForward1CtaSm100:
         # out. rescale_threshold (letting row_max go stale) must be 0 for fp8: it would
         # let P reach 2^(max_offset + threshold) and saturate.
         self.max_offset = 8 if is_fp8 else 0
-        self.rescale_threshold = 0.0 if is_fp8 else 8.0
+        # 0 = exact running max: sparse-MLA training forwards need it (the lazy rescale leaves
+        # a coherent bf16 gain error on peaked rows; AI/SPARSE_MLA_EXACT_SOFTMAX_MAX.md).
+        self.rescale_threshold = 0.0 if is_fp8 else float(rescale_threshold)
         # e4m3 max is 448 -> log2 = 8.807
         _log2_dtype_max = 8.807 if is_fp8 else 127.0
         assert self.max_offset + self.rescale_threshold < _log2_dtype_max, (
@@ -617,6 +620,8 @@ class FlashAttentionMLAForward1CtaSm100:
     ):
         # fmt: on
         self.has_learnable_sink = learnable_sink is not None
+        # sparse training: bf16 rounding residual of O, for the backward's dpsum
+        assert mOlo is None or not self.is_split_kv, "mOlo is not supported with split-KV"
         assert (mIndexTopk is not None) == self.is_topk_gather, (
             "mIndexTopk presence must match the is_topk_gather ctor flag"
         )
@@ -624,7 +629,6 @@ class FlashAttentionMLAForward1CtaSm100:
             ("mP", mP), ("mRowMax", mRowMax),
             ("window_size_left", window_size_left),
             ("window_size_right", window_size_right),
-            ("mOlo", mOlo),
         ]:
             assert t is None, f"{name} is not supported by the 1CTA MLA kernel (v1)"
         if const_expr(mPageTable is not None):
@@ -709,6 +713,14 @@ class FlashAttentionMLAForward1CtaSm100:
                 else O_split_transpose,
             ),
         )
+        if const_expr(mOlo is not None):
+            mOlo = cute.make_tensor(
+                mOlo.iterator,
+                cute.make_layout(mOlo.shape, stride=new_stride(mOlo)),
+            )
+            mOlo = cute.make_tensor(
+                mOlo.iterator, cute.select(mOlo.layout, mode=QO_layout_transpose)
+            )
         mK, mV = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=KV_layout_transpose))
             if mX is not None
@@ -763,6 +775,8 @@ class FlashAttentionMLAForward1CtaSm100:
             ]
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
+            if const_expr(mOlo is not None):
+                mOlo = pack_gqa_layout(mOlo, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
         if const_expr(not self.pad_qheads):
             mQ_tma, mQv_tma, mO_tma = mQ, mQv, mO
 
@@ -1073,6 +1087,7 @@ class FlashAttentionMLAForward1CtaSm100:
             tma_tensor_V,
             tma_tensor_O,
             mLSE,
+            mOlo,
             mCuSeqlensQ,
             mCuSeqlensK,
             mSeqUsedQ,
@@ -1127,6 +1142,7 @@ class FlashAttentionMLAForward1CtaSm100:
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mOlo: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
@@ -1547,6 +1563,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 descale_tensors,
                 tile_scheduler=tile_scheduler,
                 learnable_sink=learnable_sink,
+                mOlo=mOlo,
             )
             tmem_alloc_barrier.arrive()
 
@@ -3165,6 +3182,7 @@ class FlashAttentionMLAForward1CtaSm100:
         descale_tensors,
         tile_scheduler: TileSchedulerProtocol,
         learnable_sink: Optional[cute.Tensor] = None,
+        mOlo: Optional[cute.Tensor] = None,
     ):
         ### ==== correction/epilogue warpgroup ====
         # Correction: copy scale smem -> rmem, copy O tmem -> rmem, rescale O, store O rmem -> tmem
@@ -3286,6 +3304,11 @@ class FlashAttentionMLAForward1CtaSm100:
                     mO_batch[None, None, head_idx]
                     if const_expr(not self.is_split_kv)
                     else mO_batch[None, None, head_idx, split_idx]
+                )
+                mOlo_cur = (
+                    seqlen.offset_batch_Q(mOlo, batch_idx, dim=3)[None, None, head_idx]
+                    if const_expr(mOlo is not None)
+                    else None
                 )
                 gO = None
                 if const_expr(self.use_tma_O):
@@ -3409,6 +3432,22 @@ class FlashAttentionMLAForward1CtaSm100:
                             if const_expr(split == self.num_hdimv_splits - 1):
                                 with cute.arch.elect_one():
                                     cute.arch.mbarrier_arrive(sO_empty_mbar_ptr)
+
+                    if const_expr(mOlo is not None):
+                        # O residual (sparse training): O_lo = fp32(O) - bf16(O), exact in
+                        # fp32 and rounded once, from the same fp32 values just rounded into
+                        # O (so it matches the 2CTA kernel). The backward preprocess forms
+                        # dpsum from O + O_lo (AI/SPARSE_MLA_DPSUM_PRECISION.md). The bf16 O
+                        # registers are free once O is stored (per-row store, or copied into
+                        # sO for TMA), so the residual reuses them rather than growing the
+                        # epilogue's register footprint.
+                        o_f32 = tOrOs_r2g_f32[split].load() * scale
+                        tOrOs_r2g[split].store(
+                            (o_f32 - o_f32.to(self.dtype_O).to(self.dtype_acc)).to(self.dtype_O)
+                        )
+                        self.store_O_packed(
+                            mOlo_cur, tOrOs_r2g[split], tidx, m_block, split, seqlen_q
+                        )
 
                 consumer_state_O0, consumer_state_O1 = consumer_states_O
 

@@ -1,9 +1,18 @@
 # Sparse (top-k) MLA forward on the 1CTA kernel
 
-Status (2026-09-28): inference forward for MQA with up to 64 Q heads, opt-in via
-`FLASH_ATTENTION_MLA_1CTA=1`. Training outputs (P / row_max / `o_lo`) are not produced;
-with grad-requiring inputs the 1CTA path raises. Split-KV is disabled for sparse MLA on both
-kernels. Plan and review log: `agent_space/SPARSE_MLA_1CTA_PORT_PLAN.md`.
+Status (2026-09-28), opt-in via `FLASH_ATTENTION_MLA_1CTA=1`:
+- **Inference forward:** MQA with up to 64 Q heads.
+- **Training forward:** with the recompute-P backward (`gather_bwd_recompute_p=True`) at
+  exactly 64 heads. The kernel produces what that backward consumes: exact-running-max LSE
+  (`rescale_threshold=0`) and the O rounding residual `o_lo`, but no P / row_max.
+  `out`/`lse`/`o_lo` are bitwise identical to the 2CTA kernel's, so the gradients match: dQ
+  and dQv bitwise, dK and dV within the sparse backward's own atomic run-to-run
+  non-determinism, which 2CTA shows too.
+- **Fallback:** every other sparse case (more than 64 heads; training with load-P or
+  != 64 heads) falls back to the 2CTA kernel under the flag.
+- **No split-KV** for sparse MLA on either kernel.
+
+Plan and review log: `agent_space/SPARSE_MLA_1CTA_PORT_PLAN.md`.
 
 ## What it does
 
@@ -111,6 +120,7 @@ Backward, sparse MLA training step:
    - deeper V residency, where bf16 SMEM allows (it is tight: ~1 KB headroom with has_qk);
    - overlapping the per-tile Q staging (q_in_tmem handshake);
    - TMA gather4 for K/V rows, instead of 128 threads issuing per-row 16-B cp.async.
-4. **Training forward** (P / row_max / `o_lo` emission, exact max): not started. Worth it
-   only in the throughput regimes above. Recompute-P backward needs exactly 64 or 128
-   heads, so h < 64 training would need P/row_max emission.
+4. **Training forward:** done for recompute-P at exactly 64 heads (see Status). Training
+   with fewer than 64 heads would need P / row_max emission, because the recompute-P
+   backward rejects padded head tiles. It is not started, and is worth it only in the
+   throughput regimes above.

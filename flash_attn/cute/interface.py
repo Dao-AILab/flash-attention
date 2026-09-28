@@ -780,13 +780,19 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
     # Opt-in routing to the 1CTA (tcgen05.mma.ws) MLA kernel. Sparse (top-k) MLA runs on
     # it only up to 64 Q heads -- one 64-row tile per token; more heads would need two
-    # tiles each re-gathering the same indices, which the 2CTA kernel avoids -- so larger
-    # sparse head counts fall back to 2CTA. Defined here because the head padding below
-    # and the SplitKV heuristics in _get_fwd_config depend on it.
+    # tiles each re-gathering the same indices, which the 2CTA kernel avoids. For training
+    # it produces only what the recompute-P backward needs (exact-max LSE and the O
+    # residual, no P / row_max), and recompute-P needs an unpadded tile: exactly 64
+    # heads. Every other sparse case falls back to 2CTA. Defined here because the head
+    # padding below and the SplitKV heuristics in _get_fwd_config depend on it.
+    sparse_1cta_ok = gather_kv_indices is None or (
+        qhead_per_kvhead <= 64
+        and (not requires_grad or (gather_bwd_recompute_p and qhead_per_kvhead == 64))
+    )
     mla_1cta = (
         qv is not None
         and os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
-        and not (gather_kv_indices is not None and qhead_per_kvhead > 64)
+        and sparse_1cta_ok
     )
     # Sparse MLA pads the heads to the kernel's tile (see pack_gqa.qheads_first_tma_view):
     # 128 rows for 2CTA, 64 for 1CTA. The kernel takes the real count and rounds the same
@@ -1533,11 +1539,11 @@ def _flash_attn_fwd(
                     # pack_gqa at any ratio (including ratios that do not divide the 64-row
                     # tile), paged KV at any page size (TMA when page_size == tile_n,
                     # else a cp.async gather warp group), and sparse top-k gather (MQA,
-                    # <= 64 heads, inference; routed here only in that case).
+                    # <= 64 heads; training only with recompute-P at exactly 64 heads, which
+                    # needs no P / row_max -- routed here only in those cases).
                     for feat, name in [
                         (p is not None, "P emission"),
                         (row_max is not None, "row_max emission"),
-                        (o_lo is not None, "sparse MLA training (grad-requiring inputs)"),
                         (local, "local attention"),
                     ]:
                         assert not feat, f"1CTA MLA kernel does not support {name}"
@@ -1566,6 +1572,7 @@ def _flash_attn_fwd(
                         is_fp8=is_fp8,
                         is_topk_gather=sparse_kv,
                         topk_length=gather_kv_length if sparse_kv else 0,
+                        rescale_threshold=mla_fwd_rescale_threshold,
                     )
                 else:
                     fa_fwd = FlashAttentionMLAForwardSm100(
