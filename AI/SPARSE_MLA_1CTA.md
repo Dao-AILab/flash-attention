@@ -222,6 +222,28 @@ No spills in either kernel.
 Dense bf16 prefill still belongs on 2CTA (0.78-0.86x); every decode shape favours dense
 kb64.
 
+**Saturating bandwidth** (decode, cold L2)
+
+Effective bandwidth is KV payload divided by time, with payload = `b x s_k x (64 + 512) x 2` B.
+Each token's KV is streamed once per 64-head tile, and Q / O add under 0.5% at large batch.
+The GPU ceiling measured with `agent_space/hbm_ceiling.py` on 8 GiB is 6.90 TB/s for a
+device-to-device copy (read + write) and 6.37 TB/s for the best read-only torch reduction.
+The HBM3e spec is about 8 TB/s.
+
+| shape | KV | 2CTA | kb128 best | kb64 |
+|---|---|---|---|---|
+| b=8, s_k=8K / 32K / 128K | 0.07 / 0.28 / 1.12 GiB | 0.79 / 0.90 / 0.95 TB/s | 1.77 / 3.61 / 5.48 | 2.20 / 4.02 / 6.04 |
+| b=32, s_k=8K / 32K / 128K | 0.28 / 1.12 / 4.50 GiB | 2.87 / 3.45 / 3.63 | 3.52 / 5.18 / 5.87 | 3.90 / 5.88 / 6.86 |
+| b=128, s_k=8K / 32K | 1.12 / 4.50 GiB | 5.29 / 5.87 | 5.54 / 6.01 | 6.15 / 6.94 |
+| b=512, s_k=8K / 32K | 4.50 / 18.0 GiB | 6.13 / 6.21 | 5.72 / 5.87 | 6.60 / 6.92 |
+| paged b=128, s_k=32K, page 64 / 128 | 4.50 GiB | - | 5.83 / 6.07 | 6.76 / 6.89 |
+
+- **kb64 saturates at about 6.9 TB/s** once a call streams at least ~4.5 GiB of KV. That is
+  the device-to-device copy rate and about 86% of spec.
+- **kb128 tops out at about 5.9-6.1 TB/s, and 2CTA at about 6.2.**
+- **Below ~1 GiB the kernels are latency-bound**, not bandwidth-bound. b=1 reaches
+  0.4-2.6 TB/s even with split-KV.
+
 ## fp8: S ahead of PV in the 128-key mainloop
 
 The 128-key mainloop issues PVt(n) before S(n+1). That order is forced when one block's V
