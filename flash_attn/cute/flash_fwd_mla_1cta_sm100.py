@@ -65,7 +65,7 @@ from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
-from flash_attn.cute.softmax import SoftmaxSm100
+from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
     SchedulingMode,
@@ -556,11 +556,11 @@ class FlashAttentionMLAForward1CtaSm100:
         stream: cuda.CUstream = None,
     ):
         # fmt: on
+        self.has_learnable_sink = learnable_sink is not None
         for name, t in [
             ("mP", mP), ("mRowMax", mRowMax), ("mIndexTopk", mIndexTopk),
             ("window_size_left", window_size_left),
             ("window_size_right", window_size_right),
-            ("learnable_sink", learnable_sink),
             ("mOlo", mOlo),
         ]:
             assert t is None, f"{name} is not supported by the 1CTA MLA kernel (v1)"
@@ -966,6 +966,7 @@ class FlashAttentionMLAForward1CtaSm100:
             mSeqUsedK,
             mPageTable,
             descale_tensors,
+            learnable_sink,
             tma_atom_Q,
             tma_atom_Qv,
             tma_atom_K,
@@ -1017,6 +1018,7 @@ class FlashAttentionMLAForward1CtaSm100:
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
         descale_tensors,
+        learnable_sink: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_Qv: cute.CopyAtom,
         tma_atom_K: Optional[cute.CopyAtom],
@@ -1412,6 +1414,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 num_splits,
                 descale_tensors,
                 tile_scheduler=tile_scheduler,
+                learnable_sink=learnable_sink,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2706,7 +2709,7 @@ class FlashAttentionMLAForward1CtaSm100:
 
                 # write row max and sum to smem
                 sRowSum[tidx % self.cta_tile_m, warp_idx // self.num_acc_halves] = softmax.row_sum[0]
-                if const_expr(mLSE is not None):
+                if const_expr(mLSE is not None or self.has_learnable_sink):
                     if tidx < self.cta_tile_m:
                         sRowMax[tidx, 0] = softmax.row_max[0]
                 self.sm_stats_barrier_full.arrive()
@@ -2820,6 +2823,7 @@ class FlashAttentionMLAForward1CtaSm100:
         num_splits: Int32,
         descale_tensors,
         tile_scheduler: TileSchedulerProtocol,
+        learnable_sink: Optional[cute.Tensor] = None,
     ):
         ### ==== correction/epilogue warpgroup ====
         # Correction: copy scale smem -> rmem, copy O tmem -> rmem, rescale O, store O rmem -> tmem
@@ -2978,18 +2982,37 @@ class FlashAttentionMLAForward1CtaSm100:
                 row_sum1 = sRowSum[tidx % self.cta_tile_m, 1]
                 row_sum = row_sum0 + row_sum1
                 LN2 = math.log(2.0)
+
+                # Both threads of a row need row_max once the sink rescales row_sum.
+                row_max = 0.0
+                if const_expr(mLSE is not None or learnable_sink is not None):
+                    row_max = sRowMax[tidx % self.cta_tile_m, 0]
+                if const_expr(learnable_sink is not None):
+                    # Only the first split owns the sink column (as in flash_fwd_sm100).
+                    if const_expr(not self.is_split_kv) or split_idx == 0:
+                        sink_val = load_learnable_sink(
+                            learnable_sink,
+                            head_idx,
+                            m_block * self.cta_tile_m + tidx % self.cta_tile_m,
+                            self.qhead_per_kvhead,
+                            self.pack_gqa,
+                        )
+                        row_max, row_sum = apply_learnable_sink(
+                            row_max,
+                            row_sum,
+                            sink_val,
+                            softmax_scale_log2_eff,
+                            max_offset=self.max_offset,
+                            empty_row_sum=float(2**self.max_offset),
+                        )
+
+                self.sm_stats_barrier_empty.arrive()
+
                 acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                 # fp8: dequantize O by v_descale here (never in the running rescale,
                 # and never in LSE -- LSE is a function of the dequantized scores only).
                 scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
                 scale = scale * v_descale
-
-                row_max = 0.0
-                if const_expr(mLSE is not None):
-                    if tidx < self.cta_tile_m:
-                        row_max = sRowMax[tidx, 0]
-
-                self.sm_stats_barrier_empty.arrive()
 
                 seqlen_q = seqlen.seqlen_q
 

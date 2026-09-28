@@ -3534,6 +3534,118 @@ def test_flash_attn_mla_1cta_split_distribution(varlen_q, monkeypatch):
         torch.testing.assert_close(lse_s[b, :rows], lse_1[b, :rows], atol=1e-3, rtol=1e-3)
 
 
+def _mla_sink_ref(q, qv, k, v, softmax_scale, causal, sink):
+    """fp32 MLA-absorbed reference returning (out, lse); the sink is one extra logit per Q head."""
+    q, qv, k, v = [t.float() for t in (q, qv, k, v)]
+    nheads, nheads_kv = q.shape[2], k.shape[2]
+    k, v = [repeat(t, "b s h d -> b s (h g) d", g=nheads // nheads_kv) for t in (k, v)]
+    scores = (torch.einsum("bshd,bthd->bhst", q, k) + torch.einsum("bshd,bthd->bhst", qv, v)) * softmax_scale
+    seqlen_q, seqlen_k = scores.shape[-2:]
+    if causal:
+        row = torch.arange(seqlen_q, device=q.device)[:, None]
+        col = torch.arange(seqlen_k, device=q.device)[None, :]
+        scores = scores.masked_fill(col > row + seqlen_k - seqlen_q, float("-inf"))
+    sink_logit = sink.float().view(1, nheads, 1, 1).expand(*scores.shape[:-1], 1)
+    logits = torch.cat([scores, sink_logit], dim=-1)
+    lse = torch.logsumexp(logits, dim=-1)
+    probs = torch.softmax(logits, dim=-1)[..., :-1]
+    out = torch.einsum("bhst,bthd->bshd", probs, v)
+    return out, lse.transpose(1, 2)
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="learnable sink test for the 1CTA MLA kernel")
+@pytest.mark.parametrize("return_lse", [True, False])
+@pytest.mark.parametrize("num_splits", [1, 3])
+@pytest.mark.parametrize("causal", [False, True])
+# 48 Q heads per KV head does not divide the 64-row tile
+@pytest.mark.parametrize("nheads", [16, 48])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(64, 1024), (300, 200)])
+def test_flash_attn_mla_1cta_learnable_sink(seqlen_q, seqlen_k, nheads, causal, num_splits, return_lse):
+    """Sink folded into the 1CTA epilogue: pack_gqa head indexing, split-KV (split 0 owns
+    the sink), fully masked rows, and the no-LSE path (row_max still has to reach the
+    epilogue when mLSE is None)."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    batch_size, hdim, hdimv = 2, 64, 512
+    q = torch.randn(batch_size, seqlen_q, nheads, hdim, device=device, dtype=dtype)
+    qv = torch.randn(batch_size, seqlen_q, nheads, hdimv, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, 1, hdim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, 1, hdimv, device=device, dtype=dtype)
+    sink = torch.randn(nheads, device=device, dtype=dtype) * 4
+    softmax_scale = 1.0 / math.sqrt(hdim + hdimv)
+    out, lse = flash_attn_func(
+        q, k, v, qv=qv, causal=causal, learnable_sink=sink, num_splits=num_splits,
+        return_lse=return_lse,
+    )
+    out_ref, lse_ref = _mla_sink_ref(q, qv, k, v, softmax_scale, causal, sink)
+    assert (out.float() - out_ref).abs().max().item() <= 2e-2
+    # Rows with no visible key (causal, seqlen_q > seqlen_k) keep only the sink: O = 0.
+    masked_rows = seqlen_q - seqlen_k if causal and seqlen_q > seqlen_k else 0
+    if masked_rows > 0:
+        assert (out[:, :masked_rows] == 0).all()
+    if not return_lse:
+        assert lse is None
+        return
+    if num_splits > 1:
+        # A split-KV tile with no KV blocks at all never reaches split 0's epilogue, so its
+        # LSE stays -inf instead of the sink (same as flash_fwd_sm100); O is still 0.
+        lse, lse_ref = lse[:, masked_rows:], lse_ref[:, masked_rows:]
+    torch.testing.assert_close(lse, lse_ref, atol=1e-2, rtol=1e-3)
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="learnable sink test for the 1CTA MLA kernel")
+@pytest.mark.parametrize("num_splits", [1, 3])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_mla_1cta_learnable_sink_fp8(causal, num_splits):
+    """fp8 + descales + sink: the sink must enter with the fp8 max_offset pre-scale and the
+    descale-folded softmax scale. Checked exactly against the same fp8 call without a sink
+    (lse' = logaddexp(lse, sink), O' = O * exp(lse - lse')), then loosely against a
+    dequantized fp32 reference."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    torch.random.manual_seed(0)
+    device, fp8 = "cuda", torch.float8_e4m3fn
+    batch_size, seqlen_q, seqlen_k, nheads, hdim, hdimv = 2, 64, 1024, 16, 64, 512
+    q, qv, k, v = [
+        torch.randn(*shape, device=device).to(fp8)
+        for shape in (
+            (batch_size, seqlen_q, nheads, hdim),
+            (batch_size, seqlen_q, nheads, hdimv),
+            (batch_size, seqlen_k, 1, hdim),
+            (batch_size, seqlen_k, 1, hdimv),
+        )
+    ]
+    q_descale = torch.rand(batch_size, 1, device=device) + 0.5
+    kv_descale = torch.rand(batch_size, 1, device=device) + 0.5
+    sink = torch.randn(nheads, device=device, dtype=torch.bfloat16) * 4
+    softmax_scale = 1.0 / math.sqrt(hdim + hdimv)
+
+    def run(learnable_sink):
+        # Descales are only exposed by the internal entry point.
+        out, lse, *_ = _flash_attn_fwd(
+            q, k, v, qv=qv, causal=causal, learnable_sink=learnable_sink, num_splits=num_splits,
+            q_descale=q_descale, k_descale=kv_descale, v_descale=kv_descale, return_lse=True,
+        )
+        return out, lse
+
+    out, lse = run(None)
+    out_sink, lse_sink = run(sink)
+    lse_expected = torch.logaddexp(lse, sink.float().view(1, 1, nheads))
+    torch.testing.assert_close(lse_sink, lse_expected, atol=1e-3, rtol=1e-4)
+    out_expected = out.float() * torch.exp(lse - lse_expected).unsqueeze(-1)
+    torch.testing.assert_close(out_sink.float(), out_expected, atol=1e-2, rtol=1e-2)
+
+    deq = lambda t, d: t.float() * d.view(batch_size, 1, 1, 1)  # noqa: E731
+    out_ref, lse_ref = _mla_sink_ref(
+        deq(q, q_descale), deq(qv, q_descale), deq(k, kv_descale), deq(v, kv_descale),
+        softmax_scale, causal, sink,
+    )
+    torch.testing.assert_close(lse_sink, lse_ref, atol=5e-2, rtol=1e-2)
+    assert (out_sink.float() - out_ref).abs().max().item() <= 0.1 * out_ref.abs().max().item()
+
+
 def causal_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device):
     """Top-k indices as produced by a causal sparse-attention selector: query t
     gets min(t+1, seqlen_k, topk_len) valid keys drawn from [0, t], with
