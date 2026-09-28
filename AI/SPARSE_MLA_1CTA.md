@@ -5,9 +5,14 @@ Status (2026-09-28), opt-in via `FLASH_ATTENTION_MLA_1CTA=1`:
 - **Training forward:** with the recompute-P backward (`gather_bwd_recompute_p=True`) at
   exactly 64 heads. The kernel produces what that backward consumes: exact-running-max LSE
   (`rescale_threshold=0`) and the O rounding residual `o_lo`, but no P / row_max.
-  `out`/`lse`/`o_lo` are bitwise identical to the 2CTA kernel's, so the gradients match: dQ
-  and dQv bitwise, dK and dV within the sparse backward's own atomic run-to-run
-  non-determinism, which 2CTA shows too.
+- **Two mainloops.** Exactly 64 heads with 16-bit inputs run the **64-key-block (kb64)
+  mainloop** (see its section below). It agrees with the 2CTA kernel to bf16 rounding, not
+  bitwise. Everything else runs the 128-key mainloop (fewer than 64 heads, fp8, and
+  `FLASH_ATTENTION_MLA_1CTA_KB64=0`). On the 128-key mainloop `out`/`lse`/`o_lo` are bitwise
+  identical to the 2CTA kernel's, and so are the gradients: dQ and dQv bitwise, dK and dV
+  within the sparse backward's own atomic run-to-run non-determinism, which 2CTA shows too.
+- **CLC.** The 1CTA sparse route always runs the persistent CLC scheduler, as the 2CTA MLA
+  kernel does. Dense 1CTA MLA still follows `FA_CLC`.
 - **Fallback:** every other sparse case (more than 64 heads; training with load-P or
   != 64 heads) falls back to the 2CTA kernel under the flag.
 - **No split-KV** for sparse MLA on either kernel.
@@ -39,10 +44,106 @@ Plan and review log: `agent_space/SPARSE_MLA_1CTA_PORT_PLAN.md`.
 - **Routing.** More than 64 heads fall back to 2CTA. A second 64-row tile per token would
   re-gather the same indices.
 
-Correctness: bitwise identical to the 2CTA kernel on every benchmarked shape and on the
-test matrix (`test_flash_attn_mla_1cta_sparse_*`), as well as matching the reference.
+Correctness: the 128-key mainloop is bitwise identical to the 2CTA kernel on every
+benchmarked shape and on the test matrix (`test_flash_attn_mla_1cta_sparse_*`), as well as
+matching the reference. The kb64 mainloop meets the contract in "Test contract" below.
+
+## 64-key-block mainloop (kb64): exactly 64 heads, 16-bit
+
+`flash_fwd_mla_1cta_kb64_sm100.FlashAttentionMLAForward1CtaKb64Sm100` subclasses the 1CTA
+kernel. It ports PR 2914's 64-head forward mainloop into it. The 128-key mainloop kept one
+key block's V in both V stages (its two dv halves), so it serialized
+S -> softmax -> P -> PV -> V release -> refill -> next S. That was its binding constraint,
+which the Phase B items (bitmask wait, pair barriers, index prefetch, register budgets)
+could not move (`agent_space/PR2914_COMPARISON_AND_PORT_PLAN.md`).
+
+**Design**
+
+- **64-key blocks.** A latent stage is one block's 64 x 512 rows (64 KB, K-major SW128).
+  There are three stages, plus one 64 x 64 rope tile. Each stage lands in 4 column-block
+  parts, each with its own cp.async mbarrier, so S streams behind the fill. The gather is
+  `CpasyncGatherKVManagerH64`: whole rows, indices loaded two blocks ahead, 2 bitmask words
+  per block.
+- **Q in TMEM.** The gather warps stage the token's Q tile through the KV ring once per
+  tile, with identity rows (so no padded heads are possible). The MMA warp copies it with
+  `tcgen05.cp.128x256b` (`utccp_128x256b_ptx`). Qv takes 128 "dual packed" columns: lanes
+  0-63 hold the lower dim half of each 128-dim chunk, lanes 64-127 the upper half. Q_rope
+  takes 16 columns.
+- **S = Q K^T.** A `.ws` TS dual GEMM, M64 N128 (`gemm_ws_ts_ptx_partial`). The two lane
+  halves of the accumulator hold the two dim halves' partial sums. The softmax warps add
+  them through a 16 KB exchange buffer, with 64-thread pair barriers.
+- **O += P V.** SS, M64 N256 x 2 N-tiles, over the MN-major re-view of the stage.
+- **Issue order.** The MMA warp issues S(n) before PV(n-1). There is one S stage (TMEM is
+  O 256 + S 64 + Qv 128 + Qr 16 = 464 of 512 columns).
+- **Epilogue.** O and o_lo stream from TMEM 32 columns at a time, with 256-bit
+  `st.global.v8`, and each O split is released as soon as it drains. The 256-bit stores
+  need 32-B aligned rows; the interface checks this and falls back to 128-bit stores.
+- **SMEM.** 3 x 64 KB + 8 KB rope + 8 KB P + 16 KB exchange + header = 232,448 B, which is
+  exactly the cap.
+- **Registers.** `min_blocks_per_mp=1`, so the budgets are honoured: softmax 192,
+  epilogue 128, warp group 2 (load/MMA/CLC/idle) 112, gather 80, uniform per warp group.
+  No spills.
+- **ptxas.** It runs at the default level (`_MLA_PTXAS_DEFAULTS["fwd_kb64"] = ""`).
+  `-O2` is 7-8% slower here.
+
+**Test contract** (PR 2914's; `tests/cute/test_flash_attn.py::_assert_mla_fwd_close`)
+
+- vs the 2CTA kernel: out rel-L2 < 5e-3 (measured ~2e-3, i.e. two independent bf16
+  roundings), the same -inf LSE pattern, finite LSE max-abs < 1e-4 (measured ~1e-6).
+- Training (`test_flash_attn_mla_1cta_sparse_train_recompute_p`):
+  - out + o_lo rel-L2 < 2e-3 (measured 7.6e-4);
+  - dq / dqv / dk / dv rel-L2 < 5e-3 (measured <= 1.6e-3);
+  - dsink < 1e-2 (measured 3.3e-3);
+  - |o_lo| <= half an ulp of out.
+- Bitwise run to run (`test_flash_attn_mla_1cta_sparse_kb64`, which also covers the
+  128-bit-store fallback).
+- The 128-key mainloop keeps the bitwise asserts.
+
+**Results** (GB300, 64 heads, topk 2048, causal)
+
+The table is `agent_space/kernel_time_fwd.py` for no-grad and train, plus the train step
+from `agent_space/bench_mla64_compare.py` (recompute-P).
+
+| T | kernel | fwd no-grad (ms) | fwd train (ms) | train step (ms) |
+|---|---|---|---|---|
+| 16k | 128-key mainloop, no CLC, -O2 (before) | 4.63 | 5.21 | 24.96 (after Phase A) |
+| 16k | 128-key mainloop + CLC | 4.18 | 4.73 | 24.26 |
+| 16k | PR 2914 H64 forward (own checkout) | 3.62 | 4.01 | 24.31 |
+| 16k | **kb64 + CLC** | **3.56** | **3.84** | **23.38** |
+| 4k | kb64 + CLC | 0.93 | 0.99 | 5.69 |
+
+ncu at 16k training (`agent_space/ncu_b7/`, summary: `agent_space/ncu_summary.py`):
+
+| | kb64 | PR H64 | 128-key + CLC |
+|---|---|---|---|
+| duration | 3.84 ms | 3.94 ms | 4.74 ms |
+| SM throughput | 70.7% | 68.9% | 57.3% |
+| memory throughput | 54.9% | 54.3% | 32.9% |
+| L2 hit rate | 93.1% | 93.1% | 88.4% |
+| issue slots busy | 33.7% | 33.5% | 17.2% |
+| local-memory spill requests | 0 | 4.3 M | 65.9 M |
+| top stall (per issue) | long scoreboard 5.8 | long scoreboard 5.9 | long scoreboard 18.0 |
+
+kb64 and the PR's kernel have the same profile; kb64 is ahead by its spill-free register
+allocation. The 128-key mainloop spills heavily under CLC at -O2 (see Follow-ups).
+
+Decode and prefill at 64 heads (`benchmarks/benchmark_sparse_mla_fwd.py --heads 64
+--kernels 2cta 1cta 1cta_kb128 --ptxas shipped`; `agent_space/bench_sparse_1cta/b7_*.csv`),
+each kernel at its shipped ptxas level:
+
+| shape | 2CTA / kb64 | kb128 / kb64 |
+|---|---|---|
+| decode b <= 32 (cold / hot) | 0.77-0.92 | 1.17-1.57 |
+| decode b = 128 | 1.12-1.32 | 1.01-1.23 |
+| decode b = 512 | 1.08-1.21 | 1.05-1.23 |
+| prefill s_q = 4096 | 1.64-1.76 | 1.19-1.39 |
+
+Small-batch decode stays latency-bound and 2CTA still wins there (Follow-up 1).
 
 ## Performance (GB300, 152 SMs, L2 129 MiB; bf16, topk 2048, h_kv 1)
+
+These tables predate CLC on the sparse route and the kb64 mainloop (see the section
+above for the current 64-head numbers).
 
 Both kernels are compiled at the default ptxas level and at `-O2`
 (`FLASH_ATTENTION_MLA_PTXAS_OPTIONS=-O2`). Ratios compare each kernel at its **best** level.
@@ -120,7 +221,12 @@ Backward, sparse MLA training step:
    - deeper V residency, where bf16 SMEM allows (it is tight: ~1 KB headroom with has_qk);
    - overlapping the per-tile Q staging (q_in_tmem handshake);
    - TMA gather4 for K/V rows, instead of 128 threads issuing per-row 16-B cp.async.
-4. **Training forward:** done for recompute-P at exactly 64 heads (see Status). Training
+4. **Training forward:** done for recompute-P at exactly 64 heads (see Status; kb64). Training
    with fewer than 64 heads would need P / row_max emission, because the recompute-P
    backward rejects padded head tiles. It is not started, and is worth it only in the
    throughput regimes above.
+5. **128-key mainloop spills under CLC.** ncu shows 66 M local-memory spill requests at
+   -O2 with CLC (the -O2 measurement was without CLC). It serves < 64 heads and fp8;
+   re-ablate its ptxas level and budgets there.
+6. **kb64 for < 64 heads.** It needs a predicated (or TMA) Q staging in place of the
+   identity-row gather, and head guards in the O / LSE stores.

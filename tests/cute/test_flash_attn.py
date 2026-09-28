@@ -3793,6 +3793,32 @@ def _mla_inputs(b, s_q, s_k, h, has_qk, dtype=torch.bfloat16, seed=0):
     return dict(q=qv, k=v, v=v), (qv, v, v, None)
 
 
+def _mla_kb64_active(nheads, dtype=torch.bfloat16):
+    """Whether a sparse forward with FLASH_ATTENTION_MLA_1CTA=1 runs the 1CTA 64-key-block
+    mainloop (exactly 64 heads, 16-bit). Its running max advances per 64 keys instead of the
+    2CTA kernel's 128, so the two agree to bf16 rounding, not bitwise."""
+    return (
+        MLA_1CTA
+        and nheads == 64
+        and dtype in (torch.float16, torch.bfloat16)
+        and os.environ.get("FLASH_ATTENTION_MLA_1CTA_KB64", "1") == "1"
+    )
+
+
+def _assert_mla_fwd_close(out, out_other, lse=None, lse_other=None, what=""):
+    """The bf16-rounding contract between two sparse-MLA forwards with different block
+    orders (PR 2914's): out rel-L2 < 5e-3, the same -inf LSE pattern, finite LSE within 1e-4.
+    Measured: out ~2e-3 (two independent bf16 roundings), LSE ~1e-6."""
+    rel = ((out.float() - out_other.float()).norm() / out_other.float().norm().clamp_min(1e-30)).item()
+    assert rel < 5e-3, f"{what}: out rel-L2 {rel:.2e}"
+    if lse is not None:
+        fin = torch.isfinite(lse_other)
+        assert torch.equal(torch.isfinite(lse), fin), f"{what}: LSE -inf pattern differs"
+        if fin.any():
+            err = (lse[fin] - lse_other[fin]).abs().max().item()
+            assert err < 1e-4, f"{what}: LSE max-abs {err:.2e}"
+
+
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA sparse MLA forward")
 @pytest.mark.parametrize("gen", ["rect", "rect_oob"])
 @pytest.mark.parametrize("topk", [128, 1024])
@@ -3815,10 +3841,13 @@ def test_flash_attn_mla_1cta_sparse_fwd(nheads, has_qk, causal, seqlen_q, seqlen
     out, lse = flash_attn_func(**kw)
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
     out_2cta, lse_2cta = flash_attn_func(**kw)
-    # Same math and accumulation order as the 2CTA kernel: bitwise identical today. If a
-    # future change reorders the reduction, relax this to the reference tolerance below.
-    assert torch.equal(out, out_2cta)
-    assert torch.equal(lse, lse_2cta)
+    if _mla_kb64_active(nheads):
+        # 64-key blocks: a different running-max sequence than the 2CTA kernel's
+        _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "1CTA kb64 vs 2CTA")
+    else:
+        # the 128-key mainloop: same math and accumulation order as the 2CTA kernel
+        assert torch.equal(out, out_2cta)
+        assert torch.equal(lse, lse_2cta)
 
     valid = _topk_valid_rows(idx, seqlen_q, seqlen_k, causal)
     # rows with no valid slot: O = 0, LSE = -inf (the reference NaNs there)
@@ -3837,11 +3866,51 @@ def test_flash_attn_mla_1cta_sparse_fwd(nheads, has_qk, causal, seqlen_q, seqlen
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA sparse MLA forward")
+@pytest.mark.parametrize("gen", ["rect", "rect_oob"])
+@pytest.mark.parametrize("topk", [128, 1024, 2048])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("has_qk", [True, False])
+def test_flash_attn_mla_1cta_sparse_kb64(has_qk, causal, topk, gen, monkeypatch):
+    """The 64-key-block mainloop (64 heads) against the 128-key one on the same inputs: the
+    bf16-rounding contract, bitwise run-to-run, O = 0 / LSE = -inf on rows with no valid
+    slot, and an output view that is only 16-B aligned (128-bit epilogue stores instead of
+    256-bit) bitwise equal to the aligned one."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    if not _mla_kb64_active(64):
+        pytest.skip("kb64 mainloop disabled")
+    b, s_q, s_k, h = 2, 97, 4096, 64
+    kw, _ = _mla_inputs(b, s_q, s_k, h, has_qk)
+    idx = rect_topk_indices(b, s_q, s_k, topk, causal, "cuda",
+                            fill_frac=0.5 if gen == "rect_oob" else 1.0,
+                            oob_frac=0.5 if gen == "rect_oob" else 0.0)
+    kw.update(gather_kv_indices=idx, causal=causal, return_lse=True)
+    out, lse = flash_attn_func(**kw)
+    out_again, lse_again = flash_attn_func(**kw)
+    assert torch.equal(out, out_again) and torch.equal(lse, lse_again), "not deterministic"
+    valid = _topk_valid_rows(idx, s_q, s_k, causal)
+    assert (out[~valid] == 0).all() and torch.isneginf(lse[~valid]).all()
+    if has_qk:
+        # 16-B (not 32-B) aligned out: the 128-bit store epilogue
+        buf = torch.empty(out.numel() + 8, device="cuda", dtype=out.dtype)
+        out_unaligned = buf[8:].view_as(out)
+        assert out_unaligned.data_ptr() % 32 == 16
+        _flash_attn_fwd(kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
+                        causal=causal, out=out_unaligned, return_lse=True)
+        assert torch.equal(out_unaligned, out), "128-bit vs 256-bit O stores differ"
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64", "0")
+    out_128, lse_128 = flash_attn_func(**kw)
+    _assert_mla_fwd_close(out, out_128, lse, lse_128, "kb64 vs 128-key mainloop")
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="1CTA sparse MLA forward")
 @pytest.mark.parametrize("has_qk", [True, False])
 @pytest.mark.parametrize("nheads", [16, 64])
 def test_flash_attn_mla_1cta_sparse_bitmask_mapping(nheads, has_qk):
-    """The bit -> S-column mapping of the validity bitmask (Layout E: each thread owns 64
-    columns, two 32-slot words). Uniform patterns can't catch swapped words or halves, so:
+    """The bit -> S-column mapping of the validity bitmask (128-key mainloop, Layout E: each
+    thread owns 64 columns, two 32-slot words; 64-key kb64 mainloop at 64 heads: one word per
+    32-key half). The slots below sit on the word boundaries of both geometries. Uniform
+    patterns can't catch swapped words or halves, so:
     (1) one valid slot at each word/half boundary, in the first and the last processed
     n_block -- the output must then be exactly that key's V row; (2) a distinct random
     pattern per 32-slot word, checked against the reference."""
@@ -3906,8 +3975,11 @@ def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sin
         kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
         learnable_sink=sink, return_lse=True,
     )
-    assert torch.equal(out, out_2cta)
-    assert torch.equal(lse, lse_2cta)
+    if _mla_kb64_active(nheads):
+        _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "1CTA kb64 vs 2CTA")
+    else:
+        assert torch.equal(out, out_2cta)
+        assert torch.equal(lse, lse_2cta)
 
 
 @pytest.mark.parametrize("nheads", [64, 128])
@@ -3949,9 +4021,10 @@ def test_flash_attn_mla_sparse_no_split_kv(nheads, monkeypatch):
 def test_flash_attn_mla_1cta_sparse_varlen(nheads, has_qk, causal, q_mode, varlen_k, monkeypatch):
     """Sparse forward with varlen Q: cu_seqlens_q runs the packed (flat over tokens)
     scheduler with batch-local indexing and keeps the TMA O store (one-token tiles cannot
-    straddle sequences); seqused_q runs the varlen scheduler. Ragged lengths include 0 and
-    1. Checked per sequence against the reference, bitwise against 2CTA, and for writes past
-    the last token (canary tail)."""
+    straddle sequences; the 64-head kb64 mainloop stores O per row); seqused_q runs the
+    varlen scheduler. Ragged lengths include 0 and 1. Checked per sequence against the
+    reference, against 2CTA (bitwise, or to bf16 rounding on the kb64 mainloop), and for
+    writes past the last token (canary tail)."""
     if not IS_SM100 or USE_FAKE_TENSOR:
         pytest.skip()
     device, dtype, topk = "cuda", torch.bfloat16, 256
@@ -4018,7 +4091,10 @@ def test_flash_attn_mla_1cta_sparse_varlen(nheads, has_qk, causal, q_mode, varle
             o, o2, l, l2 = out[rows], out_2cta[rows], lse[rows], lse_2cta[rows]
         else:
             o, o2, l, l2 = out[i, :sq], out_2cta[i, :sq], lse[i, :sq], lse_2cta[i, :sq]
-        assert torch.equal(o, o2) and torch.equal(l, l2), f"sequence {i}: 1CTA != 2CTA"
+        if _mla_kb64_active(nheads):
+            _assert_mla_fwd_close(o, o2, l, l2, f"sequence {i}: 1CTA kb64 vs 2CTA")
+        else:
+            assert torch.equal(o, o2) and torch.equal(l, l2), f"sequence {i}: 1CTA != 2CTA"
         q_r = qs[i][None] if has_qk else None
         k_r = ks[i][None] if has_qk else vs[i][None]
         ref_q = q_r if has_qk else qvs[i][None]
@@ -4091,9 +4167,11 @@ def test_flash_attn_mla_1cta_sparse_train_recompute_p(has_qk, causal, varlen, ha
                                                       monkeypatch):
     """Sparse training with the recompute-P backward at exactly 64 heads runs its forward on
     the 1CTA kernel: exact running max (rescale_threshold 0), LSE and the O residual, no
-    P / row_max. Forward outputs must be bitwise identical to the 2CTA kernel's; the
-    gradients then match too -- dQ / dQv bitwise, dK / dV up to the sparse backward's own
-    run-to-run non-determinism (atomic scatter-adds)."""
+    P / row_max. On the 128-key mainloop (FLASH_ATTENTION_MLA_1CTA_KB64=0) the forward
+    outputs are bitwise identical to the 2CTA kernel's and so are dQ / dQv (dK / dV up to
+    the sparse backward's atomic scatter-add order). The default 64-key-block mainloop
+    agrees to bf16 rounding: out / LSE under the forward contract, out + o_lo and every
+    gradient by relative L2."""
     if not IS_SM100 or USE_FAKE_TENSOR:
         pytest.skip()
     import flash_attn.cute.interface as fa_interface
@@ -4164,13 +4242,33 @@ def test_flash_attn_mla_1cta_sparse_train_recompute_p(has_qk, causal, varlen, ha
             f"FLASH_ATTENTION_MLA_1CTA={flag}: forward ran on the wrong kernel"
         )
     monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", real_cache)
-    for name, i in (("out", 0), ("lse", 1), ("o_lo", 2)):
-        assert torch.equal(results["1"][i], results["0"][i]), f"{name}: 1CTA != 2CTA"
+    rel_l2 = lambda a, b: ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()  # noqa: E731
+    kb64 = _mla_kb64_active(h, dtype)
+    if kb64:
+        # 64-key blocks: bf16-rounding agreement with the 2CTA kernel, not bitwise
+        _assert_mla_fwd_close(results["1"][0], results["0"][0], results["1"][1], results["0"][1],
+                              "1CTA kb64 vs 2CTA")
+        for flag in ("1", "0"):
+            out_f, _, o_lo_f, _ = results[flag]
+            # o_lo is the rounding residual: at most half an ulp of out
+            _, e = torch.frexp(out_f.float())
+            half_ulp = torch.ldexp(torch.ones_like(out_f, dtype=torch.float32), e - 9)
+            assert (o_lo_f.float().abs() <= half_ulp)[out_f != 0].all(), flag
+        # the near-fp32 O the backward's dpsum uses; measured <= 8e-4
+        o32 = [results[f][0].float() + results[f][2].float() for f in ("1", "0")]
+        assert rel_l2(*o32) < 2e-3, "out + o_lo"
+    else:
+        for name, i in (("out", 0), ("lse", 1), ("o_lo", 2)):
+            assert torch.equal(results["1"][i], results["0"][i]), f"{name}: 1CTA != 2CTA"
     names = ("dq", "dk", "dv", "dqv") if has_qk else ("dqv", "dv")
     if sink is not None:
         names = names + ("dsink",)
     for name, a, b in zip(names, results["1"][3], results["0"][3]):
-        if name in ("dq", "dqv"):
+        if kb64:
+            # P is recomputed from a slightly different LSE and dpsum from a slightly
+            # different O: measured rel-L2 <= 1.6e-3 on the grads, 3.3e-3 on dsink
+            assert rel_l2(a, b) < (1e-2 if name == "dsink" else 5e-3), name
+        elif name in ("dq", "dqv"):
             assert torch.equal(a, b), name
         else:
             # atomic scatter-add order varies run to run, for the 2CTA kernel alike
@@ -4534,7 +4632,9 @@ def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, nheads, share
     in-kernel; token_chunk additionally bounds the dS transient to a token
     chunk. Checks:
       1. the recompute forward is bitwise-identical to the default forward
-         (same kernel math, only the p/row_max stores are skipped);
+         (same kernel math, only the p/row_max stores are skipped) -- to bf16
+         rounding when FLASH_ATTENTION_MLA_1CTA=1 routes 64-head recompute-P to
+         the 1CTA 64-key-block forward;
       2. grads match the fp32 reference within the standard tolerance;
       3. the token-chunked backward matches the unchunked one bitwise on
          dq/dqv (dk/dv only up to fp32-atomic accumulation order). The causal
@@ -4601,8 +4701,13 @@ def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, nheads, share
         return
 
     assert (gather_kv_indices == -1).any(), "test must exercise sentinel slots"
-    assert torch.equal(out, out_default), "recompute fwd out must be bitwise-identical"
-    assert torch.equal(lse, lse_default), "recompute fwd lse must be bitwise-identical"
+    if _mla_kb64_active(nheads, dtype):
+        # FLASH_ATTENTION_MLA_1CTA=1: recompute-P runs the 1CTA 64-key-block forward, the
+        # default (load-P) path the 2CTA one
+        _assert_mla_fwd_close(out, out_default, lse, lse_default, "recompute vs default fwd")
+    else:
+        assert torch.equal(out, out_default), "recompute fwd out must be bitwise-identical"
+        assert torch.equal(lse, lse_default), "recompute fwd lse must be bitwise-identical"
 
     # dq/dqv (pure GEMM consumers of identical dS tiles) are bitwise-stable
     # across retain_graph reruns and across chunking; dk/dv accumulate with
@@ -5001,7 +5106,10 @@ def test_flash_attn_mla_sparse_bwd_learnable_sink(nheads, varlen, shared_kv, cau
     it). Runs default (load-p), recompute_p, recompute_p + token_chunk and
     load-p + token_chunk with -1-padded indices (non-causal indices under
     causal=True, so the causal key limit must also be applied) and checks:
-      1. out, lse and dsink are bitwise-identical across the four modes;
+      1. out, lse and dsink are bitwise-identical across the four modes (with
+         FLASH_ATTENTION_MLA_1CTA=1 at 64 heads the recompute modes run the 1CTA
+         64-key-block forward: bf16-rounding agreement with the load-P modes,
+         bitwise between the two recompute modes);
       2. chunked dq/dqv are bitwise-equal to unchunked (dk/dv within
          fp32-atomic accumulation noise);
       3. every grad including dsink is within the standard tolerance of the
@@ -5074,14 +5182,25 @@ def test_flash_attn_mla_sparse_bwd_learnable_sink(nheads, varlen, shared_kv, cau
     assert (gather_kv_indices == -1).any(), "test must exercise sentinel slots"
     out, lse, grads = results["default"]
     assert not lse.isnan().any(), "LSE contains NaN"
+    kb64 = _mla_kb64_active(nheads, dtype)
     for mode, (out_m, lse_m, grads_m) in results.items():
         for name, t in zip(names, grads_m):
             assert not t.isnan().any(), f"{name} has NaN in mode {mode}"
+        if kb64 and modes[mode][0]:
+            _assert_mla_fwd_close(out_m, out, lse_m, lse, f"mode {mode} vs default")
+            rel = ((grads_m[-1].float() - grads[-1].float()).norm()
+                   / grads[-1].float().norm().clamp_min(1e-12)).item()
+            assert rel < 1e-2, f"dsink rel_l2 {rel:.2e} in mode {mode}"
+            continue
         # Same forward kernel math in every mode (recompute_p only skips the
         # p/row_max stores), and dsink is a function of (dpsum, lse, sink) only.
         assert torch.equal(out_m, out), f"out not bitwise-identical in mode {mode}"
         assert torch.equal(lse_m, lse), f"lse not bitwise-identical in mode {mode}"
         assert torch.equal(grads_m[-1], grads[-1]), f"dsink not bitwise-identical in mode {mode}"
+    # the two recompute modes share one forward kernel
+    (out_r, lse_r, grads_r), (out_rc, lse_rc, grads_rc) = results["recompute_p"], results["recompute_p+chunk"]
+    assert torch.equal(out_rc, out_r) and torch.equal(lse_rc, lse_r), "recompute modes differ"
+    assert torch.equal(grads_rc[-1], grads_r[-1]), "dsink differs between the recompute modes"
     for chunked, unchunked in (("recompute_p+chunk", "recompute_p"), ("load_p+chunk", "default")):
         for i, (name, a, b) in enumerate(zip(names[:-1], results[chunked][2], results[unchunked][2])):
             if i in atomic_grads:

@@ -58,6 +58,7 @@ from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
 from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
 from flash_attn.cute.flash_fwd_mla_1cta_sm100 import FlashAttentionMLAForward1CtaSm100
+from flash_attn.cute.flash_fwd_mla_1cta_kb64_sm100 import FlashAttentionMLAForward1CtaKb64Sm100
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
 from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
@@ -311,12 +312,15 @@ _LEARNABLE_SINK_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 #   bwd_dq_dqv  dQ/dQv GEMM: 4064 B -> 0, 3.0-4.2x; the 64-head dQdQvGemmKernelH64 does not spill
 #               at either level, -O2 +0.3-1%
 #   bwd_dk      dK GEMM: no spill either way, +3-4%
+#   fwd_kb64    1CTA sparse forward, 64-key-block mainloop: no spill at the default level;
+#               -O2 is 7-8% slower (4k / 16k) -> ptxas default
 #   bwd_preprocess: no spill, no measurable change -> left at the ptxas default
 # FLASH_ATTENTION_MLA_PTXAS_OPTIONS overrides every MLA kernel ("" = the ptxas default),
 # e.g. to rerun that ablation. The resolved flags are part of each compile key: the JIT
 # caches (in-memory and on disk) key on it, not on compile options.
 _MLA_PTXAS_DEFAULTS = {
     "fwd": "-O2",            # FlashAttentionMLAForwardSm100 and ...1CtaSm100
+    "fwd_kb64": "",          # FlashAttentionMLAForward1CtaKb64Sm100
     "bwd": "-O2",            # FlashAttentionSparseMLABackwardSm100
     "bwd_dq_dqv": "-O2",     # dQdQvGemmKernel
     "bwd_dk": "-O2",         # dKGemmKernel
@@ -1324,11 +1328,41 @@ def _flash_attn_fwd(
     mla_1cta_q_tmem = (
         mla_1cta and os.environ.get("FLASH_ATTENTION_MLA_1CTA_Q_TMEM", "1") == "1"
     )
-    mla_ptxas_options = _mla_ptxas_options("fwd") if qv is not None else ""
+    # Sparse MLA tiles are one token each with uniform cost: the persistent CLC scheduler
+    # overlaps a tile's epilogue with the next tile's gather (~10% at 64 heads, both 1CTA
+    # mainloops). The 2CTA MLA kernel always runs it; dense 1CTA MLA follows FA_CLC.
+    mla_1cta_use_clc = bool(sparse_kv) or (use_clc_scheduler if use_clc_scheduler is not None else True)
+    # Sparse, exactly 64 heads, 16-bit: the 64-key-block mainloop (three latent stages, Q in
+    # TMEM, S(n) before PV(n-1); flash_fwd_mla_1cta_kb64_sm100). It agrees with the 2CTA
+    # kernel to bf16 rounding, not bitwise. FLASH_ATTENTION_MLA_1CTA_KB64=0 keeps the
+    # 128-key mainloop (A/B runs).
+    mla_1cta_kb64 = (
+        mla_1cta
+        and bool(sparse_kv)
+        and nheads_per_kv == 64
+        and not is_fp8
+        and os.environ.get("FLASH_ATTENTION_MLA_1CTA_KB64", "1") == "1"
+    )
+    # its epilogue stores O / o_lo with 256-bit stores when their rows are 32-B aligned
+    mla_1cta_kb64_o_align32 = mla_1cta_kb64 and (
+        fake_mode
+        or all(
+            t.data_ptr() % 32 == 0
+            and all(st * t.element_size() % 32 == 0 for st in t.stride()[:-1])
+            for t in (out, o_lo)
+            if t is not None
+        )
+    )
+    mla_ptxas_options = (
+        _mla_ptxas_options("fwd_kb64" if mla_1cta_kb64 else "fwd") if qv is not None else ""
+    )
 
     compile_key = (
         mla_1cta,
         mla_1cta_q_tmem,
+        mla_1cta_kb64,
+        mla_1cta_kb64_o_align32,
+        mla_1cta and mla_1cta_use_clc,
         mla_ptxas_options,
         dtype,
         head_dim,
@@ -1553,29 +1587,43 @@ def _flash_attn_fwd(
                         assert gather_kv_indices.dtype == torch.int32, (
                             "gather_kv_indices must be int32"
                         )
-                    fa_fwd = FlashAttentionMLAForward1CtaSm100(
-                        is_causal=causal,
-                        # the REAL head count: sparse pads to the 64-row tile in-kernel
-                        qhead_per_kvhead=nheads_per_kv,
-                        nheads_kv=num_head_kv,
-                        hdim=head_dim,
-                        hdimv=head_dim_v,
-                        use_clc_scheduler=use_clc_scheduler
-                        if use_clc_scheduler is not None
-                        else True,
-                        has_qk=has_qk,
-                        pack_gqa=pack_gqa,
-                        # paged / top-k KV gathers into the unified sK slot -> q_in_tmem
-                        q_in_tmem=mla_1cta_q_tmem or page_table is not None or sparse_kv,
-                        has_seqused_q=seqused_q is not None,
-                        has_cu_seqlens_q=cu_seqlens_q is not None,
-                        use_cpasync_load_KV=paged_kv_cpasync or sparse_kv,
-                        is_split_kv=is_split_kv,
-                        is_fp8=is_fp8,
-                        is_topk_gather=sparse_kv,
-                        topk_length=gather_kv_length if sparse_kv else 0,
-                        rescale_threshold=mla_fwd_rescale_threshold,
-                    )
+                    if mla_1cta_kb64:
+                        fa_fwd = FlashAttentionMLAForward1CtaKb64Sm100(
+                            is_causal=causal,
+                            qhead_per_kvhead=nheads_per_kv,
+                            nheads_kv=num_head_kv,
+                            hdim=head_dim,
+                            hdimv=head_dim_v,
+                            use_clc_scheduler=mla_1cta_use_clc,
+                            has_qk=has_qk,
+                            has_seqused_q=seqused_q is not None,
+                            has_cu_seqlens_q=cu_seqlens_q is not None,
+                            topk_length=gather_kv_length,
+                            rescale_threshold=mla_fwd_rescale_threshold,
+                            o_store_bits=256 if mla_1cta_kb64_o_align32 else 128,
+                        )
+                    else:
+                        fa_fwd = FlashAttentionMLAForward1CtaSm100(
+                            is_causal=causal,
+                            # the REAL head count: sparse pads to the 64-row tile in-kernel
+                            qhead_per_kvhead=nheads_per_kv,
+                            nheads_kv=num_head_kv,
+                            hdim=head_dim,
+                            hdimv=head_dim_v,
+                            use_clc_scheduler=mla_1cta_use_clc,
+                            has_qk=has_qk,
+                            pack_gqa=pack_gqa,
+                            # paged / top-k KV gathers into the unified sK slot -> q_in_tmem
+                            q_in_tmem=mla_1cta_q_tmem or page_table is not None or sparse_kv,
+                            has_seqused_q=seqused_q is not None,
+                            has_cu_seqlens_q=cu_seqlens_q is not None,
+                            use_cpasync_load_KV=paged_kv_cpasync or sparse_kv,
+                            is_split_kv=is_split_kv,
+                            is_fp8=is_fp8,
+                            is_topk_gather=sparse_kv,
+                            topk_length=gather_kv_length if sparse_kv else 0,
+                            rescale_threshold=mla_fwd_rescale_threshold,
+                        )
                 else:
                     fa_fwd = FlashAttentionMLAForwardSm100(
                         is_causal=causal,

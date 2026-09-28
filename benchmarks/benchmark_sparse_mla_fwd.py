@@ -3,10 +3,13 @@
 MQA, hdim 64 (rope) + 512 (latent), inference (no grad). For each shape the same inputs
 and index lists go through:
   2cta    FLASH_ATTENTION_MLA_1CTA=0 -- Q heads padded to 128 per token
-  1cta    FLASH_ATTENTION_MLA_1CTA=1 -- padded to 64 (<= 64 heads only)
+  1cta    FLASH_ATTENTION_MLA_1CTA=1 -- padded to 64 (<= 64 heads only); exactly 64 heads
+          run the 64-key-block (kb64) mainloop
+  1cta_kb128  the same with FLASH_ATTENTION_MLA_1CTA_KB64=0 (the 128-key mainloop)
   dense   1CTA dense MLA over topk contiguous keys (same FLOPs, no gather): a
           speed-of-light reference for the gather
-at each requested ptxas level (FLASH_ATTENTION_MLA_PTXAS_OPTIONS; --ptxas default O2).
+at each requested ptxas level (FLASH_ATTENTION_MLA_PTXAS_OPTIONS; --ptxas default O2, or
+"shipped" for each kernel's interface default, _MLA_PTXAS_DEFAULTS).
 
 Timing:
   hot   same inputs back to back (KV can stay L2-resident across iterations)
@@ -97,7 +100,7 @@ def main():
     ap.add_argument("--causal", action="store_true", help="bottom-right causal (prefill)")
     ap.add_argument("--kernels", nargs="+", default=["2cta", "1cta", "dense"])
     ap.add_argument("--ptxas", nargs="+", default=["default", "O2"],
-                    help="ptxas levels: default, or O<n> (passed as -O<n>)")
+                    help="ptxas levels: default, O<n> (passed as -O<n>), or shipped")
     ap.add_argument("--cache", nargs="+", default=["cold", "hot"])
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
@@ -142,10 +145,14 @@ def main():
             kw_dense = dict(q=qv, k=vd, v=vd)
         out_2cta = {}
         for kernel, ptxas, cache in itertools.product(args.kernels, args.ptxas, args.cache):
-            if kernel == "1cta" and h > 64:
+            if kernel.startswith("1cta") and h > 64:
                 continue
             os.environ["FLASH_ATTENTION_MLA_1CTA"] = "0" if kernel == "2cta" else "1"
-            os.environ["FLASH_ATTENTION_MLA_PTXAS_OPTIONS"] = "" if ptxas == "default" else f"-{ptxas}"
+            os.environ["FLASH_ATTENTION_MLA_1CTA_KB64"] = "0" if kernel == "1cta_kb128" else "1"
+            if ptxas == "shipped":
+                os.environ.pop("FLASH_ATTENTION_MLA_PTXAS_OPTIONS", None)
+            else:
+                os.environ["FLASH_ATTENTION_MLA_PTXAS_OPTIONS"] = "" if ptxas == "default" else f"-{ptxas}"
             if kernel == "dense":
                 fn = lambda: flash_attn_func(**kw_dense, causal=False)
             else:
@@ -154,8 +161,11 @@ def main():
             match = ""
             if kernel == "2cta":
                 out_2cta[ptxas] = out
-            elif kernel == "1cta" and ptxas in out_2cta:
-                match = str(torch.equal(out, out_2cta[ptxas]))
+            elif kernel.startswith("1cta") and ptxas in out_2cta:
+                # "True" when bitwise; the kb64 mainloop agrees to bf16 rounding (rel-L2)
+                o2 = out_2cta[ptxas].float()
+                match = ("True" if torch.equal(out, out_2cta[ptxas])
+                         else f"relL2={((out.float() - o2).norm() / o2.norm()).item():.1e}")
             ms = time_fn(fn, args.iters, args.warmup, cache == "cold", flush_buf)
             gbps = payload_bytes / (ms * 1e-3) / 1e9 if kernel != "dense" else (
                 b * s_q * min(args.topk, s_k) * row_elems * 2) / (ms * 1e-3) / 1e9
