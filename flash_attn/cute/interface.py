@@ -1269,10 +1269,17 @@ def _flash_attn_fwd(
     mla_1cta_q_tmem = (
         mla_1cta and os.environ.get("FLASH_ATTENTION_MLA_1CTA_Q_TMEM", "1") == "1"
     )
+    # Opt-in extra ptxas flags for the MLA (qv) forward kernels, e.g. "-O2" to ablate
+    # register spilling at the default ptxas level. Part of the compile key: the JIT
+    # caches (in-memory and on disk) are keyed on it, not on compile options.
+    mla_ptxas_options = (
+        os.environ.get("FLASH_ATTENTION_PTXAS_OPTIONS", "") if qv is not None else ""
+    )
 
     compile_key = (
         mla_1cta,
         mla_1cta_q_tmem,
+        mla_ptxas_options,
         dtype,
         head_dim,
         head_dim_v,
@@ -1625,7 +1632,8 @@ def _flash_attn_fwd(
                 learnable_sink=learnable_sink_tensor,
                 mOlo=o_lo_tensor,
                 stream=current_stream,
-                options="--enable-tvm-ffi",
+                options="--enable-tvm-ffi"
+                + (f" --ptxas-options '{mla_ptxas_options}'" if mla_ptxas_options else ""),
             )
         else:
             compile_args = [
