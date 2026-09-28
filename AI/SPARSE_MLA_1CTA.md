@@ -123,11 +123,29 @@ ncu at 16k training (`agent_space/ncu_b7/`, summary: `agent_space/ncu_summary.py
 | memory throughput | 54.9% | 54.3% | 32.9% |
 | L2 hit rate | 93.1% | 93.1% | 88.4% |
 | issue slots busy | 33.7% | 33.5% | 17.2% |
-| local-memory spill requests | 0 | 4.3 M | 65.9 M |
+| local-memory spill requests (instrumented, see below) | 0 | 4.3 M | 65.9 M |
 | top stall (per issue) | long scoreboard 5.8 | long scoreboard 5.9 | long scoreboard 18.0 |
 
 kb64 and the PR's kernel have the same profile; kb64 is ahead by its spill-free register
-allocation. The 128-key mainloop spills heavily under CLC at -O2 (see Follow-ups).
+allocation.
+
+The 128-key row overstates its spilling. ncu counts spill requests in its SASS-instrumented
+pass, which slows the kernel, so every mbarrier retry-loop iteration is counted many times.
+Joining ncu's per-instruction counts with a lineinfo disassembly
+(`agent_space/spill_dyn.py`, `agent_space/spill128/`) attributes the local traffic as follows:
+
+- **About 97% of the executed local loads are one reload** (`LDL [R1+0xa4]`): the SMEM
+  storage base address, stored once at kernel entry. It is reloaded inside each mbarrier
+  wait's retry loop, in softmax, the CLC consumer, MMA and the gather warps. It runs only
+  while the warp is already blocked.
+- **The real spills are in the epilogue warps' final O store in training** (lines
+  3524/3559, the bf16 O plus the `o_lo` residual at a 128-register budget). Per epilogue
+  warp per tile, that is about 130 local stores and 200 loads.
+- **Hardware-counted local requests are small:** 7.8 M loads and 6.9 M stores, 0.5% of
+  the LSU peak.
+
+This epilogue belongs to the bf16 sparse training forward, which only
+`FLASH_ATTENTION_MLA_1CTA_KB64=0` reaches now; the default route is kb64.
 
 Decode and prefill at 64 heads (`benchmarks/benchmark_sparse_mla_fwd.py --heads 64
 --kernels 2cta 1cta 1cta_kb128 --ptxas shipped`; `agent_space/bench_sparse_1cta/b7_*.csv`),
@@ -446,9 +464,20 @@ Backward, sparse MLA training step:
    with fewer than 64 heads would need P / row_max emission, because the recompute-P
    backward rejects padded head tiles. It is not started, and is worth it only in the
    throughput regimes above.
-5. **128-key mainloop spills under CLC.** ncu shows 66 M local-memory spill requests at
-   -O2 with CLC (the -O2 measurement was without CLC). It serves < 64 heads and fp8;
-   re-ablate its ptxas level and budgets there.
+5. **128-key mainloop spills: resolved, no action needed.** The 66 M figure is ncu's
+   instrumented count. It is dominated by the reload of the SMEM base address inside the
+   mbarrier retry loops (see the ncu table). The only real spills are in the bf16 sparse
+   training epilogue (O plus `o_lo`), which default routing no longer reaches.
+
+   Every shipped 128-key variant compiles to 0 B of local memory at -O2
+   (`agent_space/spill_probe_128.py`):
+   - dense bf16 prefill at 16 heads with CLC;
+   - dense decode at 128 heads without CLC;
+   - dense fp8;
+   - sparse fp8 with CLC on and off.
+
+   The bf16 sparse A/B build (KB64=0) has 16 B of local memory for inference with CLC,
+   112 B without CLC (MMA warp), and 208-216 B for training.
 6. **kb64 for < 64 heads.** It needs a predicated (or TMA) Q staging in place of the
    identity-row gather, and head guards in the O / LSE stores.
 7. **Dense bf16 prefill** runs 0.53-0.64x of 2CTA on the 1CTA kernel (see "Prefill: 1CTA vs
