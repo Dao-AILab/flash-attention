@@ -1317,6 +1317,7 @@ class FlashAttentionMLAForward1CtaSm100:
                     sV,
                     pipeline_K,
                     pipeline_V,
+                    sO_empty_mbar_ptr,
                     staging_mbar_ptr,
                     sK_free_mbar_ptr,
                     block_info,
@@ -1850,6 +1851,7 @@ class FlashAttentionMLAForward1CtaSm100:
         sV: cute.Tensor,
         pipeline_K: Optional[pipeline.PipelineAsyncUmma],
         pipeline_V: pipeline.PipelineAsyncUmma,
+        sO_empty_mbar_ptr: cute.Pointer,
         staging_mbar_ptr: cute.Pointer,
         sK_free_mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
@@ -1864,6 +1866,8 @@ class FlashAttentionMLAForward1CtaSm100:
             producer_state_K = pipeline.make_pipeline_state(Producer, stages=self.num_stages_K)
         producer_state_V = pipeline.make_pipeline_state(Producer, stages=self.num_stages_V)
         staging_phase = Int32(0)
+        # phase 1 first, as in the load warp: the first wait passes (no previous tile)
+        producer_phase_O = Int32(1)
         tidx = cute.arch.thread_idx()[0] % self.num_cpasync_load_threads
         dv_split = const_expr(self.hdimv // self.num_hdimv_splits)
         page_size_divmod = FastDivmodDivisor(cute.size(mV.shape[0]))
@@ -1926,6 +1930,14 @@ class FlashAttentionMLAForward1CtaSm100:
                     # warp's tcgen05.cp's have consumed it before gathering K over it.
                     cute.arch.mbarrier_wait(staging_mbar_ptr, phase=staging_phase)
                     staging_phase ^= 1
+                if const_expr(self.use_tma_O):
+                    # sO overlays V stage 0 and V is written by THIS warp group, so the
+                    # load warp's sO_empty wait does not order it: under a persistent (CLC)
+                    # scheduler the next tile's V gather would otherwise race the previous
+                    # tile's epilogue writes / TMA store of sO. Every thread waits (a wait
+                    # is not an arrival, so the barrier's count of 1 epilogue arrive holds).
+                    cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
+                    producer_phase_O ^= 1
                 for i in cutlass.range(num_n_blocks_load, unroll=1):
                     n_block = n_block_first - i
                     if const_expr(self.has_qk):

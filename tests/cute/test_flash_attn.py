@@ -3534,6 +3534,49 @@ def test_flash_attn_mla_1cta_split_distribution(varlen_q, monkeypatch):
         torch.testing.assert_close(lse_s[b, :rows], lse_1[b, :rows], atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.skipif(not MLA_1CTA, reason="1CTA MLA cp.async KV path")
+@pytest.mark.parametrize("has_qk", [True, False])
+def test_flash_attn_mla_1cta_paged_clc_bitwise(has_qk):
+    """The persistent (CLC) scheduler only changes which CTA runs a tile, so its output
+    must be bitwise identical to the non-persistent one. Regression test for the sO /
+    V-stage-0 overlap: the cp.async KV gather (paged, page_size != tile_n) must wait for
+    the previous tile's TMA O store (sO overlays V) -- see agent_space/ledger_sO_race.md.
+    Needs >1 tile per CTA (CLC, causal so the interface keeps CLC on) and the TMA O store
+    (dense batched Q)."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    import flash_attn.cute.utils as fa_utils
+
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    b, s, h, page_size = 4, 2048, 16, 16
+    q = torch.randn(b, s, h, 64, device=device, dtype=dtype) if has_qk else None
+    qv = torch.randn(b, s, h, 512, device=device, dtype=dtype)
+    k = torch.randn(b, s, 1, 64, device=device, dtype=dtype)
+    v = torch.randn(b, s, 1, 512, device=device, dtype=dtype)
+    num_pages = b * s // page_size
+    perm = torch.randperm(num_pages, device=device)
+    page_table = perm.view(b, s // page_size).to(torch.int32)
+    to_pages = lambda x: x.reshape(num_pages, page_size, 1, x.shape[-1])[perm.argsort()].contiguous()  # noqa: E731
+    k_p, v_p = to_pages(k), to_pages(v)
+    if not has_qk:
+        q, k_p, qv = qv, v_p, None  # shared_kv: interface routes it as qv-only MLA
+    seqused_k = torch.full((b,), s, dtype=torch.int32, device=device)
+    outs = []
+    saved = fa_utils._fa_clc_enabled
+    try:
+        for clc in (False, True):
+            fa_utils._fa_clc_enabled = clc
+            outs.append(flash_attn_varlen_func(
+                q, k_p, v_p, qv=qv, causal=True, page_table=page_table,
+                seqused_k=seqused_k, max_seqlen_q=s, return_lse=True,
+            ))
+    finally:
+        fa_utils._fa_clc_enabled = saved
+    assert torch.equal(outs[0][0], outs[1][0])
+    assert torch.equal(outs[0][1], outs[1][1])
+
+
 def _mla_sink_ref(q, qv, k, v, softmax_scale, causal, sink):
     """fp32 MLA-absorbed reference returning (out, lse); the sink is one extra logit per Q head."""
     q, qv, k, v = [t.float() for t in (q, qv, k, v)]
