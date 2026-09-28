@@ -3753,6 +3753,201 @@ def test_flash_attn_mla_1cta_fp8_descales_must_be_shared():
         )
 
 
+def rect_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, causal, device, *,
+                      fill_frac=1.0, shuffle_slots=True, oob_frac=0.0, seed=0):
+    """Top-k index lists for rectangular (s_q != s_k) sparse attention tests.
+
+    Query t may attend keys [0, limit_t) with limit_t = t + 1 + s_k - s_q when causal
+    (bottom-right aligned, the kernel's seqlen_k_limit) and s_k otherwise. Each row draws
+    min(topk, fill_frac * limit_t) DISTINCT keys spread over its whole valid range and pads
+    with -1 (so topk > seqlen_k works). shuffle_slots scatters the valid entries across
+    slots; oob_frac turns that fraction of the -1 padding into indices >= limit_t (keys
+    the kernel must mask by range, not by sentinel).
+    """
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    idx = torch.full((batch_size, seqlen_q, topk_len), -1, dtype=torch.int32)
+    for b in range(batch_size):
+        for t in range(seqlen_q):
+            limit = max(0, min(seqlen_k, t + 1 + seqlen_k - seqlen_q) if causal else seqlen_k)
+            n = min(topk_len, int(limit * fill_frac))
+            if n > 0:
+                idx[b, t, :n] = torch.randperm(limit, generator=g)[:n].to(torch.int32)
+            n_oob = int((topk_len - n) * oob_frac)
+            if n_oob > 0 and limit < seqlen_k:
+                idx[b, t, n:n + n_oob] = torch.randint(
+                    limit, seqlen_k, (n_oob,), generator=g, dtype=torch.int32
+                )
+            if shuffle_slots:
+                idx[b, t] = idx[b, t][torch.randperm(topk_len, generator=g)]
+    return idx.to(device).contiguous()
+
+
+def _topk_valid_rows(idx, seqlen_q, seqlen_k, causal):
+    """(b, s_q) bool: row has at least one slot the kernel treats as valid."""
+    t = torch.arange(seqlen_q, device=idx.device).view(1, -1, 1)
+    limit = (t + 1 + seqlen_k - seqlen_q).clamp(max=seqlen_k) if causal else seqlen_k
+    return ((idx >= 0) & (idx < limit)).any(-1)
+
+
+def _mla_inputs(b, s_q, s_k, h, has_qk, dtype=torch.bfloat16, seed=0):
+    torch.random.manual_seed(seed)
+    q = torch.randn(b, s_q, h, 64, device="cuda", dtype=dtype)
+    qv = torch.randn(b, s_q, h, 512, device="cuda", dtype=dtype)
+    k = torch.randn(b, s_k, 1, 64, device="cuda", dtype=dtype)
+    v = torch.randn(b, s_k, 1, 512, device="cuda", dtype=dtype)
+    if has_qk:
+        return dict(q=q, k=k, v=v, qv=qv), (q, k, v, qv)
+    # shared_kv: the interface routes (q=qv, k=v, v=v) as qv-only MLA
+    return dict(q=qv, k=v, v=v), (qv, v, v, None)
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="1CTA sparse MLA forward")
+@pytest.mark.parametrize("gen", ["rect", "rect_oob"])
+@pytest.mark.parametrize("topk", [128, 1024])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(1, 8192), (128, 1024), (300, 200), (1024, 1024)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("has_qk", [True, False])
+@pytest.mark.parametrize("nheads", [1, 16, 24, 48, 64])
+def test_flash_attn_mla_1cta_sparse_fwd(nheads, has_qk, causal, seqlen_q, seqlen_k, topk, gen,
+                                        monkeypatch):
+    """Inference sparse forward on the 1CTA kernel (<= 64 heads, padded to the 64-row tile):
+    vs the reference, and vs the 2CTA kernel (padded to 128) on the same inputs."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    b = 2
+    kw, (q_r, k_r, v_r, qv_r) = _mla_inputs(b, seqlen_q, seqlen_k, nheads, has_qk)
+    idx = rect_topk_indices(b, seqlen_q, seqlen_k, topk, causal, "cuda",
+                            fill_frac=0.5 if gen == "rect_oob" else 1.0,
+                            oob_frac=0.5 if gen == "rect_oob" else 0.0)
+    kw.update(gather_kv_indices=idx, causal=causal, return_lse=True)
+    out, lse = flash_attn_func(**kw)
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
+    out_2cta, lse_2cta = flash_attn_func(**kw)
+    # Same math and accumulation order as the 2CTA kernel: bitwise identical today. If a
+    # future change reorders the reduction, relax this to the reference tolerance below.
+    assert torch.equal(out, out_2cta)
+    assert torch.equal(lse, lse_2cta)
+
+    valid = _topk_valid_rows(idx, seqlen_q, seqlen_k, causal)
+    # rows with no valid slot: O = 0, LSE = -inf (the reference NaNs there)
+    assert (out[~valid] == 0).all()
+    assert torch.isneginf(lse[~valid]).all()
+    ref_args = dict(causal=causal, gather_kv_indices=idx)
+    out_ref, _ = attention_ref(q_r, k_r, v_r, qv=qv_r, **ref_args)
+    out_pt, _ = attention_ref(q_r, k_r, v_r, qv=qv_r, upcast=False, reorder_ops=True, **ref_args)
+    if not valid.any():
+        return
+    # compare valid rows only: the reference is NaN on rows with no valid slot
+    err = (out.float() - out_ref.float()).abs()[valid].max().item()
+    err_pt = (out_pt.float() - out_ref.float()).abs()[valid].max().item()
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref)[valid].abs().max().item()
+    assert err <= 2 * err_pt + fwd_atol, (err, err_pt, fwd_atol)
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="1CTA sparse MLA forward")
+@pytest.mark.parametrize("has_qk", [True, False])
+@pytest.mark.parametrize("nheads", [16, 64])
+def test_flash_attn_mla_1cta_sparse_bitmask_mapping(nheads, has_qk):
+    """The bit -> S-column mapping of the validity bitmask (Layout E: each thread owns 64
+    columns, two 32-slot words). Uniform patterns can't catch swapped words or halves, so:
+    (1) one valid slot at each word/half boundary, in the first and the last processed
+    n_block -- the output must then be exactly that key's V row; (2) a distinct random
+    pattern per 32-slot word, checked against the reference."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    b, s_q, s_k, topk = 1, 2, 512, 256
+    kw, (q_r, k_r, v_r, qv_r) = _mla_inputs(b, s_q, s_k, nheads, has_qk)
+    v_rows = kw["v"]
+    for n_block in (0, topk // 128 - 1):
+        for slot in (0, 31, 32, 63, 64, 95, 96, 127):
+            idx = torch.full((b, s_q, topk), -1, dtype=torch.int32, device="cuda")
+            key = 37 + slot  # any distinct key per case
+            idx[..., n_block * 128 + slot] = key
+            out, _ = flash_attn_func(**kw, gather_kv_indices=idx, return_lse=True)
+            want = v_rows[0, key, 0].expand(s_q, nheads, -1)
+            assert torch.equal(out[0], want), f"n_block={n_block} slot={slot}"
+    # distinct per-word patterns: every 32-slot word differs, no half is a copy of the other
+    g = torch.Generator(device="cpu").manual_seed(1)
+    words = torch.randint(0, 2**32, (topk // 32,), generator=g, dtype=torch.int64)
+    assert len(set(words.tolist())) == len(words)
+    bits = ((words.view(-1, 1) >> torch.arange(32)) & 1).flatten().bool()
+    keys = torch.randperm(s_k, generator=g)[:topk].to(torch.int32)
+    idx = torch.where(bits, keys, torch.full_like(keys, -1)).view(1, 1, topk).expand(b, s_q, topk)
+    idx = idx.contiguous().cuda()
+    out, _ = flash_attn_func(**kw, gather_kv_indices=idx, return_lse=True)
+    out_ref, _ = attention_ref(q_r, k_r, v_r, qv=qv_r, gather_kv_indices=idx)
+    out_pt, _ = attention_ref(q_r, k_r, v_r, qv=qv_r, gather_kv_indices=idx, upcast=False,
+                              reorder_ops=True)
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + fwd_atol
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="1CTA sparse MLA forward")
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("nheads", [1, 24, 48, 64])
+def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sink, monkeypatch):
+    """Padded heads must never be written: with fewer than 64 heads the packed layout maps a
+    token's padded rows onto the next token's heads (and past the tensor for the last
+    token). out/lse are views into canary-filled buffers; the tails must survive, and every
+    real row must match the 2CTA kernel. Covers both the TMA O store (dense Q) and the
+    guarded LSE / sink paths."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    b, s_q, s_k, topk = 2, 33, 1024, 256
+    kw, _ = _mla_inputs(b, s_q, s_k, nheads, has_qk=True)
+    idx = rect_topk_indices(b, s_q, s_k, topk, False, "cuda", fill_frac=0.3)
+    sink = (torch.randn(nheads, device="cuda", dtype=torch.bfloat16) * 4
+            if has_learnable_sink else None)
+    canary_out, canary_lse, pad = -777.0, -555.0, 64 * 512 * 4
+    n_out, n_lse = b * s_q * nheads * 512, b * s_q * nheads
+    buf_out = torch.full((n_out + pad,), canary_out, device="cuda", dtype=torch.bfloat16)
+    buf_lse = torch.full((n_lse + pad,), canary_lse, device="cuda", dtype=torch.float32)
+    out = buf_out[:n_out].view(b, s_q, nheads, 512)
+    lse = buf_lse[:n_lse].view(b, s_q, nheads)
+    _flash_attn_fwd(kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
+                    learnable_sink=sink, out=out, lse=lse, return_lse=True)
+    torch.cuda.synchronize()
+    assert (buf_out[n_out:] == canary_out).all(), "padded-head O rows written past the tensor"
+    assert (buf_lse[n_lse:] == canary_lse).all(), "padded-head LSE written past the tensor"
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
+    out_2cta, lse_2cta, *_ = _flash_attn_fwd(
+        kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
+        learnable_sink=sink, return_lse=True,
+    )
+    assert torch.equal(out, out_2cta)
+    assert torch.equal(lse, lse_2cta)
+
+
+@pytest.mark.parametrize("nheads", [64, 128])
+def test_flash_attn_mla_sparse_no_split_kv(nheads, monkeypatch):
+    """Split-KV is disabled for sparse MLA on both kernels. Under FLASH_ATTENTION_MLA_1CTA=1,
+    64 heads route to 1CTA and 128 fall back to 2CTA. An explicit num_splits > 1 must
+    raise -- checked before config selection, which would otherwise silently turn it into 1
+    on the 2CTA route -- and the heuristic (num_splits=0) must resolve to one split: the
+    combine kernel never runs."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    import flash_attn.cute.interface as fa_interface
+    b, s_q, s_k, topk = 1, 1, 8192, 2048
+    kw, _ = _mla_inputs(b, s_q, s_k, nheads, has_qk=True)
+    idx = rect_topk_indices(b, s_q, s_k, topk, False, "cuda")
+    with pytest.raises(ValueError, match="num_splits=3 is not supported with gather_kv_indices"):
+        flash_attn_func(**kw, gather_kv_indices=idx, num_splits=3)
+    calls = []
+    real_combine = fa_interface._flash_attn_fwd_combine
+
+    def recording_combine(*args, **kwargs):
+        calls.append(1)
+        return real_combine(*args, **kwargs)
+
+    recording_combine.compile_cache = real_combine.compile_cache
+    monkeypatch.setattr(fa_interface, "_flash_attn_fwd_combine", recording_combine)
+    out_h, lse_h = flash_attn_func(**kw, gather_kv_indices=idx, num_splits=0, return_lse=True)
+    assert not calls, "sparse MLA ran split-KV (combine was called)"
+    out_1, lse_1 = flash_attn_func(**kw, gather_kv_indices=idx, num_splits=1, return_lse=True)
+    assert torch.equal(out_h, out_1) and torch.equal(lse_h, lse_1)
+
+
 def causal_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device):
     """Top-k indices as produced by a causal sparse-attention selector: query t
     gets min(t+1, seqlen_k, topk_len) valid keys drawn from [0, t], with

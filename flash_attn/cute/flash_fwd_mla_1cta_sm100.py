@@ -32,8 +32,12 @@
 #    descriptor coordinate), otherwise a cp.async gather by a dedicated 4-warp load
 #    warp group (warps 12-15) reusing PagedKVManager. Requires q_in_tmem when there is
 #    a rope part.
-#  - Not supported: topk/DSA gather, bitmask, P/rowmax emission, local.
-#    pack_gqa is supported (any ratio up to 128).
+#  - Sparse top-k gather (MQA, <= 64 Q heads, inference): one tile = one token's heads
+#    padded to 64 in-kernel (qheads_first_tma_view: TMA zero-fills / drops the padded
+#    rows). The cp.async warp group gathers K/V rows by index and builds a per-n_block
+#    validity bitmask (0 <= idx < seqlen_k_limit, causal folded in) that the softmax
+#    warps apply to S. No split-KV on this path.
+#  - Not supported: P/rowmax emission, local. pack_gqa is supported (any ratio up to 128).
 #
 # SMEM (226 KB): sQv 64K + sV 128K (one n_block) + sP 16K + stats, plus either
 #   sQ 8K + sK 8K, or (q_in_tmem) a unified sK 16K whose first half doubles as the
@@ -49,7 +53,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int64, Int32, Boolean, const_expr
+from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
 from cutlass.cute import FastDivmodDivisor
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -59,8 +63,15 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 from quack import copy_utils
 
 from flash_attn.cute import utils as fa_utils
-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+from flash_attn.cute.pack_gqa import (
+    PackGQA,
+    pack_gqa_layout,
+    qheads_first_tma_view,
+    regroup_padded_qheads,
+    sparse_mla_qhead_tile,
+)
 from flash_attn.cute.paged_kv import PagedKVManager
+from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
@@ -101,12 +112,38 @@ class FlashAttentionMLAForward1CtaSm100:
         use_cpasync_load_KV: bool = False,
         is_split_kv: bool = False,
         is_fp8: bool = False,
+        is_topk_gather: bool = False,
+        topk_length: int = 0,
         num_stages_V: Optional[int] = None,
         num_stages_K: Optional[int] = None,
         num_stages_P: Optional[int] = None,
         _qk_issue_last: bool = False,
     ):
-        self.is_causal = is_causal
+        # ==== sparse top-k gather ====
+        # One tile = one token: its Q heads (MQA) padded to the 64-row tile, so a single
+        # gathered K/V list serves the whole tile. qhead_per_kvhead is the REAL head count;
+        # the padding is done in-kernel (see pack_gqa.qheads_first_tma_view).
+        self.is_topk_gather = is_topk_gather
+        self.topk_length = topk_length
+        self.qhead_per_kvhead_valid = qhead_per_kvhead
+        if is_topk_gather:
+            assert pack_gqa, "sparse top-k gather packs the Q heads of one token (pack_gqa)"
+            assert nheads_kv == 1, "sparse top-k gather is MQA-only"
+            assert use_cpasync_load_KV, "sparse top-k gather loads K/V with cp.async"
+            assert not is_split_kv, "split-KV is disabled for sparse MLA"
+            assert topk_length > 0 and topk_length % 128 == 0, (
+                f"topk_length must be a positive multiple of tile_n=128, got {topk_length}"
+            )
+            qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead, min_tile=64)
+            assert qhead_per_kvhead == 64, (
+                "the 1CTA sparse MLA kernel supports <= 64 Q heads (larger counts use 2CTA)"
+            )
+        self.pad_qheads = qhead_per_kvhead != self.qhead_per_kvhead_valid
+        # Sparse: causal is applied through the index-validity bitmask (idx < seqlen_k_limit
+        # with the bottom-right causal limit), not positionally -- the S columns are
+        # gathered slots, not key positions. The positional machinery sees non-causal.
+        self.is_causal_topk = is_causal and is_topk_gather
+        self.is_causal = is_causal and not is_topk_gather
         self.is_local = False
         self.qhead_per_kvhead = qhead_per_kvhead
         self.nheads_kv = nheads_kv
@@ -123,6 +160,9 @@ class FlashAttentionMLAForward1CtaSm100:
         # the page index as a descriptor coordinate.
         self.use_cpasync_load_KV = use_cpasync_load_KV
         self.use_tma_KV = not use_cpasync_load_KV
+        assert not is_topk_gather or self.q_in_tmem or not has_qk, (
+            "sparse top-k gather with a rope part requires q_in_tmem=True (unified sK slot)"
+        )
         # The cp.async gather fills one unified (tile_n, hdim) sK slot. The legacy
         # two-phase QK path instead loads K as interleaved 32-row token gathers, which
         # would need a second, quite different paged gather for a path that is slower on
@@ -184,6 +224,9 @@ class FlashAttentionMLAForward1CtaSm100:
         self.has_seqused_q = has_seqused_q
         self.has_cu_seqlens_q = has_cu_seqlens_q
         self.is_varlen_q = has_seqused_q or has_cu_seqlens_q
+        assert not (is_topk_gather and self.is_varlen_q), (
+            "varlen Q is not yet supported on the 1CTA sparse path"
+        )
 
         # ==== tile scheduler ====
         self.is_persistent = False
@@ -352,6 +395,8 @@ class FlashAttentionMLAForward1CtaSm100:
         self.num_stages_P = 1 if num_stages_P is None else num_stages_P
         self.num_stages_Oi = 1
         self.num_stages_sm_stats = 2
+        # sparse: per-n_block validity bitmask, cp.async warp group -> softmax warps
+        self.num_stages_bitmask = 2
         assert self.num_stages_S == 2, "mainloops expect 2 stages for S"
         assert self.num_stages_V % self.num_hdimv_splits == 0, (
             "V stages must be a whole number of n_blocks (num_hdimv_splits per block)"
@@ -455,6 +500,13 @@ class FlashAttentionMLAForward1CtaSm100:
         )
         sStats_struct = cute.struct.MemRange[Float32, cute.cosize(self.sStats_layout)]
         sScale_struct = cute.struct.MemRange[Float32, cute.cosize(self.sScale_layout)]
+        # sparse only: (tile_n // 32 words, stages) validity bits, zero-size otherwise
+        sBitmask_struct = cute.struct.MemRange[
+            Uint32, cute.cosize(self.sBitmask_layout) if self.is_topk_gather else 0
+        ]
+        mbar_ptr_bitmask_struct = cute.struct.MemRange[
+            Int64, 2 * self.num_stages_bitmask if self.is_topk_gather else 0
+        ]
 
         (
             mbar_ptr_Q_struct,
@@ -495,6 +547,7 @@ class FlashAttentionMLAForward1CtaSm100:
             mbar_ptr_O0: mbar_ptr_O0_struct
             mbar_ptr_O1: mbar_ptr_O1_struct
             mbar_ptr_sm_stats: mbar_sm_stats_struct
+            mbar_ptr_bitmask: mbar_ptr_bitmask_struct
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
             # the CLC response is read with a 16-byte copy
             clc_response: cute.struct.Align[
@@ -516,6 +569,7 @@ class FlashAttentionMLAForward1CtaSm100:
             sRowMax: sStats_struct
             sRowSum: sStats_struct
             sScale: sScale_struct
+            sBitmask: sBitmask_struct
             sQv: sQv_struct
             sQ: sQ_struct
             sK: sK_struct
@@ -557,8 +611,11 @@ class FlashAttentionMLAForward1CtaSm100:
     ):
         # fmt: on
         self.has_learnable_sink = learnable_sink is not None
+        assert (mIndexTopk is not None) == self.is_topk_gather, (
+            "mIndexTopk presence must match the is_topk_gather ctor flag"
+        )
         for name, t in [
-            ("mP", mP), ("mRowMax", mRowMax), ("mIndexTopk", mIndexTopk),
+            ("mP", mP), ("mRowMax", mRowMax),
             ("window_size_left", window_size_left),
             ("window_size_right", window_size_right),
             ("mOlo", mOlo),
@@ -571,9 +628,12 @@ class FlashAttentionMLAForward1CtaSm100:
             # last mode changes (page instead of batch).
             assert mCuSeqlensK is None, "paged KV is not supported with cu_seqlens_k"
         else:
-            assert not self.use_cpasync_load_KV, (
-                "use_cpasync_load_KV requires a page table"
+            assert not self.use_cpasync_load_KV or self.is_topk_gather, (
+                "use_cpasync_load_KV requires a page table or top-k indices"
             )
+        assert not (self.is_topk_gather and mPageTable is not None), (
+            "paged KV + top-k gather is not supported"
+        )
         # Q-side varlen is a compile-time ctor flag (it selects the scheduler); K-side
         # is inferred from the tensors here, as in the 2CTA kernel.
         assert (mCuSeqlensQ is not None) == self.has_cu_seqlens_q, (
@@ -665,6 +725,23 @@ class FlashAttentionMLAForward1CtaSm100:
 
         self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
 
+        # (b, s_q, topk) -> (topk, s_q, b)
+        if const_expr(mIndexTopk is not None):
+            mIndexTopk = cute.make_tensor(
+                mIndexTopk.iterator, cute.select(mIndexTopk.layout, mode=[2, 1, 0])
+            )
+
+        # Sparse, fewer than 64 real heads: TMA sources for Q/Qv/O are heads-first views
+        # with the REAL head extent, so TMA zero-fills the padded rows of each token's
+        # tile on load and drops them on store (see pack_gqa.qheads_first_tma_view).
+        if const_expr(self.pad_qheads):
+            mQ_tma, mQv_tma, mO_tma = [
+                qheads_first_tma_view(mX, self.qhead_per_kvhead_valid, head_idx=2)
+                if mX is not None
+                else None
+                for mX in (mQ, mQv, mO)
+            ]
+
         if const_expr(self.pack_gqa):
             # (s_q, d, h, b) -> ((qhead_per_kvhead, s_q), d, h_kv, b); mode 0 becomes the
             # packed row index m = h_in_group + qhead_per_kvhead * q_pos.
@@ -676,6 +753,8 @@ class FlashAttentionMLAForward1CtaSm100:
             ]
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
+        if const_expr(not self.pad_qheads):
+            mQ_tma, mQv_tma, mO_tma = mQ, mQv, mO
 
         # ==== Prepare MMAs ====
         # (local_var, dtype_a, major_a, major_b, mma_tiler)
@@ -762,6 +841,8 @@ class FlashAttentionMLAForward1CtaSm100:
 
         self.sStats_layout = cute.make_layout((self.cta_tile_m, self.num_acc_halves))
         self.sScale_layout = cute.make_layout((self.cta_tile_m, self.num_stages_sm_stats))
+        # word w of a stage holds the validity bits of gathered slots [32w, 32w + 32)
+        self.sBitmask_layout = cute.make_layout((self.tile_n // 32, self.num_stages_bitmask))
 
         # fmt: off
         for attr, dtype, layout in [
@@ -779,8 +860,12 @@ class FlashAttentionMLAForward1CtaSm100:
         )
         cta_shape = cta_layout_vmnk.shape
 
-        def make_tma(make_fn, mX, smem_layout, mma_tiler, tiled_mma):
-            return make_fn(tma_load_op, mX, smem_layout, mma_tiler, tiled_mma, cta_shape)
+        def make_tma(make_fn, mX, smem_layout, mma_tiler, tiled_mma, packed_qheads=False):
+            atom, tensor = make_fn(tma_load_op, mX, smem_layout, mma_tiler, tiled_mma, cta_shape)
+            if const_expr(packed_qheads and self.pad_qheads):
+                # fold the heads-first coordinates back into ((64, s_q), ..., 1, ...)
+                tensor = regroup_padded_qheads(tensor, self.qhead_per_kvhead, head_idx=2)
+            return atom, tensor
 
         A, B = cute.nvgpu.make_tiled_tma_atom_A, cute.nvgpu.make_tiled_tma_atom_B
 
@@ -795,8 +880,8 @@ class FlashAttentionMLAForward1CtaSm100:
             else (self.sK32_layout, self.mma_tiler_QK32, tiled_mma_QK32)
         )
         _tma_specs = [
-            ("tma_atom_Q",  "tma_tensor_Q",  A, mQ,  self.sQ_layout,   self.mma_tiler_QK,   tiled_mma_Qst),
-            ("tma_atom_Qv", "tma_tensor_Qv", A, mQv, self.sQv_layout,  self.mma_tiler_QvV,  tiled_mma_QvV),
+            ("tma_atom_Q",  "tma_tensor_Q",  A, mQ_tma,  self.sQ_layout,   self.mma_tiler_QK,   tiled_mma_Qst),
+            ("tma_atom_Qv", "tma_tensor_Qv", A, mQv_tma, self.sQv_layout,  self.mma_tiler_QvV,  tiled_mma_QvV),
             ("tma_atom_K",  "tma_tensor_K",  B, mK,  *_K_tma),
             ("tma_atom_V",  "tma_tensor_V",  B, mV,  self.sV_layout,   self.mma_tiler_QvV,  tiled_mma_QvV),
         ]
@@ -808,7 +893,10 @@ class FlashAttentionMLAForward1CtaSm100:
                 atom_name in ("tma_atom_K", "tma_atom_V") and not self.use_tma_KV
             )
             _tmas[atom_name], _tmas[tensor_name] = (
-                make_tma(make_fn, m, smem_layout, mma_tiler, tiled_mma)
+                make_tma(
+                    make_fn, m, smem_layout, mma_tiler, tiled_mma,
+                    packed_qheads=atom_name in ("tma_atom_Q", "tma_atom_Qv"),
+                )
                 if const_expr(m is not None and not skip)
                 else (None, None)
             )
@@ -857,8 +945,12 @@ class FlashAttentionMLAForward1CtaSm100:
         if const_expr(self.use_tma_O):
             tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
             tma_atom_O, tma_tensor_O = cpasync.make_tiled_tma_atom(
-                tma_store_op, mO, cute.select(sO_layout, mode=[0, 1]), self.epi_tile
+                tma_store_op, mO_tma, cute.select(sO_layout, mode=[0, 1]), self.epi_tile
             )
+            if const_expr(self.pad_qheads):
+                tma_tensor_O = regroup_padded_qheads(
+                    tma_tensor_O, self.qhead_per_kvhead, head_idx=2
+                )
         else:
             # packed rows are not contiguous in gmem, and varlen-q rows past seqlen_q
             # must not be written at all: store rmem -> gmem per row instead.
@@ -948,6 +1040,15 @@ class FlashAttentionMLAForward1CtaSm100:
             barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.SoftmaxStatsEmpty),
             num_threads=self.num_softmax_threads + self.num_epilogue_threads,
         )
+        # sparse: the cp.async warp group syncs on it while assembling each bitmask
+        self.cpasync_barrier = (
+            cutlass.pipeline.NamedBarrier(
+                barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.Cpasync),
+                num_threads=self.num_cpasync_load_threads,
+            )
+            if const_expr(self.is_topk_gather)
+            else None
+        )
 
         LOG2_E = math.log2(math.e)
         softmax_scale_log2 = softmax_scale * LOG2_E
@@ -965,6 +1066,7 @@ class FlashAttentionMLAForward1CtaSm100:
             mSeqUsedQ,
             mSeqUsedK,
             mPageTable,
+            mIndexTopk,
             descale_tensors,
             learnable_sink,
             tma_atom_Q,
@@ -985,6 +1087,7 @@ class FlashAttentionMLAForward1CtaSm100:
             self.sP_layout_staged,
             self.sStats_layout,
             self.sScale_layout,
+            self.sBitmask_layout,
             sO_layout,
             tiled_mma_QK,
             tiled_mma_Qst,
@@ -1017,6 +1120,7 @@ class FlashAttentionMLAForward1CtaSm100:
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
+        mIndexTopk: Optional[cute.Tensor],
         descale_tensors,
         learnable_sink: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
@@ -1037,6 +1141,7 @@ class FlashAttentionMLAForward1CtaSm100:
         sP_layout_staged: cute.ComposedLayout,
         sStats_layout: cute.Layout,
         sScale_layout: cute.Layout,
+        sBitmask_layout: cute.Layout,
         sO_layout: cute.ComposedLayout,
         tiled_mma_QK: cute.TiledMma,
         tiled_mma_Qst: cute.TiledMma,
@@ -1140,6 +1245,10 @@ class FlashAttentionMLAForward1CtaSm100:
         pipeline_O0       = make_pipeline(UmmaAsync, storage.mbar_ptr_O0,       self.num_stages_Oi,       mma_warp,   epi_threads)
         pipeline_O1       = make_pipeline(UmmaAsync, storage.mbar_ptr_O1,       self.num_stages_Oi,       mma_warp,   epi_threads)
         pipeline_sm_stats = make_pipeline(Async,     storage.mbar_ptr_sm_stats, self.num_stages_sm_stats, sm_threads, epi_threads)
+        pipeline_bitmask  = (
+            make_pipeline(Async, storage.mbar_ptr_bitmask, self.num_stages_bitmask, cpasync_threads, sm_threads)
+            if const_expr(self.is_topk_gather) else None
+        )
         # fmt: on
 
         sO_empty_mbar_ptr = storage.sO_empty_mbar_ptr
@@ -1181,6 +1290,11 @@ class FlashAttentionMLAForward1CtaSm100:
         sRowMax = storage.sRowMax.get_tensor(sStats_layout)
         sRowSum = storage.sRowSum.get_tensor(sStats_layout)
         sScale = storage.sScale.get_tensor(sScale_layout)
+        sBitmask = (
+            storage.sBitmask.get_tensor(sBitmask_layout)
+            if const_expr(self.is_topk_gather)
+            else None
+        )
 
         # sO overlays sV (first dv-split slot region)
         sO = cute.make_tensor(
@@ -1313,10 +1427,13 @@ class FlashAttentionMLAForward1CtaSm100:
                     mK,
                     mV,
                     mPageTable,
+                    mIndexTopk,
                     sK,
                     sV,
+                    sBitmask,
                     pipeline_K,
                     pipeline_V,
+                    pipeline_bitmask,
                     sO_empty_mbar_ptr,
                     staging_mbar_ptr,
                     sK_free_mbar_ptr,
@@ -1374,11 +1491,13 @@ class FlashAttentionMLAForward1CtaSm100:
                 sRowMax,
                 sRowSum,
                 sScale,
+                sBitmask,
                 sP,
                 tmem_ptr,
                 pipeline_S,
                 pipeline_P,
                 pipeline_sm_stats,
+                pipeline_bitmask,
                 block_info,
                 SeqlenInfoCls,
                 num_splits,
@@ -1506,9 +1625,7 @@ class FlashAttentionMLAForward1CtaSm100:
             )
 
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx
-            )
+            n_block_min, n_block_max = self._n_block_range(block_info, seqlen, m_block, split_idx)
             num_n_blocks = n_block_max - n_block_min
             # Split-kv: this split's slice of the n_block range can be empty (the
             # per-split count is rounded up, so empties are the trailing splits).
@@ -1733,6 +1850,19 @@ class FlashAttentionMLAForward1CtaSm100:
                 pipeline_K.producer_tail(producer_state_K)
             pipeline_V.producer_tail(producer_state_V)
 
+    @cute.jit
+    def _n_block_range(
+        self, block_info: BlockInfo, seqlen: SeqlenInfoQK, m_block: Int32, split_idx: Int32
+    ):
+        """[n_block_min, n_block_max) for one tile. Shared by all five warp roles: their
+        pipelines only stay balanced if they agree exactly.
+
+        Sparse: the n_blocks walk the tile's top-k list (topk_length // tile_n blocks of
+        gathered slots), not key positions; causal/seqlen validity is in the bitmask."""
+        if const_expr(self.is_topk_gather):
+            return Int32(0), Int32(self.topk_length // self.tile_n)
+        return block_info.get_n_block_min_max(seqlen, m_block, split_idx=split_idx)
+
     def _get_block_idx(self, n_block: Int32, mPageTable_cur: Optional[cute.Tensor]) -> Int32:
         """Physical KV block for a logical n_block: the page id when paged."""
         return n_block if const_expr(mPageTable_cur is None) else mPageTable_cur[n_block]
@@ -1846,11 +1976,14 @@ class FlashAttentionMLAForward1CtaSm100:
         self,
         mK: Optional[cute.Tensor],
         mV: cute.Tensor,
-        mPageTable: cute.Tensor,
+        mPageTable: Optional[cute.Tensor],
+        mIndexTopk: Optional[cute.Tensor],
         sK: Optional[cute.Tensor],
         sV: cute.Tensor,
+        sBitmask: Optional[cute.Tensor],
         pipeline_K: Optional[pipeline.PipelineAsyncUmma],
         pipeline_V: pipeline.PipelineAsyncUmma,
+        pipeline_bitmask: Optional[pipeline.PipelineAsync],
         sO_empty_mbar_ptr: cute.Pointer,
         staging_mbar_ptr: cute.Pointer,
         sK_free_mbar_ptr: cute.Pointer,
@@ -1859,18 +1992,25 @@ class FlashAttentionMLAForward1CtaSm100:
         num_splits: Int32,
         tile_scheduler: TileSchedulerProtocol,
     ):
-        # ==== cp.async load warp group (paged KV, page_size != tile_n) ====
-        # produces: K, V ; consumes: -
+        # ==== cp.async load warp group (paged KV with page_size != tile_n, or top-k gather) ====
+        # produces: K, V (+ the validity bitmask for top-k) ; consumes: -
         Producer = pipeline.PipelineUserType.Producer
         if const_expr(self.has_qk):
             producer_state_K = pipeline.make_pipeline_state(Producer, stages=self.num_stages_K)
         producer_state_V = pipeline.make_pipeline_state(Producer, stages=self.num_stages_V)
+        if const_expr(self.is_topk_gather):
+            producer_state_bitmask = pipeline.make_pipeline_state(
+                Producer, stages=self.num_stages_bitmask
+            )
         staging_phase = Int32(0)
         # phase 1 first, as in the load warp: the first wait passes (no previous tile)
         producer_phase_O = Int32(1)
         tidx = cute.arch.thread_idx()[0] % self.num_cpasync_load_threads
         dv_split = const_expr(self.hdimv // self.num_hdimv_splits)
-        page_size_divmod = FastDivmodDivisor(cute.size(mV.shape[0]))
+        if const_expr(not self.is_topk_gather):
+            page_size_divmod = FastDivmodDivisor(cute.size(mV.shape[0]))
+        # warp index within the cp.async group: selects this warp's bitmask word
+        cpasync_warp_idx = tidx // cute.arch.WARP_SIZE
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1879,9 +2019,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx
-            )
+            n_block_min, n_block_max = self._n_block_range(block_info, seqlen, m_block, split_idx)
             num_n_blocks = n_block_max - n_block_min
             # Split-kv: this split's slice of the n_block range can be empty (the
             # per-split count is rounded up, so empties are the trailing splits).
@@ -1889,86 +2027,182 @@ class FlashAttentionMLAForward1CtaSm100:
             # pipeline phases and raw-mbar phase counters consistent; the epilogue
             # still writes LSE = -inf so the combine kernel can ignore this split.
             has_work = block_info.has_kv_work(n_block_min, n_block_max)
-            if has_work:
-
-                make_manager = partial(
-                    PagedKVManager.create,
-                    mPageTable,
-                    page_size_divmod=page_size_divmod,
-                    bidb=batch_idx,
-                    bidh=head_idx_kv,
+            if const_expr(self.is_topk_gather):
+                # (no split-KV on this path, so every tile has work)
+                # ==== top-k gather: one tile = one token ====
+                m_idx = m_block
+                mIndexTopk_cur = mIndexTopk[None, m_idx, batch_idx]
+                # bottom-right causal limit on key positions, applied via the bitmask
+                seqlen_k_limit = (
+                    m_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
+                    if const_expr(self.is_causal_topk)
+                    else seqlen.seqlen_k
+                )
+                gather = CpasyncGatherKVManager.create(
+                    mIndexTopk_cur,
+                    cta_rank_in_cluster=Int32(0),
                     thread_idx=tidx,
-                    seqlen_k=seqlen.seqlen_k,
-                    leftpad_k=0,
-                    n_block_size=self.tile_n,
+                    warp_idx=cpasync_warp_idx,
+                    topk_length=self.topk_length,
+                    seqlen_k_limit=seqlen_k_limit,
+                    tile_n=self.tile_n,
+                    hdim=self.hdim if const_expr(self.has_qk) else dv_split,
+                    hdim_v=self.hdimv,
+                    num_hdimv_splits=self.num_hdimv_splits,
                     num_threads=self.num_cpasync_load_threads,
-                )
-                # Both managers use mode "K" (non-transposed): the 1CTA kernel reads P@V
-                # through an smem VIEW of the same sV bytes, so there is no separate Vt tile
-                # to gather (unlike the CTA-split 2CTA kernel).
-                if const_expr(self.has_qk):
-                    paged_K = make_manager(
-                        mK_paged=mK,
-                        mV_paged=mK,
-                        head_dim_padded=self.hdim,
-                        head_dim_v_padded=self.hdim,
-                        dtype=self.dtype_K,
-                    )
-                paged_V = make_manager(
-                    mK_paged=mV,
-                    mV_paged=mV,
-                    head_dim_padded=dv_split,
-                    head_dim_v_padded=dv_split,
                     dtype=self.dtype_V,
+                    cta_group_size=1,
+                    cpasync_barrier=self.cpasync_barrier,
+                    disable_bitmask=False,
+                    sBitmask=sBitmask,
+                    pipeline_bitmask=pipeline_bitmask,
                 )
+                mK_cur = (
+                    seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
+                    if const_expr(self.has_qk)
+                    else None
+                )
+                mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
 
-                # See the load warp: a fully-masked m-tile still needs one balanced K/V set.
-                num_n_blocks_load = cutlass.max(num_n_blocks, 1)
-                n_block_first = n_block_max - 1 if num_n_blocks > 0 else 0
                 if const_expr(self.cpasync_staging_sync):
-                    # The Q staging tile aliases the first half of sK; wait until the mma
-                    # warp's tcgen05.cp's have consumed it before gathering K over it.
+                    # Q staging aliases sK's first half (see the paged branch below)
                     cute.arch.mbarrier_wait(staging_mbar_ptr, phase=staging_phase)
                     staging_phase ^= 1
                 if const_expr(self.use_tma_O):
-                    # sO overlays V stage 0 and V is written by THIS warp group, so the
-                    # load warp's sO_empty wait does not order it: under a persistent (CLC)
-                    # scheduler the next tile's V gather would otherwise race the previous
-                    # tile's epilogue writes / TMA store of sO. Every thread waits (a wait
-                    # is not an arrival, so the barrier's count of 1 epilogue arrive holds).
+                    # sO overlays V stage 0 (see the paged branch below)
                     cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
                     producer_phase_O ^= 1
-                for i in cutlass.range(num_n_blocks_load, unroll=1):
-                    n_block = n_block_first - i
+                # descending n_block, matching the mma and softmax order
+                for i in cutlass.range(n_block_max - n_block_min, unroll=1):
+                    n_block = n_block_max - 1 - i
+                    # the row pointers are computed in load_X from these registers
+                    gather.load_index_topk(n_block, transpose=False)
                     if const_expr(self.has_qk):
-                        paged_K.load_page_table(n_block)
-                        producer_state_K = self.cpasync_load_KV(
-                            paged_K, pipeline_K, sK, self.hdim, n_block, producer_state_K
+                        producer_state_K = self.cpasync_gather_KV(
+                            gather, pipeline_K, sK, mK_cur, "K", producer_state_K
                         )
-                    paged_V.load_page_table(n_block)
                     for split in cutlass.range_constexpr(self.num_hdimv_splits):
-                        producer_state_V = self.cpasync_load_KV(
-                            paged_V,
-                            pipeline_V,
-                            sV,
-                            dv_split,
-                            n_block,
-                            producer_state_V,
+                        producer_state_V = self.cpasync_gather_KV(
+                            gather, pipeline_V, sV, mV_cur, "V", producer_state_V,
                             d_offset=split * dv_split,
                         )
+                    # after the gathers are in flight; the softmax needs it only with S
+                    producer_state_bitmask = gather.compute_bitmask(producer_state_bitmask)
 
                 if const_expr(self.cpasync_staging_sync):
-                    # All of this tile's K writes have landed -> the load warp may stage the
-                    # next tile's Q over sK's first half. cp.async completion is per thread,
-                    # so each waits for its own groups and arrives (init count = all of them).
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.mbarrier_arrive(sK_free_mbar_ptr)
+
+            else:
+                if has_work:
+
+                    make_manager = partial(
+                        PagedKVManager.create,
+                        mPageTable,
+                        page_size_divmod=page_size_divmod,
+                        bidb=batch_idx,
+                        bidh=head_idx_kv,
+                        thread_idx=tidx,
+                        seqlen_k=seqlen.seqlen_k,
+                        leftpad_k=0,
+                        n_block_size=self.tile_n,
+                        num_threads=self.num_cpasync_load_threads,
+                    )
+                    # Both managers use mode "K" (non-transposed): the 1CTA kernel reads P@V
+                    # through an smem VIEW of the same sV bytes, so there is no separate Vt tile
+                    # to gather (unlike the CTA-split 2CTA kernel).
+                    if const_expr(self.has_qk):
+                        paged_K = make_manager(
+                            mK_paged=mK,
+                            mV_paged=mK,
+                            head_dim_padded=self.hdim,
+                            head_dim_v_padded=self.hdim,
+                            dtype=self.dtype_K,
+                        )
+                    paged_V = make_manager(
+                        mK_paged=mV,
+                        mV_paged=mV,
+                        head_dim_padded=dv_split,
+                        head_dim_v_padded=dv_split,
+                        dtype=self.dtype_V,
+                    )
+
+                    # See the load warp: a fully-masked m-tile still needs one balanced K/V set.
+                    num_n_blocks_load = cutlass.max(num_n_blocks, 1)
+                    n_block_first = n_block_max - 1 if num_n_blocks > 0 else 0
+                    if const_expr(self.cpasync_staging_sync):
+                        # The Q staging tile aliases the first half of sK; wait until the mma
+                        # warp's tcgen05.cp's have consumed it before gathering K over it.
+                        cute.arch.mbarrier_wait(staging_mbar_ptr, phase=staging_phase)
+                        staging_phase ^= 1
+                    if const_expr(self.use_tma_O):
+                        # sO overlays V stage 0 and V is written by THIS warp group, so the
+                        # load warp's sO_empty wait does not order it: under a persistent (CLC)
+                        # scheduler the next tile's V gather would otherwise race the previous
+                        # tile's epilogue writes / TMA store of sO. Every thread waits (a wait
+                        # is not an arrival, so the barrier's count of 1 epilogue arrive holds).
+                        cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
+                        producer_phase_O ^= 1
+                    for i in cutlass.range(num_n_blocks_load, unroll=1):
+                        n_block = n_block_first - i
+                        if const_expr(self.has_qk):
+                            paged_K.load_page_table(n_block)
+                            producer_state_K = self.cpasync_load_KV(
+                                paged_K, pipeline_K, sK, self.hdim, n_block, producer_state_K
+                            )
+                        paged_V.load_page_table(n_block)
+                        for split in cutlass.range_constexpr(self.num_hdimv_splits):
+                            producer_state_V = self.cpasync_load_KV(
+                                paged_V,
+                                pipeline_V,
+                                sV,
+                                dv_split,
+                                n_block,
+                                producer_state_V,
+                                d_offset=split * dv_split,
+                            )
+
+                    if const_expr(self.cpasync_staging_sync):
+                        # All of this tile's K writes have landed -> the load warp may stage the
+                        # next tile's Q over sK's first half. cp.async completion is per thread,
+                        # so each waits for its own groups and arrives (init count = all of them).
+                        cute.arch.cp_async_wait_group(0)
+                        cute.arch.mbarrier_arrive(sK_free_mbar_ptr)
 
             work_tile = tile_scheduler.advance_to_next_work()
 
         if const_expr(self.has_qk):
             pipeline_K.producer_tail(producer_state_K)
         pipeline_V.producer_tail(producer_state_V)
+        if const_expr(self.is_topk_gather):
+            # compute_bitmask does the producer acquires, so the tail is ours too
+            pipeline_bitmask.producer_tail(producer_state_bitmask)
+
+    @cute.jit
+    def cpasync_gather_KV(
+        self,
+        gather: CpasyncGatherKVManager,
+        pipeline_X: pipeline.PipelineAsyncUmma,
+        sX: cute.Tensor,  # staged MMA B-operand smem tile
+        mX: cute.Tensor,  # (s_k, d) for this batch / kv head
+        K_or_V: cutlass.Constexpr[str],
+        producer_state: pipeline.PipelineState,
+        d_offset: int = 0,
+    ):
+        """Gather one (tile_n, d) tile of K (or of a V dv split) by top-k index.
+
+        Row r of the tile is gathered slot r of this n_block, which is S column r in the
+        q_in_tmem / has_qk=False layouts. Invalid slots (-1, >= seqlen_k_limit) are
+        predicated off, and a predicated-off cp.async zero-fills (src-size 0).
+        load_index_topk for this n_block must already have run in the caller.
+        """
+        stage = producer_state.index
+        pipeline_X.producer_acquire(producer_state)
+        gather.load_X(mX, sX[None, None, None, stage], False, K_or_V, d_offset)
+        cute.arch.cp_async_commit_group()
+        pipeline_X.sync_object_full.arrive_cp_async_mbarrier(stage)
+        producer_state.advance()
+        return producer_state
 
     @cute.jit
     def load_QQv_packed(
@@ -2186,9 +2420,7 @@ class FlashAttentionMLAForward1CtaSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
 
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx
-            )
+            n_block_min, n_block_max = self._n_block_range(block_info, seqlen, m_block, split_idx)
             num_n_blocks = n_block_max - n_block_min
             # Split-kv: this split's slice of the n_block range can be empty (the
             # per-split count is rounded up, so empties are the trailing splits).
@@ -2462,6 +2694,14 @@ class FlashAttentionMLAForward1CtaSm100:
             if col_idx >= col_limit or col_idx < 0:
                 tSrS[i] = -Float32.inf
 
+    def is_valid_qhead_row(self, packed_row) -> Boolean:
+        """Head guard for non-TMA per-row accesses (LSE, per-row O): with in-kernel Q-head
+        padding the packed layout maps a padded head onto the next token's real heads.
+        See pack_gqa.qheads_first_tma_view."""
+        if const_expr(not self.pad_qheads):
+            return Boolean(True)
+        return packed_row % self.qhead_per_kvhead < self.qhead_per_kvhead_valid
+
     def _kv_head_idx(self, head_idx: Int32) -> Int32:
         """KV head for descale indexing (FA3 semantics: descales are per (b, h_kv))."""
         return (
@@ -2509,11 +2749,13 @@ class FlashAttentionMLAForward1CtaSm100:
         sRowMax: cute.Tensor,
         sRowSum: cute.Tensor,
         sScale: cute.Tensor,
+        sBitmask: Optional[cute.Tensor],
         sP: cute.Tensor,
         tmem_ptr: cute.Pointer,
         pipeline_S: pipeline.PipelineAsync,
         pipeline_P: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
+        pipeline_bitmask: Optional[pipeline.PipelineAsync],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         num_splits: Int32,
@@ -2574,6 +2816,10 @@ class FlashAttentionMLAForward1CtaSm100:
         producer_state_sm_stats = pipeline.make_pipeline_state(
             Producer, stages=self.num_stages_sm_stats
         )
+        # Threaded through every softmax step; only waited on / advanced when sparse.
+        consumer_state_bitmask = pipeline.make_pipeline_state(
+            Consumer, stages=self.num_stages_bitmask
+        )
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -2584,9 +2830,7 @@ class FlashAttentionMLAForward1CtaSm100:
             # S, and softmax_scale_log2 == softmax_scale * log2(e).
             qk_descale, _ = self._effective_descales(descale_tensors, batch_idx, head_idx)
             softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx
-            )
+            n_block_min, n_block_max = self._n_block_range(block_info, seqlen, m_block, split_idx)
             num_n_blocks = n_block_max - n_block_min
             # Split-kv: this split's slice of the n_block range can be empty (the
             # per-split count is rounded up, so empties are the trailing splits).
@@ -2628,6 +2872,9 @@ class FlashAttentionMLAForward1CtaSm100:
                     pipeline_sm_stats,
                     tidx,
                     warp_idx,
+                    sBitmask=sBitmask,
+                    pipeline_bitmask=pipeline_bitmask,
+                    tScS_t2r=tScS_t2r,
                 )
 
                 ### first iteration ###
@@ -2636,6 +2883,7 @@ class FlashAttentionMLAForward1CtaSm100:
                     consumer_state_S,
                     producer_state_P,
                     producer_state_sm_stats,
+                    consumer_state_bitmask,
                 ) = softmax_step_fn(
                     consumer_state_S,
                     producer_state_P,
@@ -2644,6 +2892,7 @@ class FlashAttentionMLAForward1CtaSm100:
                     n_block,
                     mask_fn=partial(mask_fn, mask_seqlen=True),
                     is_first=True,
+                    consumer_state_bitmask=consumer_state_bitmask,
                 )
                 n_block -= 1
 
@@ -2675,6 +2924,7 @@ class FlashAttentionMLAForward1CtaSm100:
                                 consumer_state_S,
                                 producer_state_P,
                                 producer_state_sm_stats,
+                                consumer_state_bitmask,
                             ) = softmax_step_fn(
                                 consumer_state_S,
                                 producer_state_P,
@@ -2682,6 +2932,7 @@ class FlashAttentionMLAForward1CtaSm100:
                                 1 - stage,
                                 n_block,
                                 mask_fn=partial(mask_fn, mask_seqlen=False),
+                                consumer_state_bitmask=consumer_state_bitmask,
                             )
                             n_block -= 1
 
@@ -2692,6 +2943,7 @@ class FlashAttentionMLAForward1CtaSm100:
                             consumer_state_S,
                             producer_state_P,
                             producer_state_sm_stats,
+                            consumer_state_bitmask,
                         ) = softmax_step_fn(
                             consumer_state_S,
                             producer_state_P,
@@ -2699,6 +2951,7 @@ class FlashAttentionMLAForward1CtaSm100:
                             1 - stage,
                             n_block,
                             mask_fn=None,
+                            consumer_state_bitmask=consumer_state_bitmask,
                         )
                         n_block -= 1
 
@@ -2709,6 +2962,7 @@ class FlashAttentionMLAForward1CtaSm100:
                         consumer_state_S,
                         producer_state_P,
                         producer_state_sm_stats,
+                        consumer_state_bitmask,
                     ) = softmax_step_fn(
                         consumer_state_S,
                         producer_state_P,
@@ -2716,6 +2970,7 @@ class FlashAttentionMLAForward1CtaSm100:
                         1,
                         n_block,
                         mask_fn=partial(mask_fn, mask_seqlen=False),
+                        consumer_state_bitmask=consumer_state_bitmask,
                     )
                     n_block -= 1
 
@@ -2759,6 +3014,10 @@ class FlashAttentionMLAForward1CtaSm100:
         n_block: Int32,
         mask_fn: Optional[Callable] = None,
         is_first: Boolean = False,
+        consumer_state_bitmask: Optional[pipeline.PipelineState] = None,
+        sBitmask: Optional[cute.Tensor] = None,
+        pipeline_bitmask: Optional[pipeline.PipelineAsync] = None,
+        tScS_t2r: Optional[cute.Tensor] = None,
     ):
         tSrP = cute.make_rmem_tensor(tSrS_t2r.shape, self.dtype_P)
         rP_smem_view = smem_store_thr.retile(tSrP)
@@ -2768,7 +3027,17 @@ class FlashAttentionMLAForward1CtaSm100:
         cute.arch.fence_view_async_tmem_load()
         pipeline_S.consumer_release(consumer_state_S)
 
-        if const_expr(mask_fn is not None):
+        if const_expr(self.is_topk_gather):
+            # Sparse: S columns are gathered slots; mask the invalid ones (index -1, out of
+            # range, or past the causal limit) on every n_block, instead of positionally.
+            pipeline_bitmask.consumer_wait(consumer_state_bitmask)
+            # this thread's datapath half covers columns [64h, 64h + 64) = words 2h, 2h+1
+            half = warp_idx // self.num_acc_halves
+            words_per_half = const_expr(self.tile_n // 32 // self.num_acc_halves)
+            word_lo = sBitmask[words_per_half * half, consumer_state_bitmask.index]
+            word_hi = sBitmask[words_per_half * half + 1, consumer_state_bitmask.index]
+            self.apply_bitmask(tSrS_t2r, tScS_t2r, word_lo, word_hi)
+        elif const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
 
         # compute threadwise row_max
@@ -2778,6 +3047,10 @@ class FlashAttentionMLAForward1CtaSm100:
         assert self.cta_tile_m * self.num_acc_halves == 128
         sRowMax[tidx % self.cta_tile_m, warp_idx // self.num_acc_halves] = row_max
         self.softmax_barrier.arrive_and_wait()
+        if const_expr(self.is_topk_gather):
+            # every thread has read its words by now (as in the 2CTA kernel)
+            pipeline_bitmask.consumer_release(consumer_state_bitmask)
+            consumer_state_bitmask.advance()
         row_max0 = sRowMax[tidx % self.cta_tile_m, 0]
         row_max1 = sRowMax[tidx % self.cta_tile_m, 1]
         row_max = max(row_max0, row_max1)
@@ -2811,7 +3084,27 @@ class FlashAttentionMLAForward1CtaSm100:
 
         softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
 
-        return consumer_state_S, producer_state_P, producer_state_sm_stats
+        return consumer_state_S, producer_state_P, producer_state_sm_stats, consumer_state_bitmask
+
+    @cute.jit
+    def apply_bitmask(
+        self,
+        tSrS: cute.Tensor,
+        tScS_t2r: cute.Tensor,
+        word_lo: Uint32,
+        word_hi: Uint32,
+    ):
+        """Mask invalid gathered slots: bit b of word w is slot 32w + b (compute_bitmask).
+
+        Each thread holds one datapath half = 64 contiguous S columns (Layout E); the
+        column comes from the logical coordinate rather than the fragment index, so the
+        mapping holds for any fragment order.
+        """
+        for i in cutlass.range_constexpr(cute.size(tSrS)):
+            col = tScS_t2r[i][1] % 64
+            word = word_hi if col >= 32 else word_lo
+            if (word >> Uint32(col % 32)) & Uint32(1) == Uint32(0):
+                tSrS[i] = -Float32.inf
 
     @cute.jit
     def correction_loop(
@@ -2911,9 +3204,7 @@ class FlashAttentionMLAForward1CtaSm100:
             softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
 
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx
-            )
+            n_block_min, n_block_max = self._n_block_range(block_info, seqlen, m_block, split_idx)
             num_n_blocks = n_block_max - n_block_min
             # Split-kv: this split's slice of the n_block range can be empty (the
             # per-split count is rounded up, so empties are the trailing splits).
@@ -3008,6 +3299,8 @@ class FlashAttentionMLAForward1CtaSm100:
                             m_block * self.cta_tile_m + tidx % self.cta_tile_m,
                             self.qhead_per_kvhead,
                             self.pack_gqa,
+                            # padded heads (sparse) get -inf: no sink
+                            qhead_per_kvhead_valid=self.qhead_per_kvhead_valid,
                         )
                         row_max, row_sum = apply_learnable_sink(
                             row_max,
@@ -3140,7 +3433,8 @@ class FlashAttentionMLAForward1CtaSm100:
                 packed_row = m_block * self.cta_tile_m + tidx
                 q_pos = packed_row // self.qhead_per_kvhead
                 h_in_group = packed_row - q_pos * self.qhead_per_kvhead
-                if q_pos < seqlen.seqlen_q:
+                # padded heads (sparse) would wrap into the next token's heads
+                if q_pos < seqlen.seqlen_q and self.is_valid_qhead_row(packed_row):
                     mLSE_cur[((h_in_group, q_pos),)] = lse
 
     @cute.jit
@@ -3174,7 +3468,8 @@ class FlashAttentionMLAForward1CtaSm100:
         h_in_group = packed_row - q_pos * self.qhead_per_kvhead
         col_base = split * dv_split + cols_per_thread * (tidx // self.cta_tile_m)
 
-        if q_pos < seqlen_q:
+        # padded heads (sparse) would wrap into the next token's heads
+        if q_pos < seqlen_q and self.is_valid_qhead_row(packed_row):
             # hdimv is contiguous and 16B-aligned in gmem, and col_base is a multiple of
             # cols_per_thread, so this thread's run is a 16B-aligned contiguous vector.
             row_crd = (h_in_group, q_pos) if const_expr(self.pack_gqa) else q_pos

@@ -750,13 +750,25 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
-    # Sparse MLA pads the heads to the 128-row tile (see pack_gqa.qheads_first_tma_view);
-    # the kernel takes the real count and rounds the same way, the interface needs the tile
-    # width for its grid math.
+    # Opt-in routing to the 1CTA (tcgen05.mma.ws) MLA kernel. Sparse (top-k) MLA runs on
+    # it only up to 64 Q heads -- one 64-row tile per token; more heads would need two
+    # tiles each re-gathering the same indices, which the 2CTA kernel avoids -- so larger
+    # sparse head counts fall back to 2CTA. Defined here because the head padding below
+    # and the SplitKV heuristics in _get_fwd_config depend on it.
+    mla_1cta = (
+        qv is not None
+        and os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
+        and not (gather_kv_indices is not None and qhead_per_kvhead > 64)
+    )
+    # Sparse MLA pads the heads to the kernel's tile (see pack_gqa.qheads_first_tma_view):
+    # 128 rows for 2CTA, 64 for 1CTA. The kernel takes the real count and rounds the same
+    # way; the interface needs the tile width for its grid math.
     nheads_per_kv = qhead_per_kvhead
     if qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
         assert num_head_kv == 1, "sparse MLA requires a single KV head"
-        qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead)
+        qhead_per_kvhead = sparse_mla_qhead_tile(
+            qhead_per_kvhead, min_tile=64 if mla_1cta else 128
+        )
         pack_gqa = True
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
@@ -882,9 +894,16 @@ def _flash_attn_fwd(
         page_table = page_table[:, :required_pages]
         max_seqlen_k = required_pages * page_size
 
-    # Opt-in routing to the 1CTA (tcgen05.mma.ws) MLA kernel. Defined here because the
-    # SplitKV heuristics in _get_fwd_config need it.
-    mla_1cta = qv is not None and os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
+    if gather_kv_indices is not None:
+        # Split-KV is not supported for sparse MLA (either kernel). Reject an explicit
+        # request here, before _get_fwd_config: its diff-headdim rule would otherwise
+        # silently turn num_splits > 1 into 1 on the 2CTA route.
+        if num_splits > 1:
+            raise ValueError(
+                f"num_splits={num_splits} is not supported with gather_kv_indices "
+                "(sparse MLA runs without split-KV)"
+            )
+        num_splits = 1
     fwd_cfg = _get_fwd_config(
         arch=arch,
         head_dim=head_dim,
@@ -1489,18 +1508,24 @@ def _flash_attn_fwd(
                     # 1CTA (tcgen05.mma.ws) MLA kernel, opt-in via FLASH_ATTENTION_MLA_1CTA=1.
                     # Supports varlen (cu_seqlens / seqused, Q and K sides independently),
                     # pack_gqa at any ratio (including ratios that do not divide the 64-row
-                    # tile), and paged KV at any page size (TMA when page_size == tile_n,
-                    # else a cp.async gather warp group). No sparse/topk gather.
+                    # tile), paged KV at any page size (TMA when page_size == tile_n,
+                    # else a cp.async gather warp group), and sparse top-k gather (MQA,
+                    # <= 64 heads, inference; routed here only in that case).
                     for feat, name in [
-                        (sparse_kv, "sparse_kv / gather_kv_indices"),
                         (p is not None, "P emission"),
                         (row_max is not None, "row_max emission"),
+                        (o_lo is not None, "sparse MLA training (grad-requiring inputs)"),
                         (local, "local attention"),
                     ]:
                         assert not feat, f"1CTA MLA kernel does not support {name}"
+                    if sparse_kv:
+                        assert gather_kv_indices.dtype == torch.int32, (
+                            "gather_kv_indices must be int32"
+                        )
                     fa_fwd = FlashAttentionMLAForward1CtaSm100(
                         is_causal=causal,
-                        qhead_per_kvhead=qhead_per_kvhead,
+                        # the REAL head count: sparse pads to the 64-row tile in-kernel
+                        qhead_per_kvhead=nheads_per_kv,
                         nheads_kv=num_head_kv,
                         hdim=head_dim,
                         hdimv=head_dim_v,
@@ -1509,13 +1534,15 @@ def _flash_attn_fwd(
                         else True,
                         has_qk=has_qk,
                         pack_gqa=pack_gqa,
-                        # paged KV gathers into the unified sK slot -> q_in_tmem
-                        q_in_tmem=mla_1cta_q_tmem or page_table is not None,
+                        # paged / top-k KV gathers into the unified sK slot -> q_in_tmem
+                        q_in_tmem=mla_1cta_q_tmem or page_table is not None or sparse_kv,
                         has_seqused_q=seqused_q is not None,
                         has_cu_seqlens_q=cu_seqlens_q is not None,
-                        use_cpasync_load_KV=paged_kv_cpasync,
+                        use_cpasync_load_KV=paged_kv_cpasync or sparse_kv,
                         is_split_kv=is_split_kv,
                         is_fp8=is_fp8,
+                        is_topk_gather=sparse_kv,
+                        topk_length=gather_kv_length if sparse_kv else 0,
                     )
                 else:
                     fa_fwd = FlashAttentionMLAForwardSm100(
