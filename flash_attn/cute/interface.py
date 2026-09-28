@@ -946,7 +946,8 @@ def _flash_attn_fwd(
     # Up to 64 heads, 16-bit: the 64-key-block mainloop (three latent stages, Q in TMEM,
     # S(n) before PV(n-1); flash_fwd_mla_1cta_kb64_sm100). One token per tile; fewer heads pad
     # the tile in-kernel. Sparse: the top-k gather front end. Dense: TMA loads (contiguous,
-    # varlen, or paged with page_size % 64 == 0) with split-KV.
+    # varlen, or paged with page_size % 64 == 0) or, paged at any other page size, the
+    # cp.async gather warps with the page table as the index source; split-KV either way.
     # It agrees with the 2CTA kernel and the 128-key mainloop to bf16 rounding, not bitwise.
     # FLASH_ATTENTION_MLA_1CTA_KB64=0 keeps the 128-key mainloop (A/B runs). Decided here:
     # the split heuristic below counts its 64-row tiles and 64-key blocks.
@@ -961,7 +962,6 @@ def _flash_attn_fwd(
             or (
                 head_dim_v == 512
                 and (q is None or head_dim == 64)
-                and (page_table is None or page_size % 64 == 0)
                 # fewer than 64 heads pad the one-token tile: that wins on decode (1.07-1.30x
                 # over the 128-key mainloop) but wastes 64 / H of the MMA work on prefill, where
                 # the 128-key mainloop packs several tokens per tile (kb64 0.34-0.81x there)
@@ -1390,6 +1390,13 @@ def _flash_attn_fwd(
     # dense kb64 with cu_seqlens_q schedules a flat grid over the tokens (packed varlen);
     # FLASH_ATTENTION_MLA_1CTA_PACKED_VARLEN=0 keeps the per-batch varlen scheduler (ablation)
     mla_1cta_packed_varlen = os.environ.get("FLASH_ATTENTION_MLA_1CTA_PACKED_VARLEN", "1") == "1"
+    # FLASH_ATTENTION_MLA_1CTA_KB64_PAGED_CPASYNC=1: kb64 dense paged with page_size % 64 == 0
+    # through the cp.async gather instead of TMA (A/B of the two loaders; same bytes)
+    mla_1cta_kb64_force_cpasync = (
+        mla_1cta_kb64_dense
+        and page_table is not None
+        and os.environ.get("FLASH_ATTENTION_MLA_1CTA_KB64_PAGED_CPASYNC", "0") == "1"
+    )
     # FLASH_ATTENTION_MLA_1CTA_CLC=0 / 1 forces it (ablation)
     if os.environ.get("FLASH_ATTENTION_MLA_1CTA_CLC"):
         mla_1cta_use_clc = os.environ["FLASH_ATTENTION_MLA_1CTA_CLC"] == "1"
@@ -1432,6 +1439,7 @@ def _flash_attn_fwd(
         page_size if mla_1cta_kb64_dense and page_table is not None else None,
         mla_1cta and mla_1cta_use_clc,
         mla_1cta_kb64_dense and mla_1cta_packed_varlen,
+        mla_1cta_kb64_force_cpasync,
         mla_1cta_s_ahead if mla_1cta else None,
         mla_ptxas_options,
         dtype,
@@ -1637,7 +1645,7 @@ def _flash_attn_fwd(
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
-                # the kb64 route loads pages by TMA (page_size % 64 == 0)
+                # the kb64 route picks its own page loader (TMA or its cp.async gather)
                 paged_kv_cpasync = (
                     page_table is not None and page_size != tile_n and not mla_1cta_kb64
                 )
@@ -1678,6 +1686,7 @@ def _flash_attn_fwd(
                             is_split_kv=is_split_kv,
                             page_size=page_size if page_table is not None else None,
                             packed_varlen=mla_1cta_packed_varlen,
+                            force_cpasync_kv=mla_1cta_kb64_force_cpasync,
                         )
                     else:
                         fa_fwd = FlashAttentionMLAForward1CtaSm100(

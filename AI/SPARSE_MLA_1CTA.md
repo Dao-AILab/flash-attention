@@ -164,8 +164,9 @@ Small-batch decode stays latency-bound and 2CTA still wins there (Follow-up 1).
 
 The kb64 kernel has two load front ends, selected at compile time by `is_topk_gather`. The
 MMA, softmax, epilogue and SMEM/TMEM plan are shared. Dense MLA at 64 heads routes there,
-unless the call is fp8, uses a page size that is not a multiple of 64, or sets
-`FLASH_ATTENTION_MLA_1CTA_KB64=0`.
+unless the call is fp8 or sets `FLASH_ATTENTION_MLA_1CTA_KB64=0`. Paged KV whose page size
+is not a multiple of 64 uses the cp.async gather front end (see "Dense kb64: paged KV at any
+page size").
 
 **Front end.** The TMA warp (warp 8) replaces the 4 cp.async gather warps, so dense runs
 12 warps with registers split 208 / 168 / 128.
@@ -287,6 +288,60 @@ Results (`agent_space/bench_kb64_varlen.py`, `agent_space/bench_sparse_1cta/kb64
 **Where packed wins.** Many short sequences, where the per-batch scheduler's per-tile batch lookup (a prefix scan) costs time. Bandwidth-bound shapes with few long sequences are neutral.
 
 **CLC with packed varlen.** Neutral to 6% slower on decode (512 seqs: 1.66 vs 1.56 ms) and neutral on prefill. So the dense kb64 default is unchanged: CLC on for prefill only.
+
+## Dense kb64: paged KV at any page size
+
+With `page_size % 64 == 0`, a 64-key block is one TMA box inside a page. Any other page size (1, 16, 32, 48, 96, ...) puts a block across pages. Those calls now run the kb64 kernel with the sparse front end, instead of falling back to the 128-key mainloop's `PagedKVManager` gather:
+
+- **Loader.** The 16-warp configuration: cp.async gather warps 12-15, registers 192 / 128 / 112 / 80, Q staged through the KV ring (`gather_q`).
+- **Index source.** `CpasyncGatherKVManagerH64` gains a paged mode:
+  - `load_index_paged` puts each row's physical page and in-page offset into the two index register sets, two blocks ahead, so the dependent page-table read stays off the issue path. The page size is a compile-time divisor.
+  - `load_X` addresses the head's `(page_size, d, num_pages)` view.
+  - Rows at or past `seqlen_k` are zero-filled by a row predicate. Their page-table entry is never used; the load reads entry 0 instead, so it stays in bounds.
+- **Loop.** `load_cpasync_paged` walks the dense block range: runtime count (pairs plus an odd tail), split-KV, `has_work`, the dummy block. The per-block issue (`gather_block_paged`) is `gather_block` without the bitmask: latent parts on their part barriers, rope rows last.
+- **Everything downstream is the dense kernel's:** MMA, positional masking, split-KV epilogue, scheduler.
+- **Flag split.** `use_cpasync_kv` (the loader) is now separate from `is_topk_gather` (bitmask, fixed count). `FLASH_ATTENTION_MLA_1CTA_KB64_PAGED_CPASYNC=1` sends page sizes that are multiples of 64 through the gather too, for A/B runs.
+- **Registers.** Every variant compiles to 128 registers and 0 B of local memory (`agent_space/spill_probe_kb64_paged.py`): decode with and without split, 16 heads, no rope, causal prefill, page 1. The epilogue already streams O in 32-column chunks.
+
+**Correctness.**
+- Paged runs are bitwise equal to the same kernel on contiguous KV. Page sizes 1 / 16 / 48 / 96 and forced-cp.async 64 were checked at 64 and 16 heads, with splits 1 / 3 and causal, including pages that straddle split boundaries, CLC on / off and no rope part.
+- Each run also matches the reference, and the 128-key mainloop under the bf16 contract (`test_flash_attn_mla_1cta_dense_kb64_varlen_paged`, `agent_space/smoke_kb64_dense.py --paged --page-size N [--force-cpasync]`).
+- The sparse, dense and varlen bitwise guards are unchanged.
+
+**Performance** (`agent_space/bench_dense_kb64.py --pages ...`; `agent_space/bench_sparse_1cta/kb64_paged_cpasync*.csv`; GB300, bf16, s_k 32K, best of `num_splits` 1 / heuristic per kernel):
+
+| 64 heads | page 1 | page 16 | page 32 | page 48 | page 96 |
+|---|---|---|---|---|---|
+| decode b 8, 128-key / kb64 (cold, hot) | 1.10, 1.16x | 1.10, 1.18x | 1.12, 1.17x | 1.12, 1.18x | 1.12, 1.18x |
+| decode b 128 | 1.08, 1.09x | 1.15, 1.15x | 1.16, 1.17x | 1.16, 1.16x | 1.16, 1.17x |
+| decode b 512 | 1.08, 1.08x | 1.15, 1.15x | 1.17, 1.17x | 1.17, 1.17x | 1.18, 1.18x |
+| causal prefill 1K x 8K | 1.32, 1.28x | 1.32, 1.29x | 1.32, 1.29x | 1.32, 1.29x | 1.32, 1.29x |
+
+- **16 heads (decode):** 1.08-1.16x at pages 1 / 16 / 48. Prefill with fewer than 64 heads stays on the 128-key mainloop.
+- **Loader A/B at page 64** (`kb64_cpforce`): the cp.async gather is within +-1% of TMA on decode and 6% slower on causal prefill. That is below the 10% bar, so sub-64-row TMA boxes (the other design for small pages) are not worth building.
+
+**Saturating bandwidth.** Effective payload bandwidth, `b * s_k * 576 * 2` bytes / time, against the 6.90 TB/s device-to-device copy ceiling:
+
+| page | kb64 b 128 / 512 (cold) | 128-key b 128 / 512 (cold) |
+|---|---|---|
+| 1 | 6.21 / 6.14 TB/s | 5.72 / 5.67 TB/s |
+| 16 | 6.67 / 6.64 | 5.82 / 5.77 |
+| 32 | 6.72 / 6.67 | 5.77 / 5.72 |
+| 48 | 6.64 / 6.63 | 5.73 / 5.69 |
+| 96 | 6.75 / 6.74 | 5.83 / 5.73 |
+| 64 (TMA) | 6.76 / 6.74 | 5.84 / 5.77 |
+
+Pages of 16 keys or more reach within 3-4% of the ceiling, the same as the TMA path. Page 1 costs about 8%: every key is its own page-table entry, and rows are scattered 1.2 KB reads.
+
+**ncu** (decode b 128, s_k 32K, split heuristic; `agent_space/ncu_dense/*_ps*.ncu-rep`):
+
+| | kb64 cp.async page 16 | kb64 TMA page 64 | 128-key cp.async page 16 | kb64 cp.async page 1 |
+|---|---|---|---|---|
+| duration | 713 us | 700 us | 825 us | 769 us |
+| DRAM throughput | 85.7% | 87.3% | 74.1% | 79.8% |
+| issue slots busy | 16.4% | 13.5% | 8.9% | 14.7% |
+| warp cycles per issued instruction | 16.4 | 15.3 | 32.7 | 18.3 |
+| local spill requests | 0 | 0 | 0.59 M | 0 |
 
 ## kb64 with fewer than 64 heads
 
@@ -488,5 +543,7 @@ Backward, sparse MLA training step:
    - 128 heads (two tiles per token, heads-first Q TMA view);
    - dense prefill with fewer than 64 heads (would need multi-token tiles with per-row causal
      limits);
-   - fp8 (the dual TMEM packing assumes 16-bit);
-   - page sizes that are not multiples of 64.
+   - fp8 (the dual TMEM packing assumes 16-bit).
+
+   Page sizes that are not multiples of 64 now run kb64 (cp.async gather; see "Dense kb64:
+   paged KV at any page size").

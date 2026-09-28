@@ -292,6 +292,12 @@ class CpasyncGatherKVManagerH64(ParamsBase):
     natural order (bitmask), so a block's issue never waits on its own index load. Rows whose index
     is -1 or >= ``seqlen_k_limit`` are zero-filled (predicated ``cp.async``) and cleared in the
     2-word validity bitmask (warps 0-1, bit = lane = key within the 32-key half).
+
+    Paged KV (dense kb64, ``page_size`` set): the index source is the batch's page-table row
+    instead of top-k indices. ``load_index_paged`` puts the physical page and the in-page offset
+    of the thread's row into the same two register sets; ``load_X`` addresses the
+    ``(page_size, d, num_pages)`` view, and the caller's ``num_valid_rows`` zero-fills rows at or
+    past ``seqlen_k``. No bitmask: the dense softmax masks by position.
     """
 
     mIndexTopk: cute.Tensor
@@ -320,9 +326,14 @@ class CpasyncGatherKVManagerH64(ParamsBase):
 
     disable_bitmask: cutlass.Constexpr[Boolean]
 
+    # paged KV: the page-table row of this batch, and the in-page offsets (rTopk holds the pages)
+    page_size: cutlass.Constexpr[Optional[int]] = None
+    mPageTable: Optional[cute.Tensor] = None
+    rPageOff: Optional[cute.Tensor] = None
+
     @staticmethod
     def create(
-        mIndexTopk: cute.Tensor,
+        mIndexTopk: Optional[cute.Tensor],
         thread_idx: Int32,
         warp_idx: Int32,
         seqlen_k_limit: Int32,
@@ -335,8 +346,12 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         disable_bitmask: cutlass.Constexpr[Boolean] = False,
         sBitmask: Optional[cute.Tensor] = None,
         pipeline_bitmask: Optional[pipeline.PipelineAsync] = None,
+        page_size: cutlass.Constexpr[Optional[int]] = None,
+        mPageTable: Optional[cute.Tensor] = None,
     ):
         assert num_threads == 128, "H64 gather: 128 producer threads"
+        assert (page_size is None) == (mPageTable is None)
+        assert page_size is None or disable_bitmask, "paged KV: positional masking, no bitmask"
         assert tile_n == 64, "H64 gather: 64-key stages"
         assert hdim % 64 == 0 and hdim_v % 64 == 0, "rows are whole 128-B chunks"
         universal_copy_bits = 128
@@ -363,6 +378,7 @@ class CpasyncGatherKVManagerH64(ParamsBase):
 
         rTopk = cute.make_rmem_tensor((2,), Int32)
         rTopk_NonInterleaved = cute.make_rmem_tensor((2,), Int32)
+        rPageOff = cute.make_rmem_tensor((2,), Int32) if page_size is not None else None
 
         return CpasyncGatherKVManagerH64(
             mIndexTopk,
@@ -383,7 +399,29 @@ class CpasyncGatherKVManagerH64(ParamsBase):
             pipeline_bitmask,
             cpasync_barrier,
             disable_bitmask,
+            page_size,
+            mPageTable,
+            rPageOff,
         )
+
+    @cute.jit
+    def load_index_paged(self, n_block: Int32, buf: cutlass.Constexpr[int]):
+        """Paged KV: the physical page and in-page offset of this thread's row of block ``n_block``
+        (the rows of ``load_index_topk``) into register set ``buf``. A key at or past ``seqlen_k``
+        reads the row's entry 0 instead of its own (entries past the sequence may be anything,
+        or past the row), and ``load_X``'s row predicate keeps its row from being loaded."""
+        rows_per_copy = self.num_threads // self.gmem_threads_per_row
+        row_groups = self.tile_n // rows_per_copy
+        lane_in_group = self.thread_idx % self.gmem_threads_per_row
+        row = (
+            lane_in_group % row_groups
+        ) * rows_per_copy + self.thread_idx // self.gmem_threads_per_row
+        key = n_block * self.tile_n + row  # n_block >= 0: unsigned divide by the constant
+        page_idx = Int32(Uint32(key) // Uint32(self.page_size))
+        # the load itself stays in bounds (entry 0) past the sequence: its page is never used
+        page_idx = page_idx if key < self.seqlen_k_limit else Int32(0)
+        self.rTopk[buf] = self.mPageTable[page_idx]
+        self.rPageOff[buf] = Int32(Uint32(key) % Uint32(self.page_size))
 
     @cute.jit
     def load_index_topk(self, n_block: Int32, buf: cutlass.Constexpr[int]):
@@ -439,9 +477,10 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         ``cp.async.mbarrier.arrive.noinc``). With ``identity_rows`` the stage is the 64 rows of ``mX``
         itself (row ``r`` of the tile <- ``mX[r]``, no top-k index, no validity predicate): the 64-head
         forward stages the token's Q tile through the KV ring this way (see AI/SPARSE_MLA_64H.md).
-        ``num_valid_rows`` (identity rows only): rows at or past it are zero-filled instead of loaded
-        -- a token with fewer than 64 Q heads, whose packed tile rows past the real heads alias the
-        next token's heads (or run past the tensor)."""
+        ``num_valid_rows``: rows at or past it are zero-filled instead of loaded -- with identity
+        rows, a token with fewer than 64 Q heads, whose packed tile rows past the real heads alias
+        the next token's heads (or run past the tensor); paged, the keys past ``seqlen_k``. Paged
+        ``mX`` is this head's ``(page_size, head_dim, num_pages)`` view."""
         assert K_or_V in ("K", "V")
         head_dim = self.hdim if const_expr(K_or_V == "K") else self.hdim_v
         sX_nd_layout = cute.make_ordered_layout((self.tile_n, head_dim), order=(0, 1))
@@ -452,10 +491,12 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
 
         use_pred = const_expr(not self.disable_bitmask and not identity_rows)
-        use_row_pred = const_expr(identity_rows and num_valid_rows is not None)
+        use_row_pred = const_expr(num_valid_rows is not None)
         tPrXPtr = cute.make_rmem_tensor((1,), cutlass.Int64)
         tPrRowValid = cute.make_rmem_tensor((1,), cutlass.Int32)
-        if const_expr(not identity_rows):
+        if const_expr(not identity_rows and self.page_size is not None):
+            tPrXPtr[0] = utils.elem_pointer(mX, (self.rPageOff[buf], 0, self.rTopk[buf])).toint()
+        elif const_expr(not identity_rows):
             topk_idx = self.rTopk[buf]
             tPrXPtr[0] = utils.elem_pointer(mX, (topk_idx, 0)).toint()
             if const_expr(use_pred):

@@ -3785,14 +3785,21 @@ def test_flash_attn_mla_1cta_dense_kb64_padded_head_canary(nheads, has_learnable
 
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA dense MLA, 64-key-block mainloop")
 @pytest.mark.parametrize("num_splits", [1, 3])
-@pytest.mark.parametrize("mode", ["cu_seqlens", "seqused_q", "paged64", "paged128", "paged256"])
+@pytest.mark.parametrize(
+    "mode",
+    ["cu_seqlens", "seqused_q", "paged64", "paged128", "paged256",
+     "paged1", "paged16", "paged48", "paged96", "paged64cp"],
+)
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("nheads", [64, 16])
 def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(nheads, causal, mode, num_splits, monkeypatch):
-    """Dense kb64 with varlen Q / K (ragged lengths incl. 0 and 1) and TMA-paged KV
-    (page_size 64 / 128 / 256 = 1-4 blocks per page, shuffled pages). Paged runs are bitwise
-    equal to the same kernel on contiguous KV; every sequence matches the reference; the
-    128-key mainloop agrees under the bf16-rounding contract."""
+    """Dense kb64 with varlen Q / K (ragged lengths incl. 0 and 1) and paged KV (shuffled
+    pages): TMA for page_size 64 / 128 / 256 (1-4 blocks per page), the cp.async gather for
+    pages that are not whole blocks (1 / 16 / 48 / 96: blocks span pages, pages straddle split
+    boundaries) and for page 64 forced through it ("paged64cp"). Paged runs are bitwise equal
+    to the same kernel on contiguous KV (the gather zero-fills rows past seqlen_k, masked to
+    P = 0 either way); every sequence matches the reference; the 128-key mainloop agrees under
+    the bf16-rounding contract. Page 16 also checks CLC on / off and no rope part bitwise."""
     if not IS_SM100 or USE_FAKE_TENSOR:
         pytest.skip()
     if not _mla_kb64_active(64):
@@ -3830,22 +3837,34 @@ def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(nheads, causal, mode, num_s
                 return_lse=True, **extra)
     out, lse, *_ = _flash_attn_fwd(**call)
     if mode.startswith("paged"):
-        ps = int(mode[len("paged"):])
+        ps = int(mode[len("paged"):].removesuffix("cp"))
+        if mode.endswith("cp"):
+            monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64_PAGED_CPASYNC", "1")
         npg = (s_k_max + ps - 1) // ps
         perm = torch.randperm(b * npg, device=device).to(torch.int32)
         page_table = perm.view(b, npg)
-        k_cache = torch.zeros(b * npg, ps, 1, 64, device=device, dtype=dtype)
-        v_cache = torch.zeros(b * npg, ps, 1, 512, device=device, dtype=dtype)
-        k_cache.view(-1, 1, 64)[:] = 0
-        for i in range(b):
-            for j in range(npg):
-                n = max(0, min(seqlens_k[i], (j + 1) * ps) - j * ps)
-                k_cache[page_table[i, j], :n] = ks[i][j * ps: j * ps + n]
-                v_cache[page_table[i, j], :n] = vs[i][j * ps: j * ps + n]
-        out_p, lse_p, *_ = _flash_attn_fwd(**dict(call, k=k_cache, v=v_cache, page_table=page_table))
+        # page j of sequence i holds its keys j*ps ..: scatter the zero-padded KV page-wise
+        k_cache = torch.empty(b * npg, ps, 1, 64, device=device, dtype=dtype)
+        v_cache = torch.empty(b * npg, ps, 1, 512, device=device, dtype=dtype)
+        k_cache[page_table.view(-1).long()] = pad(ks, npg * ps).view(b * npg, ps, 1, 64)
+        v_cache[page_table.view(-1).long()] = pad(vs, npg * ps).view(b * npg, ps, 1, 512)
+        call_p = dict(call, k=k_cache, v=v_cache, page_table=page_table)
+        out_p, lse_p, *_ = _flash_attn_fwd(**call_p)
         # rows past seqused_q are never written (uninitialized in both)
         vq = torch.arange(s_q_max, device=device)[None] < torch.tensor(seqlens_q, device=device)[:, None]
         assert torch.equal(out_p[vq], out[vq]) and torch.equal(lse_p[vq], lse[vq]), "paged != contiguous"
+        if ps == 16:
+            for clc in ("0", "1"):
+                monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_CLC", clc)
+                out_c, lse_c, *_ = _flash_attn_fwd(**call_p)
+                assert torch.equal(out_c[vq], out[vq]) and torch.equal(lse_c[vq], lse[vq]), f"CLC={clc}"
+            monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA_CLC")
+            # no rope part: the gather skips the K rows
+            nope = dict(q=None, k=None)
+            out_n, lse_n, *_ = _flash_attn_fwd(**dict(call, **nope))
+            out_np, lse_np, *_ = _flash_attn_fwd(**dict(call_p, **nope))
+            assert torch.equal(out_np[vq], out_n[vq]) and torch.equal(lse_np[vq], lse_n[vq]), "no rope"
+        monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA_KB64_PAGED_CPASYNC", raising=False)
     for i, (sq, sk) in enumerate(zip(seqlens_q, seqlens_k)):
         if sq == 0:
             continue

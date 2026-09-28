@@ -34,6 +34,9 @@ Two load front ends share the MMA, softmax and epilogue (`is_topk_gather`, compi
   keys are contiguous (or paged, page_size % 64 == 0); causal / seqlen masking is positional;
   the block range comes from BlockInfo per tile and split (runtime count, split-KV writes fp32
   O / LSE partials for the combine kernel). 12 warps.
+- dense paged with pages that are not whole 64-key blocks (`use_cpasync_kv`): the sparse
+  gather warps with the page table as the index source (page and offset per row, rows past
+  seqlen_k zero-filled) and the dense block range, masking and epilogue. 16 warps.
 """
 
 import math
@@ -108,7 +111,14 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         is_split_kv: bool = False,
         page_size: Optional[int] = None,
         packed_varlen: bool = True,
+        force_cpasync_kv: bool = False,
     ):
+        # The load front end: the cp.async gather warps 12-15 for top-k gather and for paged KV
+        # whose pages are not whole 64-key blocks (a block spans pages: no TMA box); TMA from the
+        # load warp otherwise. force_cpasync_kv takes paged page_size % 64 == 0 through the gather
+        # too (A/B of the two loaders; the loaded bytes are identical).
+        paged_cpasync = page_size is not None and (page_size % 64 != 0 or force_cpasync_kv)
+        use_cpasync_kv = is_topk_gather or paged_cpasync
         # the shared fields (scheduler, packed varlen, causal (in the bitmask when sparse),
         # head padding, split-KV)
         super().__init__(
@@ -123,8 +133,8 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             q_in_tmem=True,
             has_seqused_q=has_seqused_q,
             has_cu_seqlens_q=has_cu_seqlens_q,
-            # sparse: the cp.async gather warps 12-15; dense: TMA from the load warp (12 warps)
-            use_cpasync_load_KV=is_topk_gather,
+            # cp.async: the gather warps 12-15 (16 warps); TMA: the load warp (12 warps)
+            use_cpasync_load_KV=use_cpasync_kv,
             is_split_kv=is_split_kv,
             is_fp8=False,
             is_topk_gather=is_topk_gather,
@@ -151,13 +161,12 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             self.TileScheduler = (
                 SingleTileLPTScheduler if self.use_clc_scheduler else SingleTileScheduler
             )
-        assert is_topk_gather or page_size is None or page_size % 64 == 0, (
-            "kb64 mainloop: paged KV needs page_size % 64 == 0 (a page is whole 64-key blocks)"
-        )
         assert not (is_topk_gather and page_size is not None)
+        assert not force_cpasync_kv or page_size is not None, "force_cpasync_kv: paged KV only"
+        self.use_cpasync_kv = use_cpasync_kv
         self.page_size = page_size
-        # 64-key blocks per page
-        self.page_blocks = page_size // 64 if page_size is not None else 1
+        # TMA paging: 64-key blocks per page
+        self.page_blocks = page_size // 64 if page_size is not None and not paged_cpasync else 1
         assert hdimv == 512 and (hdim == 64 or not has_qk), (
             "kb64 mainloop: 64 rope + 512 latent dims"
         )
@@ -172,12 +181,12 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         self.o_store_bits = o_store_bits
 
         # ==== warps ====
-        # 0-3 softmax, 4-7 epilogue, 8 TMA load (dense) or idle (sparse: Q goes through the KV
-        # ring), 9 MMA, 10 CLC (idle without CLC), 11 idle, 12-15 cp.async gather (sparse)
+        # 0-3 softmax, 4-7 epilogue, 8 TMA load (TMA) or idle (cp.async: Q goes through the KV
+        # ring), 9 MMA, 10 CLC (idle without CLC), 11 idle, 12-15 cp.async gather
         self.empty_warp_ids = tuple(
             w
             for w, active in [
-                (self.load_warp_id, is_topk_gather),
+                (self.load_warp_id, use_cpasync_kv),
                 (11, True),
                 (self.clc_scheduler_warp_id, not self.use_clc_scheduler),
             ]
@@ -188,8 +197,8 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
 
         # ==== registers (honoured with min_blocks_per_mp=1 at launch) ====
         # setmaxnreg must be uniform per warp group: WG0 softmax, WG1 epilogue, WG2
-        # (load / MMA / CLC / idle), WG3 gather (sparse only).
-        if is_topk_gather:
+        # (load / MMA / CLC / idle), WG3 gather (cp.async only).
+        if use_cpasync_kv:
             # 16 warps: 192 + 128 + 112 + 80 = 512 (64K registers at 128 per thread)
             self.num_regs_softmax = 192
             self.num_regs_epilogue = 128
@@ -500,7 +509,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         # fewer than 64 heads (dense): TMA sources for Q / Qv are heads-first views with the real
         # head extent, so TMA zero-fills a token's padded rows (see pack_gqa.qheads_first_tma_view)
         mQ_tma = mQv_tma = None
-        if const_expr(self.pad_qheads and not self.is_topk_gather):
+        if const_expr(self.pad_qheads and not self.use_cpasync_kv):
             mQ_tma, mQv_tma = [
                 qheads_first_tma_view(mX, self.qhead_per_kvhead_valid, head_idx=2)
                 if mX is not None
@@ -516,7 +525,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         ]
         if const_expr(mLSE is not None):
             mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
-        if const_expr(not self.pad_qheads or self.is_topk_gather):
+        if const_expr(not self.pad_qheads or self.use_cpasync_kv):
             mQ_tma, mQv_tma = mQ, mQv
 
         # ==== MMAs (layout / descriptor providers of the .ws PTX helpers) ====
@@ -589,7 +598,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         cta_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk), (tiled_mma_Sd.thr_id.shape,)
         )
-        if const_expr(not self.is_topk_gather):
+        if const_expr(not self.use_cpasync_kv):
             mma_tiler_part = (self.cta_tile_m, self.tile_n, self.hdimv // self.num_kv_parts)
             self.sVp_layout_staged = sm100_utils.make_smem_layout_b(
                 tiled_mma=tiled_mma_64,
@@ -830,8 +839,8 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             is_two_cta=False,
         )
 
-        # ==== Prefetch TMA descriptors (dense) ====
-        if const_expr(not self.is_topk_gather):
+        # ==== Prefetch TMA descriptors (TMA front end) ====
+        if const_expr(not self.use_cpasync_kv):
             if warp_idx == self.load_warp_id:
                 for atom in (tma_atom_Q, tma_atom_Qv, tma_atom_K, tma_atom_V):
                     if const_expr(atom is not None):
@@ -841,9 +850,9 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         mma_warp = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
         sm_threads = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_softmax_threads)
         epi_threads = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_epilogue_threads)
-        # sparse: the 128 gather threads; dense: the TMA warp (one elected issuer)
+        # cp.async: the 128 gather threads; TMA: the load warp (one elected issuer)
         kv_producer = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, self.num_cpasync_load_threads if const_expr(self.is_topk_gather) else 1
+            pipeline.Agent.Thread, self.num_cpasync_load_threads if const_expr(self.use_cpasync_kv) else 1
         )
         TmaUmma = pipeline.PipelineTmaUmma
         AsyncUmma = pipeline.PipelineAsyncUmma
@@ -862,10 +871,10 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             )
 
         # fmt: off
-        # sparse: the gather threads arrive on the full barriers with cp.async.mbarrier.arrive.noinc;
-        # dense: TMA with the rope rows (or, without rope, the last latent part) on the full
-        # barrier. The MMA warp releases with tcgen05.commit (after PV(n), or the Q copies).
-        if const_expr(self.is_topk_gather):
+        # cp.async: the gather threads arrive on the full barriers with cp.async.mbarrier.arrive.noinc;
+        # TMA: the rope rows (or, without rope, the last latent part) on the full barrier. The
+        # MMA warp releases with tcgen05.commit (after PV(n), or the Q copies).
+        if const_expr(self.use_cpasync_kv):
             pipeline_KV   = make_pipeline(AsyncUmma, storage.mbar_ptr_KV,       self.num_stages_KV,       kv_producer,    mma_warp)
         else:
             pipeline_KV   = make_pipeline(TmaUmma,   storage.mbar_ptr_KV,       self.num_stages_KV,       kv_producer,    mma_warp,
@@ -884,12 +893,12 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         if const_expr(self.is_topk_gather):
             pipeline_bitmask = make_pipeline(Async,  storage.mbar_ptr_bitmask,  self.num_stages_bitmask,  kv_producer,    sm_threads)
         # fmt: on
-        # part barriers of the KV ring (sparse: 128 cp.async arrivals per landed part; dense: one
+        # part barriers of the KV ring (cp.async: 128 arrivals per landed part; TMA: one
         # arrive_and_expect_tx + the part's TMA bytes) and the MMA warp's private "Q copies
         # done" barrier (one tcgen05.commit per tile)
         mbar_KV_part = storage.mbar_ptr_KV_part.data_ptr()
         mbar_utccp = storage.mbar_ptr_utccp.ptr
-        part_arrivals = self.num_cpasync_load_threads if const_expr(self.is_topk_gather) else 1
+        part_arrivals = self.num_cpasync_load_threads if const_expr(self.use_cpasync_kv) else 1
         if warp_idx == 0:
             if cute.arch.lane_idx() == 0:
                 for i in range(self.num_latent_part_mbars * self.num_stages_KV):
@@ -929,9 +938,9 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         sBitmask = None
         if const_expr(self.is_topk_gather):
             sBitmask = storage.sBitmask.get_tensor(sBitmask_layout)
-        # dense: the latent parts, the TMA destination (same bytes as sV, see __call__)
+        # TMA: the latent parts, the TMA destination (same bytes as sV, see __call__)
         sVp = None
-        if const_expr(not self.is_topk_gather):
+        if const_expr(not self.use_cpasync_kv):
             sVp = cute.make_tensor(
                 cute.recast_ptr(sV.iterator, sVp_layout_staged.inner, self.dtype_V),
                 sVp_layout_staged.outer,
@@ -1011,14 +1020,20 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                     cute.arch.setmaxregister_decrease(self.num_regs_other)
                 self.empty_warp(tile_scheduler)
 
-        if const_expr(self.is_topk_gather):
+        if const_expr(self.use_cpasync_kv):
             if warp_idx >= self.cpasync_load_warp_indices[0]:
                 if const_expr(self.num_regs_cpasync < self.num_regs_per_thread):
                     cute.arch.setmaxregister_decrease(self.num_regs_cpasync)
-                self.load_cpasync(
-                    mIndexTopk, mQ, mQv, mK, mV, sK, sV, sBitmask, pipeline_KV, pipeline_K,
-                    mbar_KV_part, pipeline_bitmask, SeqlenInfoCls, tile_scheduler=tile_scheduler,
-                )
+                if const_expr(self.is_topk_gather):
+                    self.load_cpasync(
+                        mIndexTopk, mQ, mQv, mK, mV, sK, sV, sBitmask, pipeline_KV, pipeline_K,
+                        mbar_KV_part, pipeline_bitmask, SeqlenInfoCls, tile_scheduler=tile_scheduler,
+                    )
+                else:
+                    self.load_cpasync_paged(
+                        mPageTable, mQ, mQv, mK, mV, sK, sV, pipeline_KV, pipeline_K, mbar_KV_part,
+                        block_info, SeqlenInfoCls, tile_scheduler=tile_scheduler,
+                    )
         else:
             if warp_idx == self.load_warp_id:
                 if const_expr(self.num_regs_load < self.num_regs_per_thread):
@@ -1453,6 +1468,147 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         return producer_state_KV, producer_state_K, producer_state_bitmask
 
     # ------------------------------------------------------------------------------------------
+    # gather warps (12-15), dense paged KV with pages that are not whole 64-key blocks: the sparse
+    # front end with the page table as the index source (page and in-page offset per row, two
+    # blocks ahead) and the dense block range (runtime count, split-KV, has_work, dummy block)
+    # ------------------------------------------------------------------------------------------
+    @cute.jit
+    def load_cpasync_paged(
+        self,
+        mPageTable: cute.Tensor,
+        mQ: Optional[cute.Tensor],
+        mQv: cute.Tensor,
+        mK: Optional[cute.Tensor],
+        mV: cute.Tensor,
+        sK: Optional[cute.Tensor],
+        sV: cute.Tensor,
+        pipeline_KV: pipeline.PipelineAsyncUmma,
+        pipeline_K: Optional[pipeline.PipelineAsyncUmma],
+        mbar_KV_part: cute.Pointer,
+        block_info: BlockInfo,
+        SeqlenInfoCls: Callable,
+        tile_scheduler: TileSchedulerProtocol,
+    ):
+        tidx = cute.arch.thread_idx()[0] % self.num_cpasync_load_threads
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % (
+            self.num_cpasync_load_threads // 32
+        )
+        Producer = pipeline.PipelineUserType.Producer
+        producer_state_KV = pipeline.make_pipeline_state(Producer, stages=self.num_stages_KV)
+        producer_state_K = None
+        if const_expr(self.has_qk):
+            producer_state_K = pipeline.make_pipeline_state(Producer, stages=self.num_stages_K)
+
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            m_block, head_idx, batch_idx, split_idx = self._tile_coords(
+                work_tile.tile_idx, SeqlenInfoCls.keywords["mCuSeqlensQ"]
+            )
+            seqlen = SeqlenInfoCls(batch_idx)
+            n_block_first, num_n_blocks, has_work = self._kb64_blocks(
+                block_info, seqlen, m_block, split_idx
+            )
+            if has_work:
+                gather = CpasyncGatherKVManagerH64.create(
+                    None,
+                    tidx,
+                    warp_idx,
+                    seqlen.seqlen_k,
+                    self.tile_n,
+                    self.hdim,
+                    self.hdimv,
+                    self.num_cpasync_load_threads,
+                    mV.element_type,
+                    disable_bitmask=True,
+                    page_size=self.page_size,
+                    mPageTable=mPageTable[batch_idx, None],
+                )
+                # this head's (page_size, d, num_pages) views
+                mK_cur = None
+                if const_expr(self.has_qk):
+                    mK_cur = mK[None, None, head_idx, None]
+                mV_cur = mV[None, None, head_idx, None]
+                gQ = None
+                if const_expr(self.has_qk):
+                    mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+                    gQ = cute.local_tile(mQ_cur, (self.cta_tile_m, self.hdim), (m_block, 0))
+                mQv_cur = seqlen.offset_batch_Q(mQv, batch_idx, dim=3)[None, None, head_idx]
+                gQv = cute.local_tile(mQv_cur, (self.cta_tile_m, self.hdimv), (m_block, 0))
+
+                # Q pseudo-block first: the MMA warp copies it to TMEM before the first S GEMM
+                producer_state_KV, producer_state_K = self.gather_q(
+                    gather, pipeline_KV, pipeline_K, mbar_KV_part, sK, sV, gQ, gQv,
+                    producer_state_KV, producer_state_K,
+                )
+                gather_block = partial(
+                    self.gather_block_paged, gather, pipeline_KV, pipeline_K, mbar_KV_part, sK, sV,
+                    mK_cur, mV_cur, seqlen.seqlen_k,
+                )
+                # descending blocks, two index register sets, indices two blocks ahead (clamped at
+                # 0: the prefetch past the range only reads a page-table entry); a runtime count,
+                # so pairs and an odd tail on register set 0
+                n_block = Int32(n_block_first)
+                gather.load_index_paged(n_block, 0)
+                gather.load_index_paged(cutlass.max(n_block - 1, 0), 1)
+                for _ in cutlass.range(num_n_blocks // 2, unroll=1):
+                    for buf in cutlass.range_constexpr(2):
+                        producer_state_KV, producer_state_K = gather_block(
+                            n_block, producer_state_KV, producer_state_K, buf
+                        )
+                        gather.load_index_paged(cutlass.max(n_block - 2, 0), buf)
+                        n_block -= 1
+                if num_n_blocks % 2 == 1:
+                    producer_state_KV, producer_state_K = gather_block(
+                        n_block, producer_state_KV, producer_state_K, 0
+                    )
+
+            work_tile = tile_scheduler.advance_to_next_work()
+
+        pipeline_KV.producer_tail(producer_state_KV)
+
+    @cute.jit
+    def gather_block_paged(
+        self,
+        gather: CpasyncGatherKVManagerH64,
+        pipeline_KV: pipeline.PipelineAsyncUmma,
+        pipeline_K: Optional[pipeline.PipelineAsyncUmma],
+        mbar_KV_part: cute.Pointer,
+        sK: Optional[cute.Tensor],
+        sV: cute.Tensor,
+        mK_cur: Optional[cute.Tensor],
+        mV_cur: cute.Tensor,
+        seqlen_k: Int32,
+        n_block: Int32,
+        producer_state_KV: pipeline.PipelineState,
+        producer_state_K: Optional[pipeline.PipelineState],
+        buf: cutlass.Constexpr[int],
+    ):
+        """One paged block: gather_block's parts / arrivals / rope-last order, rows at or past
+        seqlen_k zero-filled (the softmax masks them by position), no bitmask."""
+        num_valid_rows = seqlen_k - n_block * self.tile_n
+        stage = producer_state_KV.index
+        pipeline_KV.producer_acquire(producer_state_KV)
+        for p in cutlass.range_constexpr(self.num_kv_parts):
+            gather.load_X(
+                mV_cur,
+                sV[None, None, None, stage],
+                "V",
+                buf,
+                col_blocks=(p * self.col_blocks_per_part, (p + 1) * self.col_blocks_per_part),
+                num_valid_rows=num_valid_rows,
+            )
+            if const_expr(p < self.num_latent_part_mbars):
+                cute.arch.cp_async_mbarrier_arrive_noinc(mbar_KV_part + (p * self.num_stages_KV + stage))
+        if const_expr(self.has_qk):
+            pipeline_K.producer_acquire(producer_state_K)
+            gather.load_X(mK_cur, sK, "K", buf, num_valid_rows=num_valid_rows)
+            producer_state_K.advance()
+        cute.arch.cp_async_commit_group()
+        pipeline_KV.sync_object_full.arrive_cp_async_mbarrier(stage)
+        producer_state_KV.advance()
+        return producer_state_KV, producer_state_K
+
+    # ------------------------------------------------------------------------------------------
     # MMA warp (9): per tile Q -> TMEM (tcgen05.cp from the Q pseudo-block), then
     #   S(0); for n = 1 .. N-1: S(n), O += P(n-1) V(n-1); O += P(N-1) V(N-1).
     # ------------------------------------------------------------------------------------------
@@ -1533,7 +1689,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             if has_work:
                 # ---- Q -> TMEM from the pseudo-block: 16 copies for Qv, 2 for Q_rope ----
                 stage_q = kv_state_S.index
-                if const_expr(self.is_topk_gather):
+                if const_expr(self.use_cpasync_kv):
                     # cp.async: the full barrier's noinc arrival fires once all of a thread's
                     # earlier copies (every Qv part) have landed
                     pipeline_KV.consumer_wait(kv_state_S)
