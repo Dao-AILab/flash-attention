@@ -308,7 +308,8 @@ _LEARNABLE_SINK_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 #   fwd         2CTA / 1CTA sparse forward: 560 / 352 B/thread local memory -> 32 / 0,
 #               median +15-17%
 #   bwd         main sparse backward: 280-1048 B -> 0-64, +1-18% (recompute-P +4-18%)
-#   bwd_dq_dqv  dQ/dQv GEMM: 4064 B -> 0, 3.0-4.2x
+#   bwd_dq_dqv  dQ/dQv GEMM: 4064 B -> 0, 3.0-4.2x; the 64-head dQdQvGemmKernelH64 does not spill
+#               at either level, -O2 +0.3-1%
 #   bwd_dk      dK GEMM: no spill either way, +3-4%
 #   bwd_preprocess: no spill, no measurable change -> left at the ptxas default
 # FLASH_ATTENTION_MLA_PTXAS_OPTIONS overrides every MLA kernel ("" = the ptxas default),
