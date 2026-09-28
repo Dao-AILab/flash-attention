@@ -91,6 +91,7 @@ from flash_attn.cute.tile_scheduler import (
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
 
 
+
 class FlashAttentionMLAForward1CtaSm100:
     # TMEM lane stride and datapath-half offset for hand-built Layout E layouts.
     # TMEM addresses: bits 16-31 = lane, bits 0-15 = column.
@@ -119,6 +120,7 @@ class FlashAttentionMLAForward1CtaSm100:
         num_stages_V: Optional[int] = None,
         num_stages_K: Optional[int] = None,
         num_stages_P: Optional[int] = None,
+        s_ahead: bool = False,
         _qk_issue_last: bool = False,
     ):
         # ==== sparse top-k gather ====
@@ -410,6 +412,17 @@ class FlashAttentionMLAForward1CtaSm100:
         assert self.num_stages_V % self.num_hdimv_splits == 0, (
             "V stages must be a whole number of n_blocks (num_hdimv_splits per block)"
         )
+        # MMA issue order. With two blocks of V resident (fp8's 4 V stages) S(n) can be issued
+        # before PVt(n-1), so the tensor core computes the next S while the softmax works
+        # instead of waiting on P; a one-block V ring (bf16) must issue PVt(n-1) first --
+        # S(n) needs V(n), whose slots only PVt(n-1) frees.
+        # Measured on fp8 (AI/SPARSE_MLA_1CTA.md, "fp8 S-ahead"): +33-36% on L2-resident
+        # prefill, where the tensor core is the bottleneck; -5-16% on decode, where it takes
+        # the loads' one-block look-ahead (both resident blocks are then held by the MMAs).
+        # The interface picks it per call; the kernel default is in order.
+        s_ahead_ok = self.num_stages_V >= 2 * self.num_hdimv_splits
+        assert not s_ahead or s_ahead_ok, "s_ahead needs two blocks of V stages"
+        self.s_ahead = bool(s_ahead)
         assert not q_in_tmem or self.num_stages_K == 1, (
             "q_in_tmem aliases the Q staging tile onto the first half of the single sK "
             "slot; num_stages_K > 1 would need a separate Q staging buffer"
@@ -2512,57 +2525,105 @@ class FlashAttentionMLAForward1CtaSm100:
                     producer_state_S, consumer_state_V_wait, consumer_state_K, stage=0
                 )
 
-                # ==== Mainloop ====
-                # Single-block V residency forces PVt(cur) before S(next): S(next)
-                # needs V(next), whose slots are freed only by PVt(cur).
-                for _ in cutlass.range(num_n_block_groups - 1, unroll=1):
-                    for stage in cutlass.range_constexpr(self.num_stages_S):
-                        (
-                            producer_state_O0,
-                            producer_state_O1,
-                            consumer_state_P,
-                            consumer_state_V_release,
-                            O_should_accumulate,
-                        ) = mma_PVt(
-                            producer_state_O0,
-                            producer_state_O1,
-                            consumer_state_P,
-                            consumer_state_V_release,
-                            O_should_accumulate,
-                        )
-                        producer_state_S, consumer_state_V_wait, consumer_state_K = mma_S(
-                            producer_state_S,
-                            consumer_state_V_wait,
-                            consumer_state_K,
-                            stage=const_expr((stage + 1) % self.num_stages_S),
-                        )
+                if const_expr(self.s_ahead):
+                    # ==== S(n) ahead of PVt(n-1) (see mma_pair_step) ====
+                    # S stages keep the block parity (block n -> stage n % 2) the softmax
+                    # expects, whichever of the two is issued first.
+                    mma_pair = partial(self.mma_pair_step, mma_S, mma_PVt)
+                    states = (
+                        producer_state_S,
+                        consumer_state_V_wait,
+                        consumer_state_K,
+                        producer_state_O0,
+                        producer_state_O1,
+                        consumer_state_P,
+                        consumer_state_V_release,
+                        O_should_accumulate,
+                    )
+                    num_pairs = num_n_blocks - 1
+                    for _ in cutlass.range(num_pairs // 2, unroll=1):
+                        for stage in cutlass.range_constexpr(self.num_stages_S):
+                            states = mma_pair(
+                                *states, stage=const_expr((stage + 1) % self.num_stages_S)
+                            )
+                    if num_pairs % 2 == 1:
+                        states = mma_pair(*states, stage=1)  # the last S is of an odd block
+                    (
+                        producer_state_S,
+                        consumer_state_V_wait,
+                        consumer_state_K,
+                        producer_state_O0,
+                        producer_state_O1,
+                        consumer_state_P,
+                        consumer_state_V_release,
+                        O_should_accumulate,
+                    ) = states
+                    (
+                        producer_state_O0,
+                        producer_state_O1,
+                        consumer_state_P,
+                        consumer_state_V_release,
+                        O_should_accumulate,
+                    ) = mma_PVt(
+                        producer_state_O0,
+                        producer_state_O1,
+                        consumer_state_P,
+                        consumer_state_V_release,
+                        O_should_accumulate,
+                    )
+                else:
+                    # ==== In order: PVt(n) then S(n+1) ====
+                    # ==== Mainloop ====
+                    # Single-block V residency forces PVt(cur) before S(next): S(next)
+                    # needs V(next), whose slots are freed only by PVt(cur).
+                    for _ in cutlass.range(num_n_block_groups - 1, unroll=1):
+                        for stage in cutlass.range_constexpr(self.num_stages_S):
+                            (
+                                producer_state_O0,
+                                producer_state_O1,
+                                consumer_state_P,
+                                consumer_state_V_release,
+                                O_should_accumulate,
+                            ) = mma_PVt(
+                                producer_state_O0,
+                                producer_state_O1,
+                                consumer_state_P,
+                                consumer_state_V_release,
+                                O_should_accumulate,
+                            )
+                            producer_state_S, consumer_state_V_wait, consumer_state_K = mma_S(
+                                producer_state_S,
+                                consumer_state_V_wait,
+                                consumer_state_K,
+                                stage=const_expr((stage + 1) % self.num_stages_S),
+                            )
 
-                # ==== Epilogue ====
-                num_final_n_blocks = self.num_stages_S if even_n_blocks else self.num_stages_S - 1
-                for stage in cutlass.range_constexpr(self.num_stages_S):
-                    n_block = num_final_n_blocks - 1 - stage
-                    if n_block >= 0:
-                        (
-                            producer_state_O0,
-                            producer_state_O1,
-                            consumer_state_P,
-                            consumer_state_V_release,
-                            O_should_accumulate,
-                        ) = mma_PVt(
-                            producer_state_O0,
-                            producer_state_O1,
-                            consumer_state_P,
-                            consumer_state_V_release,
-                            O_should_accumulate,
-                        )
-                        if const_expr(stage == 0):
-                            if n_block > 0:
-                                producer_state_S, consumer_state_V_wait, consumer_state_K = mma_S(
-                                    producer_state_S,
-                                    consumer_state_V_wait,
-                                    consumer_state_K,
-                                    stage=1,
-                                )
+                    # ==== Epilogue ====
+                    num_final_n_blocks = self.num_stages_S if even_n_blocks else self.num_stages_S - 1
+                    for stage in cutlass.range_constexpr(self.num_stages_S):
+                        n_block = num_final_n_blocks - 1 - stage
+                        if n_block >= 0:
+                            (
+                                producer_state_O0,
+                                producer_state_O1,
+                                consumer_state_P,
+                                consumer_state_V_release,
+                                O_should_accumulate,
+                            ) = mma_PVt(
+                                producer_state_O0,
+                                producer_state_O1,
+                                consumer_state_P,
+                                consumer_state_V_release,
+                                O_should_accumulate,
+                            )
+                            if const_expr(stage == 0):
+                                if n_block > 0:
+                                    producer_state_S, consumer_state_V_wait, consumer_state_K = mma_S(
+                                        producer_state_S,
+                                        consumer_state_V_wait,
+                                        consumer_state_K,
+                                        stage=1,
+                                    )
 
                 if const_expr(self.has_qk):
                     # Released at the END of the tile on purpose when q_in_tmem: the release
@@ -2583,6 +2644,51 @@ class FlashAttentionMLAForward1CtaSm100:
         pipeline_S.producer_tail(producer_state_S)
         pipeline_O0.producer_tail(producer_state_O0)
         pipeline_O1.producer_tail(producer_state_O1)
+
+    @cute.jit
+    def mma_pair_step(
+        self,
+        mma_S: Callable,
+        mma_PVt: Callable,
+        producer_state_S: pipeline.PipelineState,
+        consumer_state_V_wait: pipeline.PipelineState,
+        consumer_state_K: pipeline.PipelineState,
+        producer_state_O0: pipeline.PipelineState,
+        producer_state_O1: pipeline.PipelineState,
+        consumer_state_P: pipeline.PipelineState,
+        consumer_state_V_release: pipeline.PipelineState,
+        O_should_accumulate: Boolean,
+        stage: cutlass.Constexpr[int],
+    ):
+        """S(n) then PVt(n-1), with the V ring holding two blocks: S(n) reads V(n) while
+        PVt(n-1) still holds V(n-1), so the tensor core computes S(n) during the softmax of
+        block n-1 instead of idling on P(n-1)."""
+        producer_state_S, consumer_state_V_wait, consumer_state_K = mma_S(
+            producer_state_S, consumer_state_V_wait, consumer_state_K, stage=stage
+        )
+        (
+            producer_state_O0,
+            producer_state_O1,
+            consumer_state_P,
+            consumer_state_V_release,
+            O_should_accumulate,
+        ) = mma_PVt(
+            producer_state_O0,
+            producer_state_O1,
+            consumer_state_P,
+            consumer_state_V_release,
+            O_should_accumulate,
+        )
+        return (
+            producer_state_S,
+            consumer_state_V_wait,
+            consumer_state_K,
+            producer_state_O0,
+            producer_state_O1,
+            consumer_state_P,
+            consumer_state_V_release,
+            O_should_accumulate,
+        )
 
     @cute.jit
     def mma_S_step(

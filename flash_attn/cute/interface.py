@@ -1356,6 +1356,22 @@ def _flash_attn_fwd(
     mla_ptxas_options = (
         _mla_ptxas_options("fwd_kb64" if mla_1cta_kb64 else "fwd") if qv is not None else ""
     )
+    # 128-key 1CTA mainloop, fp8 (a two-block V ring): issue S(n) ahead of PVt(n-1) when the
+    # tensor core is the bottleneck. That is when many tiles share one KV stream, which then
+    # stays L2-resident: >= 8 tiles of 64 rows, i.e. seqlen_q x heads >= 512 (prefill /
+    # extend; +33-36% measured). Decode streams each tile's KV from DRAM and needs the loads'
+    # one-block look-ahead that S-ahead gives up (-5-16%). Varlen without a max_seqlen_q hint
+    # stays in order. FLASH_ATTENTION_MLA_1CTA_S_AHEAD=0 / 1 forces it (ablation; 1 needs fp8).
+    _s_ahead_seqlen_q = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
+    mla_1cta_s_ahead = (
+        is_fp8
+        and not mla_1cta_kb64
+        and _s_ahead_seqlen_q is not None
+        and _s_ahead_seqlen_q * nheads_per_kv >= 512
+    )
+    _s_ahead_env = os.environ.get("FLASH_ATTENTION_MLA_1CTA_S_AHEAD")
+    if _s_ahead_env:
+        mla_1cta_s_ahead = _s_ahead_env == "1"
 
     compile_key = (
         mla_1cta,
@@ -1363,6 +1379,7 @@ def _flash_attn_fwd(
         mla_1cta_kb64,
         mla_1cta_kb64_o_align32,
         mla_1cta and mla_1cta_use_clc,
+        mla_1cta_s_ahead if mla_1cta else None,
         mla_ptxas_options,
         dtype,
         head_dim,
@@ -1623,6 +1640,7 @@ def _flash_attn_fwd(
                             is_topk_gather=sparse_kv,
                             topk_length=gather_kv_length if sparse_kv else 0,
                             rescale_threshold=mla_fwd_rescale_threshold,
+                            s_ahead=mla_1cta_s_ahead,
                         )
                 else:
                     fa_fwd = FlashAttentionMLAForwardSm100(

@@ -140,6 +140,64 @@ each kernel at its shipped ptxas level:
 
 Small-batch decode stays latency-bound and 2CTA still wins there (Follow-up 1).
 
+## fp8: S ahead of PV in the 128-key mainloop
+
+The 128-key mainloop issues PVt(n) before S(n+1). That order is forced when one block's V
+fills the V ring (bf16: 2 stages = the two dv halves of one block), because S(n+1) reads
+V(n+1) and only PVt(n) frees V(n)'s slots. The MMA warp issues in order, and PVt(n) waits
+for the softmax to produce P(n). So the tensor core idles through every softmax step.
+
+fp8 has 4 V stages, i.e. two blocks resident. With `s_ahead` (`mma_pair_step`) the MMA warp
+issues S(n) before PVt(n-1), and the tensor core computes S(n) while the softmax works on
+block n-1. S stages keep the block parity (block n -> stage n % 2), so the softmax is
+unchanged. The arithmetic is unchanged too: the output is bitwise identical to the in-order
+order on dense (with and without split-KV), causal prefill (1 / 2 / 3 / odd block counts),
+varlen-q, sparse, and paged (cp.async and TMA) (`agent_space/s_ahead_bitwise.py`).
+
+S-ahead is not free. Both resident blocks are then held by the MMAs, so the loads lose their
+one-block look-ahead. The interface therefore turns it on only when the tensor core is the
+bottleneck: fp8 with `seqlen_q x heads >= 512`, i.e. at least 8 tiles sharing one KV stream,
+which stays L2-resident. Varlen without a `max_seqlen_q` hint stays in order.
+`FLASH_ATTENTION_MLA_1CTA_S_AHEAD=0/1` forces the choice.
+
+Ablation (`agent_space/bench_fp8_s_ahead.py`, `agent_space/bench_sparse_1cta/fp8_s_ahead.csv`;
+160 rows, all bitwise equal). Speedup over in order, min / median / max:
+
+| fp8 regime | S-ahead forced | interface default |
+|---|---|---|
+| dense decode, 16 / 64 / 128 heads, b 1-512, s_k 8K / 32K, split and not (cold) | 0.84 / 0.93 / 1.17 | 0.96 / 1.00 / 1.16 (noise) |
+| same, hot | 0.83 / 0.94 / 1.42 | 0.98 / 1.00 / 1.01 |
+| paged decode (page 128 TMA, 64 cp.async) | 0.84-0.87 | 1.00 |
+| sparse decode, 64 heads (cold / hot) | 0.92 / 1.12 median | 1.00 |
+| dense causal prefill, s_q 256-4096 | 1.03 / 1.33 / 1.40 | same |
+| sparse causal prefill | 1.09 | 1.09 |
+
+**Adaptive order: tried and dropped.** At run time the MMA warp issued whichever of S(n) /
+PVt(n-1) had its operand first, polled with `mbarrier.test_wait`. (`try_wait` can suspend
+the thread; as a probe it made the kernel slower.) It matched in order on decode but reached
+only 1.21x on prefill, and it showed an intermittent ~28 us stall on one small-batch sparse
+decode shape per run. The shape moved between runs, and a nanosleep backoff did not fix it.
+
+## Prefill: 1CTA vs 2CTA (causal, b = 1, cold)
+
+Source: `agent_space/bench_prefill_1cta_vs_2cta.py`,
+`agent_space/bench_sparse_1cta/prefill_1cta_vs_2cta.csv`. Each column is 2CTA-bf16 time
+divided by the variant's time, so > 1 means faster than 2CTA. The 2CTA MLA kernel has no
+fp8 path.
+
+| kind | heads | shapes (s_q x s_k) | 1CTA bf16 | 1CTA fp8 (S-ahead) |
+|---|---|---|---|---|
+| dense | 16 | 1Kx16K / 4Kx4K / 4Kx16K | 0.53 / 0.58 / 0.58 | 1.06 / 1.13 / 1.26 |
+| dense | 64 | same | 0.58 / 0.60 / 0.61 | 1.24 / 1.18 / 1.33 |
+| dense | 128 | same | 0.57 / 0.56 / 0.64 | 1.24 / 1.06 / 1.40 |
+| sparse (topk 2048) | 16 | 4Kx8K / 4Kx32K | 1.39 / 1.38 | 2.23 / 2.21 |
+| sparse (topk 2048) | 64 | same | 1.66 / 1.64 (kb64) | 2.20 / 2.18 |
+
+- **Dense bf16 prefill belongs on 2CTA.** Even the kb64 structure measured only 1.14-1.20x
+  over 1CTA dense, via the arange-index proxy (`agent_space/bench_dense_vs_kb64_proxy.py`).
+- **fp8 1CTA with S-ahead beats 2CTA bf16** on dense prefill. Sparse 1CTA wins at both
+  precisions.
+
 ## Performance (GB300, 152 SMs, L2 129 MiB; bf16, topk 2048, h_kv 1)
 
 These tables predate CLC on the sparse route and the kb64 mainloop (see the section
@@ -230,3 +288,5 @@ Backward, sparse MLA training step:
    re-ablate its ptxas level and budgets there.
 6. **kb64 for < 64 heads.** It needs a predicated (or TMA) Q staging in place of the
    identity-row gather, and head guards in the O / LSE stores.
+7. **Dense bf16 prefill** runs 0.53-0.64x of 2CTA on the 1CTA kernel (see "Prefill: 1CTA vs
+   2CTA"); a routing heuristic should keep it on 2CTA if 1CTA ever becomes the default.
