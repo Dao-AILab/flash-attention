@@ -63,6 +63,8 @@ import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
+    SingleTileLPTScheduler,
+    SingleTileScheduler,
     TileSchedulerArguments,
     TileSchedulerProtocol,
     ParamsBase,
@@ -105,6 +107,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         is_topk_gather: bool = True,
         is_split_kv: bool = False,
         page_size: Optional[int] = None,
+        packed_varlen: bool = True,
     ):
         # the shared fields (scheduler, packed varlen, causal (in the bitmask when sparse),
         # head padding, split-KV)
@@ -138,6 +141,16 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             self.pad_qheads = True
         self.pack_gqa = True
         assert self.qhead_per_kvhead == 64, "kb64 mainloop: at most 64 Q heads per KV head"
+        if packed_varlen and not is_topk_gather and has_cu_seqlens_q and not has_seqused_q:
+            # Packed varlen scheduling, as the sparse front end (the base sets it for top-k):
+            # a tile is one token, so it can never straddle two sequences. The grid is flat over
+            # the total_q tokens (num_batch = 1) and every role recovers (batch, local token) in
+            # _tile_coords; no per-batch enumeration, and CLC applies to varlen as well.
+            # seqused_q keeps the varlen scheduler (rows past it would still get tiles here).
+            self.use_packed_varlen_sched = True
+            self.TileScheduler = (
+                SingleTileLPTScheduler if self.use_clc_scheduler else SingleTileScheduler
+            )
         assert is_topk_gather or page_size is None or page_size % 64 == 0, (
             "kb64 mainloop: paged KV needs page_size % 64 == 0 (a page is whole 64-key blocks)"
         )

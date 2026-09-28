@@ -246,6 +246,30 @@ The HBM3e spec is about 8 TB/s.
 - **Below ~1 GiB the kernels are latency-bound**, not bandwidth-bound. b=1 reaches
   0.4-2.6 TB/s even with split-KV.
 
+## Dense kb64: packed varlen scheduling
+
+With `cu_seqlens_q` (and no `seqused_q`), dense kb64 schedules a flat grid over the `total_q` tokens, as the sparse front end does:
+- `num_batch = 1`;
+- CLC (`SingleTileLPTScheduler`), or `SingleTileScheduler` without CLC;
+- every role recovers the batch and the batch-local token in `_tile_coords` (a binary search on `cu_seqlens_q`).
+
+This is safe because a kb64 tile is one token (64 heads, or padded heads on decode), so it can never straddle two sequences. `seqused_q` keeps the per-batch `SingleTileVarlenScheduler`. `FLASH_ATTENTION_MLA_1CTA_PACKED_VARLEN=0` restores it for A/B runs.
+
+Outputs are bitwise identical to the per-batch scheduler (`agent_space/kb64_varlen_ref.py`, 36 cases incl. split-KV 3 / heuristic and zero-length sequences; `test_flash_attn_mla_1cta_dense_kb64_packed_varlen_decode`).
+
+Results (`agent_space/bench_kb64_varlen.py`, `agent_space/bench_sparse_1cta/kb64_varlen.csv`; GB300, 64 / 16 heads, cold):
+
+| varlen shape | packed | per-batch | per-batch / packed | 128-key / packed |
+|---|---|---|---|---|
+| 2048 single-token seqs, s_k <= 4K | 0.76-0.80 ms | 1.00-1.05 ms | 1.31x | 1.36-1.48x |
+| 512 single-token seqs, s_k <= 32K | 1.53-1.56 ms | 1.53-1.56 ms | 1.00x | 1.20-1.23x |
+| 128 single-token seqs, s_k <= 32K | 0.52-0.54 ms | 0.52-0.59 ms | 1.00-1.13x | 1.36-1.37x |
+| ragged causal prefill, 8 / 32 docs | 1.74 / 2.67 ms | 1.79 / 2.73 ms | 1.03x | 1.47 / 1.89x |
+
+**Where packed wins.** Many short sequences, where the per-batch scheduler's per-tile batch lookup (a prefix scan) costs time. Bandwidth-bound shapes with few long sequences are neutral.
+
+**CLC with packed varlen.** Neutral to 6% slower on decode (512 seqs: 1.66 vs 1.56 ms) and neutral on prefill. So the dense kb64 default is unchanged: CLC on for prefill only.
+
 ## kb64 with fewer than 64 heads
 
 **Mechanism.**

@@ -1387,6 +1387,9 @@ def _flash_attn_fwd(
         # decode; varlen without a max_seqlen_q hint counts as decode
         _clc_seqlen_q = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
         mla_1cta_use_clc = _clc_seqlen_q is not None and _clc_seqlen_q > 1
+    # dense kb64 with cu_seqlens_q schedules a flat grid over the tokens (packed varlen);
+    # FLASH_ATTENTION_MLA_1CTA_PACKED_VARLEN=0 keeps the per-batch varlen scheduler (ablation)
+    mla_1cta_packed_varlen = os.environ.get("FLASH_ATTENTION_MLA_1CTA_PACKED_VARLEN", "1") == "1"
     # FLASH_ATTENTION_MLA_1CTA_CLC=0 / 1 forces it (ablation)
     if os.environ.get("FLASH_ATTENTION_MLA_1CTA_CLC"):
         mla_1cta_use_clc = os.environ["FLASH_ATTENTION_MLA_1CTA_CLC"] == "1"
@@ -1428,6 +1431,7 @@ def _flash_attn_fwd(
         mla_1cta_kb64_o_align32,
         page_size if mla_1cta_kb64_dense and page_table is not None else None,
         mla_1cta and mla_1cta_use_clc,
+        mla_1cta_kb64_dense and mla_1cta_packed_varlen,
         mla_1cta_s_ahead if mla_1cta else None,
         mla_ptxas_options,
         dtype,
@@ -1673,6 +1677,7 @@ def _flash_attn_fwd(
                             is_topk_gather=bool(sparse_kv),
                             is_split_kv=is_split_kv,
                             page_size=page_size if page_table is not None else None,
+                            packed_varlen=mla_1cta_packed_varlen,
                         )
                     else:
                         fa_fwd = FlashAttentionMLAForward1CtaSm100(

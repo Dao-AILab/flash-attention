@@ -3705,6 +3705,50 @@ def test_flash_attn_mla_1cta_dense_kb64(nheads, has_qk, causal, seqlen_q, seqlen
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA dense MLA, 64-key-block mainloop")
+@pytest.mark.parametrize("num_splits", [1, 3, 0])
+@pytest.mark.parametrize("nheads", [64, 16])
+def test_flash_attn_mla_1cta_dense_kb64_packed_varlen_decode(nheads, num_splits, monkeypatch):
+    """Dense kb64 with cu_seqlens_q schedules a flat grid over the tokens (packed varlen, one
+    token per tile). Many single-token sequences with ragged s_k (including 1 and multiples of
+    64), split-KV: bitwise equal to the per-batch varlen scheduler and with CLC on / off,
+    close to the 128-key mainloop, and a sample of sequences against the reference."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    if not _mla_kb64_active(nheads):
+        pytest.skip("kb64 mainloop disabled")
+    device, dtype = "cuda", torch.bfloat16
+    g = torch.Generator(device="cpu").manual_seed(0)
+    n = 300
+    seqlens_k = torch.randint(1, 3000, (n,), generator=g).tolist()
+    seqlens_k[:4] = [1, 64, 128, 2999]
+    cu = lambda lens: torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device=device)  # noqa: E731
+    torch.random.manual_seed(0)
+    q = torch.randn(n, nheads, 64, device=device, dtype=dtype)
+    qv = torch.randn(n, nheads, 512, device=device, dtype=dtype)
+    k = torch.randn(sum(seqlens_k), 1, 64, device=device, dtype=dtype)
+    v = torch.randn(sum(seqlens_k), 1, 512, device=device, dtype=dtype)
+    call = dict(qv=qv, num_splits=num_splits, cu_seqlens_q=cu([1] * n), cu_seqlens_k=cu(seqlens_k),
+                max_seqlen_q=1, max_seqlen_k=max(seqlens_k), return_lse=True)
+    out, lse, *_ = _flash_attn_fwd(q, k, v, **call)
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_CLC", "1")
+    out_clc, lse_clc, *_ = _flash_attn_fwd(q, k, v, **call)
+    assert torch.equal(out, out_clc) and torch.equal(lse, lse_clc), "CLC changed the result"
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_PACKED_VARLEN", "0")
+    out_pb, lse_pb, *_ = _flash_attn_fwd(q, k, v, **call)
+    assert torch.equal(out, out_pb) and torch.equal(lse, lse_pb), "packed != per-batch scheduler"
+    monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA_CLC")
+    monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA_PACKED_VARLEN")
+    starts = cu(seqlens_k).tolist()
+    for i in [0, 1, 2, 3, 57, 150, 299]:
+        ks, ke = starts[i], starts[i + 1]
+        o_ref, l_ref = _mla_dense_ref(q[i][None, None], qv[i][None, None], k[ks:ke][None], v[ks:ke][None], False)
+        _check_mla_vs_ref(out[i][None, None], lse[i][None, None], o_ref, l_ref, f"sequence {i}")
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64", "0")
+    out_128, lse_128, *_ = _flash_attn_fwd(q, k, v, **call)
+    _assert_mla_fwd_close(out, out_128, lse, lse_128, "kb64 vs 128-key mainloop")
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="1CTA dense MLA, 64-key-block mainloop")
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("nheads", [1, 24, 48])
 def test_flash_attn_mla_1cta_dense_kb64_padded_head_canary(nheads, has_learnable_sink):
