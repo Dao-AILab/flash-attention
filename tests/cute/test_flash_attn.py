@@ -3592,8 +3592,8 @@ def _mla_sink_ref(q, qv, k, v, softmax_scale, causal, sink):
 @pytest.mark.parametrize("return_lse", [True, False])
 @pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("causal", [False, True])
-# 48 Q heads per KV head does not divide the 64-row tile
-@pytest.mark.parametrize("nheads", [16, 48])
+# 48 Q heads per KV head does not divide the 64-row tile; 64 runs the dense kb64 mainloop
+@pytest.mark.parametrize("nheads", [16, 48, 64])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(64, 1024), (300, 200)])
 def test_flash_attn_mla_1cta_learnable_sink(seqlen_q, seqlen_k, nheads, causal, num_splits, return_lse):
     """Sink folded into the 1CTA epilogue: pack_gqa head indexing, split-KV (split 0 owns
@@ -3628,6 +3628,156 @@ def test_flash_attn_mla_1cta_learnable_sink(seqlen_q, seqlen_k, nheads, causal, 
         # LSE stays -inf instead of the sink (same as flash_fwd_sm100); O is still 0.
         lse, lse_ref = lse[:, masked_rows:], lse_ref[:, masked_rows:]
     torch.testing.assert_close(lse, lse_ref, atol=1e-2, rtol=1e-3)
+
+
+def _mla_dense_ref(q, qv, k, v, causal, seqlen_k_used=None):
+    """fp32 MLA-absorbed reference, (out, lse) with lse (b, s_q, h); q may be None (no rope).
+    Rows with no visible key are NaN in out / -inf in lse."""
+    k_lat = v.float()[:, :, 0]
+    scale = (qv.shape[-1] + (q.shape[-1] if q is not None else 0)) ** -0.5
+    s = torch.einsum("bqhd,bkd->bhqk", qv.float(), k_lat)
+    if q is not None:
+        s = s + torch.einsum("bqhd,bkd->bhqk", q.float(), k.float()[:, :, 0])
+    s = s * scale
+    s_q, s_k = s.shape[-2:]
+    lim = torch.full((s_q,), s_k if seqlen_k_used is None else seqlen_k_used, device=s.device)
+    if causal:
+        lim = torch.minimum(lim, torch.arange(s_q, device=s.device) + 1 + lim - s_q)
+    s = s.masked_fill(torch.arange(s_k, device=s.device)[None, :] >= lim[:, None], float("-inf"))
+    lse = torch.logsumexp(s, -1)
+    out = torch.einsum("bhqk,bkd->bqhd", torch.softmax(s, -1), k_lat)
+    return out, lse.transpose(1, 2)
+
+
+def _check_mla_vs_ref(out, lse, out_ref, lse_ref, what=""):
+    valid = torch.isfinite(lse_ref)  # (b, s_q, h): rows with >= 1 visible key
+    assert (out[~valid] == 0).all() and torch.isneginf(lse[~valid]).all(), what
+    if valid.any():
+        o, r = out.float()[valid], out_ref[valid]
+        rel = ((o - r).norm() / r.norm()).item()
+        assert rel < 1e-2, f"{what}: out rel-L2 vs reference {rel:.2e}"
+        assert (lse[valid] - lse_ref[valid]).abs().max().item() < 1e-3, what
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="1CTA dense MLA, 64-key-block mainloop")
+@pytest.mark.parametrize("num_splits", [1, 3, 0])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [(1, 8192), (1, 100), (1, 63), (1, 64), (1, 3), (4, 777), (300, 200), (128, 1024)],
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("has_qk", [True, False])
+def test_flash_attn_mla_1cta_dense_kb64(has_qk, causal, seqlen_q, seqlen_k, num_splits, monkeypatch):
+    """Dense MLA at 64 heads runs the 64-key-block (kb64) mainloop: TMA loads per latent part,
+    positional masking, a runtime block count (1 block, odd counts, fully masked causal rows
+    with a dummy block) and split-KV (explicit, heuristic, and empty splits: s_k = 3 has one
+    block for 3 splits). Checked against the fp32 reference, against the 128-key mainloop
+    (FLASH_ATTENTION_MLA_1CTA_KB64=0) under the bf16-rounding contract, bitwise run to run,
+    and bitwise with and without the CLC scheduler."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    if not _mla_kb64_active(64):
+        pytest.skip("kb64 mainloop disabled")
+    import flash_attn.cute.utils as fa_utils
+    b = 2
+    kw, (q_r, k_r, v_r, qv_r) = _mla_inputs(b, seqlen_q, seqlen_k, 64, has_qk)
+    call = dict(q=kw["q"] if has_qk else None, k=kw["k"] if has_qk else None, v=kw["v"],
+                qv=kw["qv"] if has_qk else kw["q"], causal=causal, num_splits=num_splits,
+                return_lse=True)
+    out, lse, *_ = _flash_attn_fwd(**call)
+    out_again, lse_again, *_ = _flash_attn_fwd(**call)
+    assert torch.equal(out, out_again) and torch.equal(lse, lse_again), "not deterministic"
+    out_ref, lse_ref = _mla_dense_ref(q_r if has_qk else None, qv_r if has_qk else q_r, k_r, v_r, causal)
+    _check_mla_vs_ref(out, lse, out_ref, lse_ref, "kb64 vs reference")
+    # CLC (dense follows FA_CLC; causal is eligible): the result must not depend on it
+    if causal:
+        monkeypatch.setattr(fa_utils, "_fa_clc_enabled", True)
+        out_clc, lse_clc, *_ = _flash_attn_fwd(**call)
+        assert torch.equal(out, out_clc) and torch.equal(lse, lse_clc), "CLC changed the result"
+        monkeypatch.setattr(fa_utils, "_fa_clc_enabled", False)
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64", "0")
+    out_128, lse_128, *_ = _flash_attn_fwd(**call)
+    _assert_mla_fwd_close(out, out_128, lse, lse_128, "kb64 vs 128-key mainloop")
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="1CTA dense MLA, 64-key-block mainloop")
+@pytest.mark.parametrize("num_splits", [1, 3])
+@pytest.mark.parametrize("mode", ["cu_seqlens", "seqused_q", "paged64", "paged128", "paged256"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(causal, mode, num_splits, monkeypatch):
+    """Dense kb64 with varlen Q / K (ragged lengths incl. 0 and 1) and TMA-paged KV
+    (page_size 64 / 128 / 256 = 1-4 blocks per page, shuffled pages). Paged runs are bitwise
+    equal to the same kernel on contiguous KV; every sequence matches the reference; the
+    128-key mainloop agrees under the bf16-rounding contract."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    if not _mla_kb64_active(64):
+        pytest.skip("kb64 mainloop disabled")
+    device, dtype, h = "cuda", torch.bfloat16, 64
+    torch.random.manual_seed(0)
+    seqlens_q = [3, 0, 1, 70, 1]
+    seqlens_k = [900, 257, 64, 1500, 1]
+    b, s_q_max, s_k_max = len(seqlens_q), max(seqlens_q), max(seqlens_k)
+    cu = lambda lens: torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device=device)  # noqa: E731
+    qs = [torch.randn(s, h, 64, device=device, dtype=dtype) for s in seqlens_q]
+    qvs = [torch.randn(s, h, 512, device=device, dtype=dtype) for s in seqlens_q]
+    ks = [torch.randn(s, 1, 64, device=device, dtype=dtype) for s in seqlens_k]
+    vs = [torch.randn(s, 1, 512, device=device, dtype=dtype) for s in seqlens_k]
+
+    def pad(xs, s_max):
+        out = torch.zeros(len(xs), s_max, *xs[0].shape[1:], device=device, dtype=xs[0].dtype)
+        for i, x in enumerate(xs):
+            out[i, : x.shape[0]] = x
+        return out
+
+    seqused_k = torch.tensor(seqlens_k, dtype=torch.int32, device=device)
+    if mode == "cu_seqlens":
+        q_in, qv_in = torch.cat(qs), torch.cat(qvs)
+        extra = dict(cu_seqlens_q=cu(seqlens_q), max_seqlen_q=s_q_max, cu_seqlens_k=cu(seqlens_k),
+                     max_seqlen_k=s_k_max)
+        k_in, v_in = torch.cat(ks), torch.cat(vs)
+    else:
+        q_in, qv_in = pad(qs, s_q_max), pad(qvs, s_q_max)
+        extra = dict(seqused_q=torch.tensor(seqlens_q, dtype=torch.int32, device=device),
+                     max_seqlen_q=s_q_max, seqused_k=seqused_k)
+        k_in, v_in = pad(ks, s_k_max), pad(vs, s_k_max)
+    call = dict(q=q_in, k=k_in, v=v_in, qv=qv_in, causal=causal, num_splits=num_splits,
+                return_lse=True, **extra)
+    out, lse, *_ = _flash_attn_fwd(**call)
+    if mode.startswith("paged"):
+        ps = int(mode[len("paged"):])
+        npg = (s_k_max + ps - 1) // ps
+        perm = torch.randperm(b * npg, device=device).to(torch.int32)
+        page_table = perm.view(b, npg)
+        k_cache = torch.zeros(b * npg, ps, 1, 64, device=device, dtype=dtype)
+        v_cache = torch.zeros(b * npg, ps, 1, 512, device=device, dtype=dtype)
+        k_cache.view(-1, 1, 64)[:] = 0
+        for i in range(b):
+            for j in range(npg):
+                n = max(0, min(seqlens_k[i], (j + 1) * ps) - j * ps)
+                k_cache[page_table[i, j], :n] = ks[i][j * ps: j * ps + n]
+                v_cache[page_table[i, j], :n] = vs[i][j * ps: j * ps + n]
+        out_p, lse_p, *_ = _flash_attn_fwd(**dict(call, k=k_cache, v=v_cache, page_table=page_table))
+        # rows past seqused_q are never written (uninitialized in both)
+        vq = torch.arange(s_q_max, device=device)[None] < torch.tensor(seqlens_q, device=device)[:, None]
+        assert torch.equal(out_p[vq], out[vq]) and torch.equal(lse_p[vq], lse[vq]), "paged != contiguous"
+    for i, (sq, sk) in enumerate(zip(seqlens_q, seqlens_k)):
+        if sq == 0:
+            continue
+        if mode == "cu_seqlens":
+            rows = slice(int(cu(seqlens_q)[i]), int(cu(seqlens_q)[i + 1]))
+            o, l = out[rows][None], lse[rows][None]
+        else:
+            o, l = out[i: i + 1, :sq], lse[i: i + 1, :sq]
+        o_ref, l_ref = _mla_dense_ref(qs[i][None], qvs[i][None], ks[i][None], vs[i][None], causal)
+        _check_mla_vs_ref(o, l, o_ref, l_ref, f"sequence {i}")
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64", "0")
+    out_128, lse_128, *_ = _flash_attn_fwd(**call)
+    if mode != "cu_seqlens":
+        # rows past seqused_q are not written by either kernel
+        valid_q = torch.arange(s_q_max, device=device)[None] < torch.tensor(seqlens_q, device=device)[:, None]
+        out, out_128, lse, lse_128 = out[valid_q], out_128[valid_q], lse[valid_q], lse_128[valid_q]
+    _assert_mla_fwd_close(out, out_128, lse, lse_128, "kb64 vs 128-key mainloop")
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="learnable sink test for the 1CTA MLA kernel")

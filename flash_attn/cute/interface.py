@@ -375,6 +375,7 @@ def _get_fwd_config(
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
     mla_1cta: bool = False,
+    single_q_stage: bool = False,
 ) -> FwdConfig:
     if seqlen_q is None:
         seqlen_q = max_seqlen_q
@@ -409,9 +410,10 @@ def _get_fwd_config(
         intra_wg_overlap = cfg.intra_wg_overlap
 
     seqlen_q_packgqa = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
-    if arch // 10 in [10, 11]:
+    if arch // 10 in [10, 11] and not single_q_stage:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
+        # also the 1CTA kb64 MLA kernel: one 64-row tile per (token, split)
         q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
@@ -445,7 +447,11 @@ def _get_fwd_config(
         assert num_splits == 1, "SM120 forward only supports num_splits=1"
     elif num_splits < 1:
         num_SMs = get_num_sms_for_selection(device.index, arch)
-        num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
+        # The 1CTA kb64 MLA kernel (single_q_stage): at least 4 of its 64-key blocks per split.
+        # Each split pays a Q load, a 128 KB fp32 O partial and its share of the combine; one
+        # block per split (128 splits at s_k = 8K, b = 1) measured 30% slower than 32 splits.
+        max_splits = min(128, max(1, num_n_blocks // 4)) if single_q_stage else 128
+        num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits)
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128).
@@ -905,10 +911,13 @@ def _flash_attn_fwd(
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
-        # Bound each sequence by its page-table row, not the shared pool.
+        # Bound each sequence by its page-table row, not the shared pool. The 1CTA MLA kernel
+        # uses max_seqlen_k only for the split-KV heuristic, which the pool size would inflate
+        # (e.g. 6 splits over 2 key blocks).
         max_seqlen_k = (
             page_table.shape[1] * page_size
-            if use_dedicated_hd256_kernel and page_table is not None
+            if (use_dedicated_hd256_kernel or (mla_1cta and qv is not None))
+            and page_table is not None
             else seqlen_k
         )
     if cu_seqlens_k is None and seqused_k is None:
@@ -933,6 +942,34 @@ def _flash_attn_fwd(
             )
         page_table = page_table[:, :required_pages]
         max_seqlen_k = required_pages * page_size
+
+    # Exactly 64 heads, 16-bit: the 64-key-block mainloop (three latent stages, Q in TMEM,
+    # S(n) before PV(n-1); flash_fwd_mla_1cta_kb64_sm100). Sparse: the top-k gather front end.
+    # Dense: TMA loads (contiguous, varlen, or paged with page_size % 64 == 0) with split-KV.
+    # It agrees with the 2CTA kernel and the 128-key mainloop to bf16 rounding, not bitwise.
+    # FLASH_ATTENTION_MLA_1CTA_KB64=0 keeps the 128-key mainloop (A/B runs). Decided here:
+    # the split heuristic below counts its 64-row tiles and 64-key blocks.
+    mla_1cta_kb64 = (
+        mla_1cta
+        and qv is not None
+        and nheads_per_kv == 64
+        and not is_fp8
+        and os.environ.get("FLASH_ATTENTION_MLA_1CTA_KB64", "1") == "1"
+        and (
+            gather_kv_indices is not None
+            or (
+                head_dim_v == 512
+                and (q is None or head_dim == 64)
+                and (page_table is None or page_size % 64 == 0)
+                and not local
+                and softcap is None
+                and score_mod is None
+                and mask_mod is None
+                and block_sparse_tensors is None
+            )
+        )
+    )
+    mla_1cta_kb64_dense = mla_1cta_kb64 and gather_kv_indices is None
 
     if gather_kv_indices is not None:
         # Split-KV is not supported for sparse MLA (either kernel). Reject an explicit
@@ -961,11 +998,12 @@ def _flash_attn_fwd(
         num_splits=num_splits,
         device=device,
         seqlen_q=seqlen_q,
-        tile_mn=tile_mn,
+        tile_mn=(64, 64) if mla_1cta_kb64_dense and tile_mn is None else tile_mn,
         block_sparse_tensors=block_sparse_tensors,
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
         mla_1cta=mla_1cta,
+        single_q_stage=mla_1cta_kb64_dense,
     )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     q_stage = fwd_cfg.q_stage
@@ -1105,7 +1143,7 @@ def _flash_attn_fwd(
                 "Q@K^T and Qv@V^T share one accumulator, so one descale must fold into "
                 "the softmax scale"
             )
-        assert tile_n == 128
+        assert tile_n == (64 if mla_1cta_kb64_dense else 128)
         if mla_1cta and (q_descale is not None or k_descale is not None
                          or v_descale is not None):
             # Fill in any missing descales with ones: a partially-filled DescaleTensors
@@ -1332,24 +1370,22 @@ def _flash_attn_fwd(
     # overlaps a tile's epilogue with the next tile's gather (~10% at 64 heads, both 1CTA
     # mainloops). The 2CTA MLA kernel always runs it; dense 1CTA MLA follows FA_CLC.
     mla_1cta_use_clc = bool(sparse_kv) or (use_clc_scheduler if use_clc_scheduler is not None else True)
-    # Sparse, exactly 64 heads, 16-bit: the 64-key-block mainloop (three latent stages, Q in
-    # TMEM, S(n) before PV(n-1); flash_fwd_mla_1cta_kb64_sm100). It agrees with the 2CTA
-    # kernel to bf16 rounding, not bitwise. FLASH_ATTENTION_MLA_1CTA_KB64=0 keeps the
-    # 128-key mainloop (A/B runs).
-    mla_1cta_kb64 = (
-        mla_1cta
-        and bool(sparse_kv)
-        and nheads_per_kv == 64
-        and not is_fp8
-        and os.environ.get("FLASH_ATTENTION_MLA_1CTA_KB64", "1") == "1"
-    )
-    # its epilogue stores O / o_lo with 256-bit stores when their rows are 32-B aligned
+    if mla_1cta_kb64_dense:
+        # dense kb64: CLC measured +2-10% on prefill (many tiles per KV stream) and neutral on
+        # decode; varlen without a max_seqlen_q hint counts as decode
+        _clc_seqlen_q = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
+        mla_1cta_use_clc = _clc_seqlen_q is not None and _clc_seqlen_q > 1
+    # FLASH_ATTENTION_MLA_1CTA_CLC=0 / 1 forces it (ablation)
+    if os.environ.get("FLASH_ATTENTION_MLA_1CTA_CLC"):
+        mla_1cta_use_clc = os.environ["FLASH_ATTENTION_MLA_1CTA_CLC"] == "1"
+    # the kb64 epilogue stores O / o_lo (split-KV: the fp32 O partial) with 256-bit stores when
+    # their rows are 32-B aligned
     mla_1cta_kb64_o_align32 = mla_1cta_kb64 and (
         fake_mode
         or all(
             t.data_ptr() % 32 == 0
             and all(st * t.element_size() % 32 == 0 for st in t.stride()[:-1])
-            for t in (out, o_lo)
+            for t in ((out_partial if is_split_kv else out), o_lo)
             if t is not None
         )
     )
@@ -1378,6 +1414,7 @@ def _flash_attn_fwd(
         mla_1cta_q_tmem,
         mla_1cta_kb64,
         mla_1cta_kb64_o_align32,
+        page_size if mla_1cta_kb64_dense and page_table is not None else None,
         mla_1cta and mla_1cta_use_clc,
         mla_1cta_s_ahead if mla_1cta else None,
         mla_ptxas_options,
@@ -1584,7 +1621,10 @@ def _flash_attn_fwd(
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
-                paged_kv_cpasync = page_table is not None and page_size != tile_n
+                # the kb64 route loads pages by TMA (page_size % 64 == 0)
+                paged_kv_cpasync = (
+                    page_table is not None and page_size != tile_n and not mla_1cta_kb64
+                )
                 has_qk = q is not None
                 if mla_1cta:
                     # 1CTA (tcgen05.mma.ws) MLA kernel, opt-in via FLASH_ATTENTION_MLA_1CTA=1.
@@ -1615,9 +1655,12 @@ def _flash_attn_fwd(
                             has_qk=has_qk,
                             has_seqused_q=seqused_q is not None,
                             has_cu_seqlens_q=cu_seqlens_q is not None,
-                            topk_length=gather_kv_length,
+                            topk_length=gather_kv_length if sparse_kv else 0,
                             rescale_threshold=mla_fwd_rescale_threshold,
                             o_store_bits=256 if mla_1cta_kb64_o_align32 else 128,
+                            is_topk_gather=bool(sparse_kv),
+                            is_split_kv=is_split_kv,
+                            page_size=page_size if page_table is not None else None,
                         )
                     else:
                         fa_fwd = FlashAttentionMLAForward1CtaSm100(

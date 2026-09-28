@@ -6,7 +6,7 @@ Status (2026-09-28), opt-in via `FLASH_ATTENTION_MLA_1CTA=1`:
   exactly 64 heads. The kernel produces what that backward consumes: exact-running-max LSE
   (`rescale_threshold=0`) and the O rounding residual `o_lo`, but no P / row_max.
 - **Two mainloops.** Exactly 64 heads with 16-bit inputs run the **64-key-block (kb64)
-  mainloop** (see its section below). It agrees with the 2CTA kernel to bf16 rounding, not
+  mainloop**, sparse and dense (see the kb64 sections below). It agrees with the 2CTA kernel to bf16 rounding, not
   bitwise. Everything else runs the 128-key mainloop (fewer than 64 heads, fp8, and
   `FLASH_ATTENTION_MLA_1CTA_KB64=0`). On the 128-key mainloop `out`/`lse`/`o_lo` are bitwise
   identical to the 2CTA kernel's, and so are the gradients: dQ and dQv bitwise, dK and dV
@@ -139,6 +139,88 @@ each kernel at its shipped ptxas level:
 | prefill s_q = 4096 | 1.64-1.76 | 1.19-1.39 |
 
 Small-batch decode stays latency-bound and 2CTA still wins there (Follow-up 1).
+
+## Dense kb64 with split-KV (64 heads, 16-bit)
+
+The kb64 kernel has two load front ends, selected at compile time by `is_topk_gather`. The
+MMA, softmax, epilogue and SMEM/TMEM plan are shared. Dense MLA at 64 heads routes there,
+unless the call is fp8, uses a page size that is not a multiple of 64, or sets
+`FLASH_ATTENTION_MLA_1CTA_KB64=0`.
+
+**Front end.** The TMA warp (warp 8) replaces the 4 cp.async gather warps, so dense runs
+12 warps with registers split 208 / 168 / 128.
+- A latent part (2 column tiles, 16 KB) is one TMA box. The builder lays out a
+  `(64, 64, 128)` tiler with 12 "stages" byte-identically to the 3 latent stages, so the
+  part box writes exactly the bytes the dual and MN-major views read.
+- Each part lands on its own mbarrier (one `arrive_and_expect_tx` plus the box). The rope
+  rows, or the last part when there is no rope, go on the stage's full barrier
+  (`PipelineTmaUmma`).
+- Q (the token's 64 packed rows) uses the same atoms and ring. The MMA copies Q to TMEM
+  part by part, because with TMA the full barrier no longer implies the parts.
+- Paged KV with `page_size % 64 == 0` takes block `n` to coordinates
+  `(n % (page_size / 64), page_table[n // (page_size / 64)])`.
+
+**Block range and masking.**
+- `BlockInfo(64, 64)` gives each (tile, split) its range, as in the 128-key kernel. The
+  count is a runtime value: 1 block, odd counts, and a fully masked dummy block when the
+  range is empty.
+- `has_kv_work` gates every role on empty splits. The epilogue then writes LSE = -inf.
+- Masking is positional. The key limit is tile-uniform (one token per tile), so only the
+  last block takes the select branch.
+- An odd block count ends on row-max parity 0, so a pair barrier protects the final
+  `sRowMax` write.
+
+**Split-KV.**
+- fp32 O / LSE partials are streamed with 256-bit stores, the sink is applied on split 0
+  only, and the existing combine kernel merges the partials.
+- The interface counts 64-row tiles and 64-key blocks. It caps splits at
+  `num_n_blocks // 4` (at least 4 blocks per split): one block per split was 30% slower at
+  b=1, s_k=8K, from per-split Q loads, 128 KB fp32 partials and combine work.
+- Paged calls on the 1CTA route bound `max_seqlen_k` by the page-table row, not the pool.
+  This also fixes over-splitting on the 128-key paged route.
+
+**Scheduler and compiler.**
+- CLC is on for dense kb64 prefill / extend (s_q > 1): +2-10% there, neutral on decode.
+- ptxas stays at the default level; `-O2` measured neutral on decode and about 2% on prefill.
+
+**Correctness.**
+- vs the fp32 reference and vs the 128-key mainloop: the bf16-rounding contract.
+- Paged runs are bitwise equal to contiguous runs.
+- Bitwise run to run and with CLC on or off.
+- Tests: `test_flash_attn_mla_1cta_dense_kb64` and `test_flash_attn_mla_1cta_dense_kb64_varlen_paged`,
+  and 64 heads in `test_flash_attn_mla_1cta_learnable_sink`.
+- The sparse front end is bitwise unchanged (`agent_space/kb64_sparse_ref.py`).
+
+**Results** (GB300, 64 heads, bf16, cold L2)
+
+Source: `agent_space/bench_dense_kb64.py`, `agent_space/bench_sparse_1cta/dense_kb64*.csv`.
+"kb128 best" is the better of `num_splits` 1 and the heuristic. kb64 is at its shipped
+defaults.
+
+| shape | 2CTA (ms) | kb128 best | kb64 | kb128 / kb64 | 2CTA / kb64 |
+|---|---|---|---|---|---|
+| decode b=1, s_k 8K / 32K / 128K | 0.103 / 0.326 / 1.312 | 0.0293 / 0.0427 / 0.0682 | 0.0235 / 0.0346 / 0.0585 | 1.25 / 1.23 / 1.17 | 4.4 / 9.4 / 22 |
+| decode b=8, s_k 8K / 32K / 128K | 0.096 / 0.337 / 1.272 | 0.0426 / 0.0837 / 0.2205 | 0.0343 / 0.0752 / 0.2001 | 1.24 / 1.11 / 1.10 | 2.8 / 4.5 / 6.4 |
+| decode b=32, s_k 8K / 32K | 0.105 / 0.350 | 0.0859 / 0.2334 | 0.0775 / 0.2053 | 1.11 / 1.14 | 1.36 / 1.70 |
+| decode b=128, s_k 8K / 32K | 0.228 / 0.823 | 0.2180 / 0.8034 | 0.1963 / 0.6958 | 1.11 / 1.15 | 1.16 / 1.18 |
+| decode b=512, s_k 8K / 32K | 0.789 / 3.111 | 0.8449 / 3.2940 | 0.7324 / 2.7948 | 1.15 / 1.18 | 1.08 / 1.11 |
+| paged decode b=8 / 128, s_k 32K, page 64 | - | 0.0864 / 0.8281 | 0.0766 / 0.7147 | 1.13 / 1.16 | - |
+| paged decode b=8 / 128, s_k 32K, page 128 | - | 0.0840 / 0.7956 | 0.0762 / 0.7015 | 1.10 / 1.13 | - |
+| causal prefill 1Kx16K / 4Kx4K / 4Kx16K | 1.130 / 0.663 / 4.295 | 1.989 / 1.114 / 6.750 | 1.442 / 0.816 / 5.229 | 1.38 / 1.37 / 1.29 | 0.78 / 0.81 / 0.82 |
+
+ncu (`agent_space/ncu_dense/`):
+
+| shape | kernel | time | throughput | long-scoreboard stall |
+|---|---|---|---|---|
+| split decode b=8, s_k=32K | kb64 | 54.7 us | DRAM 70.8% | 13.9 |
+| split decode b=8, s_k=32K | kb128 | 65.3 us | DRAM 59.4% | 30.6 |
+| causal prefill 4Kx4K | kb64 | 816 us | SM 83% | 7.7 |
+| causal prefill 4Kx4K | kb128 | 1.12 ms | SM 63% | 19.4 |
+
+No spills in either kernel.
+
+Dense bf16 prefill still belongs on 2CTA (0.78-0.86x); every decode shape favours dense
+kb64.
 
 ## fp8: S ahead of PV in the 128-key mainloop
 
@@ -290,3 +372,8 @@ Backward, sparse MLA training step:
    identity-row gather, and head guards in the O / LSE stores.
 7. **Dense bf16 prefill** runs 0.53-0.64x of 2CTA on the 1CTA kernel (see "Prefill: 1CTA vs
    2CTA"); a routing heuristic should keep it on 2CTA if 1CTA ever becomes the default.
+
+8. **Dense kb64 beyond 64 heads / fp8 / small pages.** 128 heads (two tiles per token,
+   heads-first Q TMA view), <= 64 heads (multi-token tiles with per-row causal limits), fp8
+   (the dual TMEM packing assumes 16-bit), and page sizes that are not multiples of 64 still
+   run the 128-key mainloop.
