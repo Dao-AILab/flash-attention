@@ -5,8 +5,10 @@ Status (2026-09-28), opt-in via `FLASH_ATTENTION_MLA_1CTA=1`:
 - **Training forward:** with the recompute-P backward (`gather_bwd_recompute_p=True`) at
   exactly 64 heads. The kernel produces what that backward consumes: exact-running-max LSE
   (`rescale_threshold=0`) and the O rounding residual `o_lo`, but no P / row_max.
-- **Two mainloops.** Exactly 64 heads with 16-bit inputs run the **64-key-block (kb64)
-  mainloop**, sparse and dense (see the kb64 sections below). It agrees with the 2CTA kernel to bf16 rounding, not
+- **Two mainloops.** 16-bit inputs with at most 64 heads run the **64-key-block (kb64)
+  mainloop** (see the kb64 sections below):
+  - sparse: any head count up to 64;
+  - dense: 64 heads, or fewer heads on decode (`seqlen_q = 1`). It agrees with the 2CTA kernel to bf16 rounding, not
   bitwise. Everything else runs the 128-key mainloop (fewer than 64 heads, fp8, and
   `FLASH_ATTENTION_MLA_1CTA_KB64=0`). On the 128-key mainloop `out`/`lse`/`o_lo` are bitwise
   identical to the 2CTA kernel's, and so are the gradients: dQ and dQv bitwise, dK and dV
@@ -244,6 +246,39 @@ The HBM3e spec is about 8 TB/s.
 - **Below ~1 GiB the kernels are latency-bound**, not bandwidth-bound. b=1 reaches
   0.4-2.6 TB/s even with split-KV.
 
+## kb64 with fewer than 64 heads
+
+**Mechanism.**
+- The tile stays one token and its rows pad to 64 in-kernel, as the sparse 128-key path
+  does.
+- Sparse gathers the Q rows with a row predicate (`CpasyncGatherKVManagerH64.load_X(...,
+  num_valid_rows=H)`): predicated-off cp.async zero-fills the padded rows.
+- Dense loads Q by TMA through the heads-first view with the real head extent
+  (`qheads_first_tma_view` / `regroup_padded_qheads`), which zero-fills them.
+- The padded rows alias the next token's heads, so the O stores are head-guarded.
+  `store_lse` and the sink loader already were.
+- 64 heads stay bitwise unchanged (`agent_space/kb64_{sparse,dense}_ref.py`).
+
+**Routing** (measured, `agent_space/bench_sparse_1cta/{dense_kb64_h16,dense_kb64_h32,sparse_h1632*}.csv`):
+- **Sparse, any head count up to 64, inference:** kb64 is 1.02-2.05x faster than the 128-key
+  mainloop on decode and 1.20-1.58x on prefill. Small-batch sparse decode still favours
+  2CTA (0.78-0.97x), as at 64 heads.
+- **Dense decode (`seqlen_q = 1`):** kb64 is 1.07-1.30x faster than the 128-key mainloop at
+  16 and 32 heads (split-KV, paged, and b up to 512).
+- **Dense prefill, fewer than 64 heads:** stays on the 128-key mainloop. Padding wastes
+  64 / H of the MMA work, while that mainloop packs 64 / H tokens per tile; kb64 measured
+  0.34-0.43x at 16 heads and 0.66-0.81x at 32.
+- **Training:** unchanged. Sparse recompute-P still needs exactly 64 heads, and the other
+  training routes run 2CTA.
+
+**Tests.**
+- `test_flash_attn_mla_1cta_dense_kb64` covers 16 / 24 / 64 heads.
+- `..._dense_kb64_varlen_paged` covers 16 / 64 heads.
+- `test_flash_attn_mla_1cta_dense_kb64_padded_head_canary` covers 1 / 24 / 48 heads, with and
+  without a sink.
+- The existing sparse 1CTA tests at 1-48 heads now take the bf16-rounding contract
+  (`_mla_kb64_active(nheads <= 64)`).
+
 ## fp8: S ahead of PV in the 128-key mainloop
 
 The 128-key mainloop issues PVt(n) before S(n+1). That order is forced when one block's V
@@ -395,7 +430,10 @@ Backward, sparse MLA training step:
 7. **Dense bf16 prefill** runs 0.53-0.64x of 2CTA on the 1CTA kernel (see "Prefill: 1CTA vs
    2CTA"); a routing heuristic should keep it on 2CTA if 1CTA ever becomes the default.
 
-8. **Dense kb64 beyond 64 heads / fp8 / small pages.** 128 heads (two tiles per token,
-   heads-first Q TMA view), <= 64 heads (multi-token tiles with per-row causal limits), fp8
-   (the dual TMEM packing assumes 16-bit), and page sizes that are not multiples of 64 still
-   run the 128-key mainloop.
+8. **Dense kb64 beyond 64 heads / fp8 / small pages / sub-64-head prefill.** These still run
+   the 128-key mainloop:
+   - 128 heads (two tiles per token, heads-first Q TMA view);
+   - dense prefill with fewer than 64 heads (would need multi-token tiles with per-row causal
+     limits);
+   - fp8 (the dual TMEM packing assumes 16-bit);
+   - page sizes that are not multiples of 64.

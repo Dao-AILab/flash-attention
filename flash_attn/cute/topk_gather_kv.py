@@ -430,6 +430,7 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         buf: cutlass.Constexpr[int],
         col_blocks: Optional[tuple] = None,
         identity_rows: cutlass.Constexpr[bool] = False,
+        num_valid_rows: Optional[Int32] = None,
     ):
         """Issue the cp.async copies of one 64-key stage of ``mX`` (``(seqlen_k, head_dim)``) into the
         K-major swizzled stage tensor ``sX`` (the MMA layout of a 64 x head_dim tile; the swizzle is
@@ -437,7 +438,10 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         row (the caller lands a stage in parts, each followed by its own
         ``cp.async.mbarrier.arrive.noinc``). With ``identity_rows`` the stage is the 64 rows of ``mX``
         itself (row ``r`` of the tile <- ``mX[r]``, no top-k index, no validity predicate): the 64-head
-        forward stages the token's Q tile through the KV ring this way (see AI/SPARSE_MLA_64H.md)."""
+        forward stages the token's Q tile through the KV ring this way (see AI/SPARSE_MLA_64H.md).
+        ``num_valid_rows`` (identity rows only): rows at or past it are zero-filled instead of loaded
+        -- a token with fewer than 64 Q heads, whose packed tile rows past the real heads alias the
+        next token's heads (or run past the tensor)."""
         assert K_or_V in ("K", "V")
         head_dim = self.hdim if const_expr(K_or_V == "K") else self.hdim_v
         sX_nd_layout = cute.make_ordered_layout((self.tile_n, head_dim), order=(0, 1))
@@ -448,6 +452,7 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
 
         use_pred = const_expr(not self.disable_bitmask and not identity_rows)
+        use_row_pred = const_expr(identity_rows and num_valid_rows is not None)
         tPrXPtr = cute.make_rmem_tensor((1,), cutlass.Int64)
         tPrRowValid = cute.make_rmem_tensor((1,), cutlass.Int32)
         if const_expr(not identity_rows):
@@ -463,6 +468,10 @@ class CpasyncGatherKVManagerH64(ParamsBase):
                 row_valid = utils.shuffle_sync(tPrRowValid[0], m, width=self.gmem_threads_per_row)
                 should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], Boolean)
                 should_load.fill(Boolean(row_valid))
+            if const_expr(use_row_pred):
+                row = rows_per_copy * m + self.thread_idx // self.gmem_threads_per_row
+                should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], Boolean)
+                should_load.fill(Boolean(row < num_valid_rows))
             if const_expr(identity_rows):
                 x_ptr_i64 = utils.elem_pointer(
                     mX, (rows_per_copy * m + self.thread_idx // self.gmem_threads_per_row, 0)
@@ -489,5 +498,5 @@ class CpasyncGatherKVManagerH64(ParamsBase):
                     self.gmem_tiled_copy_KV,
                     mX_cur_copy_ki,
                     tXsX_k,
-                    pred=should_load if const_expr(use_pred) else None,
+                    pred=should_load if const_expr(use_pred or use_row_pred) else None,
                 )

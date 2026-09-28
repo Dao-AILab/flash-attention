@@ -943,16 +943,17 @@ def _flash_attn_fwd(
         page_table = page_table[:, :required_pages]
         max_seqlen_k = required_pages * page_size
 
-    # Exactly 64 heads, 16-bit: the 64-key-block mainloop (three latent stages, Q in TMEM,
-    # S(n) before PV(n-1); flash_fwd_mla_1cta_kb64_sm100). Sparse: the top-k gather front end.
-    # Dense: TMA loads (contiguous, varlen, or paged with page_size % 64 == 0) with split-KV.
+    # Up to 64 heads, 16-bit: the 64-key-block mainloop (three latent stages, Q in TMEM,
+    # S(n) before PV(n-1); flash_fwd_mla_1cta_kb64_sm100). One token per tile; fewer heads pad
+    # the tile in-kernel. Sparse: the top-k gather front end. Dense: TMA loads (contiguous,
+    # varlen, or paged with page_size % 64 == 0) with split-KV.
     # It agrees with the 2CTA kernel and the 128-key mainloop to bf16 rounding, not bitwise.
     # FLASH_ATTENTION_MLA_1CTA_KB64=0 keeps the 128-key mainloop (A/B runs). Decided here:
     # the split heuristic below counts its 64-row tiles and 64-key blocks.
     mla_1cta_kb64 = (
         mla_1cta
         and qv is not None
-        and nheads_per_kv == 64
+        and nheads_per_kv <= 64
         and not is_fp8
         and os.environ.get("FLASH_ATTENTION_MLA_1CTA_KB64", "1") == "1"
         and (
@@ -961,6 +962,16 @@ def _flash_attn_fwd(
                 head_dim_v == 512
                 and (q is None or head_dim == 64)
                 and (page_table is None or page_size % 64 == 0)
+                # fewer than 64 heads pad the one-token tile: that wins on decode (1.07-1.30x
+                # over the 128-key mainloop) but wastes 64 / H of the MMA work on prefill, where
+                # the 128-key mainloop packs several tokens per tile (kb64 0.34-0.81x there)
+                and (
+                    nheads_per_kv == 64
+                    or (
+                        num_head_kv == 1
+                        and (seqlen_q if cu_seqlens_q is None else host_max_seqlen_q) == 1
+                    )
+                )
                 and not local
                 and softcap is None
                 and score_mod is None
@@ -991,8 +1002,9 @@ def _flash_attn_fwd(
         window_size_right=window_size_right,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
-        qhead_per_kvhead=qhead_per_kvhead,
-        pack_gqa=pack_gqa,
+        # the dense kb64 tile is one token (heads padded to 64)
+        qhead_per_kvhead=64 if mla_1cta_kb64_dense else qhead_per_kvhead,
+        pack_gqa=pack_gqa or mla_1cta_kb64_dense,
         batch_size=batch_size,
         num_head_kv=num_head_kv,
         num_splits=num_splits,

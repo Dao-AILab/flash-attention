@@ -51,7 +51,11 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from cutlass._mlir.dialects import llvm
 
-from flash_attn.cute.pack_gqa import pack_gqa_layout
+from flash_attn.cute.pack_gqa import (
+    pack_gqa_layout,
+    qheads_first_tma_view,
+    regroup_padded_qheads,
+)
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
@@ -124,10 +128,16 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             topk_length=topk_length if is_topk_gather else 0,
             rescale_threshold=rescale_threshold,
         )
-        # sparse: the Q tile is gathered with identity rows (no predicate); dense: one token's
-        # 64 heads are one TMA box. Either way no padded heads.
-        assert not self.pad_qheads, "kb64 mainloop: exactly 64 Q heads"
-        assert self.qhead_per_kvhead == 64, "kb64 mainloop: exactly 64 Q heads per KV head"
+        # One token per 64-row tile. Fewer than 64 Q heads pad the tile in-kernel (the sparse base
+        # already did): sparse gathers the Q rows with a row predicate, dense loads Q by TMA
+        # through a heads-first view with the real head extent; either way the padded rows are
+        # zero and their O / LSE stores are skipped (packed padded rows alias the next token).
+        if not is_topk_gather and qhead_per_kvhead < 64:
+            assert nheads_kv == 1, "kb64 mainloop: padded Q heads need MQA"
+            self.qhead_per_kvhead = 64
+            self.pad_qheads = True
+        self.pack_gqa = True
+        assert self.qhead_per_kvhead == 64, "kb64 mainloop: at most 64 Q heads per KV head"
         assert is_topk_gather or page_size is None or page_size % 64 == 0, (
             "kb64 mainloop: paged KV needs page_size % 64 == 0 (a page is whole 64-key blocks)"
         )
@@ -474,6 +484,16 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             if mLSE is not None
             else None
         )
+        # fewer than 64 heads (dense): TMA sources for Q / Qv are heads-first views with the real
+        # head extent, so TMA zero-fills a token's padded rows (see pack_gqa.qheads_first_tma_view)
+        mQ_tma = mQv_tma = None
+        if const_expr(self.pad_qheads and not self.is_topk_gather):
+            mQ_tma, mQv_tma = [
+                qheads_first_tma_view(mX, self.qhead_per_kvhead_valid, head_idx=2)
+                if mX is not None
+                else None
+                for mX in (mQ, mQv)
+            ]
         # pack the 64 heads into the token mode: ((64, s_q), d, 1, b)
         mQ, mQv, mO, mOlo = [
             pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
@@ -483,6 +503,8 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         ]
         if const_expr(mLSE is not None):
             mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
+        if const_expr(not self.pad_qheads or self.is_topk_gather):
+            mQ_tma, mQv_tma = mQ, mQv
 
         # ==== MMAs (layout / descriptor providers of the .ws PTX helpers) ====
         K, MN = tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN
@@ -570,8 +592,11 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                 tma_load_op, mV, sVp_layout, mma_tiler_part, tiled_mma_64, cta_layout_vmnk.shape
             )
             tma_atom_Qv, tma_tensor_Qv = cute.nvgpu.make_tiled_tma_atom_B(
-                tma_load_op, mQv, sVp_layout, mma_tiler_part, tiled_mma_64, cta_layout_vmnk.shape
+                tma_load_op, mQv_tma, sVp_layout, mma_tiler_part, tiled_mma_64, cta_layout_vmnk.shape
             )
+            if const_expr(self.pad_qheads):
+                # fold the heads-first coordinates back into ((64, s_q), ..., 1, ...)
+                tma_tensor_Qv = regroup_padded_qheads(tma_tensor_Qv, self.qhead_per_kvhead, head_idx=2)
             if const_expr(self.has_qk):
                 sK_half = cute.select(self.sK_layout_staged, mode=[0, 1, 2])
                 assert cute.size_in_bytes(self.dtype_K, sK_half) * 2 == self.tx_rope
@@ -579,8 +604,10 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                     tma_load_op, mK, sK_half, self.mma_tiler_rope, tiled_mma_64, cta_layout_vmnk.shape
                 )
                 tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_B(
-                    tma_load_op, mQ, sK_half, self.mma_tiler_rope, tiled_mma_64, cta_layout_vmnk.shape
+                    tma_load_op, mQ_tma, sK_half, self.mma_tiler_rope, tiled_mma_64, cta_layout_vmnk.shape
                 )
+                if const_expr(self.pad_qheads):
+                    tma_tensor_Q = regroup_padded_qheads(tma_tensor_Q, self.qhead_per_kvhead, head_idx=2)
 
         self.sStats_layout = cute.make_layout((self.cta_tile_m, self.threads_per_row))
         # row-max exchange double-buffered by block parity
@@ -1349,12 +1376,20 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                 0,
                 col_blocks=(p * self.col_blocks_per_part, (p + 1) * self.col_blocks_per_part),
                 identity_rows=True,
+                num_valid_rows=self.qhead_per_kvhead_valid if const_expr(self.pad_qheads) else None,
             )
             if const_expr(p < self.num_latent_part_mbars):
                 cute.arch.cp_async_mbarrier_arrive_noinc(mbar_KV_part + (p * self.num_stages_KV + stage))
         if const_expr(self.has_qk):
             pipeline_K.producer_acquire(producer_state_K)
-            gather.load_X(gQ, sK, "K", 0, identity_rows=True)
+            gather.load_X(
+                gQ,
+                sK,
+                "K",
+                0,
+                identity_rows=True,
+                num_valid_rows=self.qhead_per_kvhead_valid if const_expr(self.pad_qheads) else None,
+            )
             producer_state_K.advance()
         cute.arch.cp_async_commit_group()
         pipeline_KV.sync_object_full.arrive_cp_async_mbarrier(stage)
@@ -2017,6 +2052,9 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
 
                 # packed (head, token) rows: rows past seqlen_q (seqused_q) are not stored
                 store_row = m_block * self.cta_tile_m + tOicOi[0][0] < seqlen.seqlen_q * self.qhead_per_kvhead
+                if const_expr(self.pad_qheads):
+                    # a padded row aliases the next token's heads (or runs past the tensor)
+                    store_row = store_row and tOicOi[0][0] < self.qhead_per_kvhead_valid
 
                 # O (and the o_lo residual) streamed 32 TMEM columns at a time: t2r, the fp32 scale,
                 # the output and its rounding residual, then the stores. Holding the whole 64 x 256

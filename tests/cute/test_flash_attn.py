@@ -3667,20 +3667,24 @@ def _check_mla_vs_ref(out, lse, out_ref, lse_ref, what=""):
 )
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("has_qk", [True, False])
-def test_flash_attn_mla_1cta_dense_kb64(has_qk, causal, seqlen_q, seqlen_k, num_splits, monkeypatch):
+@pytest.mark.parametrize("nheads", [64, 16, 24])
+def test_flash_attn_mla_1cta_dense_kb64(nheads, has_qk, causal, seqlen_q, seqlen_k, num_splits,
+                                        monkeypatch):
     """Dense MLA at 64 heads runs the 64-key-block (kb64) mainloop: TMA loads per latent part,
     positional masking, a runtime block count (1 block, odd counts, fully masked causal rows
     with a dummy block) and split-KV (explicit, heuristic, and empty splits: s_k = 3 has one
     block for 3 splits). Checked against the fp32 reference, against the 128-key mainloop
     (FLASH_ATTENTION_MLA_1CTA_KB64=0) under the bf16-rounding contract, bitwise run to run,
-    and bitwise with and without the CLC scheduler."""
+    and bitwise with and without the CLC scheduler. Fewer than 64 heads pad the one-token tile
+    in-kernel; with fewer than 64 heads only decode (seqlen_q = 1) routes to kb64, prefill shapes
+    then check the 128-key mainloop against itself and the reference."""
     if not IS_SM100 or USE_FAKE_TENSOR:
         pytest.skip()
-    if not _mla_kb64_active(64):
+    if not _mla_kb64_active(nheads):
         pytest.skip("kb64 mainloop disabled")
     import flash_attn.cute.utils as fa_utils
     b = 2
-    kw, (q_r, k_r, v_r, qv_r) = _mla_inputs(b, seqlen_q, seqlen_k, 64, has_qk)
+    kw, (q_r, k_r, v_r, qv_r) = _mla_inputs(b, seqlen_q, seqlen_k, nheads, has_qk)
     call = dict(q=kw["q"] if has_qk else None, k=kw["k"] if has_qk else None, v=kw["v"],
                 qv=kw["qv"] if has_qk else kw["q"], causal=causal, num_splits=num_splits,
                 return_lse=True)
@@ -3701,10 +3705,46 @@ def test_flash_attn_mla_1cta_dense_kb64(has_qk, causal, seqlen_q, seqlen_k, num_
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA dense MLA, 64-key-block mainloop")
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("nheads", [1, 24, 48])
+def test_flash_attn_mla_1cta_dense_kb64_padded_head_canary(nheads, has_learnable_sink):
+    """Dense kb64 with fewer than 64 heads pads each token's tile: the padded rows alias the next
+    token's heads (and run past the tensor for the last token), so they must never be written.
+    out / lse are views into canary-filled buffers whose tails must survive; every row matches
+    the reference. Decode (seqlen_q = 1): the shape that routes fewer than 64 heads to kb64."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    if not _mla_kb64_active(nheads):
+        pytest.skip("kb64 mainloop disabled")
+    b, s_q, s_k = 33, 1, 1000
+    kw, (q_r, k_r, v_r, qv_r) = _mla_inputs(b, s_q, s_k, nheads, has_qk=True)
+    sink = torch.randn(nheads, device="cuda", dtype=torch.bfloat16) * 4 if has_learnable_sink else None
+    canary_out, canary_lse, pad = -777.0, -555.0, 64 * 512 * 4
+    n_out, n_lse = b * s_q * nheads * 512, b * s_q * nheads
+    buf_out = torch.full((n_out + pad,), canary_out, device="cuda", dtype=torch.bfloat16)
+    buf_lse = torch.full((n_lse + pad,), canary_lse, device="cuda", dtype=torch.float32)
+    out = buf_out[:n_out].view(b, s_q, nheads, 512)
+    lse = buf_lse[:n_lse].view(b, s_q, nheads)
+    _flash_attn_fwd(kw["q"], kw["k"], kw["v"], qv=kw["qv"], learnable_sink=sink, out=out, lse=lse,
+                    causal=True, return_lse=True)
+    torch.cuda.synchronize()
+    assert (buf_out[n_out:] == canary_out).all(), "padded-head O rows written past the tensor"
+    assert (buf_lse[n_lse:] == canary_lse).all(), "padded-head LSE written past the tensor"
+    if sink is None:
+        out_ref, lse_ref = _mla_dense_ref(q_r, qv_r, k_r, v_r, causal=True)
+        _check_mla_vs_ref(out, lse, out_ref, lse_ref, "padded kb64 vs reference")
+    else:
+        out_ref, lse_ref = _mla_sink_ref(q_r, qv_r, k_r, v_r, 1.0 / math.sqrt(576), True, sink)
+        assert (out.float() - out_ref).abs().max().item() <= 2e-2
+        torch.testing.assert_close(lse, lse_ref, atol=1e-2, rtol=1e-3)
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="1CTA dense MLA, 64-key-block mainloop")
 @pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("mode", ["cu_seqlens", "seqused_q", "paged64", "paged128", "paged256"])
 @pytest.mark.parametrize("causal", [False, True])
-def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(causal, mode, num_splits, monkeypatch):
+@pytest.mark.parametrize("nheads", [64, 16])
+def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(nheads, causal, mode, num_splits, monkeypatch):
     """Dense kb64 with varlen Q / K (ragged lengths incl. 0 and 1) and TMA-paged KV
     (page_size 64 / 128 / 256 = 1-4 blocks per page, shuffled pages). Paged runs are bitwise
     equal to the same kernel on contiguous KV; every sequence matches the reference; the
@@ -3713,9 +3753,10 @@ def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(causal, mode, num_splits, m
         pytest.skip()
     if not _mla_kb64_active(64):
         pytest.skip("kb64 mainloop disabled")
-    device, dtype, h = "cuda", torch.bfloat16, 64
+    device, dtype, h = "cuda", torch.bfloat16, nheads
     torch.random.manual_seed(0)
-    seqlens_q = [3, 0, 1, 70, 1]
+    # fewer than 64 heads reach kb64 on decode only (max_seqlen_q = 1)
+    seqlens_q = [3, 0, 1, 70, 1] if nheads == 64 else [1, 0, 1, 1, 1]
     seqlens_k = [900, 257, 64, 1500, 1]
     b, s_q_max, s_k_max = len(seqlens_q), max(seqlens_q), max(seqlens_k)
     cu = lambda lens: torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device=device)  # noqa: E731
@@ -3944,12 +3985,13 @@ def _mla_inputs(b, s_q, s_k, h, has_qk, dtype=torch.bfloat16, seed=0):
 
 
 def _mla_kb64_active(nheads, dtype=torch.bfloat16):
-    """Whether a sparse forward with FLASH_ATTENTION_MLA_1CTA=1 runs the 1CTA 64-key-block
-    mainloop (exactly 64 heads, 16-bit). Its running max advances per 64 keys instead of the
-    2CTA kernel's 128, so the two agree to bf16 rounding, not bitwise."""
+    """Whether an MLA forward with FLASH_ATTENTION_MLA_1CTA=1 runs the 1CTA 64-key-block
+    mainloop (at most 64 heads, padded in-kernel, 16-bit; for training only the sparse
+    recompute-P route at exactly 64 heads reaches it). Its running max advances per 64 keys
+    instead of the 2CTA kernel's 128, so the two agree to bf16 rounding, not bitwise."""
     return (
         MLA_1CTA
-        and nheads == 64
+        and nheads <= 64
         and dtype in (torch.float16, torch.bfloat16)
         and os.environ.get("FLASH_ATTENTION_MLA_1CTA_KB64", "1") == "1"
     )
