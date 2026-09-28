@@ -302,6 +302,34 @@ torch2cute_dtype_map = {
 
 _LEARNABLE_SINK_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
+# Extra ptxas flags per MLA kernel. At the default ptxas level these kernels spill, and -O2
+# removes it; each flip below was measured on GB300 (AI/SPARSE_MLA_1CTA.md, "ptxas -O2"):
+#   fwd         2CTA / 1CTA sparse forward: 560 / 352 B/thread local memory -> 32 / 0,
+#               median +15-17%
+#   bwd         main sparse backward: 280-1048 B -> 0-64, +1-18% (recompute-P +4-18%)
+#   bwd_dq_dqv  dQ/dQv GEMM: 4064 B -> 0, 3.0-4.2x
+#   bwd_dk      dK GEMM: no spill either way, +3-4%
+#   bwd_preprocess: no spill, no measurable change -> left at the ptxas default
+# FLASH_ATTENTION_MLA_PTXAS_OPTIONS overrides every MLA kernel ("" = the ptxas default),
+# e.g. to rerun that ablation. The resolved flags are part of each compile key: the JIT
+# caches (in-memory and on disk) key on it, not on compile options.
+_MLA_PTXAS_DEFAULTS = {
+    "fwd": "-O2",            # FlashAttentionMLAForwardSm100 and ...1CtaSm100
+    "bwd": "-O2",            # FlashAttentionSparseMLABackwardSm100
+    "bwd_dq_dqv": "-O2",     # dQdQvGemmKernel
+    "bwd_dk": "-O2",         # dKGemmKernel
+    "bwd_preprocess": "",    # FlashAttentionBackwardPreprocess, sparse MLA call only
+}
+
+
+def _mla_ptxas_options(kernel: str) -> str:
+    env = os.environ.get("FLASH_ATTENTION_MLA_PTXAS_OPTIONS")
+    return env if env is not None else _MLA_PTXAS_DEFAULTS[kernel]
+
+
+def _compile_options(ptxas_options: str = "") -> str:
+    return "--enable-tvm-ffi" + (f" --ptxas-options '{ptxas_options}'" if ptxas_options else "")
+
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
@@ -1288,12 +1316,7 @@ def _flash_attn_fwd(
     mla_1cta_q_tmem = (
         mla_1cta and os.environ.get("FLASH_ATTENTION_MLA_1CTA_Q_TMEM", "1") == "1"
     )
-    # Opt-in extra ptxas flags for the MLA (qv) forward kernels, e.g. "-O2" to ablate
-    # register spilling at the default ptxas level. Part of the compile key: the JIT
-    # caches (in-memory and on disk) are keyed on it, not on compile options.
-    mla_ptxas_options = (
-        os.environ.get("FLASH_ATTENTION_PTXAS_OPTIONS", "") if qv is not None else ""
-    )
+    mla_ptxas_options = _mla_ptxas_options("fwd") if qv is not None else ""
 
     compile_key = (
         mla_1cta,
@@ -1659,8 +1682,7 @@ def _flash_attn_fwd(
                 learnable_sink=learnable_sink_tensor,
                 mOlo=o_lo_tensor,
                 stream=current_stream,
-                options="--enable-tvm-ffi"
-                + (f" --ptxas-options '{mla_ptxas_options}'" if mla_ptxas_options else ""),
+                options=_compile_options(mla_ptxas_options),
             )
         else:
             compile_args = [
@@ -1915,6 +1937,7 @@ def _compile_bwd_preprocess(
     has_cu_total_m_blocks,
     hdim_multiple_of,
     has_o_lo=False,
+    ptxas_options="",
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1945,7 +1968,7 @@ def _compile_bwd_preprocess(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
         mRowMax, mScaleP, softmax_scale, mCuTotalMBlocks, mOlo,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+        options=_compile_options(ptxas_options),
     )
 
 
@@ -1964,6 +1987,7 @@ def _bwd_preprocess(
     cu_total_m_blocks=None,
     hdim_multiple_of=32,
     o_lo=None,
+    ptxas_options="",
     *,
     fake_mode,
 ):
@@ -2007,6 +2031,7 @@ def _bwd_preprocess(
         cu_total_m_blocks is not None,
         hdim_multiple_of,
         o_lo is not None,
+        ptxas_options,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
@@ -3220,6 +3245,7 @@ def _flash_attn_bwd_sparse_mla(
         nheads_kv=nheads if pad_qheads else nheads_kv,
         softmax_scale=softmax_scale,
         o_lo=o_lo,
+        ptxas_options=_mla_ptxas_options("bwd_preprocess"),
         fake_mode=fake_mode,
     )
 
@@ -3237,6 +3263,7 @@ def _flash_attn_bwd_sparse_mla(
         gather_kv_length,
         disable_sparse_kv_bitmask,
         recompute_p,
+        _mla_ptxas_options("bwd"),
     )
 
     if compile_key not in _flash_attn_bwd_sparse_mla.compile_cache:
@@ -3297,7 +3324,7 @@ def _flash_attn_bwd_sparse_mla(
             seqused_q_tensor,
             seqused_k_tensor,
             current_stream,
-            options="--enable-tvm-ffi",
+            options=_compile_options(_mla_ptxas_options("bwd")),
         )
         _flash_attn_bwd_sparse_mla.compile_cache[compile_key] = fa_bwd_kernel
 
@@ -3426,7 +3453,7 @@ _flash_attn_bwd_sparse_mla.compile_cache = get_jit_cache("bwd_dsa")
 
 
 def _compile_sparse_mla_dq_dqv(
-    dtype, nheads, head_dim, head_dim_v, top_k, varlen_q, varlen_k, compute_dq,
+    dtype, nheads, head_dim, head_dim_v, top_k, varlen_q, varlen_k, compute_dq, ptxas_options,
 ):
     sym = cute.sym_int 
     b, b_plus_1, seqlen_q, seqlen_k = sym(), sym(), sym(), sym()
@@ -3465,7 +3492,7 @@ def _compile_sparse_mla_dq_dqv(
         mCuSeqlensQ,
         mCuSeqlensK,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+        options=_compile_options(ptxas_options),
     )
 
 
@@ -3486,6 +3513,7 @@ def _sparse_mla_dq_dqv(
     
     compile_key = (
         dtype_cute, nheads, head_dim, head_dim_v, gather_kv_length, varlen_q, varlen_k, k is not None,
+        _mla_ptxas_options("bwd_dq_dqv"),
     )
     if compile_key not in _sparse_mla_dq_dqv.compile_cache:
         _sparse_mla_dq_dqv.compile_cache[compile_key] = _compile_sparse_mla_dq_dqv(
@@ -3506,6 +3534,7 @@ def _compile_sparse_mla_dk(
     head_dim: int,
     topk: int,
     varlen: bool,
+    ptxas_options: str,
 ):
     kernel = dKGemmKernel(
         topk,
@@ -3542,7 +3571,7 @@ def _compile_sparse_mla_dk(
         mCuSeqlensQ,
         mCuSeqlensK,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+        options=_compile_options(ptxas_options),
     )
 
 
@@ -3580,7 +3609,7 @@ def _sparse_mla_dk(
     head_dim = q.shape[-1] if q is not None else 0
 
     compile_key = (
-        dtype_cute, dtype_acc_cute, nheads, head_dim, topk, varlen,
+        dtype_cute, dtype_acc_cute, nheads, head_dim, topk, varlen, _mla_ptxas_options("bwd_dk"),
     )
 
     if compile_key not in _sparse_mla_dk.compile_cache:

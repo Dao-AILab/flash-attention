@@ -36,7 +36,7 @@ test matrix (`test_flash_attn_mla_1cta_sparse_*`), as well as matching the refer
 ## Performance (GB300, 152 SMs, L2 129 MiB; bf16, topk 2048, h_kv 1)
 
 Both kernels are compiled at the default ptxas level and at `-O2`
-(`FLASH_ATTENTION_PTXAS_OPTIONS=-O2`). Ratios compare each kernel at its **best** level.
+(`FLASH_ATTENTION_MLA_PTXAS_OPTIONS=-O2`). Ratios compare each kernel at its **best** level.
 "Cold" flushes L2 before each call; "hot" replays a CUDA graph of back-to-back calls.
 Data: `agent_space/bench_sparse_1cta/{decode,prefill}_p1.csv`, from
 `benchmarks/benchmark_sparse_mla_fwd.py`.
@@ -76,13 +76,37 @@ h=64, has_qk: 2CTA 1.49 ms vs 1CTA 1.23-1.25 ms (s_k 8K / 32K).
   -O2 takes these to 32 B and 0 B. So the default level confounds any comparison. The few
   2x+ single-shape outliers at batch <= 8 look like measurement noise.
 
+## ptxas -O2 (default for MLA kernels since 2026-09-28)
+
+`interface._MLA_PTXAS_DEFAULTS` compiles the MLA kernels with `--ptxas-options '-O2'`. It is
+part of each compile key. `FLASH_ATTENTION_MLA_PTXAS_OPTIONS` overrides every MLA kernel at
+once, and `""` means the ptxas default level (use this to rerun the ablations).
+
+Forward: see the numbers above (median +15-17%; local memory 560 -> 32 B on 2CTA, 352 -> 0 B
+on 1CTA).
+
+Backward, sparse MLA training step:
+- Setup: b=1, T in {4K, 16K}, causal, topk 2048, heads {128, 64, 24}, load-P and recompute-P
+  (the latter at 64 / 128 heads only).
+- Measurement: per-kernel CUDA time from the profiler. Two GPUs with opposite run orders
+  (default -> -O2 on one, -O2 -> default on the other), which agree to within 1%.
+- Script: `agent_space/bench_sparse_mla_bwd_ptxas.py`; data in
+  `agent_space/bench_sparse_1cta/bwd_gpu*_*.csv`.
+
+| kernel | default -> -O2 speedup (min / median / max) | local mem B/thread (default -> -O2) | default now |
+|---|---|---|---|
+| dQ/dQv GEMM (`dQdQvGemmKernel`) | 2.99 / 3.07 / 4.16x | 4064-4104 -> 0 | -O2 |
+| main backward (`FlashAttentionSparseMLABackwardSm100`) | 1.00 / 1.01 / 1.18x (recompute-P 1.04-1.18x) | 280-1048 -> 0-64 | -O2 |
+| dK GEMM (`dKGemmKernel`) | 1.03 / 1.04 / 1.04x | 0 -> 0 | -O2 |
+| bwd preprocess (sparse-MLA instantiation) | 0.99 / 1.00 / 1.01x | 0 -> 0 | ptxas default |
+
 ## Follow-ups
 
 1. **Routing heuristic.** Prefer 2CTA when the number of sparse tiles (b x s_q) is below
    roughly the SM count, and 1CTA from about one wave up. Measure the crossover more finely
    (96..256).
-2. **Make -O2 the default for the MLA forward kernels.** It is a large, consistent win.
-   Check compile time.
+2. ~~Make -O2 the default for the MLA kernels.~~ Done (see above); the preprocess kernel is
+   left at the ptxas default (no measurable change).
 3. **Single-SM per-block latency** is the 1CTA ceiling at small batch. Candidates:
    - deeper V residency, where bf16 SMEM allows (it is tight: ~1 KB headroom with has_qk);
    - overlapping the per-tile Q staging (q_in_tmem handshake);

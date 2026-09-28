@@ -6,7 +6,7 @@ and index lists go through:
   1cta    FLASH_ATTENTION_MLA_1CTA=1 -- padded to 64 (<= 64 heads only)
   dense   1CTA dense MLA over topk contiguous keys (same FLOPs, no gather): a
           speed-of-light reference for the gather
-at each requested ptxas level (FLASH_ATTENTION_PTXAS_OPTIONS; --ptxas default O2).
+at each requested ptxas level (FLASH_ATTENTION_MLA_PTXAS_OPTIONS; --ptxas default O2).
 
 Timing:
   hot   same inputs back to back (KV can stay L2-resident across iterations)
@@ -145,7 +145,7 @@ def main():
             if kernel == "1cta" and h > 64:
                 continue
             os.environ["FLASH_ATTENTION_MLA_1CTA"] = "0" if kernel == "2cta" else "1"
-            os.environ["FLASH_ATTENTION_PTXAS_OPTIONS"] = "" if ptxas == "default" else f"-{ptxas}"
+            os.environ["FLASH_ATTENTION_MLA_PTXAS_OPTIONS"] = "" if ptxas == "default" else f"-{ptxas}"
             if kernel == "dense":
                 fn = lambda: flash_attn_func(**kw_dense, causal=False)
             else:
