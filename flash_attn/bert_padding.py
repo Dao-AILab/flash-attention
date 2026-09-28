@@ -11,12 +11,13 @@ class IndexFirstAxis(torch.autograd.Function):
         ctx.save_for_backward(indices)
         assert input.ndim >= 2
         ctx.first_axis_dim, other_shape = input.shape[0], input.shape[1:]
+        return input.index_select(0, indices)
         second_dim = other_shape.numel()
         # TD [2022-03-04] For some reason torch.gather is a bit faster than indexing.
         # return input[indices]
-        return torch.gather(
-            rearrange(input, "b ... -> b (...)"), 0, repeat(indices, "z -> z d", d=second_dim)
-        ).reshape(-1, *other_shape)
+        #return torch.gather(
+        #    rearrange(input, "b ... -> b (...)"), 0, repeat(indices, "z -> z d", d=second_dim)
+        #).reshape(-1, *other_shape)
 
     @staticmethod
     def backward(ctx, grad_output):
