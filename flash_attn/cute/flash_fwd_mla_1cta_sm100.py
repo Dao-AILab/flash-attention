@@ -63,6 +63,7 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 from quack import copy_utils
 
 from flash_attn.cute import utils as fa_utils
+from flash_attn.cute.utils import get_batch_from_cu_tensor
 from flash_attn.cute.pack_gqa import (
     PackGQA,
     pack_gqa_layout,
@@ -139,6 +140,12 @@ class FlashAttentionMLAForward1CtaSm100:
                 "the 1CTA sparse MLA kernel supports <= 64 Q heads (larger counts use 2CTA)"
             )
         self.pad_qheads = qhead_per_kvhead != self.qhead_per_kvhead_valid
+        # Packed varlen scheduling (as in the 2CTA kernel): with cu_seqlens_q and exactly one
+        # token per tile, the grid is flat over the total_q tokens (num_batch = 1) and every
+        # role recovers (batch, local m_block) by binary search on cu_seqlens_q. Sparse tiles
+        # are uniform-cost, so the varlen scheduler's per-batch enumeration buys nothing;
+        # this keeps CLC and wastes no tiles.
+        self.use_packed_varlen_sched = has_cu_seqlens_q and is_topk_gather
         # Sparse: causal is applied through the index-validity bitmask (idx < seqlen_k_limit
         # with the bottom-right causal limit), not positionally -- the S columns are
         # gathered slots, not key positions. The positional machinery sees non-causal.
@@ -203,9 +210,11 @@ class FlashAttentionMLAForward1CtaSm100:
         # Under split-kv O_partial is fp32, which doubles sO past the sV slot it overlays;
         # the per-row predicated store needs no smem at all, and partial-O traffic
         # (64 x 512 x 4B per tile) is small next to the per-n_block KV stream.
+        # Packed varlen (sparse) keeps TMA O: its tiles are exactly one token, so a store box
+        # can never straddle into the next sequence.
         self.use_tma_O = (
             (not self.pack_gqa or self.pack_gqa_tma)
-            and not has_cu_seqlens_q
+            and (not has_cu_seqlens_q or self.use_packed_varlen_sched)
             and not is_split_kv
         )
 
@@ -224,9 +233,6 @@ class FlashAttentionMLAForward1CtaSm100:
         self.has_seqused_q = has_seqused_q
         self.has_cu_seqlens_q = has_cu_seqlens_q
         self.is_varlen_q = has_seqused_q or has_cu_seqlens_q
-        assert not (is_topk_gather and self.is_varlen_q), (
-            "varlen Q is not yet supported on the 1CTA sparse path"
-        )
 
         # ==== tile scheduler ====
         self.is_persistent = False
@@ -235,7 +241,7 @@ class FlashAttentionMLAForward1CtaSm100:
         self.scheduling_mode = (
             SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
         )
-        if self.is_varlen_q:
+        if self.is_varlen_q and not self.use_packed_varlen_sched:
             self.TileScheduler = SingleTileVarlenScheduler
         elif self.use_clc_scheduler:
             self.TileScheduler = SingleTileLPTScheduler
@@ -725,10 +731,14 @@ class FlashAttentionMLAForward1CtaSm100:
 
         self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
 
-        # (b, s_q, topk) -> (topk, s_q, b)
+        # (b, s_q, topk) -> (topk, s_q, b), or (total_q, topk) -> (topk, total_q)
         if const_expr(mIndexTopk is not None):
             mIndexTopk = cute.make_tensor(
-                mIndexTopk.iterator, cute.select(mIndexTopk.layout, mode=[2, 1, 0])
+                mIndexTopk.iterator,
+                cute.select(
+                    mIndexTopk.layout,
+                    mode=[2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0],
+                ),
             )
 
         # Sparse, fewer than 64 real heads: TMA sources for Q/Qv/O are heads-first views
@@ -987,7 +997,9 @@ class FlashAttentionMLAForward1CtaSm100:
         # (ratio, s) tuple), which is what the varlen scheduler's grid bound expects --
         # it scales per-batch seqlens by qhead_per_kvhead_packgqa the same way.
         num_batch_sched = (
-            cute.size(mCuSeqlensQ.shape[0] - 1)
+            1
+            if const_expr(self.use_packed_varlen_sched)
+            else cute.size(mCuSeqlensQ.shape[0] - 1)
             if const_expr(mCuSeqlensQ is not None)
             else cute.size(mQv.shape[3])
         )
@@ -1618,7 +1630,9 @@ class FlashAttentionMLAForward1CtaSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = self._tile_coords(
+                work_tile.tile_idx, SeqlenInfoCls.keywords["mCuSeqlensQ"]
+            )
             # with pack_gqa the scheduler's head index already is the kv head
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
@@ -1851,6 +1865,18 @@ class FlashAttentionMLAForward1CtaSm100:
             pipeline_V.producer_tail(producer_state_V)
 
     @cute.jit
+    def _tile_coords(self, tile_idx, mCuSeqlensQ: Optional[cute.Tensor]):
+        """(m_block, head_idx, batch_idx, split_idx) of a work tile, m_block batch-local.
+
+        Under packed varlen scheduling the scheduler's m_block is a global token index;
+        every role converts it the same way here, so none of them can disagree."""
+        m_block, head_idx, batch_idx, split_idx = tile_idx
+        if const_expr(self.use_packed_varlen_sched):
+            batch_idx = get_batch_from_cu_tensor(m_block, mCuSeqlensQ)
+            m_block = m_block - mCuSeqlensQ[batch_idx]
+        return m_block, head_idx, batch_idx, split_idx
+
+    @cute.jit
     def _n_block_range(
         self, block_info: BlockInfo, seqlen: SeqlenInfoQK, m_block: Int32, split_idx: Int32
     ):
@@ -2014,7 +2040,9 @@ class FlashAttentionMLAForward1CtaSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = self._tile_coords(
+                work_tile.tile_idx, SeqlenInfoCls.keywords["mCuSeqlensQ"]
+            )
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
@@ -2030,8 +2058,12 @@ class FlashAttentionMLAForward1CtaSm100:
             if const_expr(self.is_topk_gather):
                 # (no split-KV on this path, so every tile has work)
                 # ==== top-k gather: one tile = one token ====
-                m_idx = m_block
-                mIndexTopk_cur = mIndexTopk[None, m_idx, batch_idx]
+                m_idx = m_block  # batch-local token index
+                mIndexTopk_cur = (
+                    mIndexTopk[None, m_idx, batch_idx]
+                    if const_expr(not self.has_cu_seqlens_q)
+                    else mIndexTopk[None, m_idx + seqlen.offset_q]
+                )
                 # bottom-right causal limit on key positions, applied via the bitmask
                 seqlen_k_limit = (
                     m_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
@@ -2417,7 +2449,9 @@ class FlashAttentionMLAForward1CtaSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         O_should_accumulate = Boolean(False)
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = self._tile_coords(
+                work_tile.tile_idx, SeqlenInfoCls.keywords["mCuSeqlensQ"]
+            )
 
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = self._n_block_range(block_info, seqlen, m_block, split_idx)
@@ -2823,7 +2857,9 @@ class FlashAttentionMLAForward1CtaSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = self._tile_coords(
+                work_tile.tile_idx, SeqlenInfoCls.keywords["mCuSeqlensQ"]
+            )
             seqlen = SeqlenInfoCls(batch_idx)
             # fp8: fold q_descale * v_descale into the softmax scale (see
             # _effective_descales); log2 folding is valid because the descale multiplies
@@ -3196,7 +3232,9 @@ class FlashAttentionMLAForward1CtaSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = self._tile_coords(
+                work_tile.tile_idx, SeqlenInfoCls.keywords["mCuSeqlensQ"]
+            )
             qk_descale, v_descale = self._effective_descales(
                 descale_tensors, batch_idx, head_idx
             )

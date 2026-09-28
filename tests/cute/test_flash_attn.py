@@ -3948,6 +3948,148 @@ def test_flash_attn_mla_sparse_no_split_kv(nheads, monkeypatch):
     assert torch.equal(out_h, out_1) and torch.equal(lse_h, lse_1)
 
 
+@pytest.mark.skipif(not MLA_1CTA, reason="1CTA sparse MLA forward")
+@pytest.mark.parametrize("varlen_k", [False, True])
+@pytest.mark.parametrize("q_mode", ["cu_seqlens_q", "seqused_q"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("has_qk", [True, False])
+@pytest.mark.parametrize("nheads", [16, 64])
+def test_flash_attn_mla_1cta_sparse_varlen(nheads, has_qk, causal, q_mode, varlen_k, monkeypatch):
+    """Sparse forward with varlen Q: cu_seqlens_q runs the packed (flat over tokens)
+    scheduler with batch-local indexing and keeps the TMA O store (one-token tiles cannot
+    straddle sequences); seqused_q runs the varlen scheduler. Ragged lengths include 0 and
+    1. Checked per sequence against the reference, bitwise against 2CTA, and for writes past
+    the last token (canary tail)."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    device, dtype, topk = "cuda", torch.bfloat16, 256
+    seqlens_q = [37, 0, 1, 200, 64, 5]
+    seqlens_k = [1024, 300, 256, 777, 1024, 129]
+    b = len(seqlens_q)
+    s_q_max, s_k_max = max(seqlens_q), max(seqlens_k)
+    torch.random.manual_seed(0)
+    d_q = 64 if has_qk else 512
+    qs = [torch.randn(sq, nheads, d_q, device=device, dtype=dtype) for sq in seqlens_q]
+    qvs = [torch.randn(sq, nheads, 512, device=device, dtype=dtype) for sq in seqlens_q]
+    ks = [torch.randn(sk, 1, 64, device=device, dtype=dtype) for sk in seqlens_k]
+    vs = [torch.randn(sk, 1, 512, device=device, dtype=dtype) for sk in seqlens_k]
+    idxs = [rect_topk_indices(1, sq, sk, topk, causal, device, fill_frac=0.7, oob_frac=0.3,
+                              seed=i)[0] for i, (sq, sk) in enumerate(zip(seqlens_q, seqlens_k))]
+    cu = lambda lens: torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device=device)  # noqa: E731
+
+    def pad_batch(xs, s_max):
+        out = torch.zeros(len(xs), s_max, *xs[0].shape[1:], device=device, dtype=xs[0].dtype)
+        for i, x in enumerate(xs):
+            out[i, : x.shape[0]] = x
+        return out
+
+    if varlen_k:
+        k_in, v_in = torch.cat(ks), torch.cat(vs)
+        kv_kw = dict(cu_seqlens_k=cu(seqlens_k), max_seqlen_k=s_k_max)
+    else:
+        k_in, v_in = pad_batch(ks, s_k_max), pad_batch(vs, s_k_max)
+        kv_kw = dict(seqused_k=torch.tensor(seqlens_k, dtype=torch.int32, device=device))
+    if q_mode == "cu_seqlens_q":
+        q_in, qv_in, idx_in = torch.cat(qs), torch.cat(qvs), torch.cat(idxs)
+        q_kw = dict(cu_seqlens_q=cu(seqlens_q), max_seqlen_q=s_q_max)
+    else:
+        q_in, qv_in = pad_batch(qs, s_q_max), pad_batch(qvs, s_q_max)
+        idx_in = pad_batch(idxs, s_q_max).contiguous()
+        q_kw = dict(seqused_q=torch.tensor(seqlens_q, dtype=torch.int32, device=device),
+                    max_seqlen_q=s_q_max)
+    if has_qk:
+        args = dict(q=q_in, k=k_in, v=v_in, qv=qv_in)
+    else:
+        args = dict(q=qv_in, k=v_in, v=v_in)
+    call = dict(**args, **q_kw, **kv_kw, gather_kv_indices=idx_in, causal=causal, return_lse=True)
+    # out as a view into a canary-filled buffer: a TMA O box straddling past the last
+    # token (cu_seqlens_q) would overwrite the tail
+    canary, pad = -777.0, 64 * 512 * 2
+    n_out = q_in.shape[:-1].numel() * 512
+    buf = torch.full((n_out + pad,), canary, device=device, dtype=dtype)
+    out_view = buf[:n_out].view(*q_in.shape[:-1], 512)
+    # _flash_attn_fwd takes shared_kv as (q=None, k=None, v, qv); only the autograd
+    # wrappers rewrite (q, k=v, v) into that form
+    out, lse, *_ = _flash_attn_fwd(
+        q_in if has_qk else None, k_in if has_qk else None, v_in, qv=qv_in, out=out_view,
+        **q_kw, **kv_kw, gather_kv_indices=idx_in, causal=causal, return_lse=True,
+    )
+    torch.cuda.synchronize()
+    assert (buf[n_out:] == canary).all(), "O written past the last token"
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
+    out_2cta, lse_2cta = flash_attn_varlen_func(**call)
+    for i, (sq, sk) in enumerate(zip(seqlens_q, seqlens_k)):
+        if sq == 0:
+            continue
+        if q_mode == "cu_seqlens_q":
+            rows = slice(int(cu(seqlens_q)[i]), int(cu(seqlens_q)[i + 1]))
+            o, o2, l, l2 = out[rows], out_2cta[rows], lse[rows], lse_2cta[rows]
+        else:
+            o, o2, l, l2 = out[i, :sq], out_2cta[i, :sq], lse[i, :sq], lse_2cta[i, :sq]
+        assert torch.equal(o, o2) and torch.equal(l, l2), f"sequence {i}: 1CTA != 2CTA"
+        q_r = qs[i][None] if has_qk else None
+        k_r = ks[i][None] if has_qk else vs[i][None]
+        ref_q = q_r if has_qk else qvs[i][None]
+        ref_qv = qvs[i][None] if has_qk else None
+        valid = _topk_valid_rows(idxs[i][None], sq, sk, causal)[0]
+        assert (o[~valid] == 0).all() and torch.isneginf(l[~valid]).all()
+        if valid.any():
+            out_ref, _ = attention_ref(ref_q, k_r, vs[i][None], qv=ref_qv, causal=causal,
+                                       gather_kv_indices=idxs[i][None])
+            out_pt, _ = attention_ref(ref_q, k_r, vs[i][None], qv=ref_qv, causal=causal,
+                                      gather_kv_indices=idxs[i][None], upcast=False,
+                                      reorder_ops=True)
+            err = (o.float() - out_ref[0].float()).abs()[valid].max().item()
+            err_pt = (out_pt[0].float() - out_ref[0].float()).abs()[valid].max().item()
+            atol = 2 * (out_ref[0] + 0.3 - 0.3 - out_ref[0])[valid].abs().max().item()
+            assert err <= 2 * err_pt + atol, (i, err, err_pt, atol)
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="1CTA sparse MLA forward (fp8 is 1CTA-only)")
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads", [16, 64])
+def test_flash_attn_mla_1cta_sparse_fp8(nheads, causal):
+    """fp8 sparse gather (4 V stages, 16-element cp.async chunks) with descales, with and
+    without a sink: exact sink identity against the sink-free fp8 call, and a loose check
+    against the dequantized fp32 reference."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    device, fp8 = "cuda", torch.float8_e4m3fn
+    b, s_q, s_k, topk = 2, 64, 2048, 512
+    torch.random.manual_seed(0)
+    q, qv, k, v = [
+        torch.randn(*shape, device=device).to(fp8)
+        for shape in ((b, s_q, nheads, 64), (b, s_q, nheads, 512), (b, s_k, 1, 64), (b, s_k, 1, 512))
+    ]
+    q_descale = torch.rand(b, 1, device=device) + 0.5
+    kv_descale = torch.rand(b, 1, device=device) + 0.5
+    sink = torch.randn(nheads, device=device, dtype=torch.bfloat16) * 4
+    idx = rect_topk_indices(b, s_q, s_k, topk, causal, device, fill_frac=0.8, oob_frac=0.5)
+
+    def run(learnable_sink):
+        out, lse, *_ = _flash_attn_fwd(
+            q, k, v, qv=qv, causal=causal, gather_kv_indices=idx, learnable_sink=learnable_sink,
+            q_descale=q_descale, k_descale=kv_descale, v_descale=kv_descale, return_lse=True,
+        )
+        return out, lse
+
+    out, lse = run(None)
+    out_sink, lse_sink = run(sink)
+    valid = _topk_valid_rows(idx, s_q, s_k, causal)
+    lse_expected = torch.logaddexp(lse, sink.float().view(1, 1, nheads))
+    torch.testing.assert_close(lse_sink, lse_expected, atol=1e-3, rtol=1e-4)
+    out_expected = out.float() * torch.exp(lse - lse_expected).unsqueeze(-1)
+    out_expected[~valid] = 0
+    torch.testing.assert_close(out_sink.float(), out_expected, atol=1e-2, rtol=1e-2)
+
+    deq = lambda t, d: (t.float() * d.view(b, 1, 1, 1)).to(torch.bfloat16)  # noqa: E731
+    out_ref, _ = attention_ref(deq(q, q_descale), deq(k, kv_descale), deq(v, kv_descale),
+                               qv=deq(qv, q_descale), causal=causal, gather_kv_indices=idx)
+    assert (out[~valid] == 0).all()
+    err = (out.float() - out_ref.float())[valid].abs().max().item()
+    assert err <= 0.1 * out_ref.float()[valid].abs().max().item(), err
+
+
 def causal_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device):
     """Top-k indices as produced by a causal sparse-attention selector: query t
     gets min(t+1, seqlen_k, topk_len) valid keys drawn from [0, t], with
