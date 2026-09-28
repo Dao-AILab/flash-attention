@@ -1034,10 +1034,12 @@ def _flash_attn_fwd(
             assert k_descale is not None and v_descale is not None, (
                 "MLA absorbed needs k_descale and v_descale together (or neither)"
             )
-            assert torch.equal(k_descale, v_descale), (
-                "MLA absorbed requires k_descale == v_descale: Q@K^T and Qv@V^T share "
-                "one accumulator, so their descales must fold into one softmax scale"
-            )
+            # Reads tensor values, so it can only run outside FakeTensorMode.
+            if not fake_mode:
+                assert torch.equal(k_descale, v_descale), (
+                    "MLA absorbed requires k_descale == v_descale: Q@K^T and Qv@V^T share "
+                    "one accumulator, so their descales must fold into one softmax scale"
+                )
         assert tile_n == 128
         if mla_1cta and (q_descale is not None or k_descale is not None
                          or v_descale is not None):
@@ -1108,6 +1110,10 @@ def _flash_attn_fwd(
     reuse_scheduler_metadata = scheduler_metadata is not None
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
     cluster_shape_m = 2 if use_2cta_instrs else 1
+    if qv is not None:
+        # The MLA kernels do not consume scheduler metadata: they write all num_splits
+        # partials statically, so combine must not see per-batch dynamic split counts.
+        assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
     if use_dedicated_hd256_kernel:
         # The hd=256 2CTA fwd kernel does not support the dynamic-persistent scheduler.
         scheduler_metadata = None
@@ -1118,6 +1124,7 @@ def _flash_attn_fwd(
         and scheduler_metadata is None
         and not disable_scheduler_metadata
         and not use_dedicated_hd256_kernel
+        and qv is None
     ):
         scheduler_metadata = _get_scheduler_metadata(
             num_batch=batch_size,
@@ -1183,6 +1190,7 @@ def _flash_attn_fwd(
         and use_single_tile_varlen_scheduler
         and batch_size > BIN_BATCH_SEARCH_THRESH
         and not use_dedicated_hd256_kernel
+        and qv is None
     )
     if (
         use_cu_hint
@@ -1494,6 +1502,7 @@ def _flash_attn_fwd(
                         has_cu_seqlens_q=cu_seqlens_q is not None,
                         use_cpasync_load_KV=paged_kv_cpasync,
                         is_split_kv=is_split_kv,
+                        is_fp8=is_fp8,
                     )
                 else:
                     fa_fwd = FlashAttentionMLAForwardSm100(

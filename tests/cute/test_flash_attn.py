@@ -90,6 +90,11 @@ def check_dsink_vs_ref(actual, ref, pt, rtol=2, atol=0.0):
 # When operating fake tensors, we cannot perform data-dependent operations (e.g., `tensor.max()`).
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
+# Routes MLA-absorbed (qv) calls to the 1CTA kernel, which has no topk/sparse KV gather.
+MLA_1CTA = os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
+skip_if_mla_1cta_sparse = pytest.mark.skipif(
+    MLA_1CTA, reason="1CTA MLA kernel does not support the topk/sparse KV gather"
+)
 # SplitKV is not supported on SM90 or SM120
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
@@ -3307,7 +3312,7 @@ def test_flash_attn_mla_absorbed(
     hdimv = 512
     if not IS_SM100:
         pytest.skip()
-    if kv_sparsity and os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1":
+    if kv_sparsity and MLA_1CTA:
         pytest.skip("1CTA MLA kernel does not support sparse KV")
     local = local_enum > 0
     if local and causal:
@@ -3393,7 +3398,7 @@ def test_flash_attn_mla_absorbed(
         # asserts it off), so only widen the matrix under that env var.
         num_splits_vals = (
             [1, 3]
-            if os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1" and not DISABLE_SPLIT
+            if MLA_1CTA and not DISABLE_SPLIT
             else [1]
         )
         pack_gqa_vals = [True]
@@ -3462,6 +3467,73 @@ def test_flash_attn_mla_absorbed(
                 check_dsink_vs_ref(grads[-1], grads_ref[-1], grads_pt[-1])
 
 
+@pytest.mark.skipif(not MLA_1CTA, reason="SplitKV with qv is implemented by the 1CTA MLA kernel only")
+@pytest.mark.parametrize("varlen_q", ["none", "cu_seqlens_q", "seqused_q"])
+def test_flash_attn_mla_1cta_split_distribution(varlen_q, monkeypatch):
+    """Every split must own KV work, not just produce the right combined output.
+
+    Catches the silent failure modes where split-KV degrades to one split doing all the
+    work: the interface forcing num_splits=1 (combine never runs), and the kernel's KV
+    range ignoring num_splits (splits >= 1 come out empty with LSE = -inf).
+    """
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    import flash_attn.cute.interface as fa_interface
+
+    captured = []
+    real_combine = fa_interface._flash_attn_fwd_combine
+
+    def recording_combine(out_partial, lse_partial, *args, **kwargs):
+        captured.append(lse_partial.clone())
+        return real_combine(out_partial, lse_partial, *args, **kwargs)
+
+    # _flash_attn_fwd_combine reaches its JIT cache through its module-global name.
+    recording_combine.compile_cache = real_combine.compile_cache
+
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    batch_size, seqlen_q, seqlen_k, nheads, hdim, hdimv, num_splits = 2, 4, 8192, 128, 64, 512, 3
+    q = torch.randn(batch_size, seqlen_q, nheads, hdim, device=device, dtype=dtype)
+    qv = torch.randn(batch_size, seqlen_q, nheads, hdimv, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, 1, hdim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, 1, hdimv, device=device, dtype=dtype)
+    seqused_q = torch.tensor([seqlen_q, seqlen_q - 1], device=device, dtype=torch.int32)
+
+    def run(num_splits):
+        if varlen_q == "none":
+            return flash_attn_func(q, k, v, qv=qv, num_splits=num_splits, return_lse=True)
+        if varlen_q == "cu_seqlens_q":
+            cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, seqlen_q, device=device, dtype=torch.int32)
+            out, lse = flash_attn_varlen_func(
+                q.flatten(0, 1), k, v, qv=qv.flatten(0, 1), cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=seqlen_q, num_splits=num_splits, return_lse=True,
+            )
+            return out.unflatten(0, (batch_size, seqlen_q)), lse.unflatten(0, (batch_size, seqlen_q))
+        return flash_attn_varlen_func(
+            q, k, v, qv=qv, seqused_q=seqused_q, num_splits=num_splits, return_lse=True,
+        )
+
+    out_1, lse_1 = run(1)
+    monkeypatch.setattr(fa_interface, "_flash_attn_fwd_combine", recording_combine)
+    out_s, lse_s = run(num_splits)
+
+    assert len(captured) == 1, "num_splits=3 did not reach the combine kernel (split-KV collapsed to 1)"
+    lse_partial = captured[0]  # (num_splits, batch, seqlen_q, nheads) or (num_splits, total_q, nheads)
+    assert lse_partial.shape[0] == num_splits
+    if varlen_q == "cu_seqlens_q":
+        lse_partial = lse_partial.unflatten(1, (batch_size, seqlen_q))
+    for b in range(batch_size):
+        rows = int(seqused_q[b]) if varlen_q == "seqused_q" else seqlen_q
+        for split in range(num_splits):
+            assert torch.isfinite(lse_partial[split, b, :rows]).all(), (
+                f"split {split} of batch {b} did no KV work (non-finite partial LSE)"
+            )
+    for b in range(batch_size):
+        rows = int(seqused_q[b]) if varlen_q == "seqused_q" else seqlen_q
+        torch.testing.assert_close(out_s[b, :rows], out_1[b, :rows], atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(lse_s[b, :rows], lse_1[b, :rows], atol=1e-3, rtol=1e-3)
+
+
 def causal_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device):
     """Top-k indices as produced by a causal sparse-attention selector: query t
     gets min(t+1, seqlen_k, topk_len) valid keys drawn from [0, t], with
@@ -3508,6 +3580,7 @@ def check_canary(name, parent, pad_words):
 # 130 rows: a partial last preprocess tile when padded heads use per-head packing.
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(130, 258), (512, 512), (1024, 1024)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+@skip_if_mla_1cta_sparse
 def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_kv, causal, dtype):
     """Sparse-MLA backward with -1-padded gather_kv_indices, the padding any
     causal top-k selector produces for early queries.
@@ -3636,6 +3709,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
 # 24 heads: padded per-head preprocess tiles must not spill into the next packed sequence.
 @pytest.mark.parametrize("nheads", [128, 24])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+@skip_if_mla_1cta_sparse
 def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dtype):
     """Varlen counterpart of test_flash_attn_mla_sparse_bwd_sentinel.
 
@@ -3795,6 +3869,7 @@ def random_cutoff_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device)
 # 64 heads: the 64-row backward tile with no padded head rows.
 @pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+@skip_if_mla_1cta_sparse
 def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, nheads, shared_kv, causal, dtype):
     """Sparse-MLA backward with gather_bwd_recompute_p and gather_bwd_token_chunk.
 
@@ -3918,6 +3993,7 @@ def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, nheads, share
 @pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("token_chunk", [None, 200])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+@skip_if_mla_1cta_sparse
 def test_flash_attn_mla_sparse_bwd_fully_masked_rows(token_chunk, recompute_p, dtype):
     """Rows whose every top-k slot is the -1 sentinel (fully masked).
 
@@ -3985,6 +4061,7 @@ def test_flash_attn_mla_sparse_bwd_fully_masked_rows(token_chunk, recompute_p, d
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("recompute_p", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+@skip_if_mla_1cta_sparse
 def test_flash_attn_mla_sparse_bwd_token_chunk_rect(recompute_p, dtype):
     """Rectangular causal chunked backward with seqlen_q > seqlen_k.
 
@@ -4046,6 +4123,7 @@ def test_flash_attn_mla_sparse_bwd_token_chunk_rect(recompute_p, dtype):
 @pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+@skip_if_mla_1cta_sparse
 def test_flash_attn_mla_sparse_bwd_token_chunk_varlen(shared_kv, recompute_p, dtype):
     """Varlen token-chunked sparse-MLA backward, causal, with non-causal
     indices and both docs split across chunk boundaries.
@@ -4149,6 +4227,7 @@ def test_flash_attn_mla_sparse_bwd_token_chunk_varlen(shared_kv, recompute_p, dt
 @pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("varlen", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+@skip_if_mla_1cta_sparse
 def test_flash_attn_mla_sparse_bwd_preprocess_tile_tail(varlen, recompute_p, dtype):
     """Sparse-MLA backward at 64 Q heads with an odd token count per sequence.
 
@@ -4254,6 +4333,7 @@ def test_flash_attn_mla_sparse_bwd_preprocess_tile_tail(varlen, recompute_p, dty
 @pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize("varlen", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+@skip_if_mla_1cta_sparse
 def test_flash_attn_mla_sparse_bwd_learnable_sink(varlen, shared_kv, causal, dtype):
     """Sparse-MLA backward with a learnable sink, across every gather_bwd mode.
 
@@ -4404,7 +4484,7 @@ def test_flash_attn_mla_sparse_bwd_learnable_sink(varlen, shared_kv, causal, dty
 # kv_sparsity=False cases (which the 2CTA matrix leaves commented out by default).
 @pytest.mark.parametrize(
     "kv_sparsity",
-    [False, True] if os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1" else [True],
+    [False, True] if MLA_1CTA else [True],
 )
 @pytest.mark.parametrize("hdim", [64])
 @pytest.mark.parametrize("shared_kv", [False, True])
@@ -4472,7 +4552,7 @@ def test_flash_attn_mla_absorbed_varlen(
     hdimv = 512
     if not IS_SM100:
         pytest.skip()
-    if os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1" and kv_sparsity:
+    if MLA_1CTA and kv_sparsity:
         pytest.skip("1CTA MLA kernel does not support the topk/sparse KV gather")
     local = local_enum > 0
     if local and causal:
@@ -4654,7 +4734,8 @@ def test_flash_attn_mla_absorbed_varlen(
             rtol = 2
 
         pack_gqa_vals = [True]
-        num_splits_vals = [1]
+        # SplitKV with qv is 1CTA-only; unpad_q exercises both cu_seqlens_q and seqused_q.
+        num_splits_vals = [1, 3] if MLA_1CTA and not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             # SplitKV not supported on SM90/SM120 - skip this iteration
             if (IS_SM90 or IS_SM120) and num_splits > 1:
@@ -5352,6 +5433,7 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(64, 64), (128, 128), (128, 256)])
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="MLA kernel requires SM100/SM110")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+@skip_if_mla_1cta_sparse
 def test_mla_sink_precision_vs_fp64(seqlen_q, seqlen_k, causal):
     """Sparse MLA + learnable sink: kernel fwd/bwd error vs an fp64 ground truth.
 
@@ -5484,6 +5566,7 @@ def self_including_topk_indices(seqlen, topk_len, device):
 )
 @pytest.mark.parametrize("varlen", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+@skip_if_mla_1cta_sparse
 def test_flash_attn_mla_sparse_bwd_precise_dpsum(varlen, nheads, recompute_p, causal, dtype):
     """Sparse-MLA training numerics: the forward writes o_lo = fp32(O) - bf16(O) and the
     backward preprocess forms dpsum = rowsum(dO * (O + o_lo)); the forward runs the online
@@ -5632,6 +5715,7 @@ def _self_last_permutation(idx):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+@skip_if_mla_1cta_sparse
 def test_flash_attn_mla_sparse_topk_order_invariance(causal, dtype):
     """The sparse-MLA training forward must not care about the ORDER of the per-row top-k
     indices beyond bf16 rounding noise.

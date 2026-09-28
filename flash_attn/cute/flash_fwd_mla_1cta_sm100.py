@@ -67,7 +67,7 @@ from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.softmax import SoftmaxSm100
 from flash_attn.cute.tile_scheduler import (
-    ClcState,
+    SchedulerState,
     SchedulingMode,
     TileSchedulerArguments,
     TileSchedulerProtocol,
@@ -549,6 +549,9 @@ class FlashAttentionMLAForward1CtaSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        learnable_sink: Optional[cute.Tensor] = None,  # (h,)
+        # Sparse-training O residual (2CTA only); accepted for signature parity.
+        mOlo: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -557,6 +560,8 @@ class FlashAttentionMLAForward1CtaSm100:
             ("mP", mP), ("mRowMax", mRowMax), ("mIndexTopk", mIndexTopk),
             ("window_size_left", window_size_left),
             ("window_size_right", window_size_right),
+            ("learnable_sink", learnable_sink),
+            ("mOlo", mOlo),
         ]:
             assert t is None, f"{name} is not supported by the 1CTA MLA kernel (v1)"
         if const_expr(mPageTable is not None):
@@ -1188,6 +1193,7 @@ class FlashAttentionMLAForward1CtaSm100:
             is_causal=self.is_causal,
             is_split_kv=self.is_split_kv,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            num_splits=num_splits,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -1213,7 +1219,7 @@ class FlashAttentionMLAForward1CtaSm100:
             clc_pipeline_consumer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, cute.arch.WARP_SIZE * num_clc_consumer_warps
             )
-            clc = ClcState.create(
+            sched_ctx = SchedulerState.create_clc(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
                     self.tile_scheduler_cls.clc_problem_shape(tile_sched_params),
                     cute.arch.block_idx(),
@@ -1235,7 +1241,7 @@ class FlashAttentionMLAForward1CtaSm100:
                     pipeline.PipelineUserType.Producer, self.sched_stages
                 ),
             )
-            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, clc=clc)
+            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, ctx=sched_ctx)
         else:
             tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params)
         assert isinstance(tile_scheduler, TileSchedulerProtocol), (
@@ -1497,7 +1503,7 @@ class FlashAttentionMLAForward1CtaSm100:
 
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx, num_splits=num_splits
+                seqlen, m_block, split_idx=split_idx
             )
             num_n_blocks = n_block_max - n_block_min
             # Split-kv: this split's slice of the n_block range can be empty (the
@@ -1505,7 +1511,7 @@ class FlashAttentionMLAForward1CtaSm100:
             # Every warp role skips the whole tile body together, which keeps all
             # pipeline phases and raw-mbar phase counters consistent; the epilogue
             # still writes LSE = -inf so the combine kernel can ignore this split.
-            has_work = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+            has_work = block_info.has_kv_work(n_block_min, n_block_max)
             if has_work:
 
                 if const_expr(self.cpasync_staging_sync):
@@ -1867,7 +1873,7 @@ class FlashAttentionMLAForward1CtaSm100:
             )
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx, num_splits=num_splits
+                seqlen, m_block, split_idx=split_idx
             )
             num_n_blocks = n_block_max - n_block_min
             # Split-kv: this split's slice of the n_block range can be empty (the
@@ -1875,7 +1881,7 @@ class FlashAttentionMLAForward1CtaSm100:
             # Every warp role skips the whole tile body together, which keeps all
             # pipeline phases and raw-mbar phase counters consistent; the epilogue
             # still writes LSE = -inf so the combine kernel can ignore this split.
-            has_work = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+            has_work = block_info.has_kv_work(n_block_min, n_block_max)
             if has_work:
 
                 make_manager = partial(
@@ -2166,7 +2172,7 @@ class FlashAttentionMLAForward1CtaSm100:
 
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx, num_splits=num_splits
+                seqlen, m_block, split_idx=split_idx
             )
             num_n_blocks = n_block_max - n_block_min
             # Split-kv: this split's slice of the n_block range can be empty (the
@@ -2174,7 +2180,7 @@ class FlashAttentionMLAForward1CtaSm100:
             # Every warp role skips the whole tile body together, which keeps all
             # pipeline phases and raw-mbar phase counters consistent; the epilogue
             # still writes LSE = -inf so the combine kernel can ignore this split.
-            has_work = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+            has_work = block_info.has_kv_work(n_block_min, n_block_max)
             if has_work:
                 even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
                 num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
@@ -2564,7 +2570,7 @@ class FlashAttentionMLAForward1CtaSm100:
             qk_descale, _ = self._effective_descales(descale_tensors, batch_idx, head_idx)
             softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
             n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx, num_splits=num_splits
+                seqlen, m_block, split_idx=split_idx
             )
             num_n_blocks = n_block_max - n_block_min
             # Split-kv: this split's slice of the n_block range can be empty (the
@@ -2572,7 +2578,7 @@ class FlashAttentionMLAForward1CtaSm100:
             # Every warp role skips the whole tile body together, which keeps all
             # pipeline phases and raw-mbar phase counters consistent; the epilogue
             # still writes LSE = -inf so the combine kernel can ignore this split.
-            has_work = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+            has_work = block_info.has_kv_work(n_block_min, n_block_max)
             if has_work:
                 even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
                 num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
@@ -2890,7 +2896,7 @@ class FlashAttentionMLAForward1CtaSm100:
 
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx, num_splits=num_splits
+                seqlen, m_block, split_idx=split_idx
             )
             num_n_blocks = n_block_max - n_block_min
             # Split-kv: this split's slice of the n_block range can be empty (the
@@ -2898,7 +2904,7 @@ class FlashAttentionMLAForward1CtaSm100:
             # Every warp role skips the whole tile body together, which keeps all
             # pipeline phases and raw-mbar phase counters consistent; the epilogue
             # still writes LSE = -inf so the combine kernel can ignore this split.
-            has_work = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+            has_work = block_info.has_kv_work(n_block_min, n_block_max)
             if has_work:
 
                 consumer_states_O = [consumer_state_O0, consumer_state_O1]
