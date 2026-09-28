@@ -3075,21 +3075,28 @@ class FlashAttentionMLAForward1CtaSm100:
         tSrP = cute.make_rmem_tensor(tSrS_t2r.shape, self.dtype_P)
         rP_smem_view = smem_store_thr.retile(tSrP)
 
-        pipeline_S.consumer_wait(consumer_state_S)
-        cute.copy(tmem_load_thr, tStS_t2r_staged[stage], tSrS_t2r)
-        cute.arch.fence_view_async_tmem_load()
-        pipeline_S.consumer_release(consumer_state_S)
-
         if const_expr(self.is_topk_gather):
-            # Sparse: S columns are gathered slots; mask the invalid ones (index -1, out of
-            # range, or past the causal limit) on every n_block, instead of positionally.
+            # Sparse: S columns are gathered slots; the invalid ones (index -1, out of range,
+            # or past the causal limit) are masked on every n_block, not positionally. The
+            # bitmask is produced with the gather, well before S: wait for it (and read this
+            # thread's words) BEFORE waiting on S, so no bitmask latency follows S's arrival.
             pipeline_bitmask.consumer_wait(consumer_state_bitmask)
             # this thread's datapath half covers columns [64h, 64h + 64) = words 2h, 2h+1
             half = warp_idx // self.num_acc_halves
             words_per_half = const_expr(self.tile_n // 32 // self.num_acc_halves)
             word_lo = sBitmask[words_per_half * half, consumer_state_bitmask.index]
             word_hi = sBitmask[words_per_half * half + 1, consumer_state_bitmask.index]
-            self.apply_bitmask(tSrS_t2r, tScS_t2r, word_lo, word_hi)
+
+        pipeline_S.consumer_wait(consumer_state_S)
+        cute.copy(tmem_load_thr, tStS_t2r_staged[stage], tSrS_t2r)
+        cute.arch.fence_view_async_tmem_load()
+        pipeline_S.consumer_release(consumer_state_S)
+
+        if const_expr(self.is_topk_gather):
+            # All 64 slots valid (the common case for dense-ish top-k lists): skip the
+            # per-element selects. Warp-uniform: a warp's threads share a datapath half.
+            if (word_lo & word_hi) != Uint32(0xFFFFFFFF):
+                self.apply_bitmask(tSrS_t2r, tScS_t2r, word_lo, word_hi)
         elif const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
 
