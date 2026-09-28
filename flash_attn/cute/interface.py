@@ -636,9 +636,14 @@ def _flash_attn_fwd(
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
+    # MLA absorbed requires K and V to share one descale tensor (see the qv checks below).
+    # Check identity before normalizing: maybe_contiguous may copy each argument separately.
+    kv_descale_shared = k_descale is not None and k_descale is v_descale
     q_descale, k_descale, v_descale = [
         maybe_contiguous(t, align_bytes=4) for t in (q_descale, k_descale, v_descale)
     ]
+    if kv_descale_shared:
+        v_descale = k_descale
     page_table = maybe_contiguous(page_table, align_bytes=4)
     learnable_sink = maybe_contiguous(learnable_sink, align_bytes=4)
     gather_kv_indices = maybe_contiguous(gather_kv_indices, align_bytes=16)
@@ -1031,15 +1036,16 @@ def _flash_attn_fwd(
             # (Q@K^T and Qv@V^T) land in ONE accumulator, so a single folded softmax
             # scale is only correct when k_descale == v_descale. That is the natural
             # case for MLA: the rope-K and latent-V halves live in one quantized cache.
+            # Require one shared tensor rather than comparing values: a value comparison
+            # syncs the device, which breaks CUDA graph capture and FakeTensorMode.
             assert k_descale is not None and v_descale is not None, (
                 "MLA absorbed needs k_descale and v_descale together (or neither)"
             )
-            # Reads tensor values, so it can only run outside FakeTensorMode.
-            if not fake_mode:
-                assert torch.equal(k_descale, v_descale), (
-                    "MLA absorbed requires k_descale == v_descale: Q@K^T and Qv@V^T share "
-                    "one accumulator, so their descales must fold into one softmax scale"
-                )
+            assert kv_descale_shared, (
+                "MLA absorbed requires k_descale and v_descale to be the same tensor: "
+                "Q@K^T and Qv@V^T share one accumulator, so one descale must fold into "
+                "the softmax scale"
+            )
         assert tile_n == 128
         if mla_1cta and (q_descale is not None or k_descale is not None
                          or v_descale is not None):

@@ -3646,6 +3646,70 @@ def test_flash_attn_mla_1cta_learnable_sink_fp8(causal, num_splits):
     assert (out_sink.float() - out_ref).abs().max().item() <= 0.1 * out_ref.abs().max().item()
 
 
+def _mla_1cta_fp8_inputs(batch_size=2, seqlen_q=17, seqlen_k=257, nheads=6, nheads_kv=2):
+    device, fp8 = "cuda", torch.float8_e4m3fn
+    torch.random.manual_seed(0)
+    q, qv, k, v = [
+        torch.randn(*shape, device=device).to(fp8)
+        for shape in (
+            (batch_size, seqlen_q, nheads, 64),
+            (batch_size, seqlen_q, nheads, 512),
+            (batch_size, seqlen_k, nheads_kv, 64),
+            (batch_size, seqlen_k, nheads_kv, 512),
+        )
+    ]
+    q_descale = torch.rand(batch_size, nheads_kv, device=device) + 0.5
+    kv_descale = torch.rand(batch_size, nheads_kv, device=device) + 0.5
+    sink = torch.linspace(-2, 7, nheads, device=device)
+    return q, qv, k, v, q_descale, kv_descale, sink
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="fp8 descales with qv are 1CTA-only")
+@pytest.mark.parametrize("num_splits", [1, 3])
+def test_flash_attn_mla_1cta_fp8_descales_cuda_graph(num_splits):
+    """The descale checks must not sync the device: capture and replay a CUDA graph of
+    the fp8 + descales + sink forward and compare it to the eager result."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    q, qv, k, v, q_descale, kv_descale, sink = _mla_1cta_fp8_inputs()
+
+    def call():
+        out, lse, *_ = _flash_attn_fwd(
+            q, k, v, qv=qv, causal=True, learnable_sink=sink, num_splits=num_splits,
+            q_descale=q_descale, k_descale=kv_descale, v_descale=kv_descale, return_lse=True,
+        )
+        return out, lse
+
+    out_eager, lse_eager = call()  # also compiles, which must happen outside capture
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            call()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_graph, lse_graph = call()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out_graph, out_eager)
+    assert torch.equal(lse_graph, lse_eager)
+
+
+@pytest.mark.skipif(not MLA_1CTA, reason="fp8 descales with qv are 1CTA-only")
+def test_flash_attn_mla_1cta_fp8_descales_must_be_shared():
+    """K and V descales fold into one softmax scale, so they must be one tensor; equal
+    values in separate allocations are rejected (checking values would sync the device)."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    q, qv, k, v, q_descale, kv_descale, sink = _mla_1cta_fp8_inputs()
+    with pytest.raises(AssertionError, match="k_descale and v_descale to be the same tensor"):
+        _flash_attn_fwd(
+            q, k, v, qv=qv, q_descale=q_descale, k_descale=kv_descale,
+            v_descale=kv_descale.clone(),
+        )
+
+
 def causal_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device):
     """Top-k indices as produced by a causal sparse-attention selector: query t
     gets min(t+1, seqlen_k, topk_len) valid keys drawn from [0, t], with
