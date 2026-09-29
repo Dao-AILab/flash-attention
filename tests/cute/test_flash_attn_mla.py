@@ -3306,3 +3306,86 @@ def test_flash_attn_mla_sparse_topk_order_invariance(nheads, causal, dtype):
         e_first, e_last = rel_l2(grads_first[i], ref), rel_l2(grads_last[i], ref)
         print(f"{name} rel-L2 vs fp64: first {e_first:.4%} last {e_last:.4%}")
         assert abs(e_first - e_last) < 0.05 * max(e_first, e_last), f"{name}: gradient accuracy depends on the top-k order"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        # (description, kwargs for _mla_1cta_route, expected 1CTA)
+        ("dense decode 64 heads", dict(topk=False, h=64, s_q=1), True),
+        ("dense decode 16 heads x 4 tokens (64 rows)", dict(topk=False, h=16, s_q=4), True),
+        ("dense 64 heads x 2 tokens (128 rows)", dict(topk=False, h=64, s_q=2), False),
+        ("dense decode 128 heads", dict(topk=False, h=128, s_q=1), False),
+        ("dense prefill", dict(topk=False, h=64, s_q=4096), False),
+        ("dense varlen without a host max_seqlen_q", dict(topk=False, h=64, s_q=None), False),
+        ("dense prefill fp8 (2CTA has no fp8)", dict(topk=False, h=64, s_q=4096, needs=True), True),
+        ("sparse 64 heads", dict(topk=True, h=64, s_q=4096), True),
+        ("sparse 24 heads decode", dict(topk=True, h=24, s_q=1), True),
+        ("sparse 128 heads (unsupported on 1CTA)", dict(topk=True, h=128, s_q=1), False),
+        ("sparse training, load-P (unsupported)", dict(topk=True, h=64, s_q=4096, grad=True), False),
+        ("sparse training, recompute-P", dict(topk=True, h=64, s_q=4096, grad=True, rp=True), True),
+    ],
+    ids=lambda c: c[0].replace(" ", "_"),
+)
+def test_flash_attn_mla_dispatch_heuristic(case, monkeypatch):
+    """The 1CTA / 2CTA MLA dispatch with FLASH_ATTENTION_MLA_1CTA unset: sparse -> 1CTA up to
+    64 heads; dense -> 1CTA on decode shapes (seqlen_q x heads per KV head <= 64), 2CTA
+    otherwise; fp8 / descales / explicit split-KV -> 1CTA. The variable overrides it."""
+    from flash_attn.cute.interface import _mla_1cta_route
+    _, kw, expected = case
+    route = lambda: _mla_1cta_route(  # noqa: E731
+        kw["topk"], kw["h"], kw.get("grad", False), kw.get("rp", False),
+        seqlen_q_hint=kw["s_q"], needs_1cta=kw.get("needs", False),
+    )
+    monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA", raising=False)
+    assert route() == expected
+    supported = not (kw["topk"] and (kw["h"] > 64 or (kw.get("grad") and not kw.get("rp"))))
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "1")
+    assert route() == supported
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
+    assert not route()
+
+
+@pytest.mark.parametrize("shape", ["dense_decode", "dense_prefill", "sparse"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_dispatch_heuristic_end_to_end(shape, monkeypatch):
+    """With FLASH_ATTENTION_MLA_1CTA unset the call runs the kernel the heuristic picks (the
+    first compile-key element is the 1CTA route) and matches the reference."""
+    if not IS_SM100:
+        pytest.skip()
+    import flash_attn.cute.interface as fa_interface
+    monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA", raising=False)
+    b, h, (s_q, s_k) = 2, 64, {"dense_decode": (1, 2048), "dense_prefill": (256, 512), "sparse": (256, 512)}[shape]
+    kw, (q_r, k_r, v_r, qv_r) = _mla_inputs(b, s_q, s_k, h, has_qk=True)
+    extra = {}
+    if shape == "sparse":
+        extra = dict(gather_kv_indices=rect_topk_indices(b, s_q, s_k, 256, True, "cuda"), causal=True)
+    real_cache = fa_interface._flash_attn_fwd.compile_cache
+
+    class Spy:
+        keys = []
+
+        def __contains__(self, key):
+            self.keys.append(key)
+            return key in real_cache
+
+        def __getitem__(self, key):
+            return real_cache[key]
+
+        def __setitem__(self, key, value):
+            real_cache[key] = value
+
+    spy = Spy()
+    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", spy)
+    out, _ = flash_attn_func(**kw, **extra)
+    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", real_cache)
+    expect_1cta = shape != "dense_prefill"
+    assert spy.keys and all(key[0] == expect_1cta for key in spy.keys), shape
+    if is_fake_mode():
+        return
+    out_ref, _ = attention_ref(q_r, k_r, v_r, qv=qv_r, **extra)
+    out_pt, _ = attention_ref(q_r, k_r, v_r, qv=qv_r, upcast=False, reorder_ops=True, **extra)
+    valid = torch.isfinite(out_ref).all(-1)
+    err = (out.float() - out_ref.float()).abs()[valid].max().item()
+    err_pt = (out_pt.float() - out_ref.float()).abs()[valid].max().item()
+    assert err <= 2 * err_pt + 1e-3, (err, err_pt)

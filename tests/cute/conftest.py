@@ -32,6 +32,11 @@ def _get_gpu_ids():
 
 
 def pytest_configure(config):
+    # MLA routing: the tests pick the kernel explicitly. Unset, the interface would apply its
+    # 1CTA / 2CTA dispatch heuristic; the suite runs 2CTA by default and 1CTA wherever
+    # supported with FLASH_ATTENTION_MLA_1CTA=1 (test_flash_attn_mla_dispatch_heuristic
+    # covers the heuristic itself, with the variable unset).
+    os.environ.setdefault("FLASH_ATTENTION_MLA_1CTA", "0")
     tmp = Path(tempfile.gettempdir()) / getuser() / "flash_attention_tests"
     tmp.mkdir(parents=True, exist_ok=True)
 

@@ -586,17 +586,37 @@ def _compute_blocks_to_batch(cu_total_blocks, num_blocks, device):
 _compute_blocks_to_batch.compile_cache = get_jit_cache("blocks_to_batch")
 
 
-def _mla_1cta_route(is_topk_gather, nheads_per_kv, requires_grad, gather_bwd_recompute_p):
-    """Whether an MLA call runs the 1CTA (tcgen05.mma.ws) kernel: opt-in via
-    FLASH_ATTENTION_MLA_1CTA=1. Sparse (top-k) MLA runs there up to 64 Q heads (one 64-row
-    tile per token; more heads would need two tiles, each re-gathering the same indices,
-    which the 2CTA kernel avoids), and for training only with the recompute-P backward (the
-    1CTA forward emits no P / row_max). Everything else runs the 2CTA kernel."""
-    if os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") != "1":
-        return False
-    return not is_topk_gather or (
+def _mla_1cta_route(
+    is_topk_gather, nheads_per_kv, requires_grad, gather_bwd_recompute_p, *,
+    seqlen_q_hint, needs_1cta,
+):
+    """Whether an MLA call runs the 1CTA (tcgen05.mma.ws) kernel rather than the 2CTA one.
+
+    Support: sparse (top-k) MLA runs on 1CTA up to 64 Q heads (one 64-row tile per token;
+    more heads would need two tiles, each re-gathering the same indices, which the 2CTA
+    kernel avoids), and for training only with the recompute-P backward (the 1CTA forward
+    emits no P / row_max). Dense MLA is supported at any shape.
+
+    Heuristic (AI/SPARSE_MLA_1CTA.md, "Dispatch heuristic"; broadly right, not per shape):
+      - needs_1cta (fp8, descales, explicit split-KV: the 2CTA MLA kernel has none) -> 1CTA;
+      - sparse -> 1CTA whenever supported (<= 64 heads);
+      - dense -> 1CTA on decode shapes, seqlen_q x heads per KV head <= 64 (one 64-row tile per
+        KV head: the kb64 mainloop with split-KV, which beats the unsplit 2CTA kernel even at
+        low occupancy); 2CTA for prefill, where its 2-CTA MMA wins. Varlen without a host
+        max_seqlen_q counts as prefill.
+    FLASH_ATTENTION_MLA_1CTA=1 / 0 overrides the heuristic (1: wherever supported; 0: never).
+    """
+    supported = not is_topk_gather or (
         nheads_per_kv <= 64 and (not requires_grad or gather_bwd_recompute_p)
     )
+    override = os.environ.get("FLASH_ATTENTION_MLA_1CTA")
+    if override is not None:
+        return override == "1" and supported
+    if not supported:
+        return False
+    if needs_1cta or is_topk_gather:
+        return True
+    return seqlen_q_hint is not None and seqlen_q_hint * nheads_per_kv <= 64
 
 
 def _flash_attn_fwd(
@@ -783,7 +803,17 @@ def _flash_attn_fwd(
     # MLA (qv): the 1CTA kernel (opt-in, see _mla_1cta_route) or the 2CTA kernel. Decided here:
     # the sparse head padding below and the split-KV heuristics in _get_fwd_config depend on it.
     mla_1cta = qv is not None and _mla_1cta_route(
-        gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p
+        gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p,
+        # the host-side max seqlen_q (a varlen max_seqlen_q tensor gives no hint)
+        seqlen_q_hint=(
+            seqlen_q if cu_seqlens_q is None
+            else max_seqlen_q if isinstance(max_seqlen_q, int) else None
+        ),
+        needs_1cta=(
+            v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            or any(t is not None for t in (q_descale, k_descale, v_descale))
+            or num_splits > 1
+        ),
     )
     # Sparse MLA pads a token's heads to the kernel's tile (pack_gqa.qheads_first_tma_view); the
     # kernel takes the real count, the interface needs the tile width for its grid math.

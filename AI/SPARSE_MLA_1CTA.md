@@ -582,6 +582,47 @@ Before merging, the interface lost the ablation machinery used to develop and me
   variants disappeared. The kb64 / 128-key / recompute-P bitwise references
   (`agent_space/kb*_ref.py`, `recompute_bwd_ref.py`) are unchanged.
 
+## Dispatch heuristic (2026-09-29)
+
+With `FLASH_ATTENTION_MLA_1CTA` unset, `interface._mla_1cta_route` picks the kernel. `1`
+forces 1CTA wherever it is supported; `0` forces 2CTA.
+- **fp8, descales, or an explicit `num_splits > 1`:** 1CTA. The 2CTA MLA kernel has none of
+  these.
+- **Sparse:** 1CTA whenever supported (<= 64 Q heads per KV head; training only with
+  recompute-P).
+- **Dense:** 1CTA on decode shapes, `seqlen_q x heads per KV head <= 64`: one 64-row tile per
+  KV head, i.e. the kb64 mainloop with split-KV. 2CTA otherwise. Varlen without a host
+  `max_seqlen_q` counts as prefill.
+
+Measured (`agent_space/bench_dispatch.py`, `agent_space/bench_sparse_1cta/dispatch.csv`;
+GB300, bf16, cold L2):
+
+| case | 2CTA | 1CTA unsplit | 1CTA split (`num_splits=0`) | picks |
+|---|---|---|---|---|
+| dense decode h64, b 1-32, s_k 8K-32K | 0.10-0.35 ms | 0.12-0.45 | **0.02-0.20** | 1CTA |
+| dense decode h64 b128 | 0.23 / 0.82 | **0.20 / 0.70** | 0.20 / 0.70 | 1CTA |
+| dense 64 rows (h16 x 4, h32 x 2), b8 | 0.34 | 0.69 | **0.08** | 1CTA |
+| dense 128 rows (h64 x 2, h16 x 8, h128 decode), b8 | 0.34 | 0.44-0.69 | **0.09-0.12** | 2CTA |
+| dense decode h128 b128 | **0.84** | 1.41 | 1.40 | 2CTA |
+| dense prefill 1K x 4K (h64 / h16) | **0.28 / 0.09** | 0.35 / 0.15 | 0.35 / 0.19 | 2CTA |
+| sparse decode h64 b 1-32 | **0.036-0.042** | 0.046-0.050 | - | 1CTA |
+| sparse decode h64 b128 | 0.084 | **0.074** | - | 1CTA |
+| sparse prefill h64 2K | 0.79 | **0.50** | - | 1CTA |
+
+Where it is right:
+- **Dense decode**, with split-KV: 1.2-9x faster than 2CTA.
+- **Dense prefill.**
+- **Sparse at about one wave of tiles and above**, and sparse prefill (1.6x).
+
+Where it is wrong:
+- **Dense decode with the default `num_splits=1`.** 1CTA runs unsplit and is 20-35% slower
+  than 2CTA below about one wave (b <= 32 at 64 heads). The win needs split-KV
+  (`num_splits=0`, the split heuristic).
+- **Small-batch 128-row dense decode**, which it leaves on 2CTA. There 1CTA with split is
+  about 3-4x faster; the `<= 64` boundary is conservative.
+- **Sparse decode below about one wave** (b <= 32): 2CTA is about 20% faster, at tens of
+  microseconds.
+
 ## Follow-ups
 
 1. **Routing heuristic.** Prefer 2CTA when the number of sparse tiles (b x s_q) is below
