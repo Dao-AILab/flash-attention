@@ -635,16 +635,14 @@ def _mla_fwd_plan(
         if not mla_1cta:
             return FlashAttentionMLAForwardSm100, cfg
         cls = Kb64 if kb64_ok else FlashAttentionMLAForward1CtaSm100
-        if is_topk_gather:
-            return cls, cfg
-        if kb64_ok:  # one token per 64-row tile (heads padded to 64)
-            tile_m, tile_n = tile_mn if tile_mn is not None else Kb64.TILE_MN
+        if kb64_ok:  # one token per 64-row tile (heads padded to 64), 64-key blocks
+            tile_m, tile_n = Kb64.TILE_MN if is_topk_gather or tile_mn is None else tile_mn
             q_stage, tile_rows = 1, max_seqlen_q * Kb64.TILE_MN[0]
             min_blocks = Kb64.MIN_BLOCKS_PER_SPLIT
         else:
             tile_m, tile_n, q_stage = cfg.m_block_size, cfg.n_block_size, cfg.q_stage
             tile_rows, min_blocks = rows, 1
-        splits = num_splits
+        splits = 1 if is_topk_gather else num_splits
         if splits < 1:
             num_n_blocks = cute.ceil_div(max_seqlen_k, tile_n)
             num_tiles = batch_size * num_head_kv * cute.ceil_div(tile_rows, q_stage * tile_m)
@@ -897,7 +895,6 @@ def _flash_attn_fwd(
         # num_head contiguous better for MQA in MLA absorbed
         lse_shape = (batch_size, seqlen_q, num_head) if cu_seqlens_q is None else (total_q, num_head)
 
-    out_provided = out is not None
     if out is None:
         out = torch.empty(
             *q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device
@@ -910,7 +907,8 @@ def _flash_attn_fwd(
             out_torch_dtype,
             device,
         )
-        validate_output_layout(out, "out", align_bytes=16)
+        out_align_bytes = 32 if head_dim_v == 512 else 16
+        validate_output_layout(out, "out", align_bytes=out_align_bytes)
 
     if lse is None:
         lse = (
@@ -1048,10 +1046,6 @@ def _flash_attn_fwd(
             num_sms=get_num_sms_for_selection(device.index, arch),
         )
     mla_1cta_kb64 = mla_fwd_cls is FlashAttentionMLAForward1CtaKb64Sm100
-    mla_1cta_kb64_dense = mla_1cta_kb64 and gather_kv_indices is None
-    if mla_1cta_kb64 and out_provided:
-        # its 256-bit O stores need 32-B aligned rows (buffers allocated here already are)
-        validate_output_layout(out, "out", align_bytes=32)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     q_stage = fwd_cfg.q_stage
     num_splits = fwd_cfg.num_splits
@@ -1183,7 +1177,7 @@ def _flash_attn_fwd(
                 "Q@K^T and Qv@V^T share one accumulator, so one descale must fold into "
                 "the softmax scale"
             )
-        assert tile_n == (64 if mla_1cta_kb64_dense else 128)
+        assert tile_n == (64 if mla_1cta_kb64 else 128)
 
         assert not is_split_kv or mla_1cta, (
             "split kv with qv is only supported by the 1CTA MLA kernel "
@@ -1384,28 +1378,30 @@ def _flash_attn_fwd(
     # coherent bf16 gain error on peaked rows. See AI/SPARSE_MLA_EXACT_SOFTMAX_MAX.md.
     mla_fwd_rescale_threshold = 0.0 if (requires_grad and sparse_kv) else 8.0
 
-    mla_1cta_use_clc = mla_1cta and mla_fwd_cls.use_clc(
-        is_topk_gather=bool(sparse_kv),
-        seqlen_q_hint=seqlen_q_hint,
-        clc_default=use_clc_scheduler if use_clc_scheduler is not None else True,
-    )
+    if mla_1cta:  # the 1CTA MLA kernels own their CLC policy
+        use_clc_scheduler = mla_fwd_cls.use_clc(
+            is_topk_gather=bool(sparse_kv),
+            seqlen_q_hint=seqlen_q_hint,
+            clc_default=use_clc_scheduler if use_clc_scheduler is not None else True,
+        )
     mla_1cta_s_ahead = mla_1cta and mla_fwd_cls.use_s_ahead(
         is_fp8=is_fp8, seqlen_q_hint=seqlen_q_hint, nheads=nheads_per_kv
     )
-    mla_ptxas_options = mla_fwd_cls.ptxas_options if mla_fwd_cls is not None else ""
 
+    paged_kv_tma = (
+        None if page_table is None
+        else page_size % 64 == 0 if mla_1cta_kb64
+        else page_size == tile_n
+    )
+    
     compile_key = (
         mla_1cta,
         mla_1cta_kb64,
-        page_size if mla_1cta_kb64_dense and page_table is not None else None,
-        mla_1cta_use_clc,
         mla_1cta_s_ahead if mla_1cta else None,
-        mla_ptxas_options,
         dtype,
         head_dim,
         head_dim_v,
-        qhead_per_kvhead,
-        nheads_per_kv,
+        nheads_per_kv,  # the real count; qhead_per_kvhead must follow from the key
         causal,
         score_mod_hash,
         mask_mod_hash,
@@ -1439,7 +1435,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        page_size not in [None, tile_n],  # paged KV non-TMA
+        paged_kv_tma,
         use_2cta_instrs,
         q_subtile_factor,
         kv_subtile_factor,
@@ -1488,8 +1484,7 @@ def _flash_attn_fwd(
             else None
         )
         q_tensor, k_tensor, v_tensor = [to_cute_tensor(t) for t in (q, k, v)]
-        # the kb64 route's O / o_lo / fp32 O partial are 32-B aligned (validated above)
-        o_align = 32 if mla_1cta_kb64 else 16
+        o_align = 32 if head_dim_v == 512 else 16
         o_tensor = to_cute_tensor(out if not is_split_kv else out_partial, assumed_align=o_align)
         if is_split_kv:
             # MLA: the transposed lse_partial view, whose seqlen mode is the contiguous one
@@ -1622,7 +1617,7 @@ def _flash_attn_fwd(
                             nheads_kv=num_head_kv,
                             hdim=head_dim,
                             hdimv=head_dim_v,
-                            use_clc_scheduler=mla_1cta_use_clc,
+                            use_clc_scheduler=use_clc_scheduler,
                             has_qk=has_qk,
                             has_seqused_q=seqused_q is not None,
                             has_cu_seqlens_q=cu_seqlens_q is not None,
@@ -1630,7 +1625,7 @@ def _flash_attn_fwd(
                             rescale_threshold=mla_fwd_rescale_threshold,
                             is_topk_gather=bool(sparse_kv),
                             is_split_kv=is_split_kv,
-                            page_size=page_size if page_table is not None else None,
+                            paged_kv_tma=paged_kv_tma,
                         )
                     else:
                         fa_fwd = FlashAttentionMLAForward1CtaSm100(
@@ -1640,7 +1635,7 @@ def _flash_attn_fwd(
                             nheads_kv=num_head_kv,
                             hdim=head_dim,
                             hdimv=head_dim_v,
-                            use_clc_scheduler=mla_1cta_use_clc,
+                            use_clc_scheduler=use_clc_scheduler,
                             has_qk=has_qk,
                             pack_gqa=pack_gqa,
                             has_seqused_q=seqused_q is not None,
@@ -1771,7 +1766,7 @@ def _flash_attn_fwd(
                 learnable_sink=learnable_sink_tensor,
                 mOlo=o_lo_tensor,
                 stream=current_stream,
-                options=_compile_options(mla_ptxas_options),
+                options=_compile_options(fa_fwd.ptxas_options),
             )
         else:
             compile_args = [
@@ -3346,7 +3341,6 @@ def _flash_attn_bwd_sparse_mla(
         gather_kv_length,
         disable_sparse_kv_bitmask,
         recompute_p,
-        FlashAttentionSparseMLABackwardSm100.ptxas_options,
     )
 
     if compile_key not in _flash_attn_bwd_sparse_mla.compile_cache:
@@ -3542,7 +3536,7 @@ _flash_attn_bwd_sparse_mla.compile_cache = get_jit_cache("bwd_dsa")
 
 
 def _compile_sparse_mla_dq_dqv(
-    dtype, nheads, head_dim, head_dim_v, top_k, varlen_q, varlen_k, compute_dq, ptxas_options,
+    dtype, nheads, head_dim, head_dim_v, top_k, varlen_q, varlen_k, compute_dq,
     kernel_cls_name,  # compile-key only: the class is picked from nheads below
 ):
     sym = cute.sym_int 
@@ -3585,7 +3579,7 @@ def _compile_sparse_mla_dq_dqv(
         mCuSeqlensQ,
         mCuSeqlensK,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options=_compile_options(ptxas_options),
+        options=_compile_options(dq_dqv_cls.ptxas_options),
     )
 
 
@@ -3609,7 +3603,6 @@ def _sparse_mla_dq_dqv(
     dq_dqv_cls = dQdQvGemmKernelH64 if nheads <= 64 else dQdQvGemmKernel
     compile_key = (
         dtype_cute, nheads, head_dim, head_dim_v, gather_kv_length, varlen_q, varlen_k, k is not None,
-        dq_dqv_cls.ptxas_options,
         dq_dqv_cls.__name__,
     )
     if compile_key not in _sparse_mla_dq_dqv.compile_cache:
@@ -3631,7 +3624,6 @@ def _compile_sparse_mla_dk(
     head_dim: int,
     topk: int,
     varlen: bool,
-    ptxas_options: str,
 ):
     kernel = dKGemmKernel(
         topk,
@@ -3668,7 +3660,7 @@ def _compile_sparse_mla_dk(
         mCuSeqlensQ,
         mCuSeqlensK,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options=_compile_options(ptxas_options),
+        options=_compile_options(dKGemmKernel.ptxas_options),
     )
 
 
@@ -3706,7 +3698,7 @@ def _sparse_mla_dk(
     head_dim = q.shape[-1] if q is not None else 0
 
     compile_key = (
-        dtype_cute, dtype_acc_cute, nheads, head_dim, topk, varlen, dKGemmKernel.ptxas_options,
+        dtype_cute, dtype_acc_cute, nheads, head_dim, topk, varlen,
     )
 
     if compile_key not in _sparse_mla_dk.compile_cache:

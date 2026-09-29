@@ -354,7 +354,8 @@ P is never stored.
 ## ptxas levels
 
 Each MLA kernel class carries its ptxas flags as a `ptxas_options` class attribute, which the
-interface adds to the compile options and the compile key.
+interface adds to the compile options. The compile key does not repeat them: the class is
+already part of it.
 
 | kernel | level | measured |
 |---|---|---|

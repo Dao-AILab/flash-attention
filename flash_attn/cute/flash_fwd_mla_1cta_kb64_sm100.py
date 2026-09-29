@@ -50,6 +50,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute import FastDivmodDivisorV2
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from cutlass._mlir.dialects import llvm
@@ -140,12 +141,15 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         rescale_threshold: float = 8.0,
         is_topk_gather: bool = True,
         is_split_kv: bool = False,
-        page_size: Optional[int] = None,
+        paged_kv_tma: Optional[bool] = None,
     ):
+        # paged_kv_tma: None without a page table; True when pages are whole 64-key blocks
+        # (page_size % 64 == 0: a block is one TMA box inside a page); False otherwise.
+        # The page size itself is a run-time value (the page mode of mK / mV).
         # The load front end: the cp.async gather warps 12-15 for top-k gather and for paged KV
         # whose pages are not whole 64-key blocks (a block spans pages: no TMA box); TMA from the
         # load warp otherwise.
-        paged_cpasync = page_size is not None and page_size % 64 != 0
+        paged_cpasync = paged_kv_tma is False
         use_cpasync_kv = is_topk_gather or paged_cpasync
         # the shared fields (scheduler, packed varlen, causal (in the bitmask when sparse),
         # head padding, split-KV)
@@ -188,11 +192,9 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             self.TileScheduler = (
                 SingleTileLPTScheduler if self.use_clc_scheduler else SingleTileScheduler
             )
-        assert not (is_topk_gather and page_size is not None)
+        assert not (is_topk_gather and paged_kv_tma is not None)
         self.use_cpasync_kv = use_cpasync_kv
-        self.page_size = page_size
-        # TMA paging: 64-key blocks per page
-        self.page_blocks = page_size // 64 if page_size is not None and not paged_cpasync else 1
+        self.paged_kv_tma = paged_kv_tma
         assert hdimv == 512 and (hdim == 64 or not has_qk), (
             "kb64 mainloop: 64 rope + 512 latent dims"
         )
@@ -435,7 +437,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         # fmt: on
         self.has_learnable_sink = learnable_sink is not None
         assert (mIndexTopk is not None) == self.is_topk_gather
-        assert (mPageTable is not None) == (self.page_size is not None)
+        assert (mPageTable is not None) == (self.paged_kv_tma is not None)
         assert mOlo is None or not self.is_split_kv, "mOlo is not supported with split-KV"
         for name, t in [
             ("mP", mP), ("mRowMax", mRowMax),
@@ -1239,11 +1241,13 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                 kv_state.advance()
 
                 # ==== KV blocks, descending ====
+                if const_expr(mPageTable is not None):
+                    page_blocks = mV.shape[0] // self.tile_n  # 64-key blocks per page (run time)
                 for i in cutlass.range(num_n_blocks, unroll=1):
                     n_block = n_block_first - i
                     if const_expr(mPageTable is not None):
-                        page = mPageTable[batch_idx, n_block // self.page_blocks]
-                        sub = n_block % self.page_blocks
+                        page = mPageTable[batch_idx, n_block // page_blocks]
+                        sub = n_block % page_blocks
                     stage = kv_state.index
                     pipeline_KV.producer_acquire(kv_state)
                     full_bar = pipeline_KV.producer_get_barrier(kv_state)
@@ -1526,7 +1530,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                     self.num_cpasync_load_threads,
                     mV.element_type,
                     disable_bitmask=True,
-                    page_size=self.page_size,
+                    page_size_divmod=FastDivmodDivisorV2(mV.shape[0]),
                     mPageTable=mPageTable[batch_idx, None],
                 )
                 # this head's (page_size, d, num_pages) views

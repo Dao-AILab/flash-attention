@@ -7,6 +7,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Int32, Uint32, const_expr, Boolean
+from cutlass.cute import FastDivmodDivisorV2
 
 from flash_attn.cute import utils
 from flash_attn.cute.utils import warp_reduce
@@ -294,7 +295,7 @@ class CpasyncGatherKVManagerH64(ParamsBase):
     is -1 or >= ``seqlen_k_limit`` are zero-filled (predicated ``cp.async``) and cleared in the
     2-word validity bitmask (warps 0-1, bit = lane = key within the 32-key half).
 
-    Paged KV (dense kb64, ``page_size`` set): the index source is the batch's page-table row
+    Paged KV (dense kb64, ``page_size_divmod`` set): the index source is the batch's page-table row
     instead of top-k indices. ``load_index_paged`` puts the physical page and the in-page offset
     of the thread's row into the same two register sets; ``load_X`` addresses the
     ``(page_size, d, num_pages)`` view, and the caller's ``num_valid_rows`` zero-fills rows at or
@@ -328,7 +329,7 @@ class CpasyncGatherKVManagerH64(ParamsBase):
     disable_bitmask: cutlass.Constexpr[Boolean]
 
     # paged KV: the page-table row of this batch, and the in-page offsets (rTopk holds the pages)
-    page_size: cutlass.Constexpr[Optional[int]] = None
+    page_size_divmod: Optional[FastDivmodDivisorV2] = None  # run-time page size
     mPageTable: Optional[cute.Tensor] = None
     rPageOff: Optional[cute.Tensor] = None
 
@@ -347,12 +348,12 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         disable_bitmask: cutlass.Constexpr[Boolean] = False,
         sBitmask: Optional[cute.Tensor] = None,
         pipeline_bitmask: Optional[pipeline.PipelineAsync] = None,
-        page_size: cutlass.Constexpr[Optional[int]] = None,
+        page_size_divmod: Optional[FastDivmodDivisorV2] = None,
         mPageTable: Optional[cute.Tensor] = None,
     ):
         assert num_threads == 128, "H64 gather: 128 producer threads"
-        assert (page_size is None) == (mPageTable is None)
-        assert page_size is None or disable_bitmask, "paged KV: positional masking, no bitmask"
+        assert (page_size_divmod is None) == (mPageTable is None)
+        assert page_size_divmod is None or disable_bitmask, "paged KV: positional masking, no bitmask"
         assert tile_n == 64, "H64 gather: 64-key stages"
         assert hdim % 64 == 0 and hdim_v % 64 == 0, "rows are whole 128-B chunks"
         universal_copy_bits = 128
@@ -379,7 +380,7 @@ class CpasyncGatherKVManagerH64(ParamsBase):
 
         rTopk = cute.make_rmem_tensor((2,), Int32)
         rTopk_NonInterleaved = cute.make_rmem_tensor((2,), Int32)
-        rPageOff = cute.make_rmem_tensor((2,), Int32) if page_size is not None else None
+        rPageOff = cute.make_rmem_tensor((2,), Int32) if page_size_divmod is not None else None
 
         return CpasyncGatherKVManagerH64(
             mIndexTopk,
@@ -400,7 +401,7 @@ class CpasyncGatherKVManagerH64(ParamsBase):
             pipeline_bitmask,
             cpasync_barrier,
             disable_bitmask,
-            page_size,
+            page_size_divmod,
             mPageTable,
             rPageOff,
         )
@@ -417,12 +418,12 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         row = (
             lane_in_group % row_groups
         ) * rows_per_copy + self.thread_idx // self.gmem_threads_per_row
-        key = n_block * self.tile_n + row  # n_block >= 0: unsigned divide by the constant
-        page_idx = Int32(Uint32(key) // Uint32(self.page_size))
+        key = n_block * self.tile_n + row
+        page_idx, page_off = divmod(key, self.page_size_divmod)
         # the load itself stays in bounds (entry 0) past the sequence: its page is never used
         page_idx = page_idx if key < self.seqlen_k_limit else Int32(0)
         self.rTopk[buf] = self.mPageTable[page_idx]
-        self.rPageOff[buf] = Int32(Uint32(key) % Uint32(self.page_size))
+        self.rPageOff[buf] = page_off
 
     @cute.jit
     def load_index_topk(self, n_block: Int32, buf: cutlass.Constexpr[int]):
@@ -495,7 +496,7 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         use_row_pred = const_expr(num_valid_rows is not None)
         tPrXPtr = cute.make_rmem_tensor((1,), cutlass.Int64)
         tPrRowValid = cute.make_rmem_tensor((1,), cutlass.Int32)
-        if const_expr(not identity_rows and self.page_size is not None):
+        if const_expr(not identity_rows and self.page_size_divmod is not None):
             tPrXPtr[0] = utils.elem_pointer(mX, (self.rPageOff[buf], 0, self.rTopk[buf])).toint()
         elif const_expr(not identity_rows):
             topk_idx = self.rTopk[buf]
