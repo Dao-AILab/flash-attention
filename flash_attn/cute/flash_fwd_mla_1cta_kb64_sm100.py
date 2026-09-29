@@ -1,4 +1,4 @@
-# Copyright (c) 2026, Tri Dao.
+# Copyright (c) 2026, Colfax International.
 """1CTA sparse-MLA forward, 64-key-block mainloop (exactly 64 Q heads, 16-bit inputs).
 
 The 128-key mainloop of FlashAttentionMLAForward1CtaSm100 holds one key block's V in both of its
