@@ -216,8 +216,14 @@ class JITPersistentCache(JITCache):
         ):
             if obj_path.exists():
                 fa_log(1, f"Loading compiled function from disk: {obj_path}")
-                m = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
-                fn = getattr(m, self.EXPORT_FUNCTION_PREFIX)
+                try:
+                    m = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
+                    fn = getattr(m, self.EXPORT_FUNCTION_PREFIX)
+                except Exception as e:
+                    # A bad entry (e.g. left by an export that ran out of disk space) is a
+                    # miss: recompile, and let the export replace it.
+                    fa_log(1, f"Unloadable cache entry {obj_path} ({type(e).__name__}); recompiling")
+                    return False
                 JITCache.__setitem__(self, key, fn)
                 return True
             else:
@@ -234,15 +240,26 @@ class JITPersistentCache(JITCache):
             label=sha256_hex,
         ):
             obj_path = self.cache_path / f"{sha256_hex}.o"
-            if obj_path.exists():
+            if obj_path.exists() and obj_path.stat().st_size > 0:
                 # Another process already exported.
                 fa_log(1, f"Skipping export, already on disk: {obj_path}")
                 return
             fa_log(1, f"Exporting compiled function to disk: {obj_path}")
-            fn.export_to_c(
-                object_file_path=str(obj_path),
-                function_name=self.EXPORT_FUNCTION_PREFIX,
-            )
+            # Write to a temporary name and rename into place, so an interrupted or failed
+            # write (a killed process, a full disk) never leaves a partial entry behind.
+            tmp_path = self.cache_path / f".{sha256_hex}.{os.getpid()}.tmp.o"
+            try:
+                fn.export_to_c(
+                    object_file_path=str(tmp_path),
+                    function_name=self.EXPORT_FUNCTION_PREFIX,
+                )
+                if tmp_path.stat().st_size == 0:
+                    raise OSError(f"empty object file {tmp_path}")
+                os.replace(tmp_path, obj_path)
+            except Exception as e:
+                tmp_path.unlink(missing_ok=True)
+                fa_log(1, f"Export to disk failed for {obj_path} ({type(e).__name__}: {e})")
+                return
             fa_log(1, f"Successfully exported compiled function to disk: {obj_path}")
 
     def _key_to_hash(self, key: CompileKeyType) -> str:
