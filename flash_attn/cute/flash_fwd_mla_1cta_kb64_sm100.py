@@ -103,26 +103,15 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
     MIN_BLOCKS_PER_SPLIT = 4
 
     @staticmethod
-    def can_implement(
-        *, is_topk_gather, nheads_per_kv, num_head_kv, is_fp8, hdim, hdimv, has_qk,
-        seqlen_q_hint, has_extensions,
-    ) -> bool:
-        """Calls this mainloop serves (the rest of 1CTA MLA runs the 128-key mainloop): 16-bit,
-        <= 64 heads; sparse at any such head count; dense with a 512-dim latent and 64-dim rope,
-        at 64 heads, or with fewer on decode only -- padding the one-token tile wins there
-        (1.07-1.30x over the 128-key mainloop) but wastes 64 / H of the MMA work on prefill,
-        where the 128-key mainloop packs several tokens per tile (kb64 0.34-0.81x). Dense
-        excludes local / softcap / score_mod / mask_mod / block sparsity (has_extensions)."""
+    def can_implement(*, is_topk_gather, is_fp8, nheads_per_kv, num_head_kv, seqlen_q_hint) -> bool:
+        """1CTA MLA calls this mainloop serves (the rest run the 128-key mainloop): 16-bit,
+        <= 64 heads; sparse at any such head count; dense at 64 heads, or with fewer on decode
+        only -- padding the one-token tile wins there (1.07-1.30x over the 128-key mainloop)
+        but wastes 64 / H of the MMA work on prefill, where the 128-key mainloop packs several
+        tokens per tile (kb64 0.34-0.81x)."""
         if is_fp8 or nheads_per_kv > 64:
             return False
-        if is_topk_gather:
-            return True
-        return (
-            hdimv == 512
-            and (not has_qk or hdim == 64)
-            and (nheads_per_kv == 64 or (num_head_kv == 1 and seqlen_q_hint == 1))
-            and not has_extensions
-        )
+        return is_topk_gather or nheads_per_kv == 64 or (num_head_kv == 1 and seqlen_q_hint == 1)
 
     @staticmethod
     def use_clc(*, is_topk_gather, seqlen_q_hint, clc_default) -> bool:

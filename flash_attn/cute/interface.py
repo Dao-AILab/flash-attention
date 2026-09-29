@@ -5,7 +5,7 @@ import os
 import math
 import operator
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache, partial
 from typing import Optional, Tuple, Callable
 
@@ -347,9 +347,6 @@ def _get_fwd_config(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
-    mla_1cta: bool = False,
-    single_q_stage: bool = False,
-    min_blocks_per_split: int = 1,
 ) -> FwdConfig:
     if seqlen_q is None:
         seqlen_q = max_seqlen_q
@@ -384,10 +381,9 @@ def _get_fwd_config(
         intra_wg_overlap = cfg.intra_wg_overlap
 
     seqlen_q_packgqa = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
-    if arch // 10 in [10, 11] and not single_q_stage:
+    if arch // 10 in [10, 11]:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
-        # also the 1CTA kb64 MLA kernel: one 64-row tile per (token, split)
         q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
@@ -421,22 +417,11 @@ def _get_fwd_config(
         assert num_splits == 1, "SM120 forward only supports num_splits=1"
     elif num_splits < 1:
         num_SMs = get_num_sms_for_selection(device.index, arch)
-        max_splits = (
-            min(128, max(1, num_n_blocks // min_blocks_per_split))
-            if min_blocks_per_split > 1
-            else 128
-        )
-        num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits)
+        num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
-    # in shared memory, causing OOM for diff-headdim (192, 128).
-    # The 1CTA MLA kernel is exempt: it stores fp32 O partials straight from registers.
-    if (
-        arch // 10 in [10, 11]
-        and head_dim != head_dim_v
-        and num_splits > 1
-        and not mla_1cta
-    ):
+    # in shared memory, causing OOM for diff-headdim (192, 128)
+    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
         if num_n_blocks >= 64 and head_dim_v != 512:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
@@ -621,6 +606,64 @@ def _mla_1cta_route(
     if seqlen_q_hint is None or seqlen_q_hint * nheads_per_kv > 64:
         return False
     return past_one_wave
+
+def _mla_fwd_plan(
+    cfg, mla_1cta, route, *, num_splits, is_topk_gather, is_fp8, nheads_per_kv, num_head_kv,
+    seqlen_q_hint, rows, max_seqlen_q, max_seqlen_k, batch_size, tile_mn, num_sms,
+):
+    """(mla_1cta, kernel class, config) for an MLA forward, on top of the generic config
+    (computed unsplit). The 2CTA kernel takes it as is (it never splits: hdimv 512). 1CTA
+    runs the kb64 mainloop where it applies (Kb64.can_implement), else the 128-key one, with
+    its own split count.
+
+    With the split heuristic (num_splits < 1) dense MLA is routed 1CTA provisionally; if the
+    split is too small for 1CTA to beat 2CTA -- 2 splits on kb64, about 5 on the 128-key
+    mainloop (AI/SPARSE_MLA_1CTA.md "Auto split") -- it is routed again unsplit.
+    """
+    Kb64 = FlashAttentionMLAForward1CtaKb64Sm100
+    kb64_ok = Kb64.can_implement(
+        is_topk_gather=is_topk_gather, is_fp8=is_fp8, nheads_per_kv=nheads_per_kv,
+        num_head_kv=num_head_kv, seqlen_q_hint=seqlen_q_hint,
+    )
+    if is_topk_gather and num_splits > 1:
+        raise ValueError(
+            f"num_splits={num_splits} is not supported with gather_kv_indices "
+            "(sparse MLA runs without split-KV)"
+        )
+
+    def plan(mla_1cta):
+        if not mla_1cta:
+            return FlashAttentionMLAForwardSm100, cfg
+        cls = Kb64 if kb64_ok else FlashAttentionMLAForward1CtaSm100
+        if is_topk_gather:
+            return cls, cfg
+        if kb64_ok:  # one token per 64-row tile (heads padded to 64)
+            tile_m, tile_n = tile_mn if tile_mn is not None else Kb64.TILE_MN
+            q_stage, tile_rows = 1, max_seqlen_q * Kb64.TILE_MN[0]
+            min_blocks = Kb64.MIN_BLOCKS_PER_SPLIT
+        else:
+            tile_m, tile_n, q_stage = cfg.m_block_size, cfg.n_block_size, cfg.q_stage
+            tile_rows, min_blocks = rows, 1
+        splits = num_splits
+        if splits < 1:
+            num_n_blocks = cute.ceil_div(max_seqlen_k, tile_n)
+            num_tiles = batch_size * num_head_kv * cute.ceil_div(tile_rows, q_stage * tile_m)
+            max_splits = min(128, max(1, num_n_blocks // min_blocks))
+            splits = num_splits_heuristic(num_tiles, num_sms, num_n_blocks, max_splits)
+        return cls, replace(
+            cfg, m_block_size=tile_m, n_block_size=tile_n, q_stage=q_stage, num_splits=splits
+        )
+
+    cls, cfg_mla = plan(mla_1cta)
+    if (
+        mla_1cta and num_splits < 1 and not is_topk_gather
+        and cfg_mla.num_splits < (2 if cls is Kb64 else 5)
+    ):
+        mla_1cta = route(split_kv=False)
+        if not mla_1cta:
+            cls, cfg_mla = plan(False)
+    return mla_1cta, cls, cfg_mla
+
 
 
 def _flash_attn_fwd(
@@ -809,7 +852,7 @@ def _flash_attn_fwd(
         else None if torch.is_tensor(max_seqlen_q) else max_seqlen_q
     )
     # MLA (qv): 1CTA or 2CTA kernel. Decided here: the sparse head padding below and the
-    # split-KV heuristic in _get_fwd_config depend on it.
+    # MLA plan (_mla_fwd_plan) depend on it.
     mla_route = partial(
         _mla_1cta_route,
         gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p,
@@ -965,80 +1008,47 @@ def _flash_attn_fwd(
         page_table = page_table[:, :required_pages]
         max_seqlen_k = required_pages * page_size
 
-    Kb64 = FlashAttentionMLAForward1CtaKb64Sm100
-
-    if gather_kv_indices is not None:
-        # before _get_fwd_config, whose diff-headdim rule would silently drop it on 2CTA
-        if num_splits > 1:
-            raise ValueError(
-                f"num_splits={num_splits} is not supported with gather_kv_indices "
-                "(sparse MLA runs without split-KV)"
-            )
-        num_splits = 1
-
-    def plan(mla_1cta):
-        # 1CTA: the kb64 mainloop where it applies (its split heuristic counts 64-row
-        # tiles), else the 128-key one
-        mla_1cta_kb64 = mla_1cta and Kb64.can_implement(
+    fwd_cfg = _get_fwd_config(
+        arch=arch,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        causal=causal,
+        local=local,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        qhead_per_kvhead=qhead_per_kvhead,
+        pack_gqa=pack_gqa,
+        batch_size=batch_size,
+        num_head_kv=num_head_kv,
+        num_splits=num_splits if qv is None else 1,  # MLA: split by _mla_fwd_plan
+        device=device,
+        seqlen_q=seqlen_q,
+        tile_mn=tile_mn,
+        block_sparse_tensors=block_sparse_tensors,
+        mma_pv_is_rs=mma_pv_is_rs,
+        intra_wg_overlap=intra_wg_overlap,
+    )
+    mla_fwd_cls = None
+    if qv is not None:
+        mla_1cta, mla_fwd_cls, fwd_cfg = _mla_fwd_plan(
+            fwd_cfg, mla_1cta, mla_route,
+            num_splits=num_splits,
             is_topk_gather=gather_kv_indices is not None,
+            is_fp8=is_fp8,
             nheads_per_kv=nheads_per_kv,
             num_head_kv=num_head_kv,
-            is_fp8=is_fp8,
-            hdim=head_dim,
-            hdimv=head_dim_v,
-            has_qk=q is not None,
             seqlen_q_hint=seqlen_q_hint,
-            has_extensions=bool(
-                local or softcap is not None or score_mod is not None or mask_mod is not None
-                or block_sparse_tensors is not None
-            ),
-        )
-        mla_1cta_kb64_dense = mla_1cta_kb64 and gather_kv_indices is None
-        mla_fwd_cls = (
-            None if qv is None
-            else Kb64 if mla_1cta_kb64
-            else FlashAttentionMLAForward1CtaSm100 if mla_1cta
-            else FlashAttentionMLAForwardSm100
-        )
-        fwd_cfg = _get_fwd_config(
-            arch=arch,
-            head_dim=head_dim,
-            head_dim_v=head_dim_v,
-            causal=causal,
-            local=local,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
+            rows=max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1),
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            # the dense kb64 tile is one token (heads padded to 64)
-            qhead_per_kvhead=Kb64.TILE_MN[0] if mla_1cta_kb64_dense else qhead_per_kvhead,
-            pack_gqa=pack_gqa or mla_1cta_kb64_dense,
             batch_size=batch_size,
-            num_head_kv=num_head_kv,
-            num_splits=num_splits,
-            device=device,
-            seqlen_q=seqlen_q,
-            tile_mn=Kb64.TILE_MN if mla_1cta_kb64_dense and tile_mn is None else tile_mn,
-            block_sparse_tensors=block_sparse_tensors,
-            mma_pv_is_rs=mma_pv_is_rs,
-            intra_wg_overlap=intra_wg_overlap,
-            mla_1cta=mla_1cta,
-            single_q_stage=mla_1cta_kb64_dense,
-            min_blocks_per_split=Kb64.MIN_BLOCKS_PER_SPLIT if mla_1cta_kb64_dense else 1,
+            tile_mn=tile_mn,
+            num_sms=get_num_sms_for_selection(device.index, arch),
         )
-        return mla_1cta_kb64, mla_1cta_kb64_dense, mla_fwd_cls, fwd_cfg
-
-    mla_1cta_kb64, mla_1cta_kb64_dense, mla_fwd_cls, fwd_cfg = plan(mla_1cta)
-    # 1CTA split beats 2CTA (unsplit at hdimv 512) from 2 splits on kb64, about 5 on the
-    # 128-key mainloop (AI/SPARSE_MLA_1CTA.md "Auto split: 1CTA split vs 2CTA")
-    min_splits_1cta = 2 if mla_1cta_kb64_dense else 5
-    if (
-        mla_1cta and num_splits_auto and gather_kv_indices is None
-        and fwd_cfg.num_splits < min_splits_1cta
-    ):
-        mla_1cta = mla_route(split_kv=False)
-        if not mla_1cta:
-            mla_1cta_kb64, mla_1cta_kb64_dense, mla_fwd_cls, fwd_cfg = plan(False)
+    mla_1cta_kb64 = mla_fwd_cls is FlashAttentionMLAForward1CtaKb64Sm100
+    mla_1cta_kb64_dense = mla_1cta_kb64 and gather_kv_indices is None
     if mla_1cta_kb64 and out_provided:
         # its 256-bit O stores need 32-B aligned rows (buffers allocated here already are)
         validate_output_layout(out, "out", align_bytes=32)
@@ -1182,6 +1192,7 @@ def _flash_attn_fwd(
         assert softcap is None
         assert score_mod is None
         assert mask_mod is None
+        assert block_sparse_tensors is None, "block sparsity is not supported with qv"
 
         if page_table is not None:
             assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
