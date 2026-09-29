@@ -304,36 +304,9 @@ torch2cute_dtype_map = {
 
 _LEARNABLE_SINK_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-# Extra ptxas flags per MLA kernel. At the default ptxas level these kernels spill, and -O2
-# removes it; each flip below was measured on GB300 (AI/SPARSE_MLA_1CTA.md, "ptxas -O2"):
-#   fwd         2CTA / 1CTA sparse forward: 560 / 352 B/thread local memory -> 32 / 0,
-#               median +15-17%
-#   bwd         main sparse backward: 280-1048 B -> 0-64, +1-18% (recompute-P +4-18%)
-#   bwd_dq_dqv  dQ/dQv GEMM: 4064 B -> 0, 3.0-4.2x; the 64-head dQdQvGemmKernelH64 does not spill
-#               at either level, -O2 +0.3-1%
-#   bwd_dk      dK GEMM: no spill either way, +3-4%
-#   fwd_kb64    1CTA sparse forward, 64-key-block mainloop: no spill at the default level;
-#               -O2 is 7-8% slower (4k / 16k) -> ptxas default
-#   bwd_preprocess: no spill, no measurable change -> left at the ptxas default
-# FLASH_ATTENTION_MLA_PTXAS_OPTIONS overrides every MLA kernel ("" = the ptxas default),
-# e.g. to rerun that ablation. The resolved flags are part of each compile key: the JIT
-# caches (in-memory and on disk) key on it, not on compile options.
-_MLA_PTXAS_DEFAULTS = {
-    "fwd": "-O2",            # FlashAttentionMLAForwardSm100 and ...1CtaSm100
-    "fwd_kb64": "",          # FlashAttentionMLAForward1CtaKb64Sm100
-    "bwd": "-O2",            # FlashAttentionSparseMLABackwardSm100
-    "bwd_dq_dqv": "-O2",     # dQdQvGemmKernel
-    "bwd_dk": "-O2",         # dKGemmKernel
-    "bwd_preprocess": "",    # FlashAttentionBackwardPreprocess, sparse MLA call only
-}
-
-
-def _mla_ptxas_options(kernel: str) -> str:
-    env = os.environ.get("FLASH_ATTENTION_MLA_PTXAS_OPTIONS")
-    return env if env is not None else _MLA_PTXAS_DEFAULTS[kernel]
-
 
 def _compile_options(ptxas_options: str = "") -> str:
+    """cute.compile options; ptxas_options is a kernel class's `ptxas_options` attribute."""
     return "--enable-tvm-ffi" + (f" --ptxas-options '{ptxas_options}'" if ptxas_options else "")
 
 
@@ -1387,7 +1360,13 @@ def _flash_attn_fwd(
         if t is not None
     )
     mla_ptxas_options = (
-        _mla_ptxas_options("fwd_kb64" if mla_1cta_kb64 else "fwd") if qv is not None else ""
+        (
+            FlashAttentionMLAForward1CtaKb64Sm100 if mla_1cta_kb64
+            else FlashAttentionMLAForward1CtaSm100 if mla_1cta
+            else FlashAttentionMLAForwardSm100
+        ).ptxas_options
+        if qv is not None
+        else ""
     )
     # 128-key 1CTA mainloop, fp8 (a two-block V ring): issue S(n) ahead of PVt(n-1) when the
     # tensor core is the bottleneck. That is when many tiles share one KV stream, which then
@@ -2047,7 +2026,6 @@ def _compile_bwd_preprocess(
     has_cu_total_m_blocks,
     hdim_multiple_of,
     has_o_lo=False,
-    ptxas_options="",
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -2078,7 +2056,7 @@ def _compile_bwd_preprocess(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
         mRowMax, mScaleP, softmax_scale, mCuTotalMBlocks, mOlo,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options=_compile_options(ptxas_options),
+        options="--enable-tvm-ffi",
     )
 
 
@@ -2097,7 +2075,6 @@ def _bwd_preprocess(
     cu_total_m_blocks=None,
     hdim_multiple_of=32,
     o_lo=None,
-    ptxas_options="",
     *,
     fake_mode,
 ):
@@ -2141,7 +2118,6 @@ def _bwd_preprocess(
         cu_total_m_blocks is not None,
         hdim_multiple_of,
         o_lo is not None,
-        ptxas_options,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
@@ -3359,7 +3335,6 @@ def _flash_attn_bwd_sparse_mla(
         nheads_kv=nheads if pad_qheads else nheads_kv,
         softmax_scale=softmax_scale,
         o_lo=o_lo,
-        ptxas_options=_mla_ptxas_options("bwd_preprocess"),
         fake_mode=fake_mode,
     )
 
@@ -3377,7 +3352,7 @@ def _flash_attn_bwd_sparse_mla(
         gather_kv_length,
         disable_sparse_kv_bitmask,
         recompute_p,
-        _mla_ptxas_options("bwd"),
+        FlashAttentionSparseMLABackwardSm100.ptxas_options,
     )
 
     if compile_key not in _flash_attn_bwd_sparse_mla.compile_cache:
@@ -3441,7 +3416,7 @@ def _flash_attn_bwd_sparse_mla(
             seqused_q_tensor,
             seqused_k_tensor,
             current_stream,
-            options=_compile_options(_mla_ptxas_options("bwd")),
+            options=_compile_options(FlashAttentionSparseMLABackwardSm100.ptxas_options),
         )
         _flash_attn_bwd_sparse_mla.compile_cache[compile_key] = fa_bwd_kernel
 
@@ -3637,10 +3612,11 @@ def _sparse_mla_dq_dqv(
     
     # the kernel class is picked in _compile_sparse_mla_dq_dqv from nheads; key it explicitly so a
     # swapped class (tests compare the 64-row and generic kernels) never reuses the other's binary
+    dq_dqv_cls = dQdQvGemmKernelH64 if nheads <= 64 else dQdQvGemmKernel
     compile_key = (
         dtype_cute, nheads, head_dim, head_dim_v, gather_kv_length, varlen_q, varlen_k, k is not None,
-        _mla_ptxas_options("bwd_dq_dqv"),
-        (dQdQvGemmKernelH64 if nheads <= 64 else dQdQvGemmKernel).__name__,
+        dq_dqv_cls.ptxas_options,
+        dq_dqv_cls.__name__,
     )
     if compile_key not in _sparse_mla_dq_dqv.compile_cache:
         _sparse_mla_dq_dqv.compile_cache[compile_key] = _compile_sparse_mla_dq_dqv(
@@ -3736,7 +3712,7 @@ def _sparse_mla_dk(
     head_dim = q.shape[-1] if q is not None else 0
 
     compile_key = (
-        dtype_cute, dtype_acc_cute, nheads, head_dim, topk, varlen, _mla_ptxas_options("bwd_dk"),
+        dtype_cute, dtype_acc_cute, nheads, head_dim, topk, varlen, dKGemmKernel.ptxas_options,
     )
 
     if compile_key not in _sparse_mla_dk.compile_cache:

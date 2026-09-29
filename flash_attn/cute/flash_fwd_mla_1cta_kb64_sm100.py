@@ -93,6 +93,9 @@ def pair_barrier_sync(barrier_id: Int32, num_threads: cutlass.Constexpr[int]) ->
 
 
 class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
+    # No spills at the ptxas default; -O2 measured 7-8% slower (4k / 16k sparse training).
+    ptxas_options = ""
+
     def __init__(
         self,
         is_causal: bool = False,

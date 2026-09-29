@@ -53,6 +53,11 @@ from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
 
 
 class FlashAttentionMLAForwardSm100:
+    # Extra ptxas flags (part of the compile key). The default level spills 560 B/thread of
+    # local memory on the sparse forward; -O2 removes it (32 B), median +15-17% on GB300
+    # (AI/SPARSE_MLA_1CTA.md, "ptxas -O2").
+    ptxas_options = "-O2"
+
     def __init__(
         self,
         is_causal: bool = False,

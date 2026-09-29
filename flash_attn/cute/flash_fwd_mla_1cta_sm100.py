@@ -93,6 +93,10 @@ from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
 
 
 class FlashAttentionMLAForward1CtaSm100:
+    # Extra ptxas flags (part of the compile key): the default level spills 352 B/thread on the
+    # sparse forward, -O2 none, median +15-17% on GB300 (AI/SPARSE_MLA_1CTA.md, "ptxas -O2").
+    ptxas_options = "-O2"
+
     # TMEM lane stride and datapath-half offset for hand-built Layout E layouts.
     # TMEM addresses: bits 16-31 = lane, bits 0-15 = column.
     TMEM_LANE_STRIDE = 1 << 16

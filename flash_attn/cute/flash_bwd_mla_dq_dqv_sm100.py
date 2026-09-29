@@ -50,6 +50,10 @@ from flash_attn.cute.utils import get_batch_from_cu_tensor
 
 
 class dQdQvGemmKernel:
+    # Extra ptxas flags (part of the compile key): 4064 B/thread spilled at the default level,
+    # 0 at -O2, 3.0-4.2x faster on GB300.
+    ptxas_options = "-O2"
+
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],

@@ -47,6 +47,10 @@ from flash_attn.cute.named_barrier import NamedBarrierBwdSm100_MLA2CTA
 
 
 class FlashAttentionSparseMLABackwardSm100:
+    # Extra ptxas flags (part of the compile key): 280-1048 B/thread of local memory at the
+    # default level -> 0-64 B at -O2, +1-18% (recompute-P +4-18%) on GB300.
+    ptxas_options = "-O2"
+
     def __init__(
         self,
         is_causal: bool = False,

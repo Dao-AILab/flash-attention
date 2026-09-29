@@ -52,6 +52,9 @@ from flash_attn.cute.utils import get_batch_from_cu_tensor
 
 
 class dQdQvGemmKernelH64:
+    # Extra ptxas flags (part of the compile key): no spills at either level, -O2 +0.3-1%.
+    ptxas_options = "-O2"
+
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],
