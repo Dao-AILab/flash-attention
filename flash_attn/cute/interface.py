@@ -588,7 +588,7 @@ _compute_blocks_to_batch.compile_cache = get_jit_cache("blocks_to_batch")
 
 def _mla_1cta_route(
     is_topk_gather, nheads_per_kv, requires_grad, gather_bwd_recompute_p, *,
-    seqlen_q_hint, needs_1cta,
+    seqlen_q_hint, needs_1cta, split_kv=True, batch_heads_kv=None, num_sms=None,
 ):
     """Whether an MLA call runs the 1CTA (tcgen05.mma.ws) kernel rather than the 2CTA one.
 
@@ -604,6 +604,12 @@ def _mla_1cta_route(
         KV head: the kb64 mainloop with split-KV, which beats the unsplit 2CTA kernel even at
         low occupancy); 2CTA for prefill, where its 2-CTA MMA wins. Varlen without a host
         max_seqlen_q counts as prefill.
+      - dense decode without split-KV (split_kv False, i.e. num_splits == 1): 1CTA only once
+        the 2CTA kernel exceeds one wave. Its decode tile is one (batch, KV head)'s rows padded
+        to 128, i.e. 2 CTAs each, so 2 * batch_heads_kv CTAs against num_sms. Below that the
+        unsplit 2CTA kernel is 14-31% faster; above it its second wave nearly doubles its time
+        and 1CTA wins (0.69-0.94x). Measured crossover: batch 72 -> 80 at 152 SMs, at 64 and 16
+        heads alike (AI/SPARSE_MLA_1CTA.md, "Dispatch heuristic").
     FLASH_ATTENTION_MLA_1CTA=1 / 0 overrides the heuristic (1: wherever supported; 0: never).
     """
     supported = not is_topk_gather or (
@@ -616,7 +622,11 @@ def _mla_1cta_route(
         return False
     if needs_1cta or is_topk_gather:
         return True
-    return seqlen_q_hint is not None and seqlen_q_hint * nheads_per_kv <= 64
+    if seqlen_q_hint is None or seqlen_q_hint * nheads_per_kv > 64:
+        return False
+    if split_kv or batch_heads_kv is None or num_sms is None:
+        return True
+    return 2 * batch_heads_kv > num_sms
 
 
 def _flash_attn_fwd(
@@ -814,6 +824,9 @@ def _flash_attn_fwd(
             or any(t is not None for t in (q_descale, k_descale, v_descale))
             or num_splits > 1
         ),
+        split_kv=num_splits != 1,
+        batch_heads_kv=batch_size * num_head_kv,
+        num_sms=get_num_sms_for_selection(v.device.index, arch),
     )
     # Sparse MLA pads a token's heads to the kernel's tile (pack_gqa.qheads_first_tma_view); the
     # kernel takes the real count, the interface needs the tile width for its grid math.

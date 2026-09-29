@@ -593,6 +593,8 @@ forces 1CTA wherever it is supported; `0` forces 2CTA.
 - **Dense:** 1CTA on decode shapes, `seqlen_q x heads per KV head <= 64`: one 64-row tile per
   KV head, i.e. the kb64 mainloop with split-KV. 2CTA otherwise. Varlen without a host
   `max_seqlen_q` counts as prefill.
+- **Dense decode without split-KV (`num_splits == 1`):** 1CTA only once 2CTA exceeds one wave,
+  `2 x batch x KV heads > num SMs`. See "Unsplit decode crossover".
 
 Measured (`agent_space/bench_dispatch.py`, `agent_space/bench_sparse_1cta/dispatch.csv`;
 GB300, bf16, cold L2):
@@ -615,13 +617,35 @@ Where it is right:
 - **Sparse at about one wave of tiles and above**, and sparse prefill (1.6x).
 
 Where it is wrong:
-- **Dense decode with the default `num_splits=1`.** 1CTA runs unsplit and is 20-35% slower
-  than 2CTA below about one wave (b <= 32 at 64 heads). The win needs split-KV
-  (`num_splits=0`, the split heuristic).
 - **Small-batch 128-row dense decode**, which it leaves on 2CTA. There 1CTA with split is
   about 3-4x faster; the `<= 64` boundary is conservative.
 - **Sparse decode below about one wave** (b <= 32): 2CTA is about 20% faster, at tens of
   microseconds.
+
+### Unsplit decode crossover
+
+With `num_splits=1`, a 2CTA decode tile holds one batch element's rows: tokens of different
+batch elements are not packed into one tile. At `seqlen_q = 1` with 64 heads that is half of
+the cluster's 128 rows (16 heads: 1/8), and each batch element costs a full 2-CTA cluster,
+2 x batch CTAs. 1CTA uses one 64-row tile per token: batch CTAs.
+- **Below one wave** of the 152 SMs, the wasted half lands on SMs that would otherwise idle.
+  Decode is memory-bound, and the unsplit 2CTA kernel is faster.
+- **Past one wave**, 2CTA needs a second wave, which nearly doubles its time, and 1CTA wins.
+
+(`agent_space/bench_dispatch_crossover.py`, `bench_sparse_1cta/dispatch_crossover.csv`;
+GB300, bf16, `num_splits=1` on both, cold L2)
+
+| heads | batch | 2CTA CTAs | s_k 8K: 2CTA / 1CTA | s_k 32K: 2CTA / 1CTA |
+|---|---|---|---|---|
+| 64 | 16-72 | 32-144 | 0.10-0.13 / 0.12-0.15 ms (1CTA 1.13-1.23x slower) | 0.34-0.44 / 0.44-0.51 (1.16-1.31x) |
+| 64 | 80 | 160 | 0.211 / **0.151** | 0.769 / **0.531** |
+| 64 | 96-304 | 192-608 | 1CTA 0.75-1.01x | 1CTA 0.74-1.02x |
+| 16 | 16-64 | 32-128 | 1CTA 1.14-1.23x slower | 1CTA 1.20-1.31x slower |
+| 16 | 80 | 160 | 0.210 / **0.149** | 0.760 / **0.529** |
+| 16 | 96-1024 | 192-2048 | 1CTA 0.71-0.94x | 1CTA 0.70-0.93x |
+
+The crossover is at the same batch (72 -> 80) for both head counts, so the rule counts 2CTA
+CTAs, not rows. With split-KV (`num_splits=0`) 1CTA wins at every batch (table above).
 
 ## Follow-ups
 

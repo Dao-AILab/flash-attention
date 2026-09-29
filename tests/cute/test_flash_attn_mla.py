@@ -3324,18 +3324,26 @@ def test_flash_attn_mla_sparse_topk_order_invariance(nheads, causal, dtype):
         ("sparse 128 heads (unsupported on 1CTA)", dict(topk=True, h=128, s_q=1), False),
         ("sparse training, load-P (unsupported)", dict(topk=True, h=64, s_q=4096, grad=True), False),
         ("sparse training, recompute-P", dict(topk=True, h=64, s_q=4096, grad=True, rp=True), True),
+        # num_splits == 1: 1CTA only once the 2CTA kernel (2 CTAs per batch x KV head) exceeds
+        # one wave of num_sms
+        ("dense decode unsplit, 2CTA one wave", dict(topk=False, h=64, s_q=1, split=False, bh=72), False),
+        ("dense decode unsplit, 2CTA two waves", dict(topk=False, h=64, s_q=1, split=False, bh=80), True),
+        ("dense decode unsplit 16 heads, one wave", dict(topk=False, h=16, s_q=1, split=False, bh=64), False),
+        ("dense prefill unsplit, two waves", dict(topk=False, h=64, s_q=4096, split=False, bh=80), False),
     ],
     ids=lambda c: c[0].replace(" ", "_"),
 )
 def test_flash_attn_mla_dispatch_heuristic(case, monkeypatch):
     """The 1CTA / 2CTA MLA dispatch with FLASH_ATTENTION_MLA_1CTA unset: sparse -> 1CTA up to
-    64 heads; dense -> 1CTA on decode shapes (seqlen_q x heads per KV head <= 64), 2CTA
-    otherwise; fp8 / descales / explicit split-KV -> 1CTA. The variable overrides it."""
+    64 heads; dense -> 1CTA on decode shapes (seqlen_q x heads per KV head <= 64), without
+    split-KV only once 2CTA exceeds one wave, 2CTA otherwise; fp8 / descales / explicit
+    split-KV -> 1CTA. The variable overrides it."""
     from flash_attn.cute.interface import _mla_1cta_route
     _, kw, expected = case
     route = lambda: _mla_1cta_route(  # noqa: E731
         kw["topk"], kw["h"], kw.get("grad", False), kw.get("rp", False),
         seqlen_q_hint=kw["s_q"], needs_1cta=kw.get("needs", False),
+        split_kv=kw.get("split", True), batch_heads_kv=kw.get("bh"), num_sms=152,
     )
     monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA", raising=False)
     assert route() == expected
@@ -3346,7 +3354,7 @@ def test_flash_attn_mla_dispatch_heuristic(case, monkeypatch):
     assert not route()
 
 
-@pytest.mark.parametrize("shape", ["dense_decode", "dense_prefill", "sparse"])
+@pytest.mark.parametrize("shape", ["dense_decode", "dense_decode_unsplit", "dense_prefill", "sparse"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_dispatch_heuristic_end_to_end(shape, monkeypatch):
     """With FLASH_ATTENTION_MLA_1CTA unset the call runs the kernel the heuristic picks (the
@@ -3355,9 +3363,15 @@ def test_flash_attn_mla_dispatch_heuristic_end_to_end(shape, monkeypatch):
         pytest.skip()
     import flash_attn.cute.interface as fa_interface
     monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA", raising=False)
-    b, h, (s_q, s_k) = 2, 64, {"dense_decode": (1, 2048), "dense_prefill": (256, 512), "sparse": (256, 512)}[shape]
+    b, h, (s_q, s_k) = 2, 64, {
+        "dense_decode": (1, 2048), "dense_decode_unsplit": (1, 2048),
+        "dense_prefill": (256, 512), "sparse": (256, 512),
+    }[shape]
     kw, (q_r, k_r, v_r, qv_r) = _mla_inputs(b, s_q, s_k, h, has_qk=True)
     extra = {}
+    # decode with split-KV (the split heuristic) -> 1CTA; unsplit at batch 2 (far below one
+    # 2CTA wave) -> 2CTA
+    fwd_kw = dict(num_splits=0) if shape == "dense_decode" else {}
     if shape == "sparse":
         extra = dict(gather_kv_indices=rect_topk_indices(b, s_q, s_k, 256, True, "cuda"), causal=True)
     real_cache = fa_interface._flash_attn_fwd.compile_cache
@@ -3377,9 +3391,9 @@ def test_flash_attn_mla_dispatch_heuristic_end_to_end(shape, monkeypatch):
 
     spy = Spy()
     monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", spy)
-    out, _ = flash_attn_func(**kw, **extra)
+    out, _ = flash_attn_func(**kw, **extra, **fwd_kw)
     monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", real_cache)
-    expect_1cta = shape != "dense_prefill"
+    expect_1cta = shape in ("dense_decode", "sparse")
     assert spy.keys and all(key[0] == expect_1cta for key in spy.keys), shape
     if is_fake_mode():
         return
