@@ -55,7 +55,7 @@ from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
 class FlashAttentionMLAForwardSm100:
     # Extra ptxas flags (part of the compile key). The default level spills 560 B/thread of
     # local memory on the sparse forward; -O2 removes it (32 B), median +15-17% on GB300
-    # (AI/SPARSE_MLA_1CTA.md, "ptxas -O2").
+    # (AI/SPARSE_MLA_1CTA.md, "ptxas levels").
     ptxas_options = "-O2"
     # sparse MLA: a token's heads padded to one 128-row (2-CTA) tile
     SPARSE_HEAD_TILE = 128

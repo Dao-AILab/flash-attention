@@ -134,7 +134,7 @@ padded up (`pack_gqa.qheads_first_tma_view`). Both modes support 1..128 heads.
 With 64 or 128 heads nothing is padded: at 64, `tile_m = 64`, the S^T UMMA runs
 at N = 64 and `sLse`/`sQr` shrink with the tile.
 
-Padded counts (1..63 -> 64, 65..127 -> 128; since 2026-09-29) need the recompute
+Padded counts (1..63 -> 64, 65..127 -> 128) need the recompute
 operands to read as zero in the padded rows, and P = 0 there exactly:
 - **Q_rope, and the QvB copy of Qv** that feeds the S^T GEMM, load through the
   heads-first padded TMA views that `qv` / `dO` / `dS` already use, so their padded

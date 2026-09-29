@@ -333,7 +333,7 @@ def test_flash_attn_mla_1cta_paged_clc_bitwise(has_qk):
     """The persistent (CLC) scheduler only changes which CTA runs a tile, so its output
     must be bitwise identical to the non-persistent one. Regression test for the sO /
     V-stage-0 overlap: the cp.async KV gather (paged, page_size != tile_n) must wait for
-    the previous tile's TMA O store (sO overlays V) -- see agent_space/ledger_sO_race.md.
+    the previous tile's TMA O store (sO overlays V).
     Needs >1 tile per CTA (CLC, causal so the interface keeps CLC on) and the TMA O store
     (dense batched Q)."""
     if not IS_SM100:

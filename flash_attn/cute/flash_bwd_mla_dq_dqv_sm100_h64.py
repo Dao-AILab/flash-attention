@@ -2,7 +2,7 @@
 
 """
 CuTe DSL implementation of the dQ+dQv gemm of the sparse-MLA (DSA) backward for up to
-64 Q heads per KV head (see AI/SPARSE_MLA_64H.md, section C6-dq). Fewer heads pad the 64-row
+64 Q heads per KV head (see AI/SPARSE_MLA_64H.md, "dQdQvGemmKernelH64"). Fewer heads pad the 64-row
 tile: the head mode has the real (dynamic) extent, so TMA zero-fills the dS rows past it and
 drops those rows of the dQ / dQv stores (as in the generic dQdQvGemmKernel).
 

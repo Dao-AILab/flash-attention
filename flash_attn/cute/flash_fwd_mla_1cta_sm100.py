@@ -17,11 +17,11 @@
 #    N=128 ws mma with its A operand in TMEM, reading a unified (128, hdim) sK slot filled
 #    by a single TMA box per n_block. Without a rope part (has_qk=False) QvV(dv0)
 #    zero-inits S. (A two-phase SS QK path with a half-size sK was slower on every
-#    measured shape and has been removed; see agent_space/NOTES_mla_1cta.md.)
+#    measured shape; AI/SPARSE_MLA_1CTA.md, "Alternatives measured and not taken".)
 #  - Varlen: cu_seqlens / seqused on either side (independently). Q-side varlen uses
 #    SingleTileVarlenScheduler; under cu_seqlens_q the O store falls back to the
 #    per-row predicated path (a bulk TMA box would race on rows belonging to the next
-#    sequence). See agent_space/NOTES_mla_1cta.md.
+#    sequence).
 #  - Paged KV at any page size: TMA when page_size == tile_n (the page index is a
 #    descriptor coordinate), otherwise a cp.async gather by a dedicated 4-warp load
 #    warp group (warps 12-15) reusing PagedKVManager.
@@ -86,7 +86,7 @@ from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
 
 class FlashAttentionMLAForward1CtaSm100:
     # Extra ptxas flags (part of the compile key): the default level spills 352 B/thread on the
-    # sparse forward, -O2 none, median +15-17% on GB300 (AI/SPARSE_MLA_1CTA.md, "ptxas -O2").
+    # sparse forward, -O2 none, median +15-17% on GB300 (AI/SPARSE_MLA_1CTA.md, "ptxas levels").
     ptxas_options = "-O2"
     # sparse MLA: a token's heads padded to one 64-row tile (pack_gqa.sparse_mla_qhead_tile)
     SPARSE_HEAD_TILE = 64
@@ -349,7 +349,7 @@ class FlashAttentionMLAForward1CtaSm100:
         self.major_mode_P = tcgen05.OperandMajorMode.K
         self.operand_source_A = tcgen05.OperandSource.SMEM
         # Only the QK mma can take its A operand (Q) from TMEM; Qv and P stay in SMEM
-        # (Qv would need 256 TMEM columns -- see agent_space/NOTES_mla_1cta.md).
+        # (Qv would need 256 TMEM columns).
         self.operand_source_Q = (
             tcgen05.OperandSource.TMEM if self.q_in_tmem else tcgen05.OperandSource.SMEM
         )
@@ -379,7 +379,7 @@ class FlashAttentionMLAForward1CtaSm100:
 
         # ==== pipeline info ====
         # fp8 halves every K/V/Q byte, freeing ~112 KB of the 227 KB SMEM budget. Measured
-        # (agent_space/bench_mla_1cta_fp8.py --ablate): spending it on the V ring is worth
+        # (AI/SPARSE_MLA_1CTA.md, "128-key mainloop"): spending it on the V ring is worth
         # 17-29% on decode -- it lets the load warp run a whole n_block ahead instead of
         # stalling on single-block V residency (the known softmax-on-the-critical-path
         # limitation). Deeper K and P rings measured neutral or worse. V=6 does not fit
@@ -394,7 +394,7 @@ class FlashAttentionMLAForward1CtaSm100:
         self.num_stages_V = 4 if is_fp8 else 2
         self.num_stages_S = 2
         # P depth measured neutral-to-negative for fp8 on every shape (the P handoff was
-        # never the bottleneck) -- see the ablation in agent_space/NOTES_mla_1cta.md.
+        # never the bottleneck).
         self.num_stages_P = 1
         self.num_stages_Oi = 1
         self.num_stages_sm_stats = 2
@@ -408,7 +408,7 @@ class FlashAttentionMLAForward1CtaSm100:
         # before PVt(n-1), so the tensor core computes the next S while the softmax works
         # instead of waiting on P; a one-block V ring (bf16) must issue PVt(n-1) first --
         # S(n) needs V(n), whose slots only PVt(n-1) frees.
-        # Measured on fp8 (AI/SPARSE_MLA_1CTA.md, "fp8 S-ahead"): +33-36% on L2-resident
+        # Measured on fp8 (AI/SPARSE_MLA_1CTA.md, "fp8: S ahead of PV"): +33-36% on L2-resident
         # prefill, where the tensor core is the bottleneck; -5-16% on decode, where it takes
         # the loads' one-block look-ahead (both resident blocks are then held by the MMAs).
         # The interface picks it per call; the kernel default is in order.
@@ -434,8 +434,7 @@ class FlashAttentionMLAForward1CtaSm100:
         self.total_tmem = self.tmem_offset_O1 + self.tmem_cols_Oi
         # Q operand region (q_in_tmem): a (64, hdim) 16-bit A operand for an M=64 ws mma
         # occupies hdim/2 columns, holding TWO copies of the tile (rows land at lanes m
-        # and m + 64 -- the PTX Layout E A-operand organization, decoded empirically in
-        # agent_space/ws_ts_mma_validation.py).
+        # and m + 64 -- the PTX Layout E A-operand organization, decoded empirically).
         self.tmem_offset_Q = self.total_tmem
         # 32 // width elements per 32-bit TMEM word (bf16: hdim/2 cols, fp8: hdim/4)
         self.tmem_cols_Q = (
@@ -465,7 +464,7 @@ class FlashAttentionMLAForward1CtaSm100:
         """Layout E packed accumulator: logical (64, n) as 128 lanes x n/2 columns.
 
         Element (m, j + (n/2) * h) lives at lane m + 64*h, column j. Validated
-        empirically against tcgen05.mma.ws in agent_space/ws_mma_validation.py.
+        empirically against tcgen05.mma.ws.
         """
         n2 = n // self.num_acc_halves
         return cute.make_layout(

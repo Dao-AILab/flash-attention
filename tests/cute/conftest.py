@@ -212,8 +212,6 @@ def _disable_torch_native_triton_bmm():
     backward of P @ V is a K=1 bmm, e.g. B=batch*nheads=1536, M=seqlen_k=8192,
     N=head_dim_v=512 -> B*M*N = 6.4e9. Deregistering just this override falls back
     to eager (cuBLAS) bmm, which handles 64-bit offsets correctly.
-
-    Repro without any FlashAttention code: agent_space/repro_torch_bmm_outer_int32.py
     """
     try:
         from torch._native import registry

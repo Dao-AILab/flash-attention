@@ -280,7 +280,8 @@ class CpasyncGatherKVManager(ParamsBase):
 
 @dataclass
 class CpasyncGatherKVManagerH64(ParamsBase):
-    """Gather producer of the native 64-head sparse-MLA forward (see AI/SPARSE_MLA_64H.md).
+    """Gather producer of the kb64 MLA forward (AI/SPARSE_MLA_1CTA.md, "kb64 mainloop") and
+    of dQdQvGemmKernelH64 (AI/SPARSE_MLA_64H.md).
 
     One stage = 64 top-k keys x whole rows: the ``hdim_v`` latent row and the ``hdim`` rope row of
     the same key (two tables, one index) as 16-B ``cp.async.cg`` copies from 128 threads, 8 threads
@@ -476,7 +477,7 @@ class CpasyncGatherKVManagerH64(ParamsBase):
         row (the caller lands a stage in parts, each followed by its own
         ``cp.async.mbarrier.arrive.noinc``). With ``identity_rows`` the stage is the 64 rows of ``mX``
         itself (row ``r`` of the tile <- ``mX[r]``, no top-k index, no validity predicate): the 64-head
-        forward stages the token's Q tile through the KV ring this way (see AI/SPARSE_MLA_64H.md).
+        forward stages the token's Q tile through the KV ring this way.
         ``num_valid_rows``: rows at or past it are zero-filled instead of loaded -- with identity
         rows, a token with fewer than 64 Q heads, whose packed tile rows past the real heads alias
         the next token's heads (or run past the tensor); paged, the keys past ``seqlen_k``. Paged
