@@ -837,6 +837,57 @@ def test_flash_attn_mla_1cta_fp8_partial_descales(present, monkeypatch):
     assert torch.equal(lse, lse_ref)
 
 
+@pytest.mark.parametrize("max_seqlen_q", ["tensor", None, 1])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_dispatch_varlen_decode_split(max_seqlen_q, monkeypatch):
+    """Varlen decode with the split heuristic and no host max_seqlen_q: max_seqlen_q is then
+    total_q, a bound on one sequence, so the 1CTA tile count must be bounded by the tokens
+    (one kb64 tile each), not batch x total_q. 64 single-token sequences on 64 heads get split
+    KV on 1CTA kb64 whether or not the caller passes the host hint."""
+    if not IS_SM100:
+        pytest.skip()
+    import flash_attn.cute.interface as fa_interface
+    monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA", raising=False)
+    device, dtype, b, h, s_k = "cuda", torch.bfloat16, 64, 64, 2048
+    torch.random.manual_seed(0)
+    q = torch.randn(b, h, 64, device=device, dtype=dtype)
+    qv = torch.randn(b, h, 512, device=device, dtype=dtype)
+    k = torch.randn(b * s_k, 1, 64, device=device, dtype=dtype)
+    v = torch.randn(b * s_k, 1, 512, device=device, dtype=dtype)
+    cu_q = torch.arange(0, b + 1, device=device, dtype=torch.int32)
+    cu_k = torch.arange(0, b + 1, device=device, dtype=torch.int32) * s_k
+    m = torch.tensor(1, device=device, dtype=torch.int32) if max_seqlen_q == "tensor" else max_seqlen_q
+    real_cache = fa_interface._flash_attn_fwd.compile_cache
+    keys = []
+
+    class Spy:
+        def __contains__(self, key):
+            keys.append(key)
+            return key in real_cache
+
+        def __getitem__(self, key):
+            return real_cache[key]
+
+        def __setitem__(self, key, value):
+            real_cache[key] = value
+
+    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", Spy())
+    out, *_ = _flash_attn_fwd(q, k, v, qv=qv, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                              max_seqlen_q=m, max_seqlen_k=s_k, num_splits=0)
+    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", real_cache)
+    # first two key entries: the 1CTA route and the kb64 mainloop; split KV is in the key too
+    assert keys and all(key[0] and key[1] for key in keys), keys
+    if is_fake_mode():
+        return
+    out_ref, _ = attention_ref(q.view(b, 1, h, 64), k.view(b, s_k, 1, 64), v.view(b, s_k, 1, 512),
+                               qv=qv.view(b, 1, h, 512))
+    out_pt, _ = attention_ref(q.view(b, 1, h, 64), k.view(b, s_k, 1, 64), v.view(b, s_k, 1, 512),
+                              qv=qv.view(b, 1, h, 512), upcast=False, reorder_ops=True)
+    err = (out.view(b, 1, h, 512).float() - out_ref.float()).abs().max().item()
+    err_pt = (out_pt.float() - out_ref.float()).abs().max().item()
+    assert err <= 2 * err_pt + 1e-3, (err, err_pt)
+
+
 def rect_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, causal, device, *,
                       fill_frac=1.0, shuffle_slots=True, oob_frac=0.0, seed=0):
     """Top-k index lists for rectangular (s_q != s_k) sparse attention tests.

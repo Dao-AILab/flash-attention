@@ -609,7 +609,8 @@ def _mla_1cta_route(
 
 def _mla_fwd_plan(
     cfg, mla_1cta, route, *, num_splits, is_topk_gather, is_fp8, nheads_per_kv, num_head_kv,
-    seqlen_q_hint, rows, max_seqlen_q, max_seqlen_k, batch_size, tile_mn, num_sms,
+    seqlen_q_hint, rows_per_token, max_seqlen_q, max_seqlen_k, batch_size, total_q, tile_mn,
+    num_sms,
 ):
     """(mla_1cta, kernel class, config) for an MLA forward, on top of the generic config
     (computed unsplit). The 2CTA kernel takes it as is (it never splits: hdimv 512). 1CTA
@@ -637,15 +638,24 @@ def _mla_fwd_plan(
         cls = Kb64 if kb64_ok else FlashAttentionMLAForward1CtaSm100
         if kb64_ok:  # one token per 64-row tile (heads padded to 64), 64-key blocks
             tile_m, tile_n = Kb64.TILE_MN if is_topk_gather or tile_mn is None else tile_mn
-            q_stage, tile_rows = 1, max_seqlen_q * Kb64.TILE_MN[0]
+            q_stage, token_rows = 1, Kb64.TILE_MN[0]
             min_blocks = Kb64.MIN_BLOCKS_PER_SPLIT
         else:
             tile_m, tile_n, q_stage = cfg.m_block_size, cfg.n_block_size, cfg.q_stage
-            tile_rows, min_blocks = rows, 1
+            token_rows, min_blocks = rows_per_token, 1
         splits = 1 if is_topk_gather else num_splits
         if splits < 1:
             num_n_blocks = cute.ceil_div(max_seqlen_k, tile_n)
-            num_tiles = batch_size * num_head_kv * cute.ceil_div(tile_rows, q_stage * tile_m)
+            # Tiles per KV head: at most batch x ceil(max rows / tile), and at most the token
+            # rows plus one partial tile per extra sequence (varlen without a host max_seqlen_q
+            # has max_seqlen_q = total_q, which only bounds a single sequence). Whole-token
+            # tiles (kb64: one token per tile) have no partial tiles.
+            m_rows = q_stage * tile_m
+            partial = 0 if token_rows % m_rows == 0 else batch_size - 1
+            num_tiles = num_head_kv * min(
+                batch_size * cute.ceil_div(max_seqlen_q * token_rows, m_rows),
+                cute.ceil_div(total_q * token_rows, m_rows) + partial,
+            )
             max_splits = min(128, max(1, num_n_blocks // min_blocks))
             splits = num_splits_heuristic(num_tiles, num_sms, num_n_blocks, max_splits)
         return cls, replace(
@@ -844,43 +854,6 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
-    # the host-side max seqlen_q, where known (a varlen max_seqlen_q tensor gives none)
-    seqlen_q_hint = (
-        seqlen_q if cu_seqlens_q is None
-        else None if torch.is_tensor(max_seqlen_q) else max_seqlen_q
-    )
-    # MLA (qv): 1CTA or 2CTA kernel. Decided here: the sparse head padding below and the
-    # MLA plan (_mla_fwd_plan) depend on it.
-    mla_route = partial(
-        _mla_1cta_route,
-        gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p,
-        seqlen_q_hint=seqlen_q_hint,
-        needs_1cta=(
-            v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-            or any(t is not None for t in (q_descale, k_descale, v_descale))
-            or num_splits > 1
-        ),
-        # 2CTA tiles: one per token (sparse) or per batch element (dense decode), 2 CTAs each
-        ctas_2cta=2 * num_head_kv * (total_q if gather_kv_indices is not None else batch_size),
-        num_sms=get_num_sms_for_selection(v.device.index, arch),
-    )
-    # num_splits < 1 (the split heuristic): 1CTA provisionally, re-decided after planning
-    num_splits_auto = num_splits < 1
-    mla_1cta = qv is not None and mla_route(split_kv=num_splits_auto)
-    # Sparse MLA pads a token's heads to the kernel's tile (pack_gqa.qheads_first_tma_view); the
-    # kernel takes the real count, the interface needs the tile width for its grid math.
-    nheads_per_kv = qhead_per_kvhead
-    if qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
-        assert num_head_kv == 1, "sparse MLA requires a single KV head"
-        qhead_per_kvhead = sparse_mla_qhead_tile(
-            qhead_per_kvhead,
-            min_tile=(
-                FlashAttentionMLAForward1CtaSm100 if mla_1cta else FlashAttentionMLAForwardSm100
-            ).SPARSE_HEAD_TILE,
-        )
-        pack_gqa = True
-    if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and requires_grad:
@@ -975,16 +948,54 @@ def _flash_attn_fwd(
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
-        # Bound by the page-table row, not the shared pool, which would inflate the 1CTA MLA
-        # split-KV heuristic (e.g. 6 splits over 2 key blocks).
+        # Bound by the page-table row, not the shared pool.
         max_seqlen_k = (
             page_table.shape[1] * page_size
-            if (use_dedicated_hd256_kernel or (mla_1cta and qv is not None))
-            and page_table is not None
+            if page_table is not None
             else seqlen_k
         )
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
+    
+    # Host-side seqlen_q for MLA routing and heuristics (max_seqlen_q is normalized above).
+    # seqlen_q_hint bounds the per-sequence length (varlen without a host max_seqlen_q: total_q,
+    # every token in one sequence); it decides what a call can run. seqlen_q_known is None when
+    # the length is unknown, for the policies that default to decode then (CLC, fp8 S-ahead).
+    seqlen_q_hint = seqlen_q if cu_seqlens_q is None else max_seqlen_q
+    seqlen_q_known = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
+    # MLA (qv): 1CTA or 2CTA kernel. Decided here: the sparse head padding below and the
+    # MLA plan (_mla_fwd_plan) depend on it.
+    mla_route = partial(
+        _mla_1cta_route,
+        gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p,
+        seqlen_q_hint=seqlen_q_hint,
+        needs_1cta=(
+            v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            or any(t is not None for t in (q_descale, k_descale, v_descale))
+            or num_splits > 1
+        ),
+        # 2CTA tiles: one per token (sparse) or per batch element (dense decode), 2 CTAs each
+        ctas_2cta=2 * num_head_kv * (total_q if gather_kv_indices is not None else batch_size),
+        num_sms=get_num_sms_for_selection(v.device.index, arch),
+    )
+    # num_splits < 1 (the split heuristic): 1CTA provisionally, re-decided after planning
+    num_splits_auto = num_splits < 1
+    mla_1cta = qv is not None and mla_route(split_kv=num_splits_auto)
+    
+    # Sparse MLA pads a token's heads to the kernel's tile (pack_gqa.qheads_first_tma_view); the
+    # kernel takes the real count, the interface needs the tile width for its grid math.
+    nheads_per_kv = qhead_per_kvhead
+    if qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
+        assert num_head_kv == 1, "sparse MLA requires a single KV head"
+        qhead_per_kvhead = sparse_mla_qhead_tile(
+            qhead_per_kvhead,
+            min_tile=(
+                FlashAttentionMLAForward1CtaSm100 if mla_1cta else FlashAttentionMLAForwardSm100
+            ).SPARSE_HEAD_TILE,
+        )
+        pack_gqa = True
+    if pack_gqa is None:
+        pack_gqa = qhead_per_kvhead > 1
 
     if use_dedicated_hd256_kernel and page_table is not None:
         # The kernel derives KV capacity from the page-table width. Normalize
@@ -1038,10 +1049,11 @@ def _flash_attn_fwd(
             nheads_per_kv=nheads_per_kv,
             num_head_kv=num_head_kv,
             seqlen_q_hint=seqlen_q_hint,
-            rows=max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1),
+            rows_per_token=qhead_per_kvhead if pack_gqa else 1,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             batch_size=batch_size,
+            total_q=total_q,
             tile_mn=tile_mn,
             num_sms=get_num_sms_for_selection(device.index, arch),
         )
@@ -1381,11 +1393,11 @@ def _flash_attn_fwd(
     if mla_1cta:  # the 1CTA MLA kernels own their CLC policy
         use_clc_scheduler = mla_fwd_cls.use_clc(
             is_topk_gather=bool(sparse_kv),
-            seqlen_q_hint=seqlen_q_hint,
+            seqlen_q_hint=seqlen_q_known,
             clc_default=use_clc_scheduler if use_clc_scheduler is not None else True,
         )
     mla_1cta_s_ahead = mla_1cta and mla_fwd_cls.use_s_ahead(
-        is_fp8=is_fp8, seqlen_q_hint=seqlen_q_hint, nheads=nheads_per_kv
+        is_fp8=is_fp8, seqlen_q_hint=seqlen_q_known, nheads=nheads_per_kv
     )
 
     paged_kv_tma = (
