@@ -27,6 +27,7 @@ Dependencies: `nvidia-cutlass-dsl>=4.6.2`, `torch`, `einops`, `apache-tvm-ffi`, 
 ```bash
 pytest tests/cute/test_flash_attn.py
 pytest tests/cute/test_flash_attn.py -k "test_flash_attn_output" -x  # single test
+pytest tests/cute/test_flash_attn_mla.py  # MLA (qv): dense / sparse / paged, 1CTA (FLASH_ATTENTION_MLA_1CTA=1) and 2CTA
 pytest tests/cute/test_flash_attn_varlen.py
 pytest tests/cute/test_mask_mod.py
 pytest tests/cute/test_score_mod.py
