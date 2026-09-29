@@ -10,12 +10,15 @@ Status (2026-09-28), opt-in via `FLASH_ATTENTION_MLA_1CTA=1`:
   mainloop** (see the kb64 sections below):
   - sparse: any head count up to 64;
   - dense: 64 heads, or fewer heads on decode (`seqlen_q = 1`). It agrees with the 2CTA kernel to bf16 rounding, not
-  bitwise. Everything else runs the 128-key mainloop (fewer than 64 heads, fp8, and
-  `FLASH_ATTENTION_MLA_1CTA_KB64=0`). On the 128-key mainloop `out`/`lse`/`o_lo` are bitwise
+  bitwise. Everything else runs the 128-key mainloop (dense prefill with fewer than 64
+  heads, more than 64 heads, fp8). On the 128-key mainloop `out`/`lse`/`o_lo` are bitwise
   identical to the 2CTA kernel's, and so are the gradients: dQ and dQv bitwise, dK and dV
   within the sparse backward's own atomic run-to-run non-determinism, which 2CTA shows too.
 - **CLC.** The 1CTA sparse route always runs the persistent CLC scheduler, as the 2CTA MLA
-  kernel does. Dense 1CTA MLA still follows `FA_CLC`.
+  kernel does. Dense kb64 uses it on prefill (`seqlen_q` hint > 1); the dense 128-key
+  mainloop follows `FA_CLC`. These are kernel-class policies (`use_clc`).
+- **Knobs.** `FLASH_ATTENTION_MLA_1CTA=1` (the opt-in route) is the only MLA env var. The
+  ablation knobs used to measure this work were removed (see "Interface cleanup").
 - **Fallback:** every other sparse case (more than 64 heads, or training with load-P)
   falls back to the 2CTA kernel under the flag.
 - **No split-KV** for sparse MLA on either kernel.
@@ -86,7 +89,7 @@ could not move (`agent_space/PR2914_COMPARISON_AND_PORT_PLAN.md`).
 - **Registers.** `min_blocks_per_mp=1`, so the budgets are honoured: softmax 192,
   epilogue 128, warp group 2 (load/MMA/CLC/idle) 112, gather 80, uniform per warp group.
   No spills.
-- **ptxas.** It runs at the default level (`_MLA_PTXAS_DEFAULTS["fwd_kb64"] = ""`).
+- **ptxas.** It runs at the default level (`FlashAttentionMLAForward1CtaKb64Sm100.ptxas_options = ""`).
   `-O2` is 7-8% slower here.
 
 **Test contract** (PR 2914's; `tests/cute/test_flash_attn.py::_assert_mla_fwd_close`)
@@ -145,8 +148,8 @@ Joining ncu's per-instruction counts with a lineinfo disassembly
 - **Hardware-counted local requests are small:** 7.8 M loads and 6.9 M stores, 0.5% of
   the LSU peak.
 
-This epilogue belongs to the bf16 sparse training forward, which only
-`FLASH_ATTENTION_MLA_1CTA_KB64=0` reaches now; the default route is kb64.
+This epilogue belonged to the bf16 sparse training forward on the 128-key mainloop, which no
+route reaches any more (bf16 sparse training runs kb64).
 
 Decode and prefill at 64 heads (`benchmarks/benchmark_sparse_mla_fwd.py --heads 64
 --kernels 2cta 1cta 1cta_kb128 --ptxas shipped`; `agent_space/bench_sparse_1cta/b7_*.csv`),
@@ -164,8 +167,8 @@ Small-batch decode stays latency-bound and 2CTA still wins there (Follow-up 1).
 ## Dense kb64 with split-KV (64 heads, 16-bit)
 
 The kb64 kernel has two load front ends, selected at compile time by `is_topk_gather`. The
-MMA, softmax, epilogue and SMEM/TMEM plan are shared. Dense MLA at 64 heads routes there,
-unless the call is fp8 or sets `FLASH_ATTENTION_MLA_1CTA_KB64=0`. Paged KV whose page size
+MMA, softmax, epilogue and SMEM/TMEM plan are shared. Dense MLA at 64 heads routes there
+unless the call is fp8 (`FlashAttentionMLAForward1CtaKb64Sm100.can_implement`). Paged KV whose page size
 is not a multiple of 64 uses the cp.async gather front end (see "Dense kb64: paged KV at any
 page size").
 
@@ -301,7 +304,7 @@ With `page_size % 64 == 0`, a 64-key block is one TMA box inside a page. Any oth
   - Rows at or past `seqlen_k` are zero-filled by a row predicate. Their page-table entry is never used; the load reads entry 0 instead, so it stays in bounds.
 - **Loop.** `load_cpasync_paged` walks the dense block range: runtime count (pairs plus an odd tail), split-KV, `has_work`, the dummy block. The per-block issue (`gather_block_paged`) is `gather_block` without the bitmask: latent parts on their part barriers, rope rows last.
 - **Everything downstream is the dense kernel's:** MMA, positional masking, split-KV epilogue, scheduler.
-- **Flag split.** `use_cpasync_kv` (the loader) is now separate from `is_topk_gather` (bitmask, fixed count). `FLASH_ATTENTION_MLA_1CTA_KB64_PAGED_CPASYNC=1` sends page sizes that are multiples of 64 through the gather too, for A/B runs.
+- **Flag split.** `use_cpasync_kv` (the loader) is now separate from `is_topk_gather` (bitmask, fixed count). (A `FLASH_ATTENTION_MLA_1CTA_KB64_PAGED_CPASYNC=1` knob sent page sizes that are multiples of 64 through the gather too, for the A/B below; it has since been removed.)
 - **Registers.** Every variant compiles to 128 registers and 0 B of local memory (`agent_space/spill_probe_kb64_paged.py`): decode with and without split, 16 heads, no rope, causal prefill, page 1. The epilogue already streams O in 32-column chunks.
 
 **Correctness.**
@@ -440,8 +443,8 @@ varlen-q, sparse, and paged (cp.async and TMA) (`agent_space/s_ahead_bitwise.py`
 S-ahead is not free. Both resident blocks are then held by the MMAs, so the loads lose their
 one-block look-ahead. The interface therefore turns it on only when the tensor core is the
 bottleneck: fp8 with `seqlen_q x heads >= 512`, i.e. at least 8 tiles sharing one KV stream,
-which stays L2-resident. Varlen without a `max_seqlen_q` hint stays in order.
-`FLASH_ATTENTION_MLA_1CTA_S_AHEAD=0/1` forces the choice.
+which stays L2-resident. Varlen without a `max_seqlen_q` hint stays in order
+(`FlashAttentionMLAForward1CtaSm100.use_s_ahead`).
 
 Ablation (`agent_space/bench_fp8_s_ahead.py`, `agent_space/bench_sparse_1cta/fp8_s_ahead.csv`;
 160 rows, all bitwise equal). Speedup over in order, min / median / max:
@@ -529,9 +532,9 @@ h=64, has_qk: 2CTA 1.49 ms vs 1CTA 1.23-1.25 ms (s_k 8K / 32K).
 
 ## ptxas -O2 (default for MLA kernels since 2026-09-28)
 
-`interface._MLA_PTXAS_DEFAULTS` compiles the MLA kernels with `--ptxas-options '-O2'`. It is
-part of each compile key. `FLASH_ATTENTION_MLA_PTXAS_OPTIONS` overrides every MLA kernel at
-once, and `""` means the ptxas default level (use this to rerun the ablations).
+Each MLA kernel class carries its ptxas flags as a `ptxas_options` class attribute (`-O2`,
+or `""` for the ptxas default on the kb64 forward); the interface adds them to the compile
+options and the compile key. To rerun an ablation, change or monkeypatch the attribute.
 
 Forward: see the numbers above (median +15-17%; local memory 560 -> 32 B on 2CTA, 352 -> 0 B
 on 1CTA).
@@ -550,6 +553,34 @@ Backward, sparse MLA training step:
 | main backward (`FlashAttentionSparseMLABackwardSm100`) | 1.00 / 1.01 / 1.18x (recompute-P 1.04-1.18x) | 280-1048 -> 0-64 | -O2 |
 | dK GEMM (`dKGemmKernel`) | 1.03 / 1.04 / 1.04x | 0 -> 0 | -O2 |
 | bwd preprocess (sparse-MLA instantiation) | 0.99 / 1.00 / 1.01x | 0 -> 0 | ptxas default |
+
+## Interface cleanup (2026-09-29)
+
+Before merging, the interface lost the ablation machinery used to develop and measure the
+1CTA kernels (`agent_space/INTERFACE_REFACTOR_PLAN.md`):
+- **Env knobs removed:** `FLASH_ATTENTION_MLA_1CTA_{KB64,Q_TMEM,PACKED_VARLEN,
+  KB64_PAGED_CPASYNC,CLC,S_AHEAD}` and `FLASH_ATTENTION_MLA_PTXAS_OPTIONS`. Each resolved to
+  its default: kb64 wherever it applies, Q in TMEM, packed varlen, TMA pages for whole
+  64-key blocks, the CLC and S-ahead policies, and the per-kernel ptxas level.
+  `FLASH_ATTENTION_MLA_1CTA=1` (the opt-in) remains until a routing heuristic replaces it.
+  Measurements above that name a knob describe how they were taken.
+- **Policies owned by the kernel classes:**
+  - kb64: `can_implement`, `use_clc`, `TILE_MN` and `MIN_BLOCKS_PER_SPLIT`;
+  - the 1CTA class: `use_clc`, `use_s_ahead`;
+  - every MLA kernel: `SPARSE_HEAD_TILE` and `ptxas_options`.
+
+  The interface picks the forward class once, and routes through `_mla_1cta_route`.
+- **kb64 O stores are always 256-bit.** 32-B alignment is validated for a caller's `out`
+  and declared through `to_cute_tensor(assumed_align=32)` /
+  `assume_tensor_aligned(align_bits=256)`, instead of a pointer probe and a second kernel
+  variant (that variant was worth 1-4% on epilogue-heavy shapes).
+- **The 128-key kernel lost its two-phase (non-Q-in-TMEM) QK path:** slower on every
+  shape, reachable only through the removed knob. Its stage-count and QK-order ablation
+  arguments went with it.
+- **Verification:** the compile-key set of the MLA suite was diffed before and after each
+  step (`agent_space/snapshot_mla_keys.sh`, `agent_space/diff_keys.py`). Only the knob-only
+  variants disappeared. The kb64 / 128-key / recompute-P bitwise references
+  (`agent_space/kb*_ref.py`, `recompute_bwd_ref.py`) are unchanged.
 
 ## Follow-ups
 
