@@ -240,7 +240,8 @@ Where the main kernel's increment comes from (ncu, 16k chunk 2 and 64k chunk 15)
 ### Validation
 
 The sparse-MLA subset above, with `test_flash_attn_mla_sparse_bwd_sentinel` and
-`..._sentinel_varlen` additionally parametrized over `recompute_p` (64 / 128 heads) so
+`..._sentinel_varlen` additionally parametrized over `recompute_p` (since 2026-09-29 at every
+head count; 1..63 heads pad the 64-row tile and use this fused path too) so
 the int32 canaries around preallocated `dk`/`dv` also guard the fused scatter (-1
 sentinels and the per-chunk key extent); the 128-head and load-P kernels are compared
 bitwise against the parent build.
@@ -256,6 +257,13 @@ tested. Code: `flash_bwd_mla_dq_dqv_sm100_h64.py` (`dQdQvGemmKernelH64`), `topk_
 (`_compile_sparse_mla_dq_dqv` picks the class when `nheads == 64`; the compile key already
 contains the head count, so the binaries are distinct). `dQdQvGemmKernel` (128 rows, cluster
 (1,2)) is unchanged and still serves every other head count.
+
+Update 2026-09-29: the class now serves 1..64 heads (`nheads <= 64`). Fewer heads pad the
+64-row tile: the head mode takes the real, dynamic extent, as in the generic kernel, so TMA
+zero-fills the dS rows past it and drops those dQ / dQv rows. The output is bitwise equal to
+the generic kernel at 24 / 1 heads (`test_flash_attn_mla_sparse_bwd_recompute_p_padded`). At
+16K tokens it takes 2.60 ms vs 4.16 ms at 24 heads (`AI/SPARSE_MLA_1CTA.md`, "Training below
+64 heads").
 
 ### Problem
 

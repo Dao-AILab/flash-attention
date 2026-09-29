@@ -1,8 +1,10 @@
 # Copyright (c) 2026, Colfax International.
 
 """
-CuTe DSL implementation of the dQ+dQv gemm of the sparse-MLA (DSA) backward for exactly
-64 Q heads per KV head (see AI/SPARSE_MLA_64H.md, section C6-dq).
+CuTe DSL implementation of the dQ+dQv gemm of the sparse-MLA (DSA) backward for up to
+64 Q heads per KV head (see AI/SPARSE_MLA_64H.md, section C6-dq). Fewer heads pad the 64-row
+tile: the head mode has the real (dynamic) extent, so TMA zero-fills the dS rows past it and
+drops those rows of the dQ / dQv stores (as in the generic dQdQvGemmKernel).
 
     dQ  = dS @ K_rope   (per token: [64 heads, top_k] x [top_k gathered rows, hdim])
     dQv = dS @ V        (per token: [64 heads, top_k] x [top_k gathered rows, hdim_v])
@@ -60,11 +62,9 @@ class dQdQvGemmKernelH64:
     ):
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.nheads = nheads
-        # 64-row tile == the head count: no padded rows (pack_gqa.sparse_mla_qhead_tile).
+        # one 64-row tile per token; fewer heads are padded rows (pack_gqa.sparse_mla_qhead_tile)
         self.tile_m = sparse_mla_qhead_tile(nheads, min_tile=64)
-        assert self.tile_m == 64 and nheads == 64, (
-            f"dQdQvGemmKernelH64 serves exactly 64 Q heads, got {nheads}"
-        )
+        assert self.tile_m == 64, f"dQdQvGemmKernelH64 serves 1..64 Q heads, got {nheads}"
         self.head_dim_k = head_dim_k or 0  # when head_dim_k not provided, dQ is not computed
         self.head_dim_v = head_dim_v
         self.top_k = top_k
@@ -204,12 +204,14 @@ class dQdQvGemmKernelH64:
                 cute.make_layout((t.shape[0], head_dim), stride=(t.stride[0], t.stride[1])),
             )
 
-        mdS = static_reshape(mdS, self.nheads, self.top_k)
-        mdQv = static_reshape(mdQv, self.nheads, self.head_dim_v)
+        # Dynamic head extent for a padded tile; see pack_gqa.qheads_first_tma_view.
+        nheads = self.nheads if self.nheads == self.tile_m else Int32(self.nheads)
+        mdS = static_reshape(mdS, nheads, self.top_k)
+        mdQv = static_reshape(mdQv, nheads, self.head_dim_v)
         mV = rows_static_hdim(mV, self.head_dim_v)
         mIdxTopK = static_reshape(mIdxTopK, self.top_k)
         if const_expr(self.compute_dQ):
-            mdQ = static_reshape(mdQ, self.nheads, self.head_dim_k)
+            mdQ = static_reshape(mdQ, nheads, self.head_dim_k)
             mK = rows_static_hdim(mK, self.head_dim_k)
 
         # ---- layout info ----

@@ -91,7 +91,7 @@ def check_dsink_vs_ref(actual, ref, pt, rtol=2, atol=0.0):
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # Routes MLA-absorbed (qv) calls to the 1CTA kernel where it applies. Sparse (top-k) MLA
-# goes to 1CTA for <= 64 heads (training: only recompute-P at exactly 64 heads); every other
+# goes to 1CTA for <= 64 heads (training: only with recompute-P); every other
 # sparse case falls back to the 2CTA kernel, so the sparse tests run under either setting.
 MLA_1CTA = os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
 # SplitKV is not supported on SM90 or SM120
@@ -4050,7 +4050,7 @@ def _mla_inputs(b, s_q, s_k, h, has_qk, dtype=torch.bfloat16, seed=0):
 def _mla_kb64_active(nheads, dtype=torch.bfloat16):
     """Whether an MLA forward with FLASH_ATTENTION_MLA_1CTA=1 runs the 1CTA 64-key-block
     mainloop (at most 64 heads, padded in-kernel, 16-bit; for training only the sparse
-    recompute-P route at exactly 64 heads reaches it). Its running max advances per 64 keys
+    recompute-P route reaches it). Its running max advances per 64 keys
     instead of the 2CTA kernel's 128, so the two agree to bf16 rounding, not bitwise."""
     return (
         MLA_1CTA
@@ -4199,18 +4199,23 @@ def test_flash_attn_mla_1cta_sparse_bitmask_mapping(nheads, has_qk):
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA sparse MLA forward")
+@pytest.mark.parametrize("train", [False, True])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("nheads", [1, 24, 48, 64])
-def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sink, monkeypatch):
+def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sink, train, monkeypatch):
     """Padded heads must never be written: with fewer than 64 heads the packed layout maps a
     token's padded rows onto the next token's heads (and past the tensor for the last
     token). out/lse are views into canary-filled buffers; the tails must survive, and every
     real row must match the 2CTA kernel. Covers both the TMA O store (dense Q) and the
-    guarded LSE / sink paths."""
+    guarded LSE / sink paths. train: the recompute-P training forward (exact max, the o_lo
+    residual under the same row guard as O, checked to half an ulp of O)."""
     if not IS_SM100 or USE_FAKE_TENSOR:
         pytest.skip()
     b, s_q, s_k, topk = 2, 33, 1024, 256
     kw, _ = _mla_inputs(b, s_q, s_k, nheads, has_qk=True)
+    if train:
+        kw = {n: x.detach().requires_grad_() for n, x in kw.items()}
+    mode = dict(gather_bwd_recompute_p=True) if train else {}
     idx = rect_topk_indices(b, s_q, s_k, topk, False, "cuda", fill_frac=0.3)
     sink = (torch.randn(nheads, device="cuda", dtype=torch.bfloat16) * 4
             if has_learnable_sink else None)
@@ -4220,15 +4225,21 @@ def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sin
     buf_lse = torch.full((n_lse + pad,), canary_lse, device="cuda", dtype=torch.float32)
     out = buf_out[:n_out].view(b, s_q, nheads, 512)
     lse = buf_lse[:n_lse].view(b, s_q, nheads)
-    _flash_attn_fwd(kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
-                    learnable_sink=sink, out=out, lse=lse, return_lse=True)
+    _, _, _, _, o_lo = _flash_attn_fwd(kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
+                                       learnable_sink=sink, out=out, lse=lse, return_lse=True, **mode)
     torch.cuda.synchronize()
     assert (buf_out[n_out:] == canary_out).all(), "padded-head O rows written past the tensor"
     assert (buf_lse[n_lse:] == canary_lse).all(), "padded-head LSE written past the tensor"
+    assert (o_lo is not None) == train
+    if train:
+        # a padded row's o_lo written onto the next token's heads would break this bound
+        _, e = torch.frexp(out.float())
+        half_ulp = torch.ldexp(torch.ones_like(out, dtype=torch.float32), e - 9)
+        assert (o_lo.float().abs() <= half_ulp)[out != 0].all(), "o_lo"
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
     out_2cta, lse_2cta, *_ = _flash_attn_fwd(
         kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
-        learnable_sink=sink, return_lse=True,
+        learnable_sink=sink, return_lse=True, **mode,
     )
     if _mla_kb64_active(nheads):
         _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "1CTA kb64 vs 2CTA")
@@ -4418,9 +4429,11 @@ def test_flash_attn_mla_1cta_sparse_fp8(nheads, causal):
 @pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("has_qk", [True, False])
-def test_flash_attn_mla_1cta_sparse_train_recompute_p(has_qk, causal, varlen, has_learnable_sink,
+# fewer than 64 heads pad the forward's and the backward's 64-row tiles
+@pytest.mark.parametrize("h", [64, 24, 1])
+def test_flash_attn_mla_1cta_sparse_train_recompute_p(h, has_qk, causal, varlen, has_learnable_sink,
                                                       monkeypatch):
-    """Sparse training with the recompute-P backward at exactly 64 heads runs its forward on
+    """Sparse training with the recompute-P backward at 1..64 heads runs its forward on
     the 1CTA kernel: exact running max (rescale_threshold 0), LSE and the O residual, no
     P / row_max. On the 128-key mainloop (FLASH_ATTENTION_MLA_1CTA_KB64=0) the forward
     outputs are bitwise identical to the 2CTA kernel's and so are dQ / dQv (dK / dV up to
@@ -4430,7 +4443,7 @@ def test_flash_attn_mla_1cta_sparse_train_recompute_p(has_qk, causal, varlen, ha
     if not IS_SM100 or USE_FAKE_TENSOR:
         pytest.skip()
     import flash_attn.cute.interface as fa_interface
-    device, dtype, h, topk = "cuda", torch.bfloat16, 64, 256
+    device, dtype, topk = "cuda", torch.bfloat16, 256
     seqlens = [300, 1, 177] if varlen else [512]
     total = sum(seqlens)
     torch.random.manual_seed(0)
@@ -4521,8 +4534,11 @@ def test_flash_attn_mla_1cta_sparse_train_recompute_p(has_qk, causal, varlen, ha
     for name, a, b in zip(names, results["1"][3], results["0"][3]):
         if kb64:
             # P is recomputed from a slightly different LSE and dpsum from a slightly
-            # different O: measured rel-L2 <= 1.6e-3 on the grads, 3.3e-3 on dsink
-            assert rel_l2(a, b) < (1e-2 if name == "dsink" else 5e-3), name
+            # different O: measured rel-L2 <= 1.6e-3 on the grads, 3.3e-3 on dsink. At one
+            # head dsink is a single bf16 scalar summing ~500 signed terms: 2CTA is 1.4e-2 off
+            # the fp32 reference there (kb64 0, the bf16 torch reference 4.6e-2).
+            dsink_tol = 5e-2 if h == 1 else 1e-2
+            assert rel_l2(a, b) < (dsink_tol if name == "dsink" else 5e-3), name
         elif name in ("dq", "dqv"):
             assert torch.equal(a, b), name
         else:
@@ -4585,8 +4601,9 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
 
     nheads < 128 covers in-kernel head padding (pack_gqa.qheads_first_tma_view):
     96 pads to 128 with a partial second CTA, 24 and 1 pad to the 64-head bwd tile.
-    recompute_p (64 / 128 heads only) runs the canaries against the recompute-P
-    backward, whose 64-head main kernel scatters dK_rope itself.
+    recompute_p runs the canaries against the recompute-P backward (padded counts:
+    zero-filled Q / Qv rows and +inf lse_log2 pads make P = 0 in the padded rows), whose
+    64-row main kernel (1..64 heads) scatters dK_rope itself.
 
     Regression test for unguarded sentinel scatters: the dV/dK backward
     epilogues used to atomically accumulate at row -1 — out of bounds of the
@@ -4599,8 +4616,6 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
     """
     if not IS_SM100:
         pytest.skip()
-    if recompute_p and nheads not in (64, 128):
-        pytest.skip("gather_bwd_recompute_p requires 64 or 128 Q heads")
     device = "cuda"
     torch.random.manual_seed(0)
     batch_size = 2
@@ -4625,14 +4640,6 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
         q_ref, k_ref, v_ref, causal=causal, qv=qv_ref, gather_kv_indices=gather_kv_indices,
         upcast=False, reorder_ops=True,
     )
-
-    if nheads not in (64, 128):
-        # Recompute-P requires an unpadded backward tile (64 or 128 heads).
-        with pytest.raises(ValueError, match="gather_bwd_recompute_p requires 64 or 128 Q heads"):
-            flash_attn_func(
-                q, k, v, qv=qv, gather_kv_indices=gather_kv_indices,
-                causal=causal, pack_gqa=True, gather_bwd_recompute_p=True,
-            )
 
     out, lse = flash_attn_func(
         q, k, v, qv=qv, gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True,
@@ -4708,11 +4715,12 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# recompute_p at 64 heads: dK_rope is scattered by the main kernel's epilogue (fused).
+# recompute_p at 1..64 heads: dK_rope is scattered by the main kernel's epilogue (fused).
 @pytest.mark.parametrize("recompute_p", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
-# 24 heads: padded per-head preprocess tiles must not spill into the next packed sequence.
+# 24 heads: padded per-head preprocess tiles must not spill into the next packed sequence
+# (recompute_p: nor the padded lse_log2 columns, which must keep their +inf).
 # 64 heads: the native 64-row (tile_m == 64) backward specialization.
 @pytest.mark.parametrize("nheads", [128, 64, 24])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
@@ -4728,8 +4736,6 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, re
     """
     if not IS_SM100:
         pytest.skip()
-    if recompute_p and nheads not in (64, 128):
-        pytest.skip("gather_bwd_recompute_p requires 64 or 128 Q heads")
     device = "cuda"
     torch.random.manual_seed(0)
     nheads_kv, hdim, hdimv = 1, 64, 512
@@ -4848,6 +4854,72 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, re
         check_tensor_vs_ref("dK(prealloc)", dk2, dk_ref, dk_pt)
         check_tensor_vs_ref("dV(prealloc)", dv2, dv_ref, dv_pt)
         check_tensor_vs_ref("dQv(prealloc)", dqv2, dqv_ref, dqv_pt)
+
+
+@pytest.mark.parametrize("nheads", [24, 1])
+@pytest.mark.parametrize("has_qk", [True, False])
+def test_flash_attn_mla_sparse_bwd_recompute_p_padded(nheads, has_qk, monkeypatch):
+    """Recompute-P with a padded head tile (1..63 heads -> 64 rows). The padded rows load
+    zero Q / Qv / dO and +inf lse_log2, so their P and dS are exactly 0:
+      1. recompute-P vs load-P grads on the same forward (bf16 contract), all finite;
+      2. zero contribution: the same call at 64 heads with the extra heads' dO zeroed gives
+         bitwise-equal dq / dqv on the real heads and dk / dv up to the atomic scatter order;
+      3. the 64-row dQ / dQv kernel (1..64 heads) is bitwise equal to the generic 128-row one.
+    Runs the 2CTA forward (the flag-off route); the kb64 route is covered by
+    test_flash_attn_mla_1cta_sparse_train_recompute_p."""
+    if not IS_SM100 or USE_FAKE_TENSOR:
+        pytest.skip()
+    import flash_attn.cute.interface as fa_interface
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
+    device, dtype, topk = "cuda", torch.bfloat16, 256
+    seqlens = [300, 1, 177]
+    total, h_full = sum(seqlens), 64
+    cu = torch.tensor([0] + list(itertools.accumulate(seqlens)), dtype=torch.int32, device=device)
+    idx = torch.cat([rect_topk_indices(1, s, s, topk, True, device, fill_frac=0.8, seed=i)[0]
+                     for i, s in enumerate(seqlens)])
+    torch.random.manual_seed(0)
+    d_q = 64 if has_qk else 512
+    q_full = torch.randn(total, h_full, d_q, device=device, dtype=dtype)
+    qv_full = torch.randn(total, h_full, 512, device=device, dtype=dtype)
+    k, v = (torch.randn(total, 1, d, device=device, dtype=dtype) for d in (64, 512))
+    g_full = torch.randn(total, h_full, 512, device=device, dtype=dtype)
+    extra = dict(cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
+                 causal=True, gather_kv_indices=idx)
+
+    def grads(h, recompute, g):
+        ins = [q_full[:, :h].contiguous(), k, v, qv_full[:, :h].contiguous()]
+        if not has_qk:
+            ins = [ins[3], v]  # shared_kv: (q=qv, k=v, v=v)
+        ins = [x.detach().clone().requires_grad_() for x in ins]
+        call = (ins[0], ins[1], ins[2]) if has_qk else (ins[0], ins[1], ins[1])
+        out, _ = flash_attn_varlen_func(*call, qv=ins[3] if has_qk else None,
+                                        gather_bwd_recompute_p=recompute, **extra)
+        names = ("dq", "dk", "dv", "dqv") if has_qk else ("dqv", "dv")
+        return dict(zip(names, torch.autograd.grad(out, ins, g)))
+
+    rel_l2 = lambda a, b: ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()  # noqa: E731
+    g = g_full[:, :nheads].contiguous()
+    rp, lp = grads(nheads, True, g), grads(nheads, False, g)
+    for name in rp:
+        assert torch.isfinite(rp[name]).all(), name
+        assert rel_l2(rp[name], lp[name]) < 5e-3, name  # one fewer P rounding; measured ~3e-3
+
+    g_pad = g_full.clone()
+    g_pad[:, nheads:] = 0
+    full = grads(h_full, True, g_pad)
+    for name in rp:
+        if name in ("dq", "dqv"):
+            assert torch.equal(rp[name], full[name][:, :nheads]), name
+        else:
+            assert rel_l2(rp[name], full[name]) < 5e-4, name  # atomic scatter-add order
+
+    # the generic 128-row dQ / dQv kernel for the same call
+    monkeypatch.setattr(fa_interface, "dQdQvGemmKernelH64", fa_interface.dQdQvGemmKernel)
+    monkeypatch.setattr(fa_interface._sparse_mla_dq_dqv, "compile_cache", {})
+    generic = grads(nheads, True, g)
+    for name in ("dq", "dqv"):
+        if name in rp:
+            assert torch.equal(rp[name], generic[name]), name
 
 
 def random_cutoff_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device):
@@ -6587,10 +6659,11 @@ def self_including_topk_indices(seqlen, topk_len, device):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 # 64 and 24 heads pad to the 128-row forward tile (pack_gqa.qheads_first_tma_view): the
-# residual store must skip the padded rows. Recompute-P requires an unpadded backward tile
-# (64 or 128 heads), so it is exercised at 128 and 64.
+# residual store must skip the padded rows. Recompute-P at 24 heads also pads the 64-row
+# backward tile (+inf lse_log2 pads).
 @pytest.mark.parametrize(
-    "nheads,recompute_p", [(128, False), (128, True), (64, False), (64, True), (24, False)]
+    "nheads,recompute_p",
+    [(128, False), (128, True), (64, False), (64, True), (24, False), (24, True)],
 )
 @pytest.mark.parametrize("varlen", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)

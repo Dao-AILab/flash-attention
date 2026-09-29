@@ -3,7 +3,8 @@
 Status (2026-09-28), opt-in via `FLASH_ATTENTION_MLA_1CTA=1`:
 - **Inference forward:** MQA with up to 64 Q heads.
 - **Training forward:** with the recompute-P backward (`gather_bwd_recompute_p=True`) at
-  exactly 64 heads. The kernel produces what that backward consumes: exact-running-max LSE
+  1..64 heads (padded to the 64-row tile in both passes; see "Training below 64 heads").
+  The kernel produces what that backward consumes: exact-running-max LSE
   (`rescale_threshold=0`) and the O rounding residual `o_lo`, but no P / row_max.
 - **Two mainloops.** 16-bit inputs with at most 64 heads run the **64-key-block (kb64)
   mainloop** (see the kb64 sections below):
@@ -15,8 +16,8 @@ Status (2026-09-28), opt-in via `FLASH_ATTENTION_MLA_1CTA=1`:
   within the sparse backward's own atomic run-to-run non-determinism, which 2CTA shows too.
 - **CLC.** The 1CTA sparse route always runs the persistent CLC scheduler, as the 2CTA MLA
   kernel does. Dense 1CTA MLA still follows `FA_CLC`.
-- **Fallback:** every other sparse case (more than 64 heads; training with load-P or
-  != 64 heads) falls back to the 2CTA kernel under the flag.
+- **Fallback:** every other sparse case (more than 64 heads, or training with load-P)
+  falls back to the 2CTA kernel under the flag.
 - **No split-KV** for sparse MLA on either kernel.
 
 Plan and review log: `agent_space/SPARSE_MLA_1CTA_PORT_PLAN.md`.
@@ -50,7 +51,7 @@ Correctness: the 128-key mainloop is bitwise identical to the 2CTA kernel on eve
 benchmarked shape and on the test matrix (`test_flash_attn_mla_1cta_sparse_*`), as well as
 matching the reference. The kb64 mainloop meets the contract in "Test contract" below.
 
-## 64-key-block mainloop (kb64): exactly 64 heads, 16-bit
+## 64-key-block mainloop (kb64): up to 64 heads, 16-bit
 
 `flash_fwd_mla_1cta_kb64_sm100.FlashAttentionMLAForward1CtaKb64Sm100` subclasses the 1CTA
 kernel. It ports PR 2914's 64-head forward mainloop into it. The 128-key mainloop kept one
@@ -365,8 +366,8 @@ Pages of 16 keys or more reach within 3-4% of the ceiling, the same as the TMA p
 - **Dense prefill, fewer than 64 heads:** stays on the 128-key mainloop. Padding wastes
   64 / H of the MMA work, while that mainloop packs 64 / H tokens per tile; kb64 measured
   0.34-0.43x at 16 heads and 0.66-0.81x at 32.
-- **Training:** unchanged. Sparse recompute-P still needs exactly 64 heads, and the other
-  training routes run 2CTA.
+- **Training:** sparse recompute-P runs kb64 at 1..64 heads (see "Training below 64
+  heads"); the other training routes run 2CTA.
 
 **Tests.**
 - `test_flash_attn_mla_1cta_dense_kb64` covers 16 / 24 / 64 heads.
@@ -375,6 +376,52 @@ Pages of 16 keys or more reach within 3-4% of the ceiling, the same as the TMA p
   without a sink.
 - The existing sparse 1CTA tests at 1-48 heads now take the bf16-rounding contract
   (`_mla_kb64_active(nheads <= 64)`).
+
+## Training below 64 heads (recompute-P, padded head tiles)
+
+Recompute-P used to require 64 or 128 heads, so sparse training below 64 heads could only
+run load-P on the 2CTA forward. The recompute-P backward now pads its head tile (1..63 ->
+64, 65..127 -> 128; `AI/SPARSE_MLA_RECOMPUTE_P.md`, "Head counts"):
+- Q_rope and the QvB copy of Qv load through the padded heads-first TMA views;
+- `lse_log2` padding is +inf, so P = 0 in the padded rows.
+
+On the 1CTA route that training runs the kb64 forward. That forward already zero-fills the
+padded Q rows and guards the O / o_lo / LSE stores.
+
+The dQ / dQv GEMM now uses the 64-row `dQdQvGemmKernelH64` for 1..64 heads, not only 64: its
+head mode takes the real, dynamic extent. The generic kernel had padded 1..63 heads to 128
+rows. The output is bitwise identical to the generic kernel, and the change also speeds up
+load-P.
+
+Train step (GB300 GPU 3, b = 1, one causal document, topk 2048, token chunk 4096;
+`agent_space/gate_loadp.py`, `agent_space/bench_sparse_1cta/gate_recompute_padded.log`):
+
+| heads, T | recompute-P kb64 fwd | recompute-P 2CTA fwd | load-P 2CTA (now) | load-P 2CTA (before) |
+|---|---|---|---|---|
+| 24, 16K | **22.49 ms** | 24.88 | 28.68 | 30.22 |
+| 32, 16K | **22.71** | 25.08 | 28.81 | 30.40 |
+| 1, 16K | **21.97** | 24.31 | 28.76 | - |
+| 24, 4K | **5.48** | 6.13 | 6.94 | 7.32 |
+| 64, 16K (unchanged) | 23.46 | 25.89 | 29.34 | 29.27 |
+
+- **Below 64 heads, training is 1.34x faster** than before (1.28x over today's load-P).
+- **dQ / dQv at 24 / 32 heads:** 4.16 -> 2.60 ms.
+- **The padded backward costs what the 64-head one does:** the main kernel takes 15.7 ms at
+  24 heads vs 16.0 ms at 64.
+- **At 96 / 128 heads** (tile 128, 2CTA forward) recompute-P is about 1% slower than load-P
+  (37.9 vs 37.4 ms at 96, 16K). Its gain there is memory: P is never stored.
+
+Correctness:
+- recompute-P vs load-P grads rel-L2 about 3e-3 at 24 / 1 / 96 heads;
+- padded rows contribute exactly zero (`test_flash_attn_mla_sparse_bwd_recompute_p_padded`);
+- sentinel canaries (`..._sentinel`, `..._sentinel_varlen`) at 96 / 24 / 1;
+- `precise_dpsum` at 24;
+- kb64 vs 2CTA training contract at 64 / 24 / 1 heads (`..._train_recompute_p`). At one
+  head, dsink is a single bf16 scalar: kb64 matches the fp32 reference exactly, while 2CTA
+  is 1.4e-2 off it (bound 5e-2);
+- the o_lo half-ulp bound at padded counts (`..._padded_head_canary[train]`);
+- 64 / 128-head grads and the 24-head load-P dq / dqv unchanged
+  (`agent_space/recompute_bwd_ref.py`: bitwise; dk / dv within atomic noise).
 
 ## fp8: S ahead of PV in the 128-key mainloop
 
@@ -491,7 +538,7 @@ on 1CTA).
 
 Backward, sparse MLA training step:
 - Setup: b=1, T in {4K, 16K}, causal, topk 2048, heads {128, 64, 24}, load-P and recompute-P
-  (the latter at 64 / 128 heads only).
+  (the latter at 64 / 128 heads only at the time).
 - Measurement: per-kernel CUDA time from the profiler. Two GPUs with opposite run orders
   (default -> -O2 on one, -O2 -> default on the other), which agree to within 1%.
 - Script: `agent_space/bench_sparse_mla_bwd_ptxas.py`; data in
@@ -515,10 +562,10 @@ Backward, sparse MLA training step:
    - deeper V residency, where bf16 SMEM allows (it is tight: ~1 KB headroom with has_qk);
    - overlapping the per-tile Q staging (q_in_tmem handshake);
    - TMA gather4 for K/V rows, instead of 128 threads issuing per-row 16-B cp.async.
-4. **Training forward:** done for recompute-P at exactly 64 heads (see Status; kb64). Training
-   with fewer than 64 heads would need P / row_max emission, because the recompute-P
-   backward rejects padded head tiles. It is not started, and is worth it only in the
-   throughput regimes above.
+4. **Training forward:** done for recompute-P at 1..64 heads (see Status; kb64; "Training
+   below 64 heads"). A kb64 load-P forward (P / row_max emission) was gated out: the
+   load-P backward's separate dK GEMM makes it about 13% slower than recompute-P at 64
+   heads (`agent_space/gate_loadp.py`).
 5. **128-key mainloop spills: resolved, no action needed.** The 66 M figure is ncu's
    instrumented count. It is dominated by the reload of the SMEM base address inside the
    mbarrier retry loops (see the ncu table). The only real spills are in the bf16 sparse

@@ -620,12 +620,14 @@ class FlashAttentionSparseMLABackwardSm100:
         topk_length_dynamic = mIndexTopk.shape[0]
 
         # TMA source contract: see pack_gqa.qheads_first_tma_view.
+        # recompute_P's Q_rope (and the QvB copy of Qv) read through the same views: a padded
+        # head row loads as zeros, so S = 0 there and the +inf lse_log2 pad makes P = 0 exactly
         if const_expr(self.pad_qheads):
-            mQv_valid, mdO_valid, mP_valid, mdS_valid = [
+            mQv_valid, mdO_valid, mP_valid, mdS_valid, mQ_valid = [
                 qheads_first_tma_view(mX, self.qhead_per_kvhead_valid, head_idx=2)
                 if mX is not None
                 else None
-                for mX in (mQv, mdO, mP, mdS)
+                for mX in (mQv, mdO, mP, mdS, mQ)
             ]
         if const_expr(self.pack_gqa):
             mQv, mdO, mP, mdS, mQ = [
@@ -641,7 +643,7 @@ class FlashAttentionSparseMLABackwardSm100:
             if const_expr(mLseLog2 is not None):
                 mLseLog2 = pack_gqa_layout(mLseLog2, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
         if const_expr(not self.pad_qheads):
-            mQv_valid, mdO_valid, mP_valid, mdS_valid = mQv, mdO, mP, mdS
+            mQv_valid, mdO_valid, mP_valid, mdS_valid, mQ_valid = mQv, mdO, mP, mdS, mQ
 
         # ((h/h_k, s_q), dv, h_k, b) -> (dv, (h/h_k, s_q), h_k, b)
         # or ((h/h_k, total_q), dv, h_k) -> (dv, (h/h_k, total_q), h_k)
@@ -831,17 +833,18 @@ class FlashAttentionSparseMLABackwardSm100:
             tma_tensor_P = regroup(tma_tensor_P)
         else:
             tma_atom_QvB, tma_tensor_QvB = make_tma(
-                B, mQv, self.sQvB_layout, self.mma_tiler_VdO, tiled_mma_VdO, False
+                B, mQv_valid, self.sQvB_layout, self.mma_tiler_VdO, tiled_mma_VdO, False
             )
             if const_expr(self.has_qk):
                 tma_atom_Qr, tma_tensor_Qr = make_tma(
-                    B, mQ, self.sQr_layout, self.mma_tiler_Kr, tiled_mma_VdO, False
+                    B, mQ_valid, self.sQr_layout, self.mma_tiler_Kr, tiled_mma_VdO, False
                 )
                 if const_expr(self.fuse_dk_rope):
                     # dims-first view of Q_rope (like mQvt for Qv): the N = dims
                     # split MN-major B box of the dK_rope gemm
                     mQrt = cute.make_tensor(
-                        mQ.iterator, cute.select(mQ.layout, mode=mma_operand_layout_transpose)
+                        mQ_valid.iterator,
+                        cute.select(mQ_valid.layout, mode=mma_operand_layout_transpose),
                     )
                     tma_atom_Qr2, tma_tensor_Qr2 = make_tma(
                         B, mQrt, self.sQr2_layout, self.mma_tiler_dKr, tiled_mma_dKr, True

@@ -794,12 +794,12 @@ def _flash_attn_fwd(
     # it only up to 64 Q heads -- one 64-row tile per token; more heads would need two
     # tiles each re-gathering the same indices, which the 2CTA kernel avoids. For training
     # it produces only what the recompute-P backward needs (exact-max LSE and the O
-    # residual, no P / row_max), and recompute-P needs an unpadded tile: exactly 64
-    # heads. Every other sparse case falls back to 2CTA. Defined here because the head
-    # padding below and the SplitKV heuristics in _get_fwd_config depend on it.
+    # residual, no P / row_max), so training routes here with recompute-P (1..64 heads;
+    # the backward pads the head tile). Every other sparse case falls back to 2CTA. Defined
+    # here because the head padding below and the SplitKV heuristics in _get_fwd_config
+    # depend on it.
     sparse_1cta_ok = gather_kv_indices is None or (
-        qhead_per_kvhead <= 64
-        and (not requires_grad or (gather_bwd_recompute_p and qhead_per_kvhead == 64))
+        qhead_per_kvhead <= 64 and (not requires_grad or gather_bwd_recompute_p)
     )
     mla_1cta = (
         qv is not None
@@ -1186,9 +1186,6 @@ def _flash_attn_fwd(
         # always use kv bitmask by default (handles -1 sentinel)
         disable_sparse_kv_bitmask = False
         if sparse_kv:
-            # Recompute-P needs an unpadded backward tile (AI/SPARSE_MLA_RECOMPUTE_P.md, "Head counts").
-            if gather_bwd_recompute_p and num_head not in (64, 128):
-                raise ValueError("gather_bwd_recompute_p requires 64 or 128 Q heads")
             assert gather_kv_indices.shape[:-1] == qv.shape[:-2]
             gather_kv_length = gather_kv_indices.shape[-1]
             assert gather_kv_length % 128 == 0
@@ -1656,8 +1653,8 @@ def _flash_attn_fwd(
                     # pack_gqa at any ratio (including ratios that do not divide the 64-row
                     # tile), paged KV at any page size (TMA when page_size == tile_n,
                     # else a cp.async gather warp group), and sparse top-k gather (MQA,
-                    # <= 64 heads; training only with recompute-P at exactly 64 heads, which
-                    # needs no P / row_max -- routed here only in those cases).
+                    # <= 64 heads; training only with recompute-P, which needs no P /
+                    # row_max -- routed here only in those cases).
                     for feat, name in [
                         (p is not None, "P emission"),
                         (row_max is not None, "row_max emission"),
@@ -3245,9 +3242,8 @@ def _flash_attn_bwd_sparse_mla(
     # count; the interface needs the tile width for the dPsum/scaleP buffers.
     qhead_tile = sparse_mla_qhead_tile(qhead_per_kvhead, min_tile=64)
     pad_qheads = qhead_tile != qhead_per_kvhead
-    if recompute_p and pad_qheads:
-        raise ValueError("gather_bwd_recompute_p requires 64 or 128 Q heads")
-    # 64-head recompute-P: the main kernel also computes and scatters dK_rope (AI/SPARSE_MLA_64H.md).
+    # 64-row recompute-P tiles (1..64 heads): the main kernel also computes and scatters dK_rope
+    # (AI/SPARSE_MLA_64H.md).
     fuse_dk_rope = recompute_p and q is not None and k is not None and qhead_tile == 64
     assert gather_kv_length % 128 == 0, f"sparse MLA bwd: {gather_kv_length=} must be divisible by 128"
     assert deterministic is False, "sparse MLA bwd: deterministic mode not yet supported"
@@ -3362,8 +3358,10 @@ def _flash_attn_bwd_sparse_mla(
     if recompute_p:
         scale_p = None
         # lse in log2 units, written by the preprocess; consumed by the main
-        # bwd kernel to recompute P = exp2(scale_log2 * S - lse_log2).
-        lse_log2 = torch.empty_like(dpsum)
+        # bwd kernel to recompute P = exp2(scale_log2 * S - lse_log2). Padded head
+        # columns (never written by the preprocess) hold +inf: with the zero-filled Q
+        # rows S = 0 there, so P = exp2(-inf) = 0 exactly (garbage could give inf / NaN).
+        lse_log2 = torch.full_like(dpsum, float("inf")) if pad_qheads else torch.empty_like(dpsum)
     else:
         scale_p = alloc(*row_max.shape[:-1], qhead_tile, dtype=torch.float32, device=device)
         lse_log2 = None
@@ -3379,7 +3377,8 @@ def _flash_attn_bwd_sparse_mla(
     # Padded counts use trivial packing: not all head counts divide the 128-row tile.
     # Non-power-of-two tiles (e.g. 48 rows for 24 heads) produced incorrect dpsum.
     _bwd_preprocess(
-        out, dout, dpsum[..., :nheads], lse, lse_log2, None,
+        out, dout, dpsum[..., :nheads], lse,
+        lse_log2[..., :nheads] if lse_log2 is not None else None, None,
         cu_seqlens_q, seqused_q, None,
         dtype, head_dim, head_dim_v, m_block_size,
         row_max=row_max,
@@ -3625,8 +3624,9 @@ def _compile_sparse_mla_dq_dqv(
     mCuSeqlensQ = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_q else None 
     mCuSeqlensK = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_k else None 
     
-    # 64 Q heads: 1-CTA 64-row kernel with a whole-row gather (AI/SPARSE_MLA_64H.md).
-    dq_dqv_cls = dQdQvGemmKernelH64 if nheads == 64 else dQdQvGemmKernel
+    # Up to 64 Q heads: the 1-CTA 64-row kernel with a whole-row gather (AI/SPARSE_MLA_64H.md);
+    # fewer heads pad the tile (TMA zero-fills dS rows past nheads and drops those dQ / dQv rows).
+    dq_dqv_cls = dQdQvGemmKernelH64 if nheads <= 64 else dQdQvGemmKernel
     dq_dqv_gemm = dq_dqv_cls(
         acc_dtype=Float32,
         nheads=nheads,
@@ -4289,7 +4289,7 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: if True, ignores scheduler_metadata if it is passed and skips
         computing metadata fresh.
 
-    gather_bwd_recompute_p: (sparse MLA, 64 or 128 Q heads) do not save p/row_max in the forward at all
+    gather_bwd_recompute_p: (sparse MLA, 1..128 Q heads) do not save p/row_max in the forward at all
         (~520 KiB per token at 128 heads, gather width 2048, held from forward to backward);
         the backward main kernel recomputes P = exp2(scale*S - lse*log2e) from (q, qv, k, v,
         lse) in-kernel. The train forward also gets faster (no p store). Grads are not
