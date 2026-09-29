@@ -59,6 +59,7 @@ from flash_attn.cute.pack_gqa import (
     qheads_first_tma_view,
     regroup_padded_qheads,
 )
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
@@ -95,6 +96,45 @@ def pair_barrier_sync(barrier_id: Int32, num_threads: cutlass.Constexpr[int]) ->
 class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
     # No spills at the ptxas default; -O2 measured 7-8% slower (4k / 16k sparse training).
     ptxas_options = ""
+    # dense: one token per tile (heads padded to 64) x 64 keys, and at least 4 of those key
+    # blocks per split: each split pays a Q load, a 128 KB fp32 O partial and its share of the
+    # combine (one block per split measured 30% slower than 32 splits at s_k = 8K, b = 1)
+    TILE_MN = (64, 64)
+    MIN_BLOCKS_PER_SPLIT = 4
+
+    @staticmethod
+    def can_implement(
+        *, is_topk_gather, nheads_per_kv, num_head_kv, is_fp8, hdim, hdimv, has_qk,
+        seqlen_q_hint, has_extensions,
+    ) -> bool:
+        """Calls this mainloop serves (the rest of 1CTA MLA runs the 128-key mainloop): 16-bit,
+        <= 64 heads; sparse at any such head count; dense with a 512-dim latent and 64-dim rope,
+        at 64 heads, or with fewer on decode only -- padding the one-token tile wins there
+        (1.07-1.30x over the 128-key mainloop) but wastes 64 / H of the MMA work on prefill,
+        where the 128-key mainloop packs several tokens per tile (kb64 0.34-0.81x). Dense
+        excludes local / softcap / score_mod / mask_mod / block sparsity (has_extensions)."""
+        if is_fp8 or nheads_per_kv > 64:
+            return False
+        if is_topk_gather:
+            return True
+        return (
+            hdimv == 512
+            and (not has_qk or hdim == 64)
+            and (nheads_per_kv == 64 or (num_head_kv == 1 and seqlen_q_hint == 1))
+            and not has_extensions
+        )
+
+    @staticmethod
+    def use_clc(*, is_topk_gather, seqlen_q_hint, clc_default) -> bool:
+        """Sparse: always. Dense: CLC measured +2-10% on prefill (many tiles per KV stream) and
+        neutral on decode; varlen without a max_seqlen_q hint counts as decode."""
+        if is_topk_gather:
+            return True
+        return seqlen_q_hint is not None and seqlen_q_hint > 1
+
+    @staticmethod
+    def use_s_ahead(*, is_fp8, seqlen_q_hint, nheads) -> bool:
+        return False  # the 128-key mainloop's fp8 schedule; kb64 always issues S ahead of PV
 
     def __init__(
         self,
@@ -109,7 +149,6 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         has_cu_seqlens_q: bool = False,
         topk_length: int = 2048,
         rescale_threshold: float = 8.0,
-        o_store_bits: int = 256,
         is_topk_gather: bool = True,
         is_split_kv: bool = False,
         page_size: Optional[int] = None,
@@ -172,12 +211,11 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         # without a rope part the interface passes the latent width as hdim; the rope
         # geometry below (tilers, TMEM, the gather's K row width) is then unused
         self.hdim = 64
-        assert o_store_bits in (128, 256)
         # O is stored thread-wise from registers: no sO alias of a latent stage
         self.use_tma_O = False
-        # epilogue O / o_lo stores: 256-bit `st.global.v8` needs 32-B aligned rows (the
-        # interface checks the pointers and strides); 128-bit otherwise
-        self.o_store_bits = o_store_bits
+        # epilogue O / o_lo stores: 256-bit `st.global.v8`. The interface declares O / o_lo /
+        # the fp32 O partial 32-B aligned (assumed_align=32; a caller's `out` is validated).
+        self.o_store_bits = 256
 
         # ==== warps ====
         # 0-3 softmax, 4-7 epilogue, 8 TMA load (TMA) or idle (cp.async: Q goes through the KV
@@ -439,30 +477,11 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             assert mOlo.element_type == self.dtype_O, "O residual must have O's dtype"
 
         # ==== Prepare tensors ====
-        new_stride = lambda mX, bits=128: (
-            *(cute.assume(s, divby=bits // mX.element_type.width) for s in mX.stride[:-1]),
-            mX.stride[-1],
-        )
-        mQ, mQv, mK, mV = [
-            cute.make_tensor(mX.iterator, cute.make_layout(mX.shape, stride=new_stride(mX)))
-            if mX is not None
-            else None
-            for mX in (mQ, mQv, mK, mV)
-        ]
-        # O and o_lo: strides and pointer aligned to the epilogue store width
+        mQ, mQv, mK, mV = [assume_tensor_aligned(mX) for mX in (mQ, mQv, mK, mV)]
+        # O and o_lo: strides aligned to the 256-bit epilogue stores (the pointers arrive
+        # 32-B aligned: see o_store_bits)
         mO, mOlo = [
-            cute.make_tensor(
-                cute.make_ptr(
-                    mX.element_type,
-                    mX.iterator.toint(),
-                    cute.AddressSpace.gmem,
-                    assumed_align=self.o_store_bits // 8,
-                ),
-                cute.make_layout(mX.shape, stride=new_stride(mX, self.o_store_bits)),
-            )
-            if mX is not None
-            else None
-            for mX in (mO, mOlo)
+            assume_tensor_aligned(mX, align_bits=self.o_store_bits) for mX in (mO, mOlo)
         ]
         # (b, s, h, d) -> (s, d, h, b), or packed (total, h, d) -> (total, d, h)
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]

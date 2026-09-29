@@ -942,8 +942,8 @@ def test_flash_attn_mla_1cta_sparse_fwd(nheads, has_qk, causal, seqlen_q, seqlen
 def test_flash_attn_mla_1cta_sparse_kb64(has_qk, causal, topk, gen, monkeypatch):
     """The 64-key-block mainloop (64 heads) against the 2CTA kernel on the same inputs: the
     bf16-rounding contract, bitwise run-to-run, O = 0 / LSE = -inf on rows with no valid
-    slot, and an output view that is only 16-B aligned (128-bit epilogue stores instead of
-    256-bit) bitwise equal to the aligned one."""
+    slot. Its 256-bit O stores need 32-B aligned rows: a caller's `out` that is only 16-B
+    aligned is rejected."""
     if not IS_SM100:
         pytest.skip()
     if not _mla_kb64_active(64):
@@ -957,13 +957,6 @@ def test_flash_attn_mla_1cta_sparse_kb64(has_qk, causal, topk, gen, monkeypatch)
     # every variant first (fake mode compiles them all, then returns)
     out, lse = flash_attn_func(**kw)
     out_again, lse_again = flash_attn_func(**kw)
-    if has_qk:
-        # 16-B (not 32-B) aligned out: the 128-bit store epilogue (the interface reads the
-        # alignment from the storage offset in fake mode, so pass 1 compiles this variant too)
-        buf = torch.empty(out.numel() + 8, device="cuda", dtype=out.dtype)
-        out_unaligned = buf[8:].view_as(out)
-        _flash_attn_fwd(kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
-                        causal=causal, out=out_unaligned, return_lse=True)
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
     out_2cta, lse_2cta = flash_attn_func(**kw)
     if is_fake_mode():
@@ -972,8 +965,14 @@ def test_flash_attn_mla_1cta_sparse_kb64(has_qk, causal, topk, gen, monkeypatch)
     valid = _topk_valid_rows(idx, s_q, s_k, causal)
     assert (out[~valid] == 0).all() and torch.isneginf(lse[~valid]).all()
     if has_qk:
+        # the alignment check reads the data pointer: real tensors only
+        buf = torch.empty(out.numel() + 8, device="cuda", dtype=out.dtype)
+        out_unaligned = buf[8:].view_as(out)
         assert out_unaligned.data_ptr() % 32 == 16
-        assert torch.equal(out_unaligned, out), "128-bit vs 256-bit O stores differ"
+        monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "1")
+        with pytest.raises(AssertionError, match="out must have aligned strides"):
+            _flash_attn_fwd(kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
+                            causal=causal, out=out_unaligned, return_lse=True)
     _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "kb64 vs 2CTA")
 
 

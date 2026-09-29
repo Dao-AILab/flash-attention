@@ -57,6 +57,8 @@ class FlashAttentionMLAForwardSm100:
     # local memory on the sparse forward; -O2 removes it (32 B), median +15-17% on GB300
     # (AI/SPARSE_MLA_1CTA.md, "ptxas -O2").
     ptxas_options = "-O2"
+    # sparse MLA: a token's heads padded to one 128-row (2-CTA) tile
+    SPARSE_HEAD_TILE = 128
 
     def __init__(
         self,
