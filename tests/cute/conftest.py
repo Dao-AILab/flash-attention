@@ -94,6 +94,10 @@ def _shared_gpu_ids(tmp: Path, worker_num: int) -> list:
 #   FLASH_ATTENTION_TEST_RECORD_KEYS=path  append every compile-cache lookup (cache name, key)
 #                                          to path.<worker>: the set of kernels a selection
 #                                          compiles, for diffing across refactors / test tiers.
+#   FLASH_ATTENTION_TEST_RECORD_KEYS_ONLY=1  with RECORD_KEYS and FLASH_ATTENTION_FAKE_TENSOR=1:
+#                                          every lookup reports a hit, so nothing compiles
+#                                          (a key snapshot in minutes; compile errors are
+#                                          left to the real two-pass run).
 # ---------------------------------------------------------------------------------------------
 _COMPILES = {"n": 0}
 _EXPECT_CACHED = os.environ.get("FLASH_ATTENTION_TEST_EXPECT_CACHED", "0") == "1"
@@ -127,13 +131,28 @@ def _install_compile_instrumentation(config):
         out = open(f"{record_path}.{os.environ.get('PYTEST_XDIST_WORKER', 'main')}", "a")
         original_contains = cache_utils.JITCache.__contains__
 
+        keys_only = (
+            os.environ.get("FLASH_ATTENTION_TEST_RECORD_KEYS_ONLY", "0") == "1"
+            and os.environ.get("FLASH_ATTENTION_FAKE_TENSOR", "0") == "1"
+        )
+
         def recording_contains(self, key):
             out.write(f"{names.get(id(self), type(self).__name__)}\t{key!r}\n")
             out.flush()
-            return original_contains(self, key)
+            return True if keys_only else original_contains(self, key)
 
         recording_contains._fa_recorded = True
         cache_utils.JITCache.__contains__ = recording_contains
+        if keys_only:
+            original_getitem = cache_utils.JITCache.__getitem__
+
+            def noop_getitem(self, key):
+                try:
+                    return original_getitem(self, key)
+                except KeyError:
+                    return lambda *args, **kwargs: None
+
+            cache_utils.JITCache.__getitem__ = noop_getitem
 
 
 @pytest.hookimpl(hookwrapper=True)
