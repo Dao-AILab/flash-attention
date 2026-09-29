@@ -591,11 +591,16 @@ forces 1CTA wherever it is supported; `0` forces 2CTA.
 - **Sparse:** 1CTA whenever supported (<= 64 Q heads per KV head; training only with
   recompute-P), once 2CTA exceeds one wave: `2 x total_q x KV heads > num SMs`. A 2CTA sparse
   tile is one token's heads padded to 128 rows, so 2 CTAs per token. See "One-wave crossover".
-- **Dense:** 1CTA on decode shapes, `seqlen_q x heads per KV head <= 64`: one 64-row tile per
-  KV head, i.e. the kb64 mainloop with split-KV. 2CTA otherwise. Varlen without a host
-  `max_seqlen_q` counts as prefill.
-- **Dense decode without split-KV (`num_splits == 1`):** 1CTA only once 2CTA exceeds one wave,
-  `2 x batch x KV heads > num SMs`. See "Unsplit decode crossover".
+- **Dense with the split heuristic (`num_splits=0`):** planned for 1CTA first, at any shape:
+  the split count comes from the 1CTA kernel's split heuristic. 1CTA is kept if that gives at
+  least 2 splits on the kb64 mainloop (<= 64 rows per KV head), or at least 5 on the 128-key
+  mainloop (65-128 rows). Otherwise the call is decided again as unsplit (next item) and
+  re-planned. The 2CTA MLA kernel never splits (hdimv 512). See "Auto split: 1CTA split vs
+  2CTA".
+- **Dense without split-KV (`num_splits == 1`, or the fallback above):** 1CTA on decode shapes,
+  `seqlen_q x heads per KV head <= 64` (one 64-row tile per KV head), and only once 2CTA
+  exceeds one wave, `2 x batch x KV heads > num SMs`; 2CTA otherwise. Varlen without a host
+  `max_seqlen_q` counts as prefill. See "One-wave crossover".
 
 Measured (`agent_space/bench_dispatch.py`, `agent_space/bench_sparse_1cta/dispatch.csv`;
 GB300, bf16, cold L2):
@@ -617,9 +622,45 @@ Where it is right:
 - **Dense prefill.**
 - **Sparse at about one wave of tiles and above**, and sparse prefill (1.6x).
 
-Where it is wrong:
-- **Small-batch 128-row dense decode**, which it leaves on 2CTA. There 1CTA with split is
-  about 3-4x faster; the `<= 64` boundary is conservative.
+Small-batch 128-row dense decode, left on 2CTA by the first version of the rule (1CTA split
+is 3-4x faster there), now goes 1CTA through the auto-split planning below.
+
+### Auto split: 1CTA split vs 2CTA
+
+With `num_splits=0` the split count is sized for the 1CTA kernel: `num_SMs // tiles`, capped
+by key blocks (kb64: 4 blocks per split). Whether a split count pays off depends on the
+mainloop (`agent_space/bench_dispatch_auto_split_fine.py`,
+`bench_sparse_1cta/dispatch_auto_split_fine.csv`; GB300, bf16, dense decode, one KV head,
+cold L2, medians of 3 interleaved runs):
+
+| rows / KV head (mainloop) | 1CTA splits | s_k 8K: 1CTA / 2CTA | s_k 32K: 1CTA / 2CTA |
+|---|---|---|---|
+| 128 (128-key), b 1-16 | 64-9 | 0.34-0.86x | 0.17-0.61x |
+| 128 (128-key), b24 | 6 | 1.05x | **0.82x** |
+| 128 (128-key), b32 | 4 | 1.28x | 1.12x |
+| 128 (128-key), b48 / b64 | 3 / 2 | 1.50x / 1.80x | 1.37x / 1.75x |
+| 64 (kb64), h64, b 16-64 | 9-2 | 0.50-0.99x | 0.35-0.90x |
+| 64 (kb64), h64, b76 | 2 | 1.035x | 0.94x |
+| 128 as 2 x 64 (kb64, h64 x 2), b 8-38 | 9-2 | 0.44-0.93x | 0.26-0.82x |
+
+- **kb64:** with 2 splits it already matches 2CTA, which spends 2 CTAs on each (half-empty)
+  64-row tile.
+- **128-key mainloop:** 2CTA covers a full 128-row tile with 2 CTAs at about twice the per-CTA
+  rate, so 1CTA needs about 3x the CTAs, i.e. 5 or more splits (the split count jumps
+  6 -> 4 between b24 and b32). The rule's worst case is 1.05x, at b24 / 8K.
+
+End to end (`agent_space/bench_dispatch_auto_split.py`,
+`bench_sparse_1cta/dispatch_auto_split.csv`): with `FLASH_ATTENTION_MLA_1CTA` unset and
+`num_splits=0`, the auto route is within 1% of the faster kernel on every shape:
+- dense decode 128 heads, b 1-256;
+- 64 heads x 1-2 tokens;
+- prefill 256-4096 tokens (2CTA: one split).
+
+Hot (CUDA graph replay, warm L2; `HOT=1`, `bench_sparse_1cta/dispatch_auto_split_hot.csv`)
+agrees: within 1% everywhere except the b24 / 8K boundary case (1.06x).
+
+When the re-planned 2CTA path is taken, the second planning pass costs about 12 us of host
+time per call.
 
 ### One-wave crossover (dense unsplit decode, sparse)
 

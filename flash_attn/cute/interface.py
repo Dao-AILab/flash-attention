@@ -6,7 +6,7 @@ import math
 import operator
 import warnings
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Optional, Tuple, Callable
 
 import torch
@@ -588,7 +588,7 @@ _compute_blocks_to_batch.compile_cache = get_jit_cache("blocks_to_batch")
 
 def _mla_1cta_route(
     is_topk_gather, nheads_per_kv, requires_grad, gather_bwd_recompute_p, *,
-    seqlen_q_hint, needs_1cta, split_kv=True, ctas_2cta=None, num_sms=None,
+    seqlen_q_hint, needs_1cta, split_kv=False, ctas_2cta=None, num_sms=None,
 ):
     """Whether an MLA call runs the 1CTA (tcgen05.mma.ws) kernel rather than the 2CTA one.
 
@@ -607,12 +607,14 @@ def _mla_1cta_route(
         it 2CTA needs a second wave, which nearly doubles its time, and 1CTA wins. The
         measured crossover (152 SMs) is 76 -> 80 tokens / batch at 64 and 16 heads alike.
       - sparse -> 1CTA whenever supported (<= 64 heads) past one 2CTA wave;
-      - dense -> 1CTA on decode shapes, seqlen_q x heads per KV head <= 64 (one 64-row tile per
-        KV head: the kb64 mainloop with split-KV, which beats the unsplit 2CTA kernel even at
-        low occupancy); 2CTA for prefill, where its 2-CTA MMA wins. Varlen without a host
-        max_seqlen_q counts as prefill.
-      - dense decode without split-KV (num_splits == 1) -> 1CTA past one 2CTA wave (with
-        split-KV 1CTA wins at every batch).
+      - dense with the split heuristic (split_kv: num_splits < 1) -> 1CTA, provisionally, at
+        any shape: the caller sizes the split with the 1CTA kernel's heuristic and, if that
+        picks too few splits (below 2 on the kb64 mainloop, 5 on the 128-key mainloop; the
+        2CTA MLA kernel never splits), decides again with split_kv=False. Split-KV 1CTA beats
+        unsplit 2CTA even at low occupancy; prefill gets one split and goes on below.
+      - dense without split-KV -> 1CTA on decode shapes (seqlen_q x heads per KV head <= 64,
+        one 64-row tile per KV head) past one 2CTA wave; 2CTA otherwise, including prefill,
+        where its 2-CTA MMA wins. Varlen without a host max_seqlen_q counts as prefill.
     FLASH_ATTENTION_MLA_1CTA=1 / 0 overrides the heuristic (1: wherever supported; 0: never).
     """
     supported = not is_topk_gather or (
@@ -628,9 +630,11 @@ def _mla_1cta_route(
     past_one_wave = ctas_2cta is None or num_sms is None or ctas_2cta > num_sms
     if is_topk_gather:
         return past_one_wave
+    if split_kv:
+        return True
     if seqlen_q_hint is None or seqlen_q_hint * nheads_per_kv > 64:
         return False
-    return split_kv or past_one_wave
+    return past_one_wave
 
 
 def _flash_attn_fwd(
@@ -816,7 +820,8 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
     # MLA (qv): the 1CTA kernel (opt-in, see _mla_1cta_route) or the 2CTA kernel. Decided here:
     # the sparse head padding below and the split-KV heuristics in _get_fwd_config depend on it.
-    mla_1cta = qv is not None and _mla_1cta_route(
+    mla_route = partial(
+        _mla_1cta_route,
         gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p,
         # the host-side max seqlen_q (a varlen max_seqlen_q tensor gives no hint)
         seqlen_q_hint=(
@@ -828,11 +833,14 @@ def _flash_attn_fwd(
             or any(t is not None for t in (q_descale, k_descale, v_descale))
             or num_splits > 1
         ),
-        split_kv=num_splits != 1,
         # 2CTA tiles: one per token (sparse) or per batch element (dense decode), 2 CTAs each
         ctas_2cta=2 * num_head_kv * (total_q if gather_kv_indices is not None else batch_size),
         num_sms=get_num_sms_for_selection(v.device.index, arch),
     )
+    # num_splits < 1 (the split heuristic): provisionally 1CTA, re-decided below if its split
+    # heuristic picks a single split
+    num_splits_auto = num_splits < 1
+    mla_1cta = qv is not None and mla_route(split_kv=num_splits_auto)
     # Sparse MLA pads a token's heads to the kernel's tile (pack_gqa.qheads_first_tma_view); the
     # kernel takes the real count, the interface needs the tile width for its grid math.
     nheads_per_kv = qhead_per_kvhead
@@ -975,33 +983,7 @@ def _flash_attn_fwd(
 
     # the host-side max seqlen_q, where known (varlen needs a max_seqlen_q hint)
     seqlen_q_hint = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
-    # The 1CTA kernel's 64-key-block mainloop (flash_fwd_mla_1cta_kb64_sm100) where it applies,
-    # else its 128-key mainloop. Decided here: kb64's split heuristic counts its 64-row tiles.
     Kb64 = FlashAttentionMLAForward1CtaKb64Sm100
-    mla_1cta_kb64 = mla_1cta and Kb64.can_implement(
-        is_topk_gather=gather_kv_indices is not None,
-        nheads_per_kv=nheads_per_kv,
-        num_head_kv=num_head_kv,
-        is_fp8=is_fp8,
-        hdim=head_dim,
-        hdimv=head_dim_v,
-        has_qk=q is not None,
-        seqlen_q_hint=seqlen_q_hint,
-        has_extensions=bool(
-            local or softcap is not None or score_mod is not None or mask_mod is not None
-            or block_sparse_tensors is not None
-        ),
-    )
-    mla_1cta_kb64_dense = mla_1cta_kb64 and gather_kv_indices is None
-    mla_fwd_cls = (
-        None if qv is None
-        else Kb64 if mla_1cta_kb64
-        else FlashAttentionMLAForward1CtaSm100 if mla_1cta
-        else FlashAttentionMLAForwardSm100
-    )
-    if mla_1cta_kb64 and out_provided:
-        # its 256-bit O stores need 32-B aligned rows (buffers allocated here already are)
-        validate_output_layout(out, "out", align_bytes=32)
 
     if gather_kv_indices is not None:
         # Split-KV is not supported for sparse MLA (either kernel). Reject an explicit
@@ -1013,32 +995,75 @@ def _flash_attn_fwd(
                 "(sparse MLA runs without split-KV)"
             )
         num_splits = 1
-    fwd_cfg = _get_fwd_config(
-        arch=arch,
-        head_dim=head_dim,
-        head_dim_v=head_dim_v,
-        causal=causal,
-        local=local,
-        window_size_left=window_size_left,
-        window_size_right=window_size_right,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        # the dense kb64 tile is one token (heads padded to 64)
-        qhead_per_kvhead=Kb64.TILE_MN[0] if mla_1cta_kb64_dense else qhead_per_kvhead,
-        pack_gqa=pack_gqa or mla_1cta_kb64_dense,
-        batch_size=batch_size,
-        num_head_kv=num_head_kv,
-        num_splits=num_splits,
-        device=device,
-        seqlen_q=seqlen_q,
-        tile_mn=Kb64.TILE_MN if mla_1cta_kb64_dense and tile_mn is None else tile_mn,
-        block_sparse_tensors=block_sparse_tensors,
-        mma_pv_is_rs=mma_pv_is_rs,
-        intra_wg_overlap=intra_wg_overlap,
-        mla_1cta=mla_1cta,
-        single_q_stage=mla_1cta_kb64_dense,
-        min_blocks_per_split=Kb64.MIN_BLOCKS_PER_SPLIT if mla_1cta_kb64_dense else 1,
-    )
+
+    def plan(mla_1cta):
+        # The 1CTA kernel's 64-key-block mainloop (flash_fwd_mla_1cta_kb64_sm100) where it
+        # applies, else its 128-key mainloop; kb64's split heuristic counts its 64-row tiles.
+        mla_1cta_kb64 = mla_1cta and Kb64.can_implement(
+            is_topk_gather=gather_kv_indices is not None,
+            nheads_per_kv=nheads_per_kv,
+            num_head_kv=num_head_kv,
+            is_fp8=is_fp8,
+            hdim=head_dim,
+            hdimv=head_dim_v,
+            has_qk=q is not None,
+            seqlen_q_hint=seqlen_q_hint,
+            has_extensions=bool(
+                local or softcap is not None or score_mod is not None or mask_mod is not None
+                or block_sparse_tensors is not None
+            ),
+        )
+        mla_1cta_kb64_dense = mla_1cta_kb64 and gather_kv_indices is None
+        mla_fwd_cls = (
+            None if qv is None
+            else Kb64 if mla_1cta_kb64
+            else FlashAttentionMLAForward1CtaSm100 if mla_1cta
+            else FlashAttentionMLAForwardSm100
+        )
+        fwd_cfg = _get_fwd_config(
+            arch=arch,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            causal=causal,
+            local=local,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            # the dense kb64 tile is one token (heads padded to 64)
+            qhead_per_kvhead=Kb64.TILE_MN[0] if mla_1cta_kb64_dense else qhead_per_kvhead,
+            pack_gqa=pack_gqa or mla_1cta_kb64_dense,
+            batch_size=batch_size,
+            num_head_kv=num_head_kv,
+            num_splits=num_splits,
+            device=device,
+            seqlen_q=seqlen_q,
+            tile_mn=Kb64.TILE_MN if mla_1cta_kb64_dense and tile_mn is None else tile_mn,
+            block_sparse_tensors=block_sparse_tensors,
+            mma_pv_is_rs=mma_pv_is_rs,
+            intra_wg_overlap=intra_wg_overlap,
+            mla_1cta=mla_1cta,
+            single_q_stage=mla_1cta_kb64_dense,
+            min_blocks_per_split=Kb64.MIN_BLOCKS_PER_SPLIT if mla_1cta_kb64_dense else 1,
+        )
+        return mla_1cta_kb64, mla_1cta_kb64_dense, mla_fwd_cls, fwd_cfg
+
+    mla_1cta_kb64, mla_1cta_kb64_dense, mla_fwd_cls, fwd_cfg = plan(mla_1cta)
+    # 1CTA split beats 2CTA (which never splits at hdimv 512) from 2 splits on the kb64
+    # kernel, but from about 5 on the 128-key kernel: 2CTA covers a 128-row tile with 2 CTAs
+    # at about twice the per-CTA rate (AI/SPARSE_MLA_1CTA.md "Dispatch heuristic")
+    min_splits_1cta = 2 if mla_1cta_kb64_dense else 5
+    if (
+        mla_1cta and num_splits_auto and gather_kv_indices is None
+        and fwd_cfg.num_splits < min_splits_1cta
+    ):
+        # too few splits for 1CTA to pay off: decide again as for num_splits=1
+        mla_1cta = mla_route(split_kv=False)
+        if not mla_1cta:
+            mla_1cta_kb64, mla_1cta_kb64_dense, mla_fwd_cls, fwd_cfg = plan(False)
+    if mla_1cta_kb64 and out_provided:
+        # its 256-bit O stores need 32-B aligned rows (buffers allocated here already are)
+        validate_output_layout(out, "out", align_bytes=32)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     q_stage = fwd_cfg.q_stage
     num_splits = fwd_cfg.num_splits
