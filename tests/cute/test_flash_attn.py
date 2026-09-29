@@ -2790,6 +2790,33 @@ def test_flash_attn_fp8_paged_decode_preserves_tail_mass():
     torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.1)
 
 
+@pytest.mark.skipif(not IS_SM100, reason="FP8 descales are SM100-only")
+@pytest.mark.parametrize("present", ["q", "k", "v", "qk", "qv", "kv"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_partial_descales(present):
+    """Any subset of q / k / v descales: a missing one is 1. The partial DescaleTensors must
+    keep each member in its own slot across the kernel boundary (bitwise equal to passing
+    ones for the missing members)."""
+    torch.manual_seed(0)
+    batch_size, seqlen, nheads, nheads_kv, d = 2, 192, 4, 2, 128
+    q, k, v = [
+        torch.randn(batch_size, seqlen, h, d, device="cuda").to(torch.float8_e4m3fn)
+        for h in (nheads, nheads_kv, nheads_kv)
+    ]
+    descales = {name: torch.rand(batch_size, nheads_kv, device="cuda") + 0.5 for name in "qkv"}
+    ones = torch.ones(batch_size, nheads_kv, device="cuda")
+    out = _flash_attn_fwd(
+        q, k, v, causal=True, **{f"{n}_descale": descales[n] for n in present}
+    )[0]
+    out_ref = _flash_attn_fwd(
+        q, k, v, causal=True,
+        **{f"{n}_descale": descales[n] if n in present else ones for n in "qkv"},
+    )[0]
+    if is_fake_mode():
+        return
+    assert torch.equal(out, out_ref)
+
+
 @pytest.mark.parametrize("page_size", [16, 64, 256])
 @pytest.mark.parametrize("seqlen_q", [64, 128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)

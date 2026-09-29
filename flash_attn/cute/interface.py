@@ -1203,17 +1203,6 @@ def _flash_attn_fwd(
                 "the softmax scale"
             )
         assert tile_n == (64 if mla_1cta_kb64_dense else 128)
-        if mla_1cta and (q_descale is not None or k_descale is not None
-                         or v_descale is not None):
-            # Fill in any missing descales with ones: a partially-filled DescaleTensors
-            # shifts positionally when it crosses the MLIR boundary
-            # (__new_from_mlir_values__ pads the TAIL with None), which would silently
-            # drop a member. All-three-or-none keeps the marshalling unambiguous.
-            ones = torch.ones(batch_size, num_head_kv, dtype=torch.float32,
-                              device=v.device)
-            q_descale = ones if q_descale is None else q_descale
-            k_descale = ones if k_descale is None else k_descale
-            v_descale = ones if v_descale is None else v_descale
 
         assert not is_split_kv or mla_1cta, (
             "split kv with qv is only supported by the 1CTA MLA kernel "

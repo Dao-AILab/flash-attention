@@ -810,6 +810,33 @@ def test_flash_attn_mla_1cta_fp8_descales_must_be_shared():
         )
 
 
+@pytest.mark.parametrize("present", ["q", "kv"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_1cta_fp8_partial_descales(present, monkeypatch):
+    """q_descale alone or the shared k / v descale alone: a missing one is 1 (bitwise equal
+    to passing ones), with no member shifting slots across the kernel boundary."""
+    if not IS_SM100:
+        pytest.skip()
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "1")  # fp8 MLA is 1CTA-only
+    q, qv, k, v, q_descale, kv_descale, sink = _mla_1cta_fp8_inputs()
+    ones = torch.ones_like(q_descale)
+
+    def call(qd, kvd):
+        return _flash_attn_fwd(
+            q, k, v, qv=qv, causal=True, learnable_sink=sink,
+            q_descale=qd, k_descale=kvd, v_descale=kvd, return_lse=True,
+        )[:2]
+
+    if present == "q":
+        (out, lse), (out_ref, lse_ref) = call(q_descale, None), call(q_descale, ones)
+    else:
+        (out, lse), (out_ref, lse_ref) = call(None, kv_descale), call(ones, kv_descale)
+    if is_fake_mode():
+        return
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
 def rect_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, causal, device, *,
                       fill_frac=1.0, shuffle_slots=True, oob_frac=0.0, seed=0):
     """Top-k index lists for rectangular (s_q != s_k) sparse attention tests.

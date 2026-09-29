@@ -135,7 +135,9 @@ class DescaleTensors(NamedTuple):
     v_descale: Optional[cute.Tensor] = None
 
     def __new_from_mlir_values__(self, values):
-        return DescaleTensors(*((*values, None, None, None)[:3]))
+        # only the present members were extracted: put each value back in its own slot
+        values = iter(values)
+        return DescaleTensors(*(None if t is None else next(values) for t in self))
 
 
 class FlashAttentionForwardSm100:

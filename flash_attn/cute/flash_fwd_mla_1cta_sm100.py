@@ -2756,29 +2756,19 @@ class FlashAttentionMLAForward1CtaSm100:
         accumulator: S = qd*kd*(Q@K^T) + qd*vd*(Qv@V^T). Folding a single scale into
         softmax is therefore only valid when kd == vd, which the interface enforces
         (natural for MLA: the rope-K and latent-V halves live in one quantized cache).
-        We fold qd*vd; v_descale is additionally applied to O in the epilogue.
-
-        All three members must be present when the struct is: `DescaleTensors`
-        round-trips through MLIR via `__new_from_mlir_values__`, which pads the *tail*
-        with None -- so a partially-filled struct (e.g. q and v set, k None) arrives
-        positionally shifted (v lands in the k slot) and silently loses v_descale. The
-        interface normalizes to all-three-or-none for this path.
+        We fold qd*vd; v_descale is additionally applied to O in the epilogue. A missing
+        member is 1.
         """
         qk_descale = Float32(1.0)
         v_descale = Float32(1.0)
         if const_expr(descale_tensors is not None):
-            assert (
-                descale_tensors.q_descale is not None
-                and descale_tensors.k_descale is not None
-                and descale_tensors.v_descale is not None
-            ), (
-                "the MLA kernel needs all three descales present (see docstring: "
-                "partially-filled DescaleTensors shift positionally across MLIR)"
-            )
             head_idx_kv = self._kv_head_idx(head_idx)
-            v_descale = Float32(descale_tensors.v_descale[batch_idx, head_idx_kv])
-            # k_descale == v_descale is enforced host-side, so folding either is the same
-            qk_descale = Float32(descale_tensors.q_descale[batch_idx, head_idx_kv]) * v_descale
+            if const_expr(descale_tensors.v_descale is not None):
+                # k_descale == v_descale is enforced host-side, so folding either is the same
+                v_descale = Float32(descale_tensors.v_descale[batch_idx, head_idx_kv])
+                qk_descale = v_descale
+            if const_expr(descale_tensors.q_descale is not None):
+                qk_descale = qk_descale * Float32(descale_tensors.q_descale[batch_idx, head_idx_kv])
         return qk_descale, v_descale
 
     @cute.jit
