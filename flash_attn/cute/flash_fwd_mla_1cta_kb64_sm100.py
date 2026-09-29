@@ -169,7 +169,6 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             use_clc_scheduler=use_clc_scheduler,
             has_qk=has_qk,
             pack_gqa=True,
-            q_in_tmem=True,
             has_seqused_q=has_seqused_q,
             has_cu_seqlens_q=has_cu_seqlens_q,
             # cp.async: the gather warps 12-15 (16 warps); TMA: the load warp (12 warps)

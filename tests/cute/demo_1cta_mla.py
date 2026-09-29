@@ -179,7 +179,7 @@ def demo_direct():
 
     fa = FlashAttentionMLAForward1CtaSm100(
         is_causal=False, qhead_per_kvhead=h // hk, nheads_kv=hk,
-        hdim=HDIM, hdimv=HDIMV, has_qk=True, pack_gqa=True, q_in_tmem=True,
+        hdim=HDIM, hdimv=HDIMV, has_qk=True, pack_gqa=True,
     )
     cvt = lambda t: from_dlpack(t.detach(), assumed_align=16)  # noqa: E731
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)

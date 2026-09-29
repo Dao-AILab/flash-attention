@@ -1614,7 +1614,6 @@ def _flash_attn_fwd(
                             use_clc_scheduler=mla_1cta_use_clc,
                             has_qk=has_qk,
                             pack_gqa=pack_gqa,
-                            q_in_tmem=True,
                             has_seqused_q=seqused_q is not None,
                             has_cu_seqlens_q=cu_seqlens_q is not None,
                             use_cpasync_load_KV=paged_kv_cpasync or sparse_kv,
