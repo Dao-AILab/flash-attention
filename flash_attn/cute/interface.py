@@ -421,8 +421,6 @@ def _get_fwd_config(
         assert num_splits == 1, "SM120 forward only supports num_splits=1"
     elif num_splits < 1:
         num_SMs = get_num_sms_for_selection(device.index, arch)
-        # a kernel may want several key blocks per split (the 1CTA kb64 MLA kernel:
-        # FlashAttentionMLAForward1CtaKb64Sm100.MIN_BLOCKS_PER_SPLIT)
         max_splits = (
             min(128, max(1, num_n_blocks // min_blocks_per_split))
             if min_blocks_per_split > 1
@@ -432,8 +430,7 @@ def _get_fwd_config(
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128).
-    # The 1CTA MLA kernel is exempt: it stores O_partial straight from registers
-    # (use_tma_O is off under split), so fp32 partials cost it no shared memory.
+    # The 1CTA MLA kernel is exempt: it stores fp32 O partials straight from registers.
     if (
         arch // 10 in [10, 11]
         and head_dim != head_dim_v
@@ -592,30 +589,19 @@ def _mla_1cta_route(
 ):
     """Whether an MLA call runs the 1CTA (tcgen05.mma.ws) kernel rather than the 2CTA one.
 
-    Support: sparse (top-k) MLA runs on 1CTA up to 64 Q heads (one 64-row tile per token;
-    more heads would need two tiles, each re-gathering the same indices, which the 2CTA
-    kernel avoids), and for training only with the recompute-P backward (the 1CTA forward
-    emits no P / row_max). Dense MLA is supported at any shape.
+    Support: dense MLA at any shape; sparse up to 64 Q heads (one 64-row tile per token),
+    training only with recompute-P (the 1CTA forward emits no P / row_max).
 
-    Heuristic (AI/SPARSE_MLA_1CTA.md, "Dispatch heuristic"; broadly right, not per shape):
-      - needs_1cta (fp8, descales, explicit split-KV: the 2CTA MLA kernel has none) -> 1CTA;
-      - one-wave rule. A 2CTA tile holds one token's heads (sparse), or one batch element's
-        decode rows (dense), padded to 128 rows -- half a 2-CTA cluster's tile at 64 heads.
-        So 2CTA launches ctas_2cta = 2 x tokens (sparse) or 2 x batch (dense decode) CTAs,
-        x KV heads, against 1CTA's one CTA per token. Below one wave of num_sms the wasted
-        half costs nothing on these memory-bound shapes and the 2CTA kernel is faster; past
-        it 2CTA needs a second wave, which nearly doubles its time, and 1CTA wins. The
-        measured crossover (152 SMs) is 76 -> 80 tokens / batch at 64 and 16 heads alike.
-      - sparse -> 1CTA whenever supported (<= 64 heads) past one 2CTA wave;
-      - dense with the split heuristic (split_kv: num_splits < 1) -> 1CTA, provisionally, at
-        any shape: the caller sizes the split with the 1CTA kernel's heuristic and, if that
-        picks too few splits (below 2 on the kb64 mainloop, 5 on the 128-key mainloop; the
-        2CTA MLA kernel never splits), decides again with split_kv=False. Split-KV 1CTA beats
-        unsplit 2CTA even at low occupancy; prefill gets one split and goes on below.
-      - dense without split-KV -> 1CTA on decode shapes (seqlen_q x heads per KV head <= 64,
-        one 64-row tile per KV head) past one 2CTA wave; 2CTA otherwise, including prefill,
-        where its 2-CTA MMA wins. Varlen without a host max_seqlen_q counts as prefill.
-    FLASH_ATTENTION_MLA_1CTA=1 / 0 overrides the heuristic (1: wherever supported; 0: never).
+    Heuristic (measurements: AI/SPARSE_MLA_1CTA.md "Dispatch heuristic"):
+      - fp8, descales or explicit split-KV (needs_1cta; 2CTA has none) -> 1CTA.
+      - One-wave rule: 2CTA spends 2 CTAs on each token (sparse) or batch element (dense
+        decode), ctas_2cta in all; 1CTA beats it only once that exceeds one wave of num_sms.
+      - Sparse -> the one-wave rule.
+      - Dense with the split heuristic (split_kv) -> 1CTA provisionally: the caller sizes the
+        split for 1CTA and asks again with split_kv=False if that gives too few splits.
+      - Dense unsplit -> the one-wave rule on decode shapes (seqlen_q x heads per KV head
+        <= 64), else 2CTA. Varlen without a host max_seqlen_q counts as prefill.
+    FLASH_ATTENTION_MLA_1CTA=1 / 0 overrides it (1: wherever supported; 0: never).
     """
     supported = not is_topk_gather or (
         nheads_per_kv <= 64 and (not requires_grad or gather_bwd_recompute_p)
@@ -704,8 +690,7 @@ def _flash_attn_fwd(
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
-    # MLA absorbed requires K and V to share one descale tensor (see the qv checks below).
-    # Check identity before normalizing: maybe_contiguous may copy each argument separately.
+    # MLA needs K and V to share one descale tensor: check identity before maybe_contiguous
     kv_descale_shared = k_descale is not None and k_descale is v_descale
     q_descale, k_descale, v_descale = [
         maybe_contiguous(t, align_bytes=4) for t in (q_descale, k_descale, v_descale)
@@ -818,16 +803,17 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
-    # MLA (qv): the 1CTA kernel (opt-in, see _mla_1cta_route) or the 2CTA kernel. Decided here:
-    # the sparse head padding below and the split-KV heuristics in _get_fwd_config depend on it.
+    # the host-side max seqlen_q, where known (a varlen max_seqlen_q tensor gives none)
+    seqlen_q_hint = (
+        seqlen_q if cu_seqlens_q is None
+        else None if torch.is_tensor(max_seqlen_q) else max_seqlen_q
+    )
+    # MLA (qv): 1CTA or 2CTA kernel. Decided here: the sparse head padding below and the
+    # split-KV heuristic in _get_fwd_config depend on it.
     mla_route = partial(
         _mla_1cta_route,
         gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p,
-        # the host-side max seqlen_q (a varlen max_seqlen_q tensor gives no hint)
-        seqlen_q_hint=(
-            seqlen_q if cu_seqlens_q is None
-            else max_seqlen_q if isinstance(max_seqlen_q, int) else None
-        ),
+        seqlen_q_hint=seqlen_q_hint,
         needs_1cta=(
             v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             or any(t is not None for t in (q_descale, k_descale, v_descale))
@@ -837,8 +823,7 @@ def _flash_attn_fwd(
         ctas_2cta=2 * num_head_kv * (total_q if gather_kv_indices is not None else batch_size),
         num_sms=get_num_sms_for_selection(v.device.index, arch),
     )
-    # num_splits < 1 (the split heuristic): provisionally 1CTA, re-decided below if its split
-    # heuristic picks a single split
+    # num_splits < 1 (the split heuristic): 1CTA provisionally, re-decided after planning
     num_splits_auto = num_splits < 1
     mla_1cta = qv is not None and mla_route(split_kv=num_splits_auto)
     # Sparse MLA pads a token's heads to the kernel's tile (pack_gqa.qheads_first_tma_view); the
@@ -949,9 +934,8 @@ def _flash_attn_fwd(
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
-        # Bound each sequence by its page-table row, not the shared pool. The 1CTA MLA kernel
-        # uses max_seqlen_k only for the split-KV heuristic, which the pool size would inflate
-        # (e.g. 6 splits over 2 key blocks).
+        # Bound by the page-table row, not the shared pool, which would inflate the 1CTA MLA
+        # split-KV heuristic (e.g. 6 splits over 2 key blocks).
         max_seqlen_k = (
             page_table.shape[1] * page_size
             if (use_dedicated_hd256_kernel or (mla_1cta and qv is not None))
@@ -981,14 +965,10 @@ def _flash_attn_fwd(
         page_table = page_table[:, :required_pages]
         max_seqlen_k = required_pages * page_size
 
-    # the host-side max seqlen_q, where known (varlen needs a max_seqlen_q hint)
-    seqlen_q_hint = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
     Kb64 = FlashAttentionMLAForward1CtaKb64Sm100
 
     if gather_kv_indices is not None:
-        # Split-KV is not supported for sparse MLA (either kernel). Reject an explicit
-        # request here, before _get_fwd_config: its diff-headdim rule would otherwise
-        # silently turn num_splits > 1 into 1 on the 2CTA route.
+        # before _get_fwd_config, whose diff-headdim rule would silently drop it on 2CTA
         if num_splits > 1:
             raise ValueError(
                 f"num_splits={num_splits} is not supported with gather_kv_indices "
@@ -997,8 +977,8 @@ def _flash_attn_fwd(
         num_splits = 1
 
     def plan(mla_1cta):
-        # The 1CTA kernel's 64-key-block mainloop (flash_fwd_mla_1cta_kb64_sm100) where it
-        # applies, else its 128-key mainloop; kb64's split heuristic counts its 64-row tiles.
+        # 1CTA: the kb64 mainloop where it applies (its split heuristic counts 64-row
+        # tiles), else the 128-key one
         mla_1cta_kb64 = mla_1cta and Kb64.can_implement(
             is_topk_gather=gather_kv_indices is not None,
             nheads_per_kv=nheads_per_kv,
@@ -1049,15 +1029,13 @@ def _flash_attn_fwd(
         return mla_1cta_kb64, mla_1cta_kb64_dense, mla_fwd_cls, fwd_cfg
 
     mla_1cta_kb64, mla_1cta_kb64_dense, mla_fwd_cls, fwd_cfg = plan(mla_1cta)
-    # 1CTA split beats 2CTA (which never splits at hdimv 512) from 2 splits on the kb64
-    # kernel, but from about 5 on the 128-key kernel: 2CTA covers a 128-row tile with 2 CTAs
-    # at about twice the per-CTA rate (AI/SPARSE_MLA_1CTA.md "Dispatch heuristic")
+    # 1CTA split beats 2CTA (unsplit at hdimv 512) from 2 splits on kb64, about 5 on the
+    # 128-key mainloop (AI/SPARSE_MLA_1CTA.md "Auto split: 1CTA split vs 2CTA")
     min_splits_1cta = 2 if mla_1cta_kb64_dense else 5
     if (
         mla_1cta and num_splits_auto and gather_kv_indices is None
         and fwd_cfg.num_splits < min_splits_1cta
     ):
-        # too few splits for 1CTA to pay off: decide again as for num_splits=1
         mla_1cta = mla_route(split_kv=False)
         if not mla_1cta:
             mla_1cta_kb64, mla_1cta_kb64_dense, mla_fwd_cls, fwd_cfg = plan(False)
@@ -1076,10 +1054,8 @@ def _flash_attn_fwd(
     is_split_kv = num_splits > 1
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
-        # The combine kernel needs LSE seqlen-contiguous, i.e. the non-qv (..., h, s)
-        # layout. The MLA kernels want (..., s, h); allocate combine's layout and give
-        # the main kernel a transposed view (its LSE writes are scatters, so strides
-        # don't matter to it).
+        # Combine needs LSE partials seqlen-contiguous, (..., h, s); the MLA kernels take
+        # (..., s, h) modes, so they get a transposed view (their LSE writes are scatters).
         lse_partial_shape = (
             lse_shape
             if qv is None
@@ -1188,12 +1164,7 @@ def _flash_attn_fwd(
                 "MLA kernel (FLASH_ATTENTION_MLA_1CTA=1)"
             )
         elif q is not None and (k_descale is not None or v_descale is not None):
-            # MLA absorbed applies q_descale to BOTH Q and Qv, and both S contributions
-            # (Q@K^T and Qv@V^T) land in ONE accumulator, so a single folded softmax
-            # scale is only correct when k_descale == v_descale. That is the natural
-            # case for MLA: the rope-K and latent-V halves live in one quantized cache.
-            # Require one shared tensor rather than comparing values: a value comparison
-            # syncs the device, which breaks CUDA graph capture and FakeTensorMode.
+            # one tensor, not equal values: comparing values would sync the device
             assert k_descale is not None and v_descale is not None, (
                 "MLA absorbed needs k_descale and v_descale together (or neither)"
             )
@@ -1259,8 +1230,7 @@ def _flash_attn_fwd(
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
     cluster_shape_m = 2 if use_2cta_instrs else 1
     if qv is not None:
-        # The MLA kernels do not consume scheduler metadata: they write all num_splits
-        # partials statically, so combine must not see per-batch dynamic split counts.
+        # the MLA kernels write all num_splits partials (no per-batch dynamic split counts)
         assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
     if use_dedicated_hd256_kernel:
         # The hd=256 2CTA fwd kernel does not support the dynamic-persistent scheduler.
@@ -1403,7 +1373,6 @@ def _flash_attn_fwd(
     # coherent bf16 gain error on peaked rows. See AI/SPARSE_MLA_EXACT_SOFTMAX_MAX.md.
     mla_fwd_rescale_threshold = 0.0 if (requires_grad and sparse_kv) else 8.0
 
-    # 1CTA MLA per-call policies, owned by the kernel class (CLC; fp8 S ahead of PV)
     mla_1cta_use_clc = mla_1cta and mla_fwd_cls.use_clc(
         is_topk_gather=bool(sparse_kv),
         seqlen_q_hint=seqlen_q_hint,
@@ -1512,10 +1481,7 @@ def _flash_attn_fwd(
         o_align = 32 if mla_1cta_kb64 else 16
         o_tensor = to_cute_tensor(out if not is_split_kv else out_partial, assumed_align=o_align)
         if is_split_kv:
-            # Must match the tensor actually passed at the call site. The MLA path hands
-            # the kernel a transposed view of lse_partial (combine needs seqlen-stride-1,
-            # the MLA kernel wants (..., s, h) modes), so mark the seqlen mode -- which is
-            # the contiguous one in that view -- as leading.
+            # MLA: the transposed lse_partial view, whose seqlen mode is the contiguous one
             lse_tensor = (
                 to_cute_tensor(lse_partial, assumed_align=4)
                 if qv is None
@@ -1627,13 +1593,7 @@ def _flash_attn_fwd(
             if qv is not None:
                 has_qk = q is not None
                 if mla_1cta:
-                    # 1CTA (tcgen05.mma.ws) MLA kernel, opt-in via FLASH_ATTENTION_MLA_1CTA=1.
-                    # Supports varlen (cu_seqlens / seqused, Q and K sides independently),
-                    # pack_gqa at any ratio (including ratios that do not divide the 64-row
-                    # tile), paged KV at any page size (TMA when page_size == tile_n,
-                    # else a cp.async gather warp group), and sparse top-k gather (MQA,
-                    # <= 64 heads; training only with recompute-P, which needs no P /
-                    # row_max -- routed here only in those cases).
+                    # 1CTA (tcgen05.mma.ws) MLA kernel; support and routing: _mla_1cta_route
                     for feat, name in [
                         (p is not None, "P emission"),
                         (row_max is not None, "row_max emission"),
@@ -1674,8 +1634,7 @@ def _flash_attn_fwd(
                             pack_gqa=pack_gqa,
                             has_seqused_q=seqused_q is not None,
                             has_cu_seqlens_q=cu_seqlens_q is not None,
-                            # the kernel picks its KV loader (TMA, or cp.async for top-k
-                            # gather and pages that are not whole 128-key blocks)
+                            # picks the KV loader (TMA, or cp.async for partial-block pages)
                             page_size=page_size if page_table is not None else None,
                             is_split_kv=is_split_kv,
                             is_fp8=is_fp8,
@@ -1949,12 +1908,8 @@ def _flash_attn_fwd(
                 ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
-        # The combine kernel wants (splits, ..., s, h) partials and a (..., s, h) output,
-        # both with the SEQLEN mode contiguous. lse_partial is allocated (..., h, s) so a
-        # transposed view satisfies that. For the final LSE the non-qv layout is (..., h, s)
-        # (transposed view works too), but the MLA/qv layout is (..., s, h) contiguous --
-        # h-major -- so combine cannot write it directly; give combine a seqlen-major
-        # staging buffer and copy back (tiny: b*s*h floats).
+        # Combine writes a seqlen-contiguous LSE. The MLA LSE is (..., s, h) contiguous, so
+        # it goes through a seqlen-major staging buffer, copied back below (b*s*h floats).
         lse_combine = None
         if lse is not None:
             if qv is None:
@@ -3332,10 +3287,8 @@ def _flash_attn_bwd_sparse_mla(
     dpsum = alloc(*heads_shape, qhead_tile, dtype=torch.float32, device=device)
     if recompute_p:
         scale_p = None
-        # lse in log2 units, written by the preprocess; consumed by the main
-        # bwd kernel to recompute P = exp2(scale_log2 * S - lse_log2). Padded head
-        # columns (never written by the preprocess) hold +inf: with the zero-filled Q
-        # rows S = 0 there, so P = exp2(-inf) = 0 exactly (garbage could give inf / NaN).
+        # lse in log2 units (from the preprocess) to recompute P = exp2(scale_log2*S - lse_log2).
+        # Padded head columns hold +inf: S = 0 there, so P = 0 exactly (garbage could be NaN).
         lse_log2 = torch.full_like(dpsum, float("inf")) if pad_qheads else torch.empty_like(dpsum)
     else:
         scale_p = alloc(*row_max.shape[:-1], qhead_tile, dtype=torch.float32, device=device)
