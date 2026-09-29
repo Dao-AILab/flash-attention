@@ -3461,6 +3461,7 @@ def test_flash_attn_mla_absorbed(
 
 @pytest.mark.skipif(not MLA_1CTA, reason="SplitKV with qv is implemented by the 1CTA MLA kernel only")
 @pytest.mark.parametrize("varlen_q", ["none", "cu_seqlens_q", "seqused_q"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_split_distribution(varlen_q, monkeypatch):
     """Every split must own KV work, not just produce the right combined output.
 
@@ -3468,7 +3469,7 @@ def test_flash_attn_mla_1cta_split_distribution(varlen_q, monkeypatch):
     work: the interface forcing num_splits=1 (combine never runs), and the kernel's KV
     range ignoring num_splits (splits >= 1 come out empty with LSE = -inf).
     """
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     import flash_attn.cute.interface as fa_interface
 
@@ -3512,6 +3513,8 @@ def test_flash_attn_mla_1cta_split_distribution(varlen_q, monkeypatch):
     assert len(captured) == 1, "num_splits=3 did not reach the combine kernel (split-KV collapsed to 1)"
     lse_partial = captured[0]  # (num_splits, batch, seqlen_q, nheads) or (num_splits, total_q, nheads)
     assert lse_partial.shape[0] == num_splits
+    if is_fake_mode():  # the combine kernel is reached (and compiled) in fake mode too
+        return
     if varlen_q == "cu_seqlens_q":
         lse_partial = lse_partial.unflatten(1, (batch_size, seqlen_q))
     for b in range(batch_size):
@@ -3528,6 +3531,7 @@ def test_flash_attn_mla_1cta_split_distribution(varlen_q, monkeypatch):
 
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA MLA cp.async KV path")
 @pytest.mark.parametrize("has_qk", [True, False])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_paged_clc_bitwise(has_qk):
     """The persistent (CLC) scheduler only changes which CTA runs a tile, so its output
     must be bitwise identical to the non-persistent one. Regression test for the sO /
@@ -3535,7 +3539,7 @@ def test_flash_attn_mla_1cta_paged_clc_bitwise(has_qk):
     the previous tile's TMA O store (sO overlays V) -- see agent_space/ledger_sO_race.md.
     Needs >1 tile per CTA (CLC, causal so the interface keeps CLC on) and the TMA O store
     (dense batched Q)."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     import flash_attn.cute.utils as fa_utils
 
@@ -3565,6 +3569,8 @@ def test_flash_attn_mla_1cta_paged_clc_bitwise(has_qk):
             ))
     finally:
         fa_utils._fa_clc_enabled = saved
+    if is_fake_mode():
+        return
     assert torch.equal(outs[0][0], outs[1][0])
     assert torch.equal(outs[0][1], outs[1][1])
 
@@ -3595,11 +3601,12 @@ def _mla_sink_ref(q, qv, k, v, softmax_scale, causal, sink):
 # 48 Q heads per KV head does not divide the 64-row tile; 64 runs the dense kb64 mainloop
 @pytest.mark.parametrize("nheads", [16, 48, 64])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(64, 1024), (300, 200)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_learnable_sink(seqlen_q, seqlen_k, nheads, causal, num_splits, return_lse):
     """Sink folded into the 1CTA epilogue: pack_gqa head indexing, split-KV (split 0 owns
     the sink), fully masked rows, and the no-LSE path (row_max still has to reach the
     epilogue when mLSE is None)."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     torch.random.manual_seed(0)
     device, dtype = "cuda", torch.bfloat16
@@ -3614,6 +3621,8 @@ def test_flash_attn_mla_1cta_learnable_sink(seqlen_q, seqlen_k, nheads, causal, 
         q, k, v, qv=qv, causal=causal, learnable_sink=sink, num_splits=num_splits,
         return_lse=return_lse,
     )
+    if is_fake_mode():
+        return
     out_ref, lse_ref = _mla_sink_ref(q, qv, k, v, softmax_scale, causal, sink)
     assert (out.float() - out_ref).abs().max().item() <= 2e-2
     # Rows with no visible key (causal, seqlen_q > seqlen_k) keep only the sink: O = 0.
@@ -3668,6 +3677,7 @@ def _check_mla_vs_ref(out, lse, out_ref, lse_ref, what=""):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("has_qk", [True, False])
 @pytest.mark.parametrize("nheads", [64, 16, 24])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_dense_kb64(nheads, has_qk, causal, seqlen_q, seqlen_k, num_splits,
                                         monkeypatch):
     """Dense MLA at 64 heads runs the 64-key-block (kb64) mainloop: TMA loads per latent part,
@@ -3678,7 +3688,7 @@ def test_flash_attn_mla_1cta_dense_kb64(nheads, has_qk, causal, seqlen_q, seqlen
     and bitwise with and without the CLC scheduler. Fewer than 64 heads pad the one-token tile
     in-kernel; with fewer than 64 heads only decode (seqlen_q = 1) routes to kb64, prefill shapes
     then check the 128-key mainloop against itself and the reference."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     if not _mla_kb64_active(nheads):
         pytest.skip("kb64 mainloop disabled")
@@ -3688,38 +3698,43 @@ def test_flash_attn_mla_1cta_dense_kb64(nheads, has_qk, causal, seqlen_q, seqlen
     call = dict(q=kw["q"] if has_qk else None, k=kw["k"] if has_qk else None, v=kw["v"],
                 qv=kw["qv"] if has_qk else kw["q"], causal=causal, num_splits=num_splits,
                 return_lse=True)
+    # every variant first (fake mode compiles them all, then returns)
     out, lse, *_ = _flash_attn_fwd(**call)
     out_again, lse_again, *_ = _flash_attn_fwd(**call)
-    assert torch.equal(out, out_again) and torch.equal(lse, lse_again), "not deterministic"
-    out_ref, lse_ref = _mla_dense_ref(q_r if has_qk else None, qv_r if has_qk else q_r, k_r, v_r, causal)
-    _check_mla_vs_ref(out, lse, out_ref, lse_ref, "kb64 vs reference")
-    # CLC (dense follows FA_CLC; causal is eligible): the result must not depend on it
-    if causal:
+    if causal:  # CLC (dense follows FA_CLC; causal is eligible): must not change the result
         monkeypatch.setattr(fa_utils, "_fa_clc_enabled", True)
         out_clc, lse_clc, *_ = _flash_attn_fwd(**call)
-        assert torch.equal(out, out_clc) and torch.equal(lse, lse_clc), "CLC changed the result"
         monkeypatch.setattr(fa_utils, "_fa_clc_enabled", False)
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64", "0")
     out_128, lse_128, *_ = _flash_attn_fwd(**call)
+    if is_fake_mode():
+        return
+    assert torch.equal(out, out_again) and torch.equal(lse, lse_again), "not deterministic"
+    out_ref, lse_ref = _mla_dense_ref(q_r if has_qk else None, qv_r if has_qk else q_r, k_r, v_r, causal)
+    _check_mla_vs_ref(out, lse, out_ref, lse_ref, "kb64 vs reference")
+    if causal:
+        assert torch.equal(out, out_clc) and torch.equal(lse, lse_clc), "CLC changed the result"
     _assert_mla_fwd_close(out, out_128, lse, lse_128, "kb64 vs 128-key mainloop")
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA dense MLA, 64-key-block mainloop")
 @pytest.mark.parametrize("num_splits", [1, 3, 0])
 @pytest.mark.parametrize("nheads", [64, 16])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_dense_kb64_packed_varlen_decode(nheads, num_splits, monkeypatch):
     """Dense kb64 with cu_seqlens_q schedules a flat grid over the tokens (packed varlen, one
     token per tile). Many single-token sequences with ragged s_k (including 1 and multiples of
     64), split-KV: bitwise equal to the per-batch varlen scheduler and with CLC on / off,
     close to the 128-key mainloop, and a sample of sequences against the reference."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     if not _mla_kb64_active(nheads):
         pytest.skip("kb64 mainloop disabled")
     device, dtype = "cuda", torch.bfloat16
     g = torch.Generator(device="cpu").manual_seed(0)
     n = 300
-    seqlens_k = torch.randint(1, 3000, (n,), generator=g).tolist()
+    with torch._subclasses.fake_tensor.unset_fake_temporarily():  # host-side lengths, real
+        seqlens_k = torch.randint(1, 3000, (n,), generator=g).tolist()
     seqlens_k[:4] = [1, 64, 128, 2999]
     cu = lambda lens: torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device=device)  # noqa: E731
     torch.random.manual_seed(0)
@@ -3729,34 +3744,38 @@ def test_flash_attn_mla_1cta_dense_kb64_packed_varlen_decode(nheads, num_splits,
     v = torch.randn(sum(seqlens_k), 1, 512, device=device, dtype=dtype)
     call = dict(qv=qv, num_splits=num_splits, cu_seqlens_q=cu([1] * n), cu_seqlens_k=cu(seqlens_k),
                 max_seqlen_q=1, max_seqlen_k=max(seqlens_k), return_lse=True)
+    # every variant first (fake mode compiles them all, then returns)
     out, lse, *_ = _flash_attn_fwd(q, k, v, **call)
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_CLC", "1")
     out_clc, lse_clc, *_ = _flash_attn_fwd(q, k, v, **call)
-    assert torch.equal(out, out_clc) and torch.equal(lse, lse_clc), "CLC changed the result"
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_PACKED_VARLEN", "0")
     out_pb, lse_pb, *_ = _flash_attn_fwd(q, k, v, **call)
-    assert torch.equal(out, out_pb) and torch.equal(lse, lse_pb), "packed != per-batch scheduler"
     monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA_CLC")
     monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA_PACKED_VARLEN")
-    starts = cu(seqlens_k).tolist()
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64", "0")
+    out_128, lse_128, *_ = _flash_attn_fwd(q, k, v, **call)
+    if is_fake_mode():
+        return
+    assert torch.equal(out, out_clc) and torch.equal(lse, lse_clc), "CLC changed the result"
+    assert torch.equal(out, out_pb) and torch.equal(lse, lse_pb), "packed != per-batch scheduler"
+    starts = list(itertools.accumulate([0] + seqlens_k))
     for i in [0, 1, 2, 3, 57, 150, 299]:
         ks, ke = starts[i], starts[i + 1]
         o_ref, l_ref = _mla_dense_ref(q[i][None, None], qv[i][None, None], k[ks:ke][None], v[ks:ke][None], False)
         _check_mla_vs_ref(out[i][None, None], lse[i][None, None], o_ref, l_ref, f"sequence {i}")
-    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64", "0")
-    out_128, lse_128, *_ = _flash_attn_fwd(q, k, v, **call)
     _assert_mla_fwd_close(out, out_128, lse, lse_128, "kb64 vs 128-key mainloop")
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA dense MLA, 64-key-block mainloop")
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("nheads", [1, 24, 48])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_dense_kb64_padded_head_canary(nheads, has_learnable_sink):
     """Dense kb64 with fewer than 64 heads pads each token's tile: the padded rows alias the next
     token's heads (and run past the tensor for the last token), so they must never be written.
     out / lse are views into canary-filled buffers whose tails must survive; every row matches
     the reference. Decode (seqlen_q = 1): the shape that routes fewer than 64 heads to kb64."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     if not _mla_kb64_active(nheads):
         pytest.skip("kb64 mainloop disabled")
@@ -3771,6 +3790,8 @@ def test_flash_attn_mla_1cta_dense_kb64_padded_head_canary(nheads, has_learnable
     lse = buf_lse[:n_lse].view(b, s_q, nheads)
     _flash_attn_fwd(kw["q"], kw["k"], kw["v"], qv=kw["qv"], learnable_sink=sink, out=out, lse=lse,
                     causal=True, return_lse=True)
+    if is_fake_mode():
+        return
     torch.cuda.synchronize()
     assert (buf_out[n_out:] == canary_out).all(), "padded-head O rows written past the tensor"
     assert (buf_lse[n_lse:] == canary_lse).all(), "padded-head LSE written past the tensor"
@@ -3792,6 +3813,7 @@ def test_flash_attn_mla_1cta_dense_kb64_padded_head_canary(nheads, has_learnable
 )
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("nheads", [64, 16])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(nheads, causal, mode, num_splits, monkeypatch):
     """Dense kb64 with varlen Q / K (ragged lengths incl. 0 and 1) and paged KV (shuffled
     pages): TMA for page_size 64 / 128 / 256 (1-4 blocks per page), the cp.async gather for
@@ -3800,7 +3822,7 @@ def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(nheads, causal, mode, num_s
     to the same kernel on contiguous KV (the gather zero-fills rows past seqlen_k, masked to
     P = 0 either way); every sequence matches the reference; the 128-key mainloop agrees under
     the bf16-rounding contract. Page 16 also checks CLC on / off and no rope part bitwise."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     if not _mla_kb64_active(64):
         pytest.skip("kb64 mainloop disabled")
@@ -3835,7 +3857,9 @@ def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(nheads, causal, mode, num_s
         k_in, v_in = pad(ks, s_k_max), pad(vs, s_k_max)
     call = dict(q=q_in, k=k_in, v=v_in, qv=qv_in, causal=causal, num_splits=num_splits,
                 return_lse=True, **extra)
+    # every variant first (fake mode compiles them all, then returns), the checks after
     out, lse, *_ = _flash_attn_fwd(**call)
+    paged = {}
     if mode.startswith("paged"):
         ps = int(mode[len("paged"):].removesuffix("cp"))
         if mode.endswith("cp"):
@@ -3849,50 +3873,52 @@ def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(nheads, causal, mode, num_s
         k_cache[page_table.view(-1).long()] = pad(ks, npg * ps).view(b * npg, ps, 1, 64)
         v_cache[page_table.view(-1).long()] = pad(vs, npg * ps).view(b * npg, ps, 1, 512)
         call_p = dict(call, k=k_cache, v=v_cache, page_table=page_table)
-        out_p, lse_p, *_ = _flash_attn_fwd(**call_p)
-        # rows past seqused_q are never written (uninitialized in both)
-        vq = torch.arange(s_q_max, device=device)[None] < torch.tensor(seqlens_q, device=device)[:, None]
-        assert torch.equal(out_p[vq], out[vq]) and torch.equal(lse_p[vq], lse[vq]), "paged != contiguous"
+        paged["paged != contiguous"] = (_flash_attn_fwd(**call_p)[:2], (out, lse))
         if ps == 16:
             for clc in ("0", "1"):
                 monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_CLC", clc)
-                out_c, lse_c, *_ = _flash_attn_fwd(**call_p)
-                assert torch.equal(out_c[vq], out[vq]) and torch.equal(lse_c[vq], lse[vq]), f"CLC={clc}"
+                paged[f"CLC={clc}"] = (_flash_attn_fwd(**call_p)[:2], (out, lse))
             monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA_CLC")
             # no rope part: the gather skips the K rows
             nope = dict(q=None, k=None)
-            out_n, lse_n, *_ = _flash_attn_fwd(**dict(call, **nope))
-            out_np, lse_np, *_ = _flash_attn_fwd(**dict(call_p, **nope))
-            assert torch.equal(out_np[vq], out_n[vq]) and torch.equal(lse_np[vq], lse_n[vq]), "no rope"
+            paged["no rope"] = (_flash_attn_fwd(**dict(call_p, **nope))[:2],
+                                _flash_attn_fwd(**dict(call, **nope))[:2])
         monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA_KB64_PAGED_CPASYNC", raising=False)
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64", "0")
+    out_128, lse_128, *_ = _flash_attn_fwd(**call)
+    if is_fake_mode():
+        return
+    # rows past seqused_q are never written (uninitialized in both)
+    vq = torch.arange(s_q_max, device=device)[None] < torch.tensor(seqlens_q, device=device)[:, None]
+    for what, ((o_a, l_a), (o_b, l_b)) in paged.items():
+        assert torch.equal(o_a[vq], o_b[vq]) and torch.equal(l_a[vq], l_b[vq]), what
+    starts_q = list(itertools.accumulate([0] + seqlens_q))
     for i, (sq, sk) in enumerate(zip(seqlens_q, seqlens_k)):
         if sq == 0:
             continue
         if mode == "cu_seqlens":
-            rows = slice(int(cu(seqlens_q)[i]), int(cu(seqlens_q)[i + 1]))
+            rows = slice(starts_q[i], starts_q[i + 1])
             o, l = out[rows][None], lse[rows][None]
         else:
             o, l = out[i: i + 1, :sq], lse[i: i + 1, :sq]
         o_ref, l_ref = _mla_dense_ref(qs[i][None], qvs[i][None], ks[i][None], vs[i][None], causal)
         _check_mla_vs_ref(o, l, o_ref, l_ref, f"sequence {i}")
-    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64", "0")
-    out_128, lse_128, *_ = _flash_attn_fwd(**call)
     if mode != "cu_seqlens":
         # rows past seqused_q are not written by either kernel
-        valid_q = torch.arange(s_q_max, device=device)[None] < torch.tensor(seqlens_q, device=device)[:, None]
-        out, out_128, lse, lse_128 = out[valid_q], out_128[valid_q], lse[valid_q], lse_128[valid_q]
+        out, out_128, lse, lse_128 = out[vq], out_128[vq], lse[vq], lse_128[vq]
     _assert_mla_fwd_close(out, out_128, lse, lse_128, "kb64 vs 128-key mainloop")
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="learnable sink test for the 1CTA MLA kernel")
 @pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_learnable_sink_fp8(causal, num_splits):
     """fp8 + descales + sink: the sink must enter with the fp8 max_offset pre-scale and the
     descale-folded softmax scale. Checked exactly against the same fp8 call without a sink
     (lse' = logaddexp(lse, sink), O' = O * exp(lse - lse')), then loosely against a
     dequantized fp32 reference."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     torch.random.manual_seed(0)
     device, fp8 = "cuda", torch.float8_e4m3fn
@@ -3921,6 +3947,8 @@ def test_flash_attn_mla_1cta_learnable_sink_fp8(causal, num_splits):
 
     out, lse = run(None)
     out_sink, lse_sink = run(sink)
+    if is_fake_mode():
+        return
     lse_expected = torch.logaddexp(lse, sink.float().view(1, 1, nheads))
     torch.testing.assert_close(lse_sink, lse_expected, atol=1e-3, rtol=1e-4)
     out_expected = out.float() * torch.exp(lse - lse_expected).unsqueeze(-1)
@@ -3955,10 +3983,11 @@ def _mla_1cta_fp8_inputs(batch_size=2, seqlen_q=17, seqlen_k=257, nheads=6, nhea
 
 @pytest.mark.skipif(not MLA_1CTA, reason="fp8 descales with qv are 1CTA-only")
 @pytest.mark.parametrize("num_splits", [1, 3])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_fp8_descales_cuda_graph(num_splits):
     """The descale checks must not sync the device: capture and replay a CUDA graph of
     the fp8 + descales + sink forward and compare it to the eager result."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     q, qv, k, v, q_descale, kv_descale, sink = _mla_1cta_fp8_inputs()
 
@@ -3970,6 +3999,8 @@ def test_flash_attn_mla_1cta_fp8_descales_cuda_graph(num_splits):
         return out, lse
 
     out_eager, lse_eager = call()  # also compiles, which must happen outside capture
+    if is_fake_mode():
+        return
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -3986,10 +4017,11 @@ def test_flash_attn_mla_1cta_fp8_descales_cuda_graph(num_splits):
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="fp8 descales with qv are 1CTA-only")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_fp8_descales_must_be_shared():
     """K and V descales fold into one softmax scale, so they must be one tensor; equal
     values in separate allocations are rejected (checking values would sync the device)."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     q, qv, k, v, q_descale, kv_descale, sink = _mla_1cta_fp8_inputs()
     with pytest.raises(AssertionError, match="k_descale and v_descale to be the same tensor"):
@@ -4081,11 +4113,12 @@ def _assert_mla_fwd_close(out, out_other, lse=None, lse_other=None, what=""):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("has_qk", [True, False])
 @pytest.mark.parametrize("nheads", [1, 16, 24, 48, 64])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_sparse_fwd(nheads, has_qk, causal, seqlen_q, seqlen_k, topk, gen,
                                         monkeypatch):
     """Inference sparse forward on the 1CTA kernel (<= 64 heads, padded to the 64-row tile):
     vs the reference, and vs the 2CTA kernel (padded to 128) on the same inputs."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     b = 2
     kw, (q_r, k_r, v_r, qv_r) = _mla_inputs(b, seqlen_q, seqlen_k, nheads, has_qk)
@@ -4096,6 +4129,8 @@ def test_flash_attn_mla_1cta_sparse_fwd(nheads, has_qk, causal, seqlen_q, seqlen
     out, lse = flash_attn_func(**kw)
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
     out_2cta, lse_2cta = flash_attn_func(**kw)
+    if is_fake_mode():
+        return
     if _mla_kb64_active(nheads):
         # 64-key blocks: a different running-max sequence than the 2CTA kernel's
         _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "1CTA kb64 vs 2CTA")
@@ -4125,12 +4160,13 @@ def test_flash_attn_mla_1cta_sparse_fwd(nheads, has_qk, causal, seqlen_q, seqlen
 @pytest.mark.parametrize("topk", [128, 1024, 2048])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("has_qk", [True, False])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_sparse_kb64(has_qk, causal, topk, gen, monkeypatch):
     """The 64-key-block mainloop (64 heads) against the 128-key one on the same inputs: the
     bf16-rounding contract, bitwise run-to-run, O = 0 / LSE = -inf on rows with no valid
     slot, and an output view that is only 16-B aligned (128-bit epilogue stores instead of
     256-bit) bitwise equal to the aligned one."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     if not _mla_kb64_active(64):
         pytest.skip("kb64 mainloop disabled")
@@ -4140,27 +4176,33 @@ def test_flash_attn_mla_1cta_sparse_kb64(has_qk, causal, topk, gen, monkeypatch)
                             fill_frac=0.5 if gen == "rect_oob" else 1.0,
                             oob_frac=0.5 if gen == "rect_oob" else 0.0)
     kw.update(gather_kv_indices=idx, causal=causal, return_lse=True)
+    # every variant first (fake mode compiles them all, then returns)
     out, lse = flash_attn_func(**kw)
     out_again, lse_again = flash_attn_func(**kw)
+    if has_qk:
+        # 16-B (not 32-B) aligned out: the 128-bit store epilogue (the interface reads the
+        # alignment from the storage offset in fake mode, so pass 1 compiles this variant too)
+        buf = torch.empty(out.numel() + 8, device="cuda", dtype=out.dtype)
+        out_unaligned = buf[8:].view_as(out)
+        _flash_attn_fwd(kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
+                        causal=causal, out=out_unaligned, return_lse=True)
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64", "0")
+    out_128, lse_128 = flash_attn_func(**kw)
+    if is_fake_mode():
+        return
     assert torch.equal(out, out_again) and torch.equal(lse, lse_again), "not deterministic"
     valid = _topk_valid_rows(idx, s_q, s_k, causal)
     assert (out[~valid] == 0).all() and torch.isneginf(lse[~valid]).all()
     if has_qk:
-        # 16-B (not 32-B) aligned out: the 128-bit store epilogue
-        buf = torch.empty(out.numel() + 8, device="cuda", dtype=out.dtype)
-        out_unaligned = buf[8:].view_as(out)
         assert out_unaligned.data_ptr() % 32 == 16
-        _flash_attn_fwd(kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
-                        causal=causal, out=out_unaligned, return_lse=True)
         assert torch.equal(out_unaligned, out), "128-bit vs 256-bit O stores differ"
-    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA_KB64", "0")
-    out_128, lse_128 = flash_attn_func(**kw)
     _assert_mla_fwd_close(out, out_128, lse, lse_128, "kb64 vs 128-key mainloop")
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA sparse MLA forward")
 @pytest.mark.parametrize("has_qk", [True, False])
 @pytest.mark.parametrize("nheads", [16, 64])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_sparse_bitmask_mapping(nheads, has_qk):
     """The bit -> S-column mapping of the validity bitmask (128-key mainloop, Layout E: each
     thread owns 64 columns, two 32-slot words; 64-key kb64 mainloop at 64 heads: one word per
@@ -4169,7 +4211,7 @@ def test_flash_attn_mla_1cta_sparse_bitmask_mapping(nheads, has_qk):
     (1) one valid slot at each word/half boundary, in the first and the last processed
     n_block -- the output must then be exactly that key's V row; (2) a distinct random
     pattern per 32-slot word, checked against the reference."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     b, s_q, s_k, topk = 1, 2, 512, 256
     kw, (q_r, k_r, v_r, qv_r) = _mla_inputs(b, s_q, s_k, nheads, has_qk)
@@ -4180,6 +4222,8 @@ def test_flash_attn_mla_1cta_sparse_bitmask_mapping(nheads, has_qk):
             key = 37 + slot  # any distinct key per case
             idx[..., n_block * 128 + slot] = key
             out, _ = flash_attn_func(**kw, gather_kv_indices=idx, return_lse=True)
+            if is_fake_mode():  # one compile key for every call here
+                return
             want = v_rows[0, key, 0].expand(s_q, nheads, -1)
             assert torch.equal(out[0], want), f"n_block={n_block} slot={slot}"
     # distinct per-word patterns: every 32-slot word differs, no half is a copy of the other
@@ -4202,6 +4246,7 @@ def test_flash_attn_mla_1cta_sparse_bitmask_mapping(nheads, has_qk):
 @pytest.mark.parametrize("train", [False, True])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("nheads", [1, 24, 48, 64])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sink, train, monkeypatch):
     """Padded heads must never be written: with fewer than 64 heads the packed layout maps a
     token's padded rows onto the next token's heads (and past the tensor for the last
@@ -4209,7 +4254,7 @@ def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sin
     real row must match the 2CTA kernel. Covers both the TMA O store (dense Q) and the
     guarded LSE / sink paths. train: the recompute-P training forward (exact max, the o_lo
     residual under the same row guard as O, checked to half an ulp of O)."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     b, s_q, s_k, topk = 2, 33, 1024, 256
     kw, _ = _mla_inputs(b, s_q, s_k, nheads, has_qk=True)
@@ -4227,6 +4272,13 @@ def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sin
     lse = buf_lse[:n_lse].view(b, s_q, nheads)
     _, _, _, _, o_lo = _flash_attn_fwd(kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
                                        learnable_sink=sink, out=out, lse=lse, return_lse=True, **mode)
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
+    out_2cta, lse_2cta, *_ = _flash_attn_fwd(
+        kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
+        learnable_sink=sink, return_lse=True, **mode,
+    )
+    if is_fake_mode():
+        return
     torch.cuda.synchronize()
     assert (buf_out[n_out:] == canary_out).all(), "padded-head O rows written past the tensor"
     assert (buf_lse[n_lse:] == canary_lse).all(), "padded-head LSE written past the tensor"
@@ -4236,11 +4288,6 @@ def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sin
         _, e = torch.frexp(out.float())
         half_ulp = torch.ldexp(torch.ones_like(out, dtype=torch.float32), e - 9)
         assert (o_lo.float().abs() <= half_ulp)[out != 0].all(), "o_lo"
-    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
-    out_2cta, lse_2cta, *_ = _flash_attn_fwd(
-        kw["q"], kw["k"], kw["v"], qv=kw["qv"], gather_kv_indices=idx,
-        learnable_sink=sink, return_lse=True, **mode,
-    )
     if _mla_kb64_active(nheads):
         _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "1CTA kb64 vs 2CTA")
     else:
@@ -4249,13 +4296,14 @@ def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sin
 
 
 @pytest.mark.parametrize("nheads", [64, 128])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_sparse_no_split_kv(nheads, monkeypatch):
     """Split-KV is disabled for sparse MLA on both kernels. Under FLASH_ATTENTION_MLA_1CTA=1,
     64 heads route to 1CTA and 128 fall back to 2CTA. An explicit num_splits > 1 must
     raise -- checked before config selection, which would otherwise silently turn it into 1
     on the 2CTA route -- and the heuristic (num_splits=0) must resolve to one split: the
     combine kernel never runs."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     import flash_attn.cute.interface as fa_interface
     b, s_q, s_k, topk = 1, 1, 8192, 2048
@@ -4275,6 +4323,8 @@ def test_flash_attn_mla_sparse_no_split_kv(nheads, monkeypatch):
     out_h, lse_h = flash_attn_func(**kw, gather_kv_indices=idx, num_splits=0, return_lse=True)
     assert not calls, "sparse MLA ran split-KV (combine was called)"
     out_1, lse_1 = flash_attn_func(**kw, gather_kv_indices=idx, num_splits=1, return_lse=True)
+    if is_fake_mode():
+        return
     assert torch.equal(out_h, out_1) and torch.equal(lse_h, lse_1)
 
 
@@ -4284,6 +4334,7 @@ def test_flash_attn_mla_sparse_no_split_kv(nheads, monkeypatch):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("has_qk", [True, False])
 @pytest.mark.parametrize("nheads", [16, 64])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_sparse_varlen(nheads, has_qk, causal, q_mode, varlen_k, monkeypatch):
     """Sparse forward with varlen Q: cu_seqlens_q runs the packed (flat over tokens)
     scheduler with batch-local indexing and keeps the TMA O store (one-token tiles cannot
@@ -4291,7 +4342,7 @@ def test_flash_attn_mla_1cta_sparse_varlen(nheads, has_qk, causal, q_mode, varle
     varlen scheduler. Ragged lengths include 0 and 1. Checked per sequence against the
     reference, against 2CTA (bitwise, or to bf16 rounding on the kb64 mainloop), and for
     writes past the last token (canary tail)."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     device, dtype, topk = "cuda", torch.bfloat16, 256
     seqlens_q = [37, 0, 1, 200, 64, 5]
@@ -4345,15 +4396,18 @@ def test_flash_attn_mla_1cta_sparse_varlen(nheads, has_qk, causal, q_mode, varle
         q_in if has_qk else None, k_in if has_qk else None, v_in, qv=qv_in, out=out_view,
         **q_kw, **kv_kw, gather_kv_indices=idx_in, causal=causal, return_lse=True,
     )
-    torch.cuda.synchronize()
-    assert (buf[n_out:] == canary).all(), "O written past the last token"
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
     out_2cta, lse_2cta = flash_attn_varlen_func(**call)
+    if is_fake_mode():
+        return
+    torch.cuda.synchronize()
+    assert (buf[n_out:] == canary).all(), "O written past the last token"
+    starts_q = list(itertools.accumulate([0] + seqlens_q))
     for i, (sq, sk) in enumerate(zip(seqlens_q, seqlens_k)):
         if sq == 0:
             continue
         if q_mode == "cu_seqlens_q":
-            rows = slice(int(cu(seqlens_q)[i]), int(cu(seqlens_q)[i + 1]))
+            rows = slice(starts_q[i], starts_q[i + 1])
             o, o2, l, l2 = out[rows], out_2cta[rows], lse[rows], lse_2cta[rows]
         else:
             o, o2, l, l2 = out[i, :sq], out_2cta[i, :sq], lse[i, :sq], lse_2cta[i, :sq]
@@ -4382,11 +4436,12 @@ def test_flash_attn_mla_1cta_sparse_varlen(nheads, has_qk, causal, q_mode, varle
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA sparse MLA forward (fp8 is 1CTA-only)")
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("nheads", [16, 64])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_sparse_fp8(nheads, causal):
     """fp8 sparse gather (4 V stages, 16-element cp.async chunks) with descales, with and
     without a sink: exact sink identity against the sink-free fp8 call, and a loose check
     against the dequantized fp32 reference."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     device, fp8 = "cuda", torch.float8_e4m3fn
     b, s_q, s_k, topk = 2, 64, 2048, 512
@@ -4409,6 +4464,8 @@ def test_flash_attn_mla_1cta_sparse_fp8(nheads, causal):
 
     out, lse = run(None)
     out_sink, lse_sink = run(sink)
+    if is_fake_mode():
+        return
     valid = _topk_valid_rows(idx, s_q, s_k, causal)
     lse_expected = torch.logaddexp(lse, sink.float().view(1, 1, nheads))
     torch.testing.assert_close(lse_sink, lse_expected, atol=1e-3, rtol=1e-4)
@@ -4431,6 +4488,7 @@ def test_flash_attn_mla_1cta_sparse_fp8(nheads, causal):
 @pytest.mark.parametrize("has_qk", [True, False])
 # fewer than 64 heads pad the forward's and the backward's 64-row tiles
 @pytest.mark.parametrize("h", [64, 24, 1])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_sparse_train_recompute_p(h, has_qk, causal, varlen, has_learnable_sink,
                                                       monkeypatch):
     """Sparse training with the recompute-P backward at 1..64 heads runs its forward on
@@ -4440,7 +4498,7 @@ def test_flash_attn_mla_1cta_sparse_train_recompute_p(h, has_qk, causal, varlen,
     the sparse backward's atomic scatter-add order). The default 64-key-block mainloop
     agrees to bf16 rounding: out / LSE under the forward contract, out + o_lo and every
     gradient by relative L2."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     import flash_attn.cute.interface as fa_interface
     device, dtype, topk = "cuda", torch.bfloat16, 256
@@ -4477,7 +4535,8 @@ def test_flash_attn_mla_1cta_sparse_train_recompute_p(h, has_qk, causal, varlen,
     g = torch.randn(*qv.shape[:-1], 512, device=device, dtype=dtype)
 
     # Which forward kernel ran: the first compile-key element is mla_1cta. Spy on the cache
-    # lookups -- kernel construction alone is not observable once the JIT cache has it.
+    # lookups -- kernel construction alone is not observable once the JIT cache has it. The
+    # membership test runs in fake mode too (the lookup of the compiled function does not).
     real_cache = fa_interface._flash_attn_fwd.compile_cache
 
     class CacheSpy:
@@ -4485,10 +4544,10 @@ def test_flash_attn_mla_1cta_sparse_train_recompute_p(h, has_qk, causal, varlen,
             self.keys = []
 
         def __contains__(self, key):
+            self.keys.append(key)
             return key in real_cache
 
         def __getitem__(self, key):
-            self.keys.append(key)
             return real_cache[key]
 
         def __setitem__(self, key, value):
@@ -4510,6 +4569,8 @@ def test_flash_attn_mla_1cta_sparse_train_recompute_p(h, has_qk, causal, varlen,
             f"FLASH_ATTENTION_MLA_1CTA={flag}: forward ran on the wrong kernel"
         )
     monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", real_cache)
+    if is_fake_mode():
+        return
     rel_l2 = lambda a, b: ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()  # noqa: E731
     kb64 = _mla_kb64_active(h, dtype)
     if kb64:
@@ -4858,6 +4919,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, re
 
 @pytest.mark.parametrize("nheads", [24, 1])
 @pytest.mark.parametrize("has_qk", [True, False])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_sparse_bwd_recompute_p_padded(nheads, has_qk, monkeypatch):
     """Recompute-P with a padded head tile (1..63 heads -> 64 rows). The padded rows load
     zero Q / Qv / dO and +inf lse_log2, so their P and dS are exactly 0:
@@ -4867,7 +4929,7 @@ def test_flash_attn_mla_sparse_bwd_recompute_p_padded(nheads, has_qk, monkeypatc
       3. the 64-row dQ / dQv kernel (1..64 heads) is bitwise equal to the generic 128-row one.
     Runs the 2CTA forward (the flag-off route); the kb64 route is covered by
     test_flash_attn_mla_1cta_sparse_train_recompute_p."""
-    if not IS_SM100 or USE_FAKE_TENSOR:
+    if not IS_SM100:
         pytest.skip()
     import flash_attn.cute.interface as fa_interface
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
@@ -4899,24 +4961,26 @@ def test_flash_attn_mla_sparse_bwd_recompute_p_padded(nheads, has_qk, monkeypatc
 
     rel_l2 = lambda a, b: ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()  # noqa: E731
     g = g_full[:, :nheads].contiguous()
+    g_pad = g_full.clone()
+    g_pad[:, nheads:] = 0
+    # every variant first (fake mode compiles them all, then returns)
     rp, lp = grads(nheads, True, g), grads(nheads, False, g)
+    full = grads(h_full, True, g_pad)
+    # the generic 128-row dQ / dQv kernel for the same call (its own compile key)
+    with monkeypatch.context() as m:
+        m.setattr(fa_interface, "dQdQvGemmKernelH64", fa_interface.dQdQvGemmKernel)
+        generic = grads(nheads, True, g)
+    if is_fake_mode():
+        return
     for name in rp:
         assert torch.isfinite(rp[name]).all(), name
         assert rel_l2(rp[name], lp[name]) < 5e-3, name  # one fewer P rounding; measured ~3e-3
-
-    g_pad = g_full.clone()
-    g_pad[:, nheads:] = 0
-    full = grads(h_full, True, g_pad)
     for name in rp:
         if name in ("dq", "dqv"):
             assert torch.equal(rp[name], full[name][:, :nheads]), name
         else:
             assert rel_l2(rp[name], full[name]) < 5e-4, name  # atomic scatter-add order
 
-    # the generic 128-row dQ / dQv kernel for the same call
-    monkeypatch.setattr(fa_interface, "dQdQvGemmKernelH64", fa_interface.dQdQvGemmKernel)
-    monkeypatch.setattr(fa_interface._sparse_mla_dq_dqv, "compile_cache", {})
-    generic = grads(nheads, True, g)
     for name in ("dq", "dqv"):
         if name in rp:
             assert torch.equal(rp[name], generic[name]), name

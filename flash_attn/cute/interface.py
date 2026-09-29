@@ -1398,15 +1398,16 @@ def _flash_attn_fwd(
     if os.environ.get("FLASH_ATTENTION_MLA_1CTA_CLC"):
         mla_1cta_use_clc = os.environ["FLASH_ATTENTION_MLA_1CTA_CLC"] == "1"
     # the kb64 epilogue stores O / o_lo (split-KV: the fp32 O partial) with 256-bit stores when
-    # their rows are 32-B aligned
-    mla_1cta_kb64_o_align32 = mla_1cta_kb64 and (
-        fake_mode
-        or all(
-            t.data_ptr() % 32 == 0
-            and all(st * t.element_size() % 32 == 0 for st in t.stride()[:-1])
-            for t in ((out_partial if is_split_kv else out), o_lo)
-            if t is not None
-        )
+    # their rows are 32-B aligned. Fake tensors have no data pointer: use the storage offset
+    # (allocations are >= 256-B aligned), so the fake compile pass picks the same variant
+    # (same compile key) as the real run.
+    def _addr_mod32(t):
+        return (t.storage_offset() * t.element_size()) % 32 if fake_mode else t.data_ptr() % 32
+
+    mla_1cta_kb64_o_align32 = mla_1cta_kb64 and all(
+        _addr_mod32(t) == 0 and all(st * t.element_size() % 32 == 0 for st in t.stride()[:-1])
+        for t in ((out_partial if is_split_kv else out), o_lo)
+        if t is not None
     )
     mla_ptxas_options = (
         _mla_ptxas_options("fwd_kb64" if mla_1cta_kb64 else "fwd") if qv is not None else ""
@@ -3605,6 +3606,7 @@ _flash_attn_bwd_sparse_mla.compile_cache = get_jit_cache("bwd_dsa")
 
 def _compile_sparse_mla_dq_dqv(
     dtype, nheads, head_dim, head_dim_v, top_k, varlen_q, varlen_k, compute_dq, ptxas_options,
+    kernel_cls_name,  # compile-key only: the class is picked from nheads below
 ):
     sym = cute.sym_int 
     b, b_plus_1, seqlen_q, seqlen_k = sym(), sym(), sym(), sym()
@@ -3665,9 +3667,12 @@ def _sparse_mla_dq_dqv(
     varlen_q = cu_seqlens_q is not None
     varlen_k = cu_seqlens_k is not None
     
+    # the kernel class is picked in _compile_sparse_mla_dq_dqv from nheads; key it explicitly so a
+    # swapped class (tests compare the 64-row and generic kernels) never reuses the other's binary
     compile_key = (
         dtype_cute, nheads, head_dim, head_dim_v, gather_kv_length, varlen_q, varlen_k, k is not None,
         _mla_ptxas_options("bwd_dq_dqv"),
+        (dQdQvGemmKernelH64 if nheads <= 64 else dQdQvGemmKernel).__name__,
     )
     if compile_key not in _sparse_mla_dq_dqv.compile_cache:
         _sparse_mla_dq_dqv.compile_cache[compile_key] = _compile_sparse_mla_dq_dqv(
