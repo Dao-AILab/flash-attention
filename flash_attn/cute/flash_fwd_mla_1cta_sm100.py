@@ -124,7 +124,8 @@ class FlashAttentionMLAForward1CtaSm100:
         pack_gqa: bool = False,
         has_seqused_q: bool = False,
         has_cu_seqlens_q: bool = False,
-        use_cpasync_load_KV: bool = False,
+        use_cpasync_load_KV: Optional[bool] = None,
+        page_size: Optional[int] = None,
         is_split_kv: bool = False,
         is_fp8: bool = False,
         is_topk_gather: bool = False,
@@ -132,6 +133,10 @@ class FlashAttentionMLAForward1CtaSm100:
         rescale_threshold: float = 8.0,
         s_ahead: bool = False,
     ):
+        # KV loader: cp.async for top-k gather and for pages that are not whole tile_n (128)
+        # blocks (see use_tma_KV below); a subclass with its own rule (kb64) passes it
+        if use_cpasync_load_KV is None:
+            use_cpasync_load_KV = is_topk_gather or (page_size is not None and page_size != 128)
         # ==== sparse top-k gather ====
         # One tile = one token: its Q heads (MQA) padded to the 64-row tile, so a single
         # gathered K/V list serves the whole tile. qhead_per_kvhead is the REAL head count;
@@ -172,10 +177,11 @@ class FlashAttentionMLAForward1CtaSm100:
         # weight-stationary TS mma against a unified (128, hdim) sK slot. Q's smem staging
         # buffer aliases the first half of sK.
         self.q_in_tmem = has_qk
-        # Paged KV with page_size != tile_n cannot be expressed as TMA boxes (a tile
+        # Paged KV with page_size != tile_n (128) cannot be expressed as TMA boxes (a tile
         # spans several pages and its rows are non-contiguous), so it is gathered with
-        # cp.async by a dedicated warp group. page_size == tile_n keeps pure TMA with
-        # the page index as a descriptor coordinate.
+        # cp.async by a dedicated warp group, as is top-k gather. page_size == tile_n keeps
+        # pure TMA with the page index as a descriptor coordinate. A subclass with its own
+        # loader rule (kb64) passes use_cpasync_load_KV explicitly.
         self.use_cpasync_load_KV = use_cpasync_load_KV
         self.use_tma_KV = not use_cpasync_load_KV
         # Q staging only exists (and only aliases sK) when there is a rope part staged

@@ -1563,10 +1563,6 @@ def _flash_attn_fwd(
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
-                # the kb64 route picks its own page loader (TMA or its cp.async gather)
-                paged_kv_cpasync = (
-                    page_table is not None and page_size != tile_n and not mla_1cta_kb64
-                )
                 has_qk = q is not None
                 if mla_1cta:
                     # 1CTA (tcgen05.mma.ws) MLA kernel, opt-in via FLASH_ATTENTION_MLA_1CTA=1.
@@ -1616,7 +1612,9 @@ def _flash_attn_fwd(
                             pack_gqa=pack_gqa,
                             has_seqused_q=seqused_q is not None,
                             has_cu_seqlens_q=cu_seqlens_q is not None,
-                            use_cpasync_load_KV=paged_kv_cpasync or sparse_kv,
+                            # the kernel picks its KV loader (TMA, or cp.async for top-k
+                            # gather and pages that are not whole 128-key blocks)
+                            page_size=page_size if page_table is not None else None,
                             is_split_kv=is_split_kv,
                             is_fp8=is_fp8,
                             is_topk_gather=sparse_kv,
@@ -1627,7 +1625,9 @@ def _flash_attn_fwd(
                 else:
                     fa_fwd = FlashAttentionMLAForwardSm100(
                         is_causal=causal,
-                        use_cpasync_load_KV=sparse_kv or paged_kv_cpasync,
+                        use_cpasync_load_KV=sparse_kv or (
+                            page_table is not None and page_size != tile_n
+                        ),
                         topk_length=gather_kv_length,
                         is_topk_gather=sparse_kv,
                         pack_gqa=pack_gqa,
