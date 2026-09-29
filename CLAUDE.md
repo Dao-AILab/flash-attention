@@ -57,6 +57,14 @@ FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x
   monkeypatch knob) before the first data-dependent check, then `if is_fake_mode(): return`.
 - `FLASH_ATTENTION_TEST_RECORD_KEYS=path` records every compile-cache lookup, for diffing the
   kernel set of a selection across changes.
+- **Most test files do not support the compilation pass yet.** Only `test_flash_attn_mla.py`
+  is fully converted; `test_flash_attn.py` mostly is, and `test_flash_attn_fast.py` and
+  `test_flash_attn_combine.py` partly. The mask_mod, score_mod, block-sparsity, varlen, hd256
+  scheduler and race-condition files are not converted at all. Their tests run with real tensors in pass 1 and
+  can compile again in pass 2, so `FLASH_ATTENTION_TEST_EXPECT_CACHED=1` (and
+  `tools/two_pass_tests.sh`) reports them as failures even when the results are correct. Run
+  those files in a single pass, or check that a failure is "kernel(s) compiled during the
+  execution pass" before treating it as a regression.
 
 Tests are parametrized over dtype (fp16/bf16), head dimension (64, 96, 128), sequence length, causal/non-causal, and MHA/GQA/MQA.
 
