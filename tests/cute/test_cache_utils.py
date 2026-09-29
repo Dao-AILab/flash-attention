@@ -63,3 +63,39 @@ def test_persistent_cache_export_is_atomic(tmp_path):
     cache._try_export_to_storage(("k2",), Good())
     assert (tmp_path / f"{cache._key_to_hash(('k2',))}.o").read_bytes() == b"object"
     assert not list(tmp_path.glob(".*.tmp.o"))
+
+
+def test_persistent_cache_replaces_nonempty_unloadable_entry(tmp_path, monkeypatch):
+    """A truncated but nonempty entry fails to load; the recompiled function's export must
+    replace it (size alone does not make an entry valid), so the next process loads it
+    instead of recompiling forever."""
+    key = ("truncated-entry",)
+    cache = cache_utils.JITPersistentCache(tmp_path)
+    obj_path = tmp_path / f"{cache._key_to_hash(key)}.o"
+    obj_path.write_bytes(b"trunc")
+
+    def load_module(path, **_kwargs):
+        if open(path, "rb").read() != b"object":
+            raise RuntimeError("Failed to lookup function '__tvm_ffi_func'")
+        return SimpleNamespace(func=object())
+
+    monkeypatch.setattr(cache_utils.cute.runtime, "load_module", load_module)
+
+    class Good:
+        def export_to_c(self, object_file_path, function_name):
+            with open(object_file_path, "wb") as f:
+                f.write(b"object")
+
+    assert not cache._try_load_from_storage(key)
+    cache[key] = Good()  # recompiled: stored in memory and exported
+    assert obj_path.read_bytes() == b"object"
+    assert not list(tmp_path.glob(".*.tmp.o"))
+    # a fresh process loads the replaced entry
+    assert cache_utils.JITPersistentCache(tmp_path)._try_load_from_storage(key)
+
+    # a nonempty entry this process loaded (or never tried) is still left alone
+    other = ("other",)
+    other_path = tmp_path / f"{cache._key_to_hash(other)}.o"
+    other_path.write_bytes(b"from another process")
+    cache[other] = Good()
+    assert other_path.read_bytes() == b"from another process"
