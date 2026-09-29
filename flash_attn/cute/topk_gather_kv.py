@@ -507,14 +507,18 @@ class CpasyncGatherKVManagerH64(ParamsBase):
 
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
             # row 16*m + t//8: its index sits in lane m of this thread's 8-thread group
-            if const_expr(use_pred):
-                row_valid = utils.shuffle_sync(tPrRowValid[0], m, width=self.gmem_threads_per_row)
+            if const_expr(use_pred or use_row_pred):
+                # both predicates apply when both are on (a valid index in a valid row)
+                row_ok = Boolean(True)
+                if const_expr(use_pred):
+                    row_ok = Boolean(
+                        utils.shuffle_sync(tPrRowValid[0], m, width=self.gmem_threads_per_row)
+                    )
+                if const_expr(use_row_pred):
+                    row = rows_per_copy * m + self.thread_idx // self.gmem_threads_per_row
+                    row_ok = row_ok and row < num_valid_rows
                 should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], Boolean)
-                should_load.fill(Boolean(row_valid))
-            if const_expr(use_row_pred):
-                row = rows_per_copy * m + self.thread_idx // self.gmem_threads_per_row
-                should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], Boolean)
-                should_load.fill(Boolean(row < num_valid_rows))
+                should_load.fill(Boolean(row_ok))
             if const_expr(identity_rows):
                 x_ptr_i64 = utils.elem_pointer(
                     mX, (rows_per_copy * m + self.thread_idx // self.gmem_threads_per_row, 0)

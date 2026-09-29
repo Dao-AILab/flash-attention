@@ -629,9 +629,8 @@ gemm_ws_ptx_partial = partial(gemm_ptx_partial, ws=True)
 def cp_smem_to_tmem_dup_64(
     sX: cute.Tensor,
     tmem_addr: Int32,
-    num_rows: int = 64,
 ) -> None:
-    """SMEM -> TMEM copy of a (num_rows <= 64, K) tile, duplicated across lane halves.
+    """SMEM -> TMEM copy of a (64, K) tile, duplicated across lane halves.
 
     Emits `tcgen05.cp.cta_group::1.64x128b.warpx2::02_13`, which lands source row m at
     BOTH TMEM lane m and lane m + 64. It is a raw bit blit, so the packing follows the
@@ -652,7 +651,6 @@ def cp_smem_to_tmem_dup_64(
     """
     width: int = const_expr(sX.element_type.width)
     assert width in (8, 16), "only 8-bit and 16-bit element types are supported"
-    assert num_rows <= 64, "the .64x128b copy shape covers at most 64 rows"
     layout = sX.layout.outer if isinstance(sX.layout, cute.ComposedLayout) else sX.layout
     k_size: int = const_expr(cute.size(layout.shape[1]))
     # elements moved per row per instruction (128 bits)

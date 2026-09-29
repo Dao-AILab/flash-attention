@@ -36,7 +36,7 @@ pytest tests/cute/test_block_sparsity.py
 
 ### Fast two-pass testing
 
-Compilation dominates test time. The fast workflow separates compilation (parallel, no GPU needed) from execution (uses cached binaries):
+Compilation dominates test time. The fast workflow separates compilation (parallel, no GPU work) from execution (uses cached binaries). The compilation pass still opens a CUDA context per xdist worker (a few hundred MB each), so set `CUDA_VISIBLE_DEVICES` for both passes:
 
 ```bash
 # Pass 1: compile all kernels in parallel using FakeTensorMode (no GPU memory allocation)
@@ -49,7 +49,7 @@ FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x
 - `FLASH_ATTENTION_FAKE_TENSOR=1` — uses PyTorch FakeTensorMode to compile kernels without allocating GPU memory or running them.
 - `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` — enables persistent disk cache at `/tmp/${USER}/flash_attention_cute_dsl_cache/`.
 - `-n 256` — pytest-xdist parallel workers (only useful in the compilation pass).
-- `tools/two_pass_tests.sh -k EXPR -g 0,1` runs both passes. The execution pass runs with
+- `tools/two_pass_tests.sh -k EXPR -g 0,1 [-f FILES]` runs both passes, both limited to the `-g` GPUs. The execution pass runs with
   `FLASH_ATTENTION_TEST_EXPECT_CACHED=1`, which fails any test that still compiles a kernel.
   `FLASH_ATTENTION_TEST_COUNT_COMPILES=1` only reports the compiles.
 - Tests must support the compilation pass: decorate with

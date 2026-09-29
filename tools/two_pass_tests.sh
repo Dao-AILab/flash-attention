@@ -4,10 +4,12 @@
 # test that still compiles (fake / real compile-key drift, or a test that skips a variant in
 # fake mode). See CLAUDE.md "Fast two-pass testing".
 #
-#   tools/two_pass_tests.sh -k "mla_sparse" [-g 0,3] [-n 48] [-f tests/cute/test_flash_attn.py] [-- extra pytest args]
+#   tools/two_pass_tests.sh -k "mla_sparse" -f tests/cute/test_flash_attn_mla.py [-g 0,3] [-n 48] [-- extra pytest args]
 #
-# -g  GPUs for the execution pass (one xdist worker per GPU); default: CUDA_VISIBLE_DEVICES or 0
-# -n  compile-pass workers (CPU only); default 48
+# -g  GPUs for both passes; default: CUDA_VISIBLE_DEVICES or 0. The execution pass runs one
+#     xdist worker per GPU. The compile pass does no GPU work, but each worker still opens a
+#     CUDA context (a few hundred MB), round-robin over these GPUs only.
+# -n  compile-pass workers; default 48
 # -f  test file(s); default tests/cute/test_flash_attn.py (MLA: tests/cute/test_flash_attn_mla.py)
 set -euo pipefail
 K="" GPUS="${CUDA_VISIBLE_DEVICES:-0}" N=48 FILES="tests/cute/test_flash_attn.py"
@@ -24,7 +26,7 @@ NGPU=$(awk -F, '{print NF}' <<<"$GPUS")
 export FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
 echo "== pass 1: compile (FakeTensorMode, -n $N)"
 set +e
-FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_TEST_COUNT_COMPILES=1 \
+CUDA_VISIBLE_DEVICES="$GPUS" FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_TEST_COUNT_COMPILES=1 \
   pytest -q -rf -n "$N" $FILES -k "$K" -p no:cacheprovider "$@" 2>&1 | grep -E "^FAILED|^ERROR|passed|failed|kernel compiles"
 status=${PIPESTATUS[0]}
 set -e

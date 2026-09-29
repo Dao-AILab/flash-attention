@@ -810,6 +810,25 @@ def test_flash_attn_mla_1cta_fp8_descales_must_be_shared():
         )
 
 
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_1cta_fp8_descale_without_rope(monkeypatch):
+    """Without a rope part (q = k = None) S = Qv @ V^T, so the latent cache's descale is
+    v_descale; a lone k_descale would be ignored, so it must be rejected."""
+    if not IS_SM100:
+        pytest.skip()
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "1")  # fp8 MLA is 1CTA-only
+    _, qv, _, v, q_descale, kv_descale, _ = _mla_1cta_fp8_inputs()
+    with pytest.raises(AssertionError, match="no rope part"):
+        _flash_attn_fwd(None, None, v, qv=qv, q_descale=q_descale, k_descale=kv_descale)
+    out, *_ = _flash_attn_fwd(None, None, v, qv=qv, q_descale=q_descale, v_descale=kv_descale)
+    out_shared, *_ = _flash_attn_fwd(
+        None, None, v, qv=qv, q_descale=q_descale, k_descale=kv_descale, v_descale=kv_descale
+    )
+    if is_fake_mode():
+        return
+    assert torch.equal(out, out_shared)
+
+
 @pytest.mark.parametrize("present", ["q", "kv"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_fp8_partial_descales(present, monkeypatch):

@@ -2709,6 +2709,8 @@ class FlashAttentionSparseMLABackwardSm100:
             # fresh accumulator): issued after the dV splits so their commits are
             # not delayed, and before dS^T is released so the tile stays valid.
             # The epilogue drains stage (g mod 2) after the two dV splits of g.
+            # stage 0 below: sdSt and sQr2 are single-stage
+            assert self.num_stages_dSt == 1 and self.num_stages_Qr == 1
             pipeline_dKr.producer_acquire(producer_state_dKr)
             gemm_dKr(
                 acc=tdKrtdKr[None, None, None, producer_state_dKr.index],

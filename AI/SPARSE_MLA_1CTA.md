@@ -103,7 +103,7 @@ Sparse prefill and training are far past one wave (1CTA 1.6x at 2K tokens).
 ### Auto split
 
 With `num_splits=0` the 1CTA split count is `num_SMs // tiles`, capped by key blocks (kb64:
-at least 4 blocks per split). The 2CTA kernel never splits. Whether a split count beats 2CTA
+at least 4 blocks per split; an explicit `num_splits` is used as given). The 2CTA kernel never splits. Whether a split count beats 2CTA
 depends on the mainloop (dense decode, one KV head, bf16, cold L2):
 
 | rows per KV head (mainloop) | 1CTA splits | s_k 8K: 1CTA / 2CTA | s_k 32K: 1CTA / 2CTA |
@@ -241,8 +241,9 @@ blocks and issues S(n) before PV(n-1).
   block takes the select branch.
 
 **Dense split-KV.** fp32 O / LSE partials go out with 256-bit stores; the sink applies on
-split 0 only; the existing combine kernel merges. At least 4 key blocks per split
-(`MIN_BLOCKS_PER_SPLIT`): one block per split was 30% slower at b 1, s_k 8K, from per-split Q
+split 0 only; the existing combine kernel merges. The split heuristic gives each split at least 4
+key blocks (`MIN_BLOCKS_PER_SPLIT`; an explicit `num_splits` may leave splits empty, which the
+epilogue and combine handle): one block per split was 30% slower at b 1, s_k 8K, from per-split Q
 loads, 128 KB fp32 partials and combine work.
 
 **Packed varlen (dense).** With `cu_seqlens_q` (and no `seqused_q`), dense kb64 schedules a

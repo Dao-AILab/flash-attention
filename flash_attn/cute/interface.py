@@ -956,13 +956,10 @@ def _flash_attn_fwd(
         )
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
-    
-    # Host-side seqlen_q for MLA routing and heuristics (max_seqlen_q is normalized above).
-    # seqlen_q_hint bounds the per-sequence length (varlen without a host max_seqlen_q: total_q,
-    # every token in one sequence); it decides what a call can run. seqlen_q_known is None when
-    # the length is unknown, for the policies that default to decode then (CLC, fp8 S-ahead).
+    # Separate use of provided and replacement max_seqlen_q as host-side hint.
     seqlen_q_hint = seqlen_q if cu_seqlens_q is None else max_seqlen_q
     seqlen_q_known = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
+
     # MLA (qv): 1CTA or 2CTA kernel. Decided here: the sparse head padding below and the
     # MLA plan (_mla_fwd_plan) depend on it.
     mla_route = partial(
@@ -1188,6 +1185,12 @@ def _flash_attn_fwd(
                 "MLA absorbed requires k_descale and v_descale to be the same tensor: "
                 "Q@K^T and Qv@V^T share one accumulator, so one descale must fold into "
                 "the softmax scale"
+            )
+        elif k_descale is not None:
+            # without a rope part S = Qv @ V^T only: the latent cache's descale is v_descale
+            assert kv_descale_shared, (
+                "MLA without q / k (no rope part) reads the latent cache as v: pass its "
+                "descale as v_descale (k_descale, if given, must be the same tensor)"
             )
         assert tile_n == (64 if mla_1cta_kb64 else 128)
 
