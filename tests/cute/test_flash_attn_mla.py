@@ -3321,29 +3321,35 @@ def test_flash_attn_mla_sparse_topk_order_invariance(nheads, causal, dtype):
         ("dense prefill fp8 (2CTA has no fp8)", dict(topk=False, h=64, s_q=4096, needs=True), True),
         ("sparse 64 heads", dict(topk=True, h=64, s_q=4096), True),
         ("sparse 24 heads decode", dict(topk=True, h=24, s_q=1), True),
+        # sparse: 2 CTAs per token on 2CTA; 1CTA only past one 2CTA wave of num_sms
+        ("sparse decode, 2CTA one wave", dict(topk=True, h=64, s_q=1, ctas=152), False),
+        ("sparse decode, 2CTA past one wave", dict(topk=True, h=64, s_q=1, ctas=160), True),
+        ("sparse decode 16 heads, one wave", dict(topk=True, h=16, s_q=1, ctas=64), False),
+        ("sparse fp8 below one wave (2CTA has no fp8)", dict(topk=True, h=64, s_q=1, ctas=64, needs=True), True),
         ("sparse 128 heads (unsupported on 1CTA)", dict(topk=True, h=128, s_q=1), False),
         ("sparse training, load-P (unsupported)", dict(topk=True, h=64, s_q=4096, grad=True), False),
         ("sparse training, recompute-P", dict(topk=True, h=64, s_q=4096, grad=True, rp=True), True),
         # num_splits == 1: 1CTA only once the 2CTA kernel (2 CTAs per batch x KV head) exceeds
         # one wave of num_sms
-        ("dense decode unsplit, 2CTA one wave", dict(topk=False, h=64, s_q=1, split=False, bh=72), False),
-        ("dense decode unsplit, 2CTA two waves", dict(topk=False, h=64, s_q=1, split=False, bh=80), True),
-        ("dense decode unsplit 16 heads, one wave", dict(topk=False, h=16, s_q=1, split=False, bh=64), False),
-        ("dense prefill unsplit, two waves", dict(topk=False, h=64, s_q=4096, split=False, bh=80), False),
+        ("dense decode unsplit, 2CTA one wave", dict(topk=False, h=64, s_q=1, split=False, ctas=144), False),
+        ("dense decode unsplit, 2CTA two waves", dict(topk=False, h=64, s_q=1, split=False, ctas=160), True),
+        ("dense decode unsplit 16 heads, one wave", dict(topk=False, h=16, s_q=1, split=False, ctas=128), False),
+        ("dense decode split, below one wave", dict(topk=False, h=64, s_q=1, ctas=16), True),
+        ("dense prefill unsplit, two waves", dict(topk=False, h=64, s_q=4096, split=False, ctas=160), False),
     ],
     ids=lambda c: c[0].replace(" ", "_"),
 )
 def test_flash_attn_mla_dispatch_heuristic(case, monkeypatch):
     """The 1CTA / 2CTA MLA dispatch with FLASH_ATTENTION_MLA_1CTA unset: sparse -> 1CTA up to
-    64 heads; dense -> 1CTA on decode shapes (seqlen_q x heads per KV head <= 64), without
-    split-KV only once 2CTA exceeds one wave, 2CTA otherwise; fp8 / descales / explicit
-    split-KV -> 1CTA. The variable overrides it."""
+    64 heads once 2CTA exceeds one wave (2 CTAs per token); dense -> 1CTA on decode shapes
+    (seqlen_q x heads per KV head <= 64), without split-KV only once 2CTA exceeds one wave,
+    2CTA otherwise; fp8 / descales / explicit split-KV -> 1CTA. The variable overrides it."""
     from flash_attn.cute.interface import _mla_1cta_route
     _, kw, expected = case
     route = lambda: _mla_1cta_route(  # noqa: E731
         kw["topk"], kw["h"], kw.get("grad", False), kw.get("rp", False),
         seqlen_q_hint=kw["s_q"], needs_1cta=kw.get("needs", False),
-        split_kv=kw.get("split", True), batch_heads_kv=kw.get("bh"), num_sms=152,
+        split_kv=kw.get("split", True), ctas_2cta=kw.get("ctas"), num_sms=152,
     )
     monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA", raising=False)
     assert route() == expected

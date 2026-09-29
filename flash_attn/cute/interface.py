@@ -588,7 +588,7 @@ _compute_blocks_to_batch.compile_cache = get_jit_cache("blocks_to_batch")
 
 def _mla_1cta_route(
     is_topk_gather, nheads_per_kv, requires_grad, gather_bwd_recompute_p, *,
-    seqlen_q_hint, needs_1cta, split_kv=True, batch_heads_kv=None, num_sms=None,
+    seqlen_q_hint, needs_1cta, split_kv=True, ctas_2cta=None, num_sms=None,
 ):
     """Whether an MLA call runs the 1CTA (tcgen05.mma.ws) kernel rather than the 2CTA one.
 
@@ -599,17 +599,20 @@ def _mla_1cta_route(
 
     Heuristic (AI/SPARSE_MLA_1CTA.md, "Dispatch heuristic"; broadly right, not per shape):
       - needs_1cta (fp8, descales, explicit split-KV: the 2CTA MLA kernel has none) -> 1CTA;
-      - sparse -> 1CTA whenever supported (<= 64 heads);
+      - one-wave rule. A 2CTA tile holds one token's heads (sparse), or one batch element's
+        decode rows (dense), padded to 128 rows -- half a 2-CTA cluster's tile at 64 heads.
+        So 2CTA launches ctas_2cta = 2 x tokens (sparse) or 2 x batch (dense decode) CTAs,
+        x KV heads, against 1CTA's one CTA per token. Below one wave of num_sms the wasted
+        half costs nothing on these memory-bound shapes and the 2CTA kernel is faster; past
+        it 2CTA needs a second wave, which nearly doubles its time, and 1CTA wins. The
+        measured crossover (152 SMs) is 76 -> 80 tokens / batch at 64 and 16 heads alike.
+      - sparse -> 1CTA whenever supported (<= 64 heads) past one 2CTA wave;
       - dense -> 1CTA on decode shapes, seqlen_q x heads per KV head <= 64 (one 64-row tile per
         KV head: the kb64 mainloop with split-KV, which beats the unsplit 2CTA kernel even at
         low occupancy); 2CTA for prefill, where its 2-CTA MMA wins. Varlen without a host
         max_seqlen_q counts as prefill.
-      - dense decode without split-KV (split_kv False, i.e. num_splits == 1): 1CTA only once
-        the 2CTA kernel exceeds one wave. Its decode tile is one (batch, KV head)'s rows padded
-        to 128, i.e. 2 CTAs each, so 2 * batch_heads_kv CTAs against num_sms. Below that the
-        unsplit 2CTA kernel is 14-31% faster; above it its second wave nearly doubles its time
-        and 1CTA wins (0.69-0.94x). Measured crossover: batch 72 -> 80 at 152 SMs, at 64 and 16
-        heads alike (AI/SPARSE_MLA_1CTA.md, "Dispatch heuristic").
+      - dense decode without split-KV (num_splits == 1) -> 1CTA past one 2CTA wave (with
+        split-KV 1CTA wins at every batch).
     FLASH_ATTENTION_MLA_1CTA=1 / 0 overrides the heuristic (1: wherever supported; 0: never).
     """
     supported = not is_topk_gather or (
@@ -620,13 +623,14 @@ def _mla_1cta_route(
         return override == "1" and supported
     if not supported:
         return False
-    if needs_1cta or is_topk_gather:
+    if needs_1cta:
         return True
+    past_one_wave = ctas_2cta is None or num_sms is None or ctas_2cta > num_sms
+    if is_topk_gather:
+        return past_one_wave
     if seqlen_q_hint is None or seqlen_q_hint * nheads_per_kv > 64:
         return False
-    if split_kv or batch_heads_kv is None or num_sms is None:
-        return True
-    return 2 * batch_heads_kv > num_sms
+    return split_kv or past_one_wave
 
 
 def _flash_attn_fwd(
@@ -825,7 +829,8 @@ def _flash_attn_fwd(
             or num_splits > 1
         ),
         split_kv=num_splits != 1,
-        batch_heads_kv=batch_size * num_head_kv,
+        # 2CTA tiles: one per token (sparse) or per batch element (dense decode), 2 CTAs each
+        ctas_2cta=2 * num_head_kv * (total_q if gather_kv_indices is not None else batch_size),
         num_sms=get_num_sms_for_selection(v.device.index, arch),
     )
     # Sparse MLA pads a token's heads to the kernel's tile (pack_gqa.qheads_first_tma_view); the

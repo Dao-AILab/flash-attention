@@ -589,7 +589,8 @@ forces 1CTA wherever it is supported; `0` forces 2CTA.
 - **fp8, descales, or an explicit `num_splits > 1`:** 1CTA. The 2CTA MLA kernel has none of
   these.
 - **Sparse:** 1CTA whenever supported (<= 64 Q heads per KV head; training only with
-  recompute-P).
+  recompute-P), once 2CTA exceeds one wave: `2 x total_q x KV heads > num SMs`. A 2CTA sparse
+  tile is one token's heads padded to 128 rows, so 2 CTAs per token. See "One-wave crossover".
 - **Dense:** 1CTA on decode shapes, `seqlen_q x heads per KV head <= 64`: one 64-row tile per
   KV head, i.e. the kb64 mainloop with split-KV. 2CTA otherwise. Varlen without a host
   `max_seqlen_q` counts as prefill.
@@ -619,10 +620,8 @@ Where it is right:
 Where it is wrong:
 - **Small-batch 128-row dense decode**, which it leaves on 2CTA. There 1CTA with split is
   about 3-4x faster; the `<= 64` boundary is conservative.
-- **Sparse decode below about one wave** (b <= 32): 2CTA is about 20% faster, at tens of
-  microseconds.
 
-### Unsplit decode crossover
+### One-wave crossover (dense unsplit decode, sparse)
 
 With `num_splits=1`, a 2CTA decode tile holds one batch element's rows: tokens of different
 batch elements are not packed into one tile. At `seqlen_q = 1` with 64 heads that is half of
@@ -646,6 +645,21 @@ GB300, bf16, `num_splits=1` on both, cold L2)
 
 The crossover is at the same batch (72 -> 80) for both head counts, so the rule counts 2CTA
 CTAs, not rows. With split-KV (`num_splits=0`) 1CTA wins at every batch (table above).
+
+Sparse decode (topk 2048, s_k 32K; `agent_space/bench_dispatch_sparse_crossover.py`,
+`bench_sparse_1cta/dispatch_sparse_crossover.csv`). A 2CTA sparse tile is one token's heads
+padded to 128 rows (2 CTAs per token); 1CTA runs one 64-row tile per token. The crossover is
+the same, 76 -> 80 tokens (2CTA 152 -> 160 CTAs), at 64 and 16 heads, with and without rope:
+
+| heads, rope | 76 tokens: 2CTA / 1CTA | 80 tokens: 2CTA / 1CTA | 88-128 tokens: 1CTA / 2CTA |
+|---|---|---|---|
+| 64, rope | 0.052 / 0.061 ms | 0.079 / **0.062** | 0.79-0.89x |
+| 64, no rope | 0.050 / 0.052 | 0.074 / 0.091 (outlier) | 0.72-0.83x |
+| 16, rope | 0.052 / 0.059 | 0.078 / **0.060** | 0.79-0.87x |
+| 16, no rope | 0.049 / 0.050 | 0.073 / **0.050** | 0.71-0.82x |
+
+At 192 tokens both kernels are in their second wave and even (0.93-1.02x). Sparse prefill
+and training are far past one wave (1CTA 1.6x at 2K tokens).
 
 ## Follow-ups
 
