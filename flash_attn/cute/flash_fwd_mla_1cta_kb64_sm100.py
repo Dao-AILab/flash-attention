@@ -110,14 +110,11 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
         is_topk_gather: bool = True,
         is_split_kv: bool = False,
         page_size: Optional[int] = None,
-        packed_varlen: bool = True,
-        force_cpasync_kv: bool = False,
     ):
         # The load front end: the cp.async gather warps 12-15 for top-k gather and for paged KV
         # whose pages are not whole 64-key blocks (a block spans pages: no TMA box); TMA from the
-        # load warp otherwise. force_cpasync_kv takes paged page_size % 64 == 0 through the gather
-        # too (A/B of the two loaders; the loaded bytes are identical).
-        paged_cpasync = page_size is not None and (page_size % 64 != 0 or force_cpasync_kv)
+        # load warp otherwise.
+        paged_cpasync = page_size is not None and page_size % 64 != 0
         use_cpasync_kv = is_topk_gather or paged_cpasync
         # the shared fields (scheduler, packed varlen, causal (in the bitmask when sparse),
         # head padding, split-KV)
@@ -151,7 +148,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             self.pad_qheads = True
         self.pack_gqa = True
         assert self.qhead_per_kvhead == 64, "kb64 mainloop: at most 64 Q heads per KV head"
-        if packed_varlen and not is_topk_gather and has_cu_seqlens_q and not has_seqused_q:
+        if not is_topk_gather and has_cu_seqlens_q and not has_seqused_q:
             # Packed varlen scheduling, as the sparse front end (the base sets it for top-k):
             # a tile is one token, so it can never straddle two sequences. The grid is flat over
             # the total_q tokens (num_batch = 1) and every role recovers (batch, local token) in
@@ -162,7 +159,6 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                 SingleTileLPTScheduler if self.use_clc_scheduler else SingleTileScheduler
             )
         assert not (is_topk_gather and page_size is not None)
-        assert not force_cpasync_kv or page_size is not None, "force_cpasync_kv: paged KV only"
         self.use_cpasync_kv = use_cpasync_kv
         self.page_size = page_size
         # TMA paging: 64-key blocks per page

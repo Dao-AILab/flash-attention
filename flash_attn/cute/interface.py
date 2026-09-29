@@ -949,14 +949,12 @@ def _flash_attn_fwd(
     # varlen, or paged with page_size % 64 == 0) or, paged at any other page size, the
     # cp.async gather warps with the page table as the index source; split-KV either way.
     # It agrees with the 2CTA kernel and the 128-key mainloop to bf16 rounding, not bitwise.
-    # FLASH_ATTENTION_MLA_1CTA_KB64=0 keeps the 128-key mainloop (A/B runs). Decided here:
-    # the split heuristic below counts its 64-row tiles and 64-key blocks.
+    # Decided here: the split heuristic below counts its 64-row tiles and 64-key blocks.
     mla_1cta_kb64 = (
         mla_1cta
         and qv is not None
         and nheads_per_kv <= 64
         and not is_fp8
-        and os.environ.get("FLASH_ATTENTION_MLA_1CTA_KB64", "1") == "1"
         and (
             gather_kv_indices is not None
             or (
@@ -1367,14 +1365,6 @@ def _flash_attn_fwd(
     # coherent bf16 gain error on peaked rows. See AI/SPARSE_MLA_EXACT_SOFTMAX_MAX.md.
     mla_fwd_rescale_threshold = 0.0 if (requires_grad and sparse_kv) else 8.0
 
-    # Opt-in to the Q-in-TMEM variant of that kernel (unified sK + single TS QK mma).
-    # Q-in-TMEM (unified sK + one N=128 weight-stationary TS QK mma) is the default: it
-    # is faster than the two-phase path on every measured shape and is bit-identical to
-    # the 2CTA kernel. Set FLASH_ATTENTION_MLA_1CTA_Q_TMEM=0 to get the legacy path
-    # (ablation only -- it does not support paged KV with a rope part).
-    mla_1cta_q_tmem = (
-        mla_1cta and os.environ.get("FLASH_ATTENTION_MLA_1CTA_Q_TMEM", "1") == "1"
-    )
     # Sparse MLA tiles are one token each with uniform cost: the persistent CLC scheduler
     # overlaps a tile's epilogue with the next tile's gather (~10% at 64 heads, both 1CTA
     # mainloops). The 2CTA MLA kernel always runs it; dense 1CTA MLA follows FA_CLC.
@@ -1384,19 +1374,6 @@ def _flash_attn_fwd(
         # decode; varlen without a max_seqlen_q hint counts as decode
         _clc_seqlen_q = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
         mla_1cta_use_clc = _clc_seqlen_q is not None and _clc_seqlen_q > 1
-    # dense kb64 with cu_seqlens_q schedules a flat grid over the tokens (packed varlen);
-    # FLASH_ATTENTION_MLA_1CTA_PACKED_VARLEN=0 keeps the per-batch varlen scheduler (ablation)
-    mla_1cta_packed_varlen = os.environ.get("FLASH_ATTENTION_MLA_1CTA_PACKED_VARLEN", "1") == "1"
-    # FLASH_ATTENTION_MLA_1CTA_KB64_PAGED_CPASYNC=1: kb64 dense paged with page_size % 64 == 0
-    # through the cp.async gather instead of TMA (A/B of the two loaders; same bytes)
-    mla_1cta_kb64_force_cpasync = (
-        mla_1cta_kb64_dense
-        and page_table is not None
-        and os.environ.get("FLASH_ATTENTION_MLA_1CTA_KB64_PAGED_CPASYNC", "0") == "1"
-    )
-    # FLASH_ATTENTION_MLA_1CTA_CLC=0 / 1 forces it (ablation)
-    if os.environ.get("FLASH_ATTENTION_MLA_1CTA_CLC"):
-        mla_1cta_use_clc = os.environ["FLASH_ATTENTION_MLA_1CTA_CLC"] == "1"
     # the kb64 epilogue stores O / o_lo (split-KV: the fp32 O partial) with 256-bit stores when
     # their rows are 32-B aligned. Fake tensors have no data pointer: use the storage offset
     # (allocations are >= 256-B aligned), so the fake compile pass picks the same variant
@@ -1417,7 +1394,7 @@ def _flash_attn_fwd(
     # stays L2-resident: >= 8 tiles of 64 rows, i.e. seqlen_q x heads >= 512 (prefill /
     # extend; +33-36% measured). Decode streams each tile's KV from DRAM and needs the loads'
     # one-block look-ahead that S-ahead gives up (-5-16%). Varlen without a max_seqlen_q hint
-    # stays in order. FLASH_ATTENTION_MLA_1CTA_S_AHEAD=0 / 1 forces it (ablation; 1 needs fp8).
+    # stays in order.
     _s_ahead_seqlen_q = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
     mla_1cta_s_ahead = (
         is_fp8
@@ -1425,19 +1402,13 @@ def _flash_attn_fwd(
         and _s_ahead_seqlen_q is not None
         and _s_ahead_seqlen_q * nheads_per_kv >= 512
     )
-    _s_ahead_env = os.environ.get("FLASH_ATTENTION_MLA_1CTA_S_AHEAD")
-    if _s_ahead_env:
-        mla_1cta_s_ahead = _s_ahead_env == "1"
 
     compile_key = (
         mla_1cta,
-        mla_1cta_q_tmem,
         mla_1cta_kb64,
         mla_1cta_kb64_o_align32,
         page_size if mla_1cta_kb64_dense and page_table is not None else None,
         mla_1cta and mla_1cta_use_clc,
-        mla_1cta_kb64_dense and mla_1cta_packed_varlen,
-        mla_1cta_kb64_force_cpasync,
         mla_1cta_s_ahead if mla_1cta else None,
         mla_ptxas_options,
         dtype,
@@ -1683,8 +1654,6 @@ def _flash_attn_fwd(
                             is_topk_gather=bool(sparse_kv),
                             is_split_kv=is_split_kv,
                             page_size=page_size if page_table is not None else None,
-                            packed_varlen=mla_1cta_packed_varlen,
-                            force_cpasync_kv=mla_1cta_kb64_force_cpasync,
                         )
                     else:
                         fa_fwd = FlashAttentionMLAForward1CtaSm100(
@@ -1697,8 +1666,7 @@ def _flash_attn_fwd(
                             use_clc_scheduler=mla_1cta_use_clc,
                             has_qk=has_qk,
                             pack_gqa=pack_gqa,
-                            # paged / top-k KV gathers into the unified sK slot -> q_in_tmem
-                            q_in_tmem=mla_1cta_q_tmem or page_table is not None or sparse_kv,
+                            q_in_tmem=True,
                             has_seqused_q=seqused_q is not None,
                             has_cu_seqlens_q=cu_seqlens_q is not None,
                             use_cpasync_load_KV=paged_kv_cpasync or sparse_kv,

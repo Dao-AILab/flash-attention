@@ -3,13 +3,10 @@
 MQA, hdim 64 (rope) + 512 (latent), inference (no grad). For each shape the same inputs
 and index lists go through:
   2cta    FLASH_ATTENTION_MLA_1CTA=0 -- Q heads padded to 128 per token
-  1cta    FLASH_ATTENTION_MLA_1CTA=1 -- padded to 64 (<= 64 heads only); exactly 64 heads
-          run the 64-key-block (kb64) mainloop
-  1cta_kb128  the same with FLASH_ATTENTION_MLA_1CTA_KB64=0 (the 128-key mainloop)
+  1cta    FLASH_ATTENTION_MLA_1CTA=1 -- padded to 64 (<= 64 heads only; the 64-key-block
+          mainloop)
   dense   1CTA dense MLA over topk contiguous keys (same FLOPs, no gather): a
           speed-of-light reference for the gather
-at each requested ptxas level (FLASH_ATTENTION_MLA_PTXAS_OPTIONS; --ptxas default O2, or
-"shipped" for each kernel's interface default, _MLA_PTXAS_DEFAULTS).
 
 Timing:
   hot   same inputs back to back (KV can stay L2-resident across iterations)
@@ -99,8 +96,6 @@ def main():
     ap.add_argument("--has-qk", type=int, nargs="+", default=[1, 0])
     ap.add_argument("--causal", action="store_true", help="bottom-right causal (prefill)")
     ap.add_argument("--kernels", nargs="+", default=["2cta", "1cta", "dense"])
-    ap.add_argument("--ptxas", nargs="+", default=["default", "O2"],
-                    help="ptxas levels: default, O<n> (passed as -O<n>), or shipped")
     ap.add_argument("--cache", nargs="+", default=["cold", "hot"])
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
@@ -111,7 +106,7 @@ def main():
     flush_buf = torch.empty(1 << 30, dtype=torch.uint8, device=dev)
     props = torch.cuda.get_device_properties(0)
     print(f"{props.name}, {props.multi_processor_count} SMs, L2 {props.L2_cache_size / 2**20:.0f} MiB")
-    header = ("kernel,ptxas,cache,has_qk,heads,batch,s_q,s_k,topk,causal,ms,tokens_per_s,"
+    header = ("kernel,cache,has_qk,heads,batch,s_q,s_k,topk,causal,ms,tokens_per_s,"
               "payload_GBps,match_2cta")
     print(header)
     csv = None
@@ -143,16 +138,11 @@ def main():
             kw = dict(q=qv, k=v, v=v)
             vd = v[:, : args.topk].contiguous()
             kw_dense = dict(q=qv, k=vd, v=vd)
-        out_2cta = {}
-        for kernel, ptxas, cache in itertools.product(args.kernels, args.ptxas, args.cache):
+        out_2cta = None
+        for kernel, cache in itertools.product(args.kernels, args.cache):
             if kernel.startswith("1cta") and h > 64:
                 continue
             os.environ["FLASH_ATTENTION_MLA_1CTA"] = "0" if kernel == "2cta" else "1"
-            os.environ["FLASH_ATTENTION_MLA_1CTA_KB64"] = "0" if kernel == "1cta_kb128" else "1"
-            if ptxas == "shipped":
-                os.environ.pop("FLASH_ATTENTION_MLA_PTXAS_OPTIONS", None)
-            else:
-                os.environ["FLASH_ATTENTION_MLA_PTXAS_OPTIONS"] = "" if ptxas == "default" else f"-{ptxas}"
             if kernel == "dense":
                 fn = lambda: flash_attn_func(**kw_dense, causal=False)
             else:
@@ -160,16 +150,16 @@ def main():
             out = fn()[0]
             match = ""
             if kernel == "2cta":
-                out_2cta[ptxas] = out
-            elif kernel.startswith("1cta") and ptxas in out_2cta:
+                out_2cta = out
+            elif kernel.startswith("1cta") and out_2cta is not None:
                 # "True" when bitwise; the kb64 mainloop agrees to bf16 rounding (rel-L2)
-                o2 = out_2cta[ptxas].float()
-                match = ("True" if torch.equal(out, out_2cta[ptxas])
+                o2 = out_2cta.float()
+                match = ("True" if torch.equal(out, out_2cta)
                          else f"relL2={((out.float() - o2).norm() / o2.norm()).item():.1e}")
             ms = time_fn(fn, args.iters, args.warmup, cache == "cold", flush_buf)
             gbps = payload_bytes / (ms * 1e-3) / 1e9 if kernel != "dense" else (
                 b * s_q * min(args.topk, s_k) * row_elems * 2) / (ms * 1e-3) / 1e9
-            row = (f"{kernel},{ptxas},{cache},{int(has_qk)},{h},{b},{s_q},{s_k},{args.topk},"
+            row = (f"{kernel},{cache},{int(has_qk)},{h},{b},{s_q},{s_k},{args.topk},"
                    f"{int(args.causal)},{ms:.4f},{b * s_q / (ms * 1e-3):.0f},{gbps:.1f},{match}")
             print(row, flush=True)
             if csv is not None:
