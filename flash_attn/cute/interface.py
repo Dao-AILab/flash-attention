@@ -3551,8 +3551,7 @@ _flash_attn_bwd_sparse_mla.compile_cache = get_jit_cache("bwd_dsa")
 
 
 def _compile_sparse_mla_dq_dqv(
-    dtype, nheads, head_dim, head_dim_v, top_k, varlen_q, varlen_k, compute_dq,
-    kernel_cls_name,  # compile-key only: the class is picked from nheads below
+    kernel_cls, dtype, nheads, head_dim, head_dim_v, top_k, varlen_q, varlen_k, compute_dq,
 ):
     sym = cute.sym_int 
     b, b_plus_1, seqlen_q, seqlen_k = sym(), sym(), sym(), sym()
@@ -3572,10 +3571,7 @@ def _compile_sparse_mla_dq_dqv(
     mCuSeqlensQ = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_q else None 
     mCuSeqlensK = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_k else None 
     
-    # Up to 64 Q heads: the 1-CTA 64-row kernel with a whole-row gather (AI/SPARSE_MLA_64H.md);
-    # fewer heads pad the tile (TMA zero-fills dS rows past nheads and drops those dQ / dQv rows).
-    dq_dqv_cls = dQdQvGemmKernelH64 if nheads <= 64 else dQdQvGemmKernel
-    dq_dqv_gemm = dq_dqv_cls(
+    dq_dqv_gemm = kernel_cls(
         acc_dtype=Float32,
         nheads=nheads,
         head_dim_k=head_dim,
@@ -3594,7 +3590,7 @@ def _compile_sparse_mla_dq_dqv(
         mCuSeqlensQ,
         mCuSeqlensK,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options=_compile_options(dq_dqv_cls.ptxas_options),
+        options=_compile_options(kernel_cls.ptxas_options),
     )
 
 
@@ -3613,8 +3609,10 @@ def _sparse_mla_dq_dqv(
     varlen_q = cu_seqlens_q is not None
     varlen_k = cu_seqlens_k is not None
     
-    # the kernel class is picked in _compile_sparse_mla_dq_dqv from nheads; key it explicitly so a
-    # swapped class (tests compare the 64-row and generic kernels) never reuses the other's binary
+    # Up to 64 Q heads: the 1-CTA 64-row kernel with a whole-row gather (AI/SPARSE_MLA_64H.md);
+    # fewer heads pad the tile (TMA zero-fills dS rows past nheads and drops those dQ / dQv rows).
+    # The class name is keyed so a swapped class (tests compare the 64-row and generic kernels)
+    # never reuses the other's binary.
     dq_dqv_cls = dQdQvGemmKernelH64 if nheads <= 64 else dQdQvGemmKernel
     compile_key = (
         dtype_cute, nheads, head_dim, head_dim_v, gather_kv_length, varlen_q, varlen_k, k is not None,
@@ -3622,7 +3620,8 @@ def _sparse_mla_dq_dqv(
     )
     if compile_key not in _sparse_mla_dq_dqv.compile_cache:
         _sparse_mla_dq_dqv.compile_cache[compile_key] = _compile_sparse_mla_dq_dqv(
-            *compile_key
+            dq_dqv_cls, dtype_cute, nheads, head_dim, head_dim_v, gather_kv_length,
+            varlen_q, varlen_k, k is not None,
         )
     if not is_fake_mode():
         _sparse_mla_dq_dqv.compile_cache[compile_key](
