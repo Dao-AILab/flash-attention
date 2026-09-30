@@ -495,7 +495,7 @@ class SingleTileLPTScheduler:
                 cutlass.Int64(args.seqlen_k) * (args.headdim + args.headdim_v) * args.element_size
             )
             size_one_head = size_one_kv_head
-            size_l2 = 50 * 1024 * 1024  # 40 MB for K & V
+            size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
             # Swizzle is the size of each "section". Round swizzle to a power of 2
             # Need to be careful about the case where only one head will fit
             # swizzle is how many heads can fit in L2
@@ -508,15 +508,22 @@ class SingleTileLPTScheduler:
             # swizzle. Instead we want to divide by the remainder.
             num_hb_quotient = (args.num_head * args.num_batch) // swizzle
             num_hb_remainder = (args.num_head * args.num_batch) % swizzle
+            #staic only supports cluster_shape_mn[0] == 1
+            num_block = args.num_block
+            # staic only used when cluster_shape_mn[0] == 1
+            # CLC swizzles whole clusters so their CTAs stay on the same head/batch.
+            # When the input counts CTA tiles, first convert M to cluster units.
+            if const_expr(scheduling_mode == SchedulingMode.CLC and not args.use_cluster_idx):
+                num_block = cute.ceil_div(args.num_block, args.cluster_shape_mn[0])
             return SingleTileLPTScheduler.Params(
-                total_blocks=args.num_block * args.num_head * args.num_batch,
-                num_block=args.num_block,
+                total_blocks=num_block * args.num_head * args.num_batch,
+                num_block=num_block,
                 num_head=args.num_head,
                 num_batch=args.num_batch,
                 l2_minor=Int32(swizzle),
                 num_head_divmod=FastDivmodDivisorV2(args.num_head),
                 l2_minor_divmod=FastDivmodDivisorV2(swizzle),
-                l2_major_divmod=FastDivmodDivisorV2(swizzle * args.num_block),
+                l2_major_divmod=FastDivmodDivisorV2(swizzle * num_block),
                 l2_minor_residual_divmod=FastDivmodDivisorV2(max(num_hb_remainder, 1)),
                 num_hb_quotient=Int32(num_hb_quotient),
                 num_splits=args.num_splits,
@@ -560,20 +567,13 @@ class SingleTileLPTScheduler:
 
     @staticmethod
     def _clc_grid_shape(params: Params):
-        num_batch_splits = (
-            params.num_batch * params.num_splits
-            if const_expr(params.is_split_kv)
-            else params.num_batch
-        )
-        if const_expr(params.use_cluster_idx):
-            # Grid must have num_block * cluster_m physical blocks so that there are num_block clusters
-            grid_x = params.num_block * params.cluster_shape_m
-        else:
-            grid_x = cute.round_up(params.num_block, params.cluster_shape_m)
+        # X flattens (M cluster, head, batch), with adjacent CTAs in each cluster.
+        # Splits stay on Y, matching the static scheduler's grid convention.
+        num_splits = params.num_splits if const_expr(params.is_split_kv) else Int32(1)
         return (
-            grid_x,
-            params.num_head,
-            num_batch_splits,
+            params.total_blocks * params.cluster_shape_m,
+            num_splits,
+            Int32(1),
         )
 
     @staticmethod
@@ -589,12 +589,8 @@ class SingleTileLPTScheduler:
     def create(
         params: Params, ctx: SchedulerState | None = None, *, loc=None, ip=None
     ) -> "SingleTileLPTScheduler":
-        if const_expr(params.scheduling_mode == SchedulingMode.CLC):
-            return SingleTileLPTScheduler(
-                params, cute.arch.block_idx()[0], Int32(0), ctx, loc=loc, ip=ip
-            )
         tile_idx, split_idx, _ = cute.arch.block_idx()
-        return SingleTileLPTScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
+        return SingleTileLPTScheduler(params, tile_idx, split_idx, ctx, loc=loc, ip=ip)
 
     @staticmethod
     def get_grid_shape(
@@ -609,49 +605,23 @@ class SingleTileLPTScheduler:
 
     @cute.jit
     def clc_work_to_coords(self, work) -> WorkTileInfo:
-        """Convert CLC response (block, head, batch_split) to WorkTileInfo.
-
-        CLC returns raw grid coordinates — no L2 swizzle (hardware decides order).
-        We only apply cluster division, optional LPT block reversal, and split_kv unpacking.
-        """
-        block_idx = work.tile_idx[0]
-        if const_expr(self.params.cluster_shape_m > 1):
-            block_idx = block_idx // self.params.cluster_shape_m
-        if const_expr(self.params.lpt):
-            # Longest-processing-time-first: reverse block order
-            if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
-                num_block = self.params.num_block // self.params.cluster_shape_m
-            else:
-                num_block = self.params.num_block
-            block_idx = num_block - 1 - block_idx
+        """Decode a physical CLC tile using the same L2 swizzle as static work."""
+        # An unsuccessful CLC response has no usable coordinates. Use the static
+        # decoder's end sentinel, also guarding dynamic split metadata loads.
+        tile_idx = self.params.total_blocks
         split_idx = Int32(0)
-        if const_expr(self.params.is_split_kv):
-            batch_idx, split_idx = divmod(work.tile_idx[2], self.params.num_splits_divmod)
-        else:
-            batch_idx = work.tile_idx[2]
-        if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
-            bidx_in_cluster = cute.arch.block_in_cluster_idx()
-            block_idx = block_idx * self.params.cluster_shape_m + bidx_in_cluster[0]
-        # Pack dynamic per-batch num_splits into high 16 bits of split_idx
-        if const_expr(self.params.is_split_kv and self.params.num_splits_dynamic_ptr is not None):
-            if work.is_valid_tile:
-                num_splits = Int32(self.params.num_splits_dynamic_ptr[batch_idx])
-                split_idx = split_idx | (num_splits << 16)
-        return WorkTileInfo(
-            (Int32(block_idx), Int32(work.tile_idx[1]), Int32(batch_idx), Int32(split_idx)),
-            work.is_valid_tile,
-        )
+        if work.is_valid_tile:
+            tile_idx = work.tile_idx[0] // self.params.cluster_shape_m
+            if const_expr(self.params.is_split_kv):
+                split_idx = work.tile_idx[1]
+        return self._decode_work_tile(tile_idx, split_idx)
 
     @cute.jit
-    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
-            work = self._ctx.get_current_work()
-            self._tile_idx = work.tile_idx[0]
-            return self.clc_work_to_coords(work)
-        # Static path: L2-swizzled coordinate mapping
+    def _decode_work_tile(self, tile_idx: Int32, split_idx: Int32) -> WorkTileInfo:
+        """Map a linear tile to (block, head, batch, split) with L2 swizzle and LPT."""
         params = self.params
         # Implement LPT scheduling coordinate calculation
-        bidhb, l2_mod = divmod(self._tile_idx, params.l2_major_divmod)
+        bidhb, l2_mod = divmod(tile_idx, params.l2_major_divmod)
         # If we're in the last section (called residual), we don't want to divide by
         # swizzle. Instead we want to divide by the remainder.
         block, bidhb_residual = 0, 0
@@ -664,8 +634,15 @@ class SingleTileLPTScheduler:
         # Longest-processing-time-first
         if const_expr(params.lpt):
             block = params.num_block - 1 - block
-        is_valid = self._tile_idx < params.total_blocks
-        split_idx = self._split_idx
+        if const_expr(
+            params.scheduling_mode == SchedulingMode.CLC
+            and params.cluster_shape_m > 1
+            and not params.use_cluster_idx
+        ):
+            # Decode/reverse in cluster units, then restore the CTA block index.
+            bidx_in_cluster = cute.arch.block_in_cluster_idx()
+            block = block * params.cluster_shape_m + bidx_in_cluster[0]
+        is_valid = tile_idx < params.total_blocks
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
         if const_expr(params.is_split_kv and params.num_splits_dynamic_ptr is not None):
             if is_valid:
@@ -676,10 +653,16 @@ class SingleTileLPTScheduler:
         )
 
     @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            work = self._ctx.get_current_work()
+            return self.clc_work_to_coords(work)
+        return self._decode_work_tile(self._tile_idx, self._split_idx)
+
+    @cute.jit
     def initial_work_tile_info(self, *, loc=None, ip=None):
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
             work = self._ctx.initial_work_tile_info()
-            self._tile_idx = work.tile_idx[0]
             return self.clc_work_to_coords(work)
         return self.get_current_work(loc=loc, ip=ip)
 
@@ -1208,7 +1191,7 @@ class SingleTileVarlenScheduler:
             assert args.mCuSeqlensQ is not None or args.mSeqUsedQ is not None, (
                 "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
             )
-            assert args.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+            assert args.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] ==  1 is supported"
             decoder = VarlenDecoder.create(
                 args,
                 fold_splits_into_scan=False,
