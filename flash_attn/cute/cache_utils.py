@@ -224,7 +224,9 @@ class JITPersistentCache(JITCache):
                 except Exception as e:
                     # A bad entry (e.g. truncated by a killed or out-of-space export) is a miss:
                     # recompile, and the export replaces it (see _try_export_to_storage).
-                    fa_log(1, f"Unloadable cache entry {obj_path} ({type(e).__name__}); recompiling")
+                    fa_log(
+                        1, f"Unloadable cache entry {obj_path} ({type(e).__name__}); recompiling"
+                    )
                     self._unloadable.add(sha256_hex)
                     return False
                 JITCache.__setitem__(self, key, fn)

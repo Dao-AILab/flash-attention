@@ -499,7 +499,9 @@ def check_tensor_vs_ref(name, actual, ref, pt, rtol=2, atol=None):
         atol = 2 * (ref + 0.3 - 0.3 - ref).abs().max().item()
     diff_max = (actual - ref).abs().max().item()
     diff_pt_max = (pt - ref).abs().max().item()
-    assert diff_max <= rtol * diff_pt_max + atol, f"{name}: {diff_max=} too large compared to {diff_pt_max=} for {rtol=}, {atol=}"
+    assert diff_max <= rtol * diff_pt_max + atol, (
+        f"{name}: {diff_max=} too large compared to {diff_pt_max=} for {rtol=}, {atol=}"
+    )
 
 
 def check_dsink_vs_ref(actual, ref, pt, rtol=2, atol=0.0):
