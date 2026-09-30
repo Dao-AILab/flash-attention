@@ -89,7 +89,6 @@ class dQdQvGemmKernelH64:
 
         self.cta_group = tcgen05.CtaGroup.ONE
 
-        self.occupancy = 1
         self.threads_per_warp = cute.arch.WARP_SIZE
 
         # ---- Set specialized warp ids ----
@@ -108,17 +107,14 @@ class dQdQvGemmKernelH64:
             )
         )
         self.num_kv_load_threads = 32 * len(self.kv_load_warp_ids)
-        # ---- Set barrier id for cta sync, epilogue sync and tmem ptr sync ----
+        # ---- Set barrier id for epilogue sync and tmem ptr sync ----
         self.epilog_sync_bar_id = 1
         self.tmem_alloc_sync_bar_id = 2
-        self.tmem_dealloc_sync_bar_id = 3
 
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             barrier_id=self.epilog_sync_bar_id,
             num_threads=self.threads_per_warp * len(self.epilogue_warp_ids),
         )
-
-        self.is_persistent = False
 
         # ---- pipeline stages ----
         # 2 whole-row KV stages (72 KiB each): a third does not fit beside the dS ring under
@@ -128,11 +124,8 @@ class dQdQvGemmKernelH64:
         self.num_stages_acc = 1
         self.num_stages_epi = 2  # dQv epilogue smem tiles (dQ has one)
         self.num_stages_clc = 1
-
-        # ---- register allocation (honoured with min_blocks_per_mp=1 at launch) ----
-        self.num_regs_KV = 224
-        self.num_regs_epi = 128
-        self.num_regs_other = 112
+        # No per-role register budgets (setmaxnreg): every role runs at the count ptxas assigns
+        # (AI/SPARSE_MLA_64H.md, "dQdQvGemmKernelH64", Registers).
 
     @cute.jit
     def __call__(
