@@ -31,6 +31,7 @@ from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.mask import AttentionMask
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
+from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
 from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
@@ -52,6 +53,13 @@ from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
 
 
 class FlashAttentionMLAForwardSm100:
+    # Extra ptxas flags (part of the compile key). The default level spills 560 B/thread of
+    # local memory on the sparse forward; -O2 removes it (32 B), median +15-17% on GB300
+    # (AI/SPARSE_MLA_1CTA.md, "ptxas levels").
+    ptxas_options = "-O2"
+    # sparse MLA: a token's heads padded to one 128-row (2-CTA) tile
+    SPARSE_HEAD_TILE = 128
+
     def __init__(
         self,
         is_causal: bool = False,
@@ -390,6 +398,9 @@ class FlashAttentionMLAForwardSm100:
         mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
         mIndexTopk: Optional[cute.Tensor] = None,   # (b, s_q, topk)  or (total_q, topk) if there is cu_seqlens_q
         mPageTable: Optional[cute.Tensor] = None,
+        # Accepted for signature parity with FlashAttentionMLAForward1CtaSm100 (the
+        # interface passes it positionally on the shared qv path); fp8 is 1CTA-only.
+        descale_tensors: Optional[DescaleTensors] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
@@ -398,6 +409,7 @@ class FlashAttentionMLAForwardSm100:
         stream: cuda.CUstream = None,
     ):
         # fmt: on
+        assert descale_tensors is None, "fp8 descales are not supported by 2CTA MLA"
         self.store_P = mP is not None
         self.store_row_max = mRowMax is not None
         self.store_O_residual = mOlo is not None
@@ -3133,6 +3145,9 @@ class FlashAttentionMLAForwardSm100:
 
             acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
             scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+            # seqlen_k == 0 with TMA KV: the fully masked dummy block still loaded a KV tile, and
+            # P = 0 times a NaN V row is NaN (scaling by 0 would keep it): write zeros instead.
+            zero_O = seqlen.seqlen_k == 0 if const_expr(self.use_tma_KV) else False
 
             self.sm_stats_barrier_empty.arrive()
 
@@ -3176,6 +3191,8 @@ class FlashAttentionMLAForwardSm100:
                     tOtOs_t2r[split],
                     tOrOs_t2r[split],
                 )
+                if zero_O:
+                    tOrOs_t2r[split].fill(0.0)
 
                 # scale and downcast Oi
                 tOrOs_r2g[split].store((tOrOs_r2g_f32[split].load() * scale).to(self.dtype_O))
@@ -3233,6 +3250,8 @@ class FlashAttentionMLAForwardSm100:
                     store_residual = row_idx < seqlen_q and self.is_valid_qhead_row(row_idx)
                     for i in cutlass.range_constexpr(cute.size(tOtOs_t2r[split], mode=[2])):
                         cute.copy(thr_tmem_load_O, tOtOs_t2r[split][None, None, i], tOrOres_f32)
+                        if zero_O:
+                            tOrOres_f32.fill(0.0)
                         o_f32 = tOrOres_f32.load() * scale
                         tOrOres_lo.store((o_f32 - o_f32.to(self.dtype_O).to(self.dtype_acc)).to(self.dtype_O))
                         if store_residual:

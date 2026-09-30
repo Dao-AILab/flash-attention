@@ -53,7 +53,8 @@ def _heads_first_order(T, head_idx):
 
 def sparse_mla_qhead_tile(qhead_per_kvhead: int, min_tile: int = 128) -> int:
     """Rows one token's Q heads occupy in a sparse-MLA tile: the real head count padded to
-    ``min_tile`` (128 in forward and dQ/dQv, 64 in backward) or to 128 when it exceeds it."""
+    ``min_tile`` (128 in the 2CTA forward and the generic dQ/dQv, 64 in the backward, the
+    1CTA forward and the 64-row dQ/dQv) or to 128 when it exceeds it."""
     assert 0 < qhead_per_kvhead <= 128, (
         f"sparse MLA: MQA with 1 to 128 heads, got {qhead_per_kvhead}"
     )
@@ -64,8 +65,8 @@ def qheads_first_tma_view(T, qhead_per_kvhead_valid, head_idx):
     """Return a heads-first TMA source with a dynamic extent equal to the real head count.
 
     .. note:: In-kernel Q-head padding (sparse MLA).
-        MQA only. Each tile covers one token and one top-k gather list: 128 heads in
-        forward and dQ/dQv, 64 or 128 in backward (``sparse_mla_qhead_tile``). The heads-first view
+        MQA only. Each tile covers one token and one top-k gather list: 64 or 128 heads
+        (``sparse_mla_qhead_tile``). The heads-first view
         ``(nheads, ..., seqlen, ...)`` has a dynamic head extent so CuTe can tile it
         without requiring divisibility. TMA zero-fills out-of-bounds loads and drops
         out-of-bounds stores, avoiding padded operand copies in global memory.

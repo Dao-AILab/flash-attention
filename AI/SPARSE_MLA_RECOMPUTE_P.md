@@ -130,16 +130,30 @@ Both paths coexist as a compile-time specialization
 ### Head counts
 
 The backward tile is 64 or 128 rows: the real Q-head count per KV head,
-padded up (`pack_gqa.qheads_first_tma_view`). Recompute-P requires the head
-count to fill that tile exactly, i.e. **64 or 128 Q heads**; the interface
-raises `ValueError` otherwise. With 64 heads nothing is padded: `tile_m = 64`,
-the S^T UMMA runs at N = 64 and `sLse`/`sQr` shrink with the tile. Padded
-counts (e.g. 24 -> 64, 96 -> 128) are not supported in this mode because the
-recompute operands are read through the packed tile layout without the
-padded TMA views `qv`/`dO` get: `lse_log2` would need `+inf` in the padded
-rows (so the recomputed P is exactly 0) and a head-sliced view for the
-preprocess, and `q` (rope) would need a padded TMA view in the main kernel.
-Load-P mode supports 1..128 heads.
+padded up (`pack_gqa.qheads_first_tma_view`). Both modes support 1..128 heads.
+With 64 or 128 heads nothing is padded: at 64, `tile_m = 64`, the S^T UMMA runs
+at N = 64 and `sLse`/`sQr` shrink with the tile.
+
+Padded counts (1..63 -> 64, 65..127 -> 128) need the recompute
+operands to read as zero in the padded rows, and P = 0 there exactly:
+- **Q_rope, and the QvB copy of Qv** that feeds the S^T GEMM, load through the
+  heads-first padded TMA views that `qv` / `dO` / `dS` already use, so their padded
+  rows are zero-filled. The dims-first Q_rope of the fused dK_rope GEMM (`sQr2`)
+  does the same.
+- **`lse_log2` is allocated at tile width filled with +inf** (`torch.full_like`,
+  about 2 us at 16K tokens). The preprocess writes only the real heads, through a
+  `[..., :nheads]` view, as for `dpsum`.
+
+In a padded row S = 0 and lse = +inf, so P = exp2(-inf) = 0. Its dO row is zero and
+its `dpsum` column is zero, so dS = 0, and the row adds nothing to dV / dK / dK_rope.
+Its dS / dQ / dQv stores are dropped by the TMA bounds. Uninitialized lse padding
+could be -inf or NaN (P = inf, then NaN); that is why the fill is needed.
+
+64-row tiles (1..64 heads) keep the fused dK_rope. 65..127 heads use the separate
+dK GEMM, as load-P does. `test_flash_attn_mla_sparse_bwd_recompute_p_padded` checks
+recompute-P against load-P at 24 / 1 heads, and checks that the padded rows
+contribute nothing. For the latter it compares against 64 heads with the extra
+heads' dO zeroed: dq / dqv are bitwise, and dk / dv agree up to atomic order.
 
 The preprocess tile is 128 packed (token, head) rows regardless of the head
 count, and the sparse-MLA path runs the preprocess without padded

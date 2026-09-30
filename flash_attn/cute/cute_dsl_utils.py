@@ -112,14 +112,14 @@ def validate_output_layout(tensor: torch.Tensor, name: str, align_bytes: int) ->
     )
 
 
-def assume_strides_aligned(t, *, canonicalize_singletons=False):
-    """Assume all strides except the last are divisible by 128 bits.
+def assume_strides_aligned(t, *, canonicalize_singletons=False, align_bits=128):
+    """Assume all strides except the last are divisible by `align_bits` (default 128 bits).
 
     Python int strides (e.g., stride=0 from GQA expand) are kept as-is
     since they're static and don't need alignment assumptions.
     Optionally zero unused dynamic singleton strides before assuming alignment.
     """
-    divby = 128 // t.element_type.width
+    divby = align_bits // t.element_type.width
     strides = tuple(
         s
         if isinstance(s, int)
@@ -132,11 +132,14 @@ def assume_strides_aligned(t, *, canonicalize_singletons=False):
     return (*strides, t.stride[-1])
 
 
-def assume_tensor_aligned(t, *, canonicalize_singletons=False):
-    """Rebuild a tensor with 128-bit aligned stride assumptions. Passes through None."""
+def assume_tensor_aligned(t, *, canonicalize_singletons=False, align_bits=128):
+    """Rebuild a tensor with `align_bits`-aligned (default 128) stride assumptions. Passes
+    through None."""
     if t is None:
         return None
-    strides = assume_strides_aligned(t, canonicalize_singletons=canonicalize_singletons)
+    strides = assume_strides_aligned(
+        t, canonicalize_singletons=canonicalize_singletons, align_bits=align_bits
+    )
     return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=strides))
 
 
