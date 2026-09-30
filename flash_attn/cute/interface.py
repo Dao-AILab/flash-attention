@@ -4222,6 +4222,12 @@ def flash_attn_varlen_func(
 
     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
 
+    page_table: paged KV. When pages load by TMA (a page holds whole key tiles), a tile loads
+        every row of its block, including rows past seqused_k in a sequence's last, partially
+        used page. Their scores are masked, but P = 0 times a NaN V row is still NaN, so those
+        rows must be finite (their values do not matter). Pages a sequence does not use may hold
+        anything, including NaN, also for a sequence with seqused_k = 0.
+
     max_seqlen_q/k: optional scalar length bounds. With Blackwell cumulative
         lengths, tensor hints are not read on the host. HD256 uses flat grids
         for omitted/tensor hints and rectangular grids for host integers.

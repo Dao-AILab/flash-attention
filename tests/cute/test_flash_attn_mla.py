@@ -907,6 +907,82 @@ def test_flash_attn_mla_dispatch_varlen_decode_split(max_seqlen_q, monkeypatch):
     assert err <= 2 * err_pt + 1e-3, (err, err_pt)
 
 
+@pytest.mark.parametrize(
+    "route",
+    [
+        ("1", 64, 64, 1), ("1", 64, 64, 3),      # 1CTA kb64, TMA pages
+        ("1", 64, 128, 1),                       # 1CTA kb64, TMA pages spanning two blocks
+        ("1", 128, 128, 1), ("1", 128, 128, 3),  # 1CTA 128-key, TMA pages
+        ("0", 64, 128, 1),                       # 2CTA, TMA pages
+        ("1", 64, 16, 1),                        # 1CTA kb64, cp.async gather
+    ],
+    ids=lambda r: f"flag{r[0]}-h{r[1]}-page{r[2]}-splits{r[3]}",
+)
+@pytest.mark.parametrize("padding", ["unused_page_nan", "tail_finite_garbage"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_paged_padding_contract(route, padding, monkeypatch):
+    """The paged-KV padding contract. Rows past seqused_k inside a partially used page must be
+    finite (TMA pages load them, and P = 0 times NaN is NaN), but may hold any finite garbage;
+    pages a batch entry does not use may hold anything, including NaN: an entry with
+    seqused_k = 0 still loads a fully masked dummy tile from its first page-table entry, and the
+    epilogue must write O = 0 for it rather than scale the accumulator. Either way the output
+    equals the run with zero padding, bitwise."""
+    if not IS_SM100:
+        pytest.skip()
+    flag, h, page_size, num_splits = route
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", flag)
+    device, dtype = "cuda", torch.bfloat16
+    k_lens = [70, 0, 130, 0]
+    b, cap = len(k_lens), 256
+    pages_per = cap // page_size
+    num_pages = b * pages_per + 1
+    junk = num_pages - 1  # a page no entry uses
+    torch.random.manual_seed(0)
+    k = torch.randn(num_pages, page_size, 1, 64, device=device, dtype=dtype) * 0.5
+    v = torch.randn(num_pages, page_size, 1, 512, device=device, dtype=dtype) * 0.5
+    page_table = torch.arange(b * pages_per, device=device, dtype=torch.int32).view(b, pages_per)
+    for i, s_k in enumerate(k_lens):
+        if s_k == 0:
+            page_table[i, 0] = junk
+    q = torch.randn(b, 1, h, 64, device=device, dtype=dtype)
+    qv = torch.randn(b, 1, h, 512, device=device, dtype=dtype)
+    seqused_k = torch.tensor(k_lens, device=device, dtype=torch.int32)
+    # the clean cache: zeros in every row past seqused_k and in the unused page
+    k_clean, v_clean = k.clone(), v.clone()
+    k_bad, v_bad = k.clone(), v.clone()
+    if not is_fake_mode():
+        k_clean[junk] = 0
+        v_clean[junk] = 0
+        for i, s_k in enumerate(k_lens):
+            if s_k > 0 and s_k % page_size:
+                p, off = page_table[i, s_k // page_size].item(), s_k % page_size
+                for t in (k_clean, v_clean):
+                    t[p, off:] = 0
+                for t in (k_bad, v_bad):
+                    t[p, off:] = 0 if padding == "unused_page_nan" else 3e4
+        if padding == "unused_page_nan":
+            k_bad[junk] = float("nan")
+            v_bad[junk] = float("nan")
+        else:
+            k_bad[junk] = 0
+            v_bad[junk] = 0
+
+    def run(k_cache, v_cache):
+        return _flash_attn_fwd(q, k_cache, v_cache, qv=qv, page_table=page_table,
+                               seqused_k=seqused_k, num_splits=num_splits, return_lse=True)[:2]
+
+    out_clean, lse_clean = run(k_clean, v_clean)
+    out_bad, lse_bad = run(k_bad, v_bad)
+    if is_fake_mode():
+        return
+    assert torch.equal(out_bad, out_clean), (out_bad - out_clean).abs().nan_to_num(1e9).max()
+    assert torch.equal(lse_bad, lse_clean)
+    for i, s_k in enumerate(k_lens):
+        if s_k == 0:
+            assert torch.count_nonzero(out_bad[i]) == 0
+            assert torch.isneginf(lse_bad[i]).all()
+
+
 def rect_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, causal, device, *,
                       fill_frac=1.0, shuffle_slots=True, oob_frac=0.0, seed=0):
     """Top-k index lists for rectangular (s_q != s_k) sparse attention tests.

@@ -2752,6 +2752,66 @@ def _fp8_decode_reference(q, k, v):
     return torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v)
 
 
+@pytest.mark.skipif(not IS_SM100, reason="SM100 paged KV (TMA pages)")
+@pytest.mark.parametrize("d, page_size", [(128, 128), (64, 128), (128, 64)])
+@pytest.mark.parametrize("num_splits", [1, 3])
+@pytest.mark.parametrize("padding", ["unused_page_nan", "tail_finite_garbage"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_padding_contract(d, page_size, num_splits, padding):
+    """The paged-KV padding contract (see test_flash_attn_mla_paged_padding_contract): rows past
+    seqused_k in a partially used page may hold finite garbage; pages an entry does not use may
+    hold NaN, including the one a seqused_k = 0 entry's fully masked dummy tile loads. The output
+    equals the run with zero padding, bitwise, and is 0 with LSE = -inf for empty entries."""
+    device, dtype = "cuda", torch.bfloat16
+    k_lens = [70, 0, 130, 0]
+    b, h, h_kv, cap = len(k_lens), 8, 2, 256
+    pages_per = cap // page_size
+    num_pages = b * pages_per + 1
+    junk = num_pages - 1
+    torch.random.manual_seed(0)
+    k = torch.randn(num_pages, page_size, h_kv, d, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    page_table = torch.arange(b * pages_per, device=device, dtype=torch.int32).view(b, pages_per)
+    for i, s_k in enumerate(k_lens):
+        if s_k == 0:
+            page_table[i, 0] = junk
+    q = torch.randn(b, 1, h, d, device=device, dtype=dtype)
+    seqused_k = torch.tensor(k_lens, device=device, dtype=torch.int32)
+    k_clean, v_clean = k.clone(), v.clone()
+    k_bad, v_bad = k.clone(), v.clone()
+    if not is_fake_mode():
+        k_clean[junk] = 0
+        v_clean[junk] = 0
+        for i, s_k in enumerate(k_lens):
+            if s_k > 0 and s_k % page_size:
+                p, off = page_table[i, s_k // page_size].item(), s_k % page_size
+                for t in (k_clean, v_clean):
+                    t[p, off:] = 0
+                for t in (k_bad, v_bad):
+                    t[p, off:] = 0 if padding == "unused_page_nan" else 3e4
+        if padding == "unused_page_nan":
+            k_bad[junk] = float("nan")
+            v_bad[junk] = float("nan")
+        else:
+            k_bad[junk] = 0
+            v_bad[junk] = 0
+
+    def run(k_cache, v_cache):
+        return _flash_attn_fwd(q, k_cache, v_cache, page_table=page_table, seqused_k=seqused_k,
+                               num_splits=num_splits, return_lse=True)[:2]
+
+    out_clean, lse_clean = run(k_clean, v_clean)
+    out_bad, lse_bad = run(k_bad, v_bad)
+    if is_fake_mode():
+        return
+    assert torch.equal(out_bad, out_clean), (out_bad - out_clean).abs().nan_to_num(1e9).max()
+    assert torch.equal(lse_bad, lse_clean)
+    for i, s_k in enumerate(k_lens):
+        if s_k == 0:
+            assert torch.count_nonzero(out_bad[i]) == 0
+            assert torch.isneginf(lse_bad[i]).all()
+
+
 @pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_paged_decode_tile_boundary():

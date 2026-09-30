@@ -1241,6 +1241,11 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                 kv_state.advance()
 
                 # ==== KV blocks, descending ====
+                # Padding contract (interface docstring, "page_table"): a TMA box loads the whole
+                # 64-key block, including rows past seqlen_k in the last, partially used page.
+                # Their scores are masked, but P = 0 times a NaN V row is NaN, so those rows must
+                # be finite. Unused pages may hold anything: an empty sequence's dummy block reads
+                # one, and the epilogue writes zeros for it (zero_O).
                 if const_expr(mPageTable is not None):
                     page_blocks = mV.shape[0] // self.tile_n  # 64-key blocks per page (run time)
                 for i in cutlass.range(num_n_blocks, unroll=1):
@@ -2219,6 +2224,9 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                 self.sm_stats_barrier_empty.arrive()
                 acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                 scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                # seqlen_k == 0 with TMA KV: the fully masked dummy block still loaded a KV tile, and
+                # P = 0 times a NaN V row is NaN (scaling by 0 would keep it): write zeros instead.
+                zero_O = seqlen.seqlen_k == 0 if const_expr(not self.use_cpasync_kv) else False
 
                 if const_expr(mLSE is not None):
                     LN2 = math.log(2.0)
@@ -2256,6 +2264,8 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                         tOgOlo_cur = tOgOlo[None, None, None, split]
                     for i in cutlass.range_constexpr(cute.size(tOtOs_t2r[split], mode=[2])):
                         cute.copy(thr_tmem_load_O, tOtOs_t2r[split][None, None, i], tOrO_chunk_f32)
+                        if zero_O:
+                            tOrO_chunk_f32.fill(0.0)
                         o_f32 = tOrO_chunk_f32.load() * scale
                         o_lp = o_f32.to(self.dtype_O)
                         tOrO_chunk.store(o_lp)

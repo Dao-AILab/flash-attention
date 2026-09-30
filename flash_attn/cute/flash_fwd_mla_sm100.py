@@ -3145,6 +3145,9 @@ class FlashAttentionMLAForwardSm100:
 
             acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
             scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+            # seqlen_k == 0 with TMA KV: the fully masked dummy block still loaded a KV tile, and
+            # P = 0 times a NaN V row is NaN (scaling by 0 would keep it): write zeros instead.
+            zero_O = seqlen.seqlen_k == 0 if const_expr(self.use_tma_KV) else False
 
             self.sm_stats_barrier_empty.arrive()
 
@@ -3188,6 +3191,8 @@ class FlashAttentionMLAForwardSm100:
                     tOtOs_t2r[split],
                     tOrOs_t2r[split],
                 )
+                if zero_O:
+                    tOrOs_t2r[split].fill(0.0)
 
                 # scale and downcast Oi
                 tOrOs_r2g[split].store((tOrOs_r2g_f32[split].load() * scale).to(self.dtype_O))
@@ -3245,6 +3250,8 @@ class FlashAttentionMLAForwardSm100:
                     store_residual = row_idx < seqlen_q and self.is_valid_qhead_row(row_idx)
                     for i in cutlass.range_constexpr(cute.size(tOtOs_t2r[split], mode=[2])):
                         cute.copy(thr_tmem_load_O, tOtOs_t2r[split][None, None, i], tOrOres_f32)
+                        if zero_O:
+                            tOrOres_f32.fill(0.0)
                         o_f32 = tOrOres_f32.load() * scale
                         tOrOres_lo.store((o_f32 - o_f32.to(self.dtype_O).to(self.dtype_acc)).to(self.dtype_O))
                         if store_residual:

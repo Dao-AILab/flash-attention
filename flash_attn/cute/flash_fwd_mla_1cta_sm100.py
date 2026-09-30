@@ -3364,6 +3364,9 @@ class FlashAttentionMLAForward1CtaSm100:
                 # and never in LSE -- LSE is a function of the dequantized scores only).
                 scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
                 scale = scale * v_descale
+                # seqlen_k == 0 with TMA KV: the fully masked dummy block still loaded a KV tile, and
+                # P = 0 times a NaN V row is NaN (scaling by 0 would keep it): write zeros instead.
+                zero_O = seqlen.seqlen_k == 0 if const_expr(not self.use_cpasync_load_KV) else False
 
                 seqlen_q = seqlen.seqlen_q
 
@@ -3391,6 +3394,8 @@ class FlashAttentionMLAForward1CtaSm100:
                         tOtOs_t2r[split],
                         tOrOs_t2r[split],
                     )
+                    if zero_O:
+                        tOrOs_t2r[split].fill(0.0)
 
                     # scale and downcast Oi
                     tOrOs_r2g[split].store((tOrOs_r2g_f32[split].load() * scale).to(self.dtype_O))

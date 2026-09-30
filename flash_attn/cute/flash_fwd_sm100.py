@@ -2770,6 +2770,8 @@ class FlashAttentionForwardSm100:
                         mO_cur,
                         gO_stage,
                         gmem_tiled_copy_O,
+                        # TMA KV loads a dummy tile when seqlen_k == 0 (see correction_epilogue)
+                        zero_fill=seqlen.seqlen_k == 0 if const_expr(self.use_tma_KV) else False,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
@@ -2949,7 +2951,7 @@ class FlashAttentionForwardSm100:
         mO_cur: Optional[cute.Tensor] = None,
         gO: Optional[cute.Tensor] = None,
         gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
-        zero_fill: cutlass.Constexpr[bool] = False,
+        zero_fill: bool | Boolean = False,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -3006,9 +3008,13 @@ class FlashAttentionForwardSm100:
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
             tOrO_frg = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
-            if const_expr(zero_fill):
+            if const_expr(zero_fill is True):
                 # Empty tile: O accumulator was never written, so write zeros directly
                 # rather than scaling whatever the TMEM columns happen to hold.
+                tOrO_frg.fill(0.0)
+            elif zero_fill:
+                # Run time (seqlen_k == 0 with TMA KV): the fully masked dummy block still loaded
+                # a KV tile, and P = 0 times a NaN V row is NaN; scaling by 0 would keep it.
                 tOrO_frg.fill(0.0)
             else:
                 cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
