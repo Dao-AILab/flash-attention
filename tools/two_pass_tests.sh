@@ -24,16 +24,12 @@ shift $((OPTIND - 1))
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 NGPU=$(awk -F, '{print NF}' <<<"$GPUS")
 export FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
+# --disable-warnings: the DSL emits thousands of deprecation warnings per run; failures and
+# their tracebacks are still printed. A failed pass exits the script (set -e), so pass 2 never
+# runs after a failed compile pass.
 echo "== pass 1: compile (FakeTensorMode, -n $N)"
-set +e
-CUDA_VISIBLE_DEVICES="$GPUS" FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_TEST_COUNT_COMPILES=1 \
-  pytest -q -rf -n "$N" $FILES -k "$K" -p no:cacheprovider "$@" 2>&1 | grep -E "^FAILED|^ERROR|passed|failed|kernel compiles"
-status=${PIPESTATUS[0]}
-set -e
-if [ "$status" -ne 0 ]; then
-  echo "pass 1 failed (exit $status): fix the failures above before executing" >&2
-  exit "$status"
-fi
+CUDA_VISIBLE_DEVICES="$GPUS" FLASH_ATTENTION_FAKE_TENSOR=1 \
+  pytest -q -rfE --disable-warnings -n "$N" $FILES -k "$K" -p no:cacheprovider "$@"
 echo "== pass 2: execute (GPUs $GPUS, -n $NGPU, compiles fail the test)"
 CUDA_VISIBLE_DEVICES="$GPUS" FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_TEST_EXPECT_CACHED=1 \
-  pytest -q -n "$NGPU" $FILES -k "$K" -p no:cacheprovider "$@"
+  pytest -q -rfE --disable-warnings -n "$NGPU" $FILES -k "$K" -p no:cacheprovider "$@"
