@@ -1082,13 +1082,9 @@ def test_flash_attn_mla_1cta_sparse_fwd(nheads, has_qk, causal, seqlen_q, seqlen
     out_2cta, lse_2cta = flash_attn_func(**kw)
     if is_fake_mode():
         return
-    if _mla_kb64_active(nheads):
-        # 64-key blocks: a different running-max sequence than the 2CTA kernel's
-        _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "1CTA kb64 vs 2CTA")
-    else:
-        # the 128-key mainloop: same math and accumulation order as the 2CTA kernel
-        assert torch.equal(out, out_2cta)
-        assert torch.equal(lse, lse_2cta)
+    # bf16, <= 64 heads under the flag: the kb64 mainloop, whose 64-key blocks give a different
+    # running-max sequence than the 2CTA kernel's
+    _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "1CTA kb64 vs 2CTA")
 
     valid = _topk_valid_rows(idx, seqlen_q, seqlen_k, causal)
     # rows with no valid slot: O = 0, LSE = -inf (the reference NaNs there)
@@ -1201,7 +1197,7 @@ def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sin
     """Padded heads must never be written: with fewer than 64 heads the packed layout maps a
     token's padded rows onto the next token's heads (and past the tensor for the last
     token). out/lse are views into canary-filled buffers; the tails must survive, and every
-    real row must match the 2CTA kernel. Covers both the TMA O store (dense Q) and the
+    real row must match the 2CTA kernel (to bf16 rounding). Covers both the TMA O store (dense Q) and the
     guarded LSE / sink paths. train: the recompute-P training forward (exact max, the o_lo
     residual under the same row guard as O, checked to half an ulp of O)."""
     if not IS_SM100:
@@ -1238,11 +1234,8 @@ def test_flash_attn_mla_1cta_sparse_padded_head_canary(nheads, has_learnable_sin
         _, e = torch.frexp(out.float())
         half_ulp = torch.ldexp(torch.ones_like(out, dtype=torch.float32), e - 9)
         assert (o_lo.float().abs() <= half_ulp)[out != 0].all(), "o_lo"
-    if _mla_kb64_active(nheads):
-        _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "1CTA kb64 vs 2CTA")
-    else:
-        assert torch.equal(out, out_2cta)
-        assert torch.equal(lse, lse_2cta)
+    # bf16, <= 64 heads under the flag: the kb64 mainloop
+    _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "1CTA kb64 vs 2CTA")
 
 
 @pytest.mark.parametrize("nheads", [64, 128])
@@ -1290,7 +1283,7 @@ def test_flash_attn_mla_1cta_sparse_varlen(nheads, has_qk, causal, q_mode, varle
     scheduler with batch-local indexing and keeps the TMA O store (one-token tiles cannot
     straddle sequences; the 64-head kb64 mainloop stores O per row); seqused_q runs the
     varlen scheduler. Ragged lengths include 0 and 1. Checked per sequence against the
-    reference, against 2CTA (bitwise, or to bf16 rounding on the kb64 mainloop), and for
+    reference, against 2CTA (to bf16 rounding: these run the kb64 mainloop), and for
     writes past the last token (canary tail)."""
     if not IS_SM100:
         pytest.skip()
@@ -1361,10 +1354,8 @@ def test_flash_attn_mla_1cta_sparse_varlen(nheads, has_qk, causal, q_mode, varle
             o, o2, l, l2 = out[rows], out_2cta[rows], lse[rows], lse_2cta[rows]
         else:
             o, o2, l, l2 = out[i, :sq], out_2cta[i, :sq], lse[i, :sq], lse_2cta[i, :sq]
-        if _mla_kb64_active(nheads):
-            _assert_mla_fwd_close(o, o2, l, l2, f"sequence {i}: 1CTA kb64 vs 2CTA")
-        else:
-            assert torch.equal(o, o2) and torch.equal(l, l2), f"sequence {i}: 1CTA != 2CTA"
+        # bf16, <= 64 heads under the flag: the kb64 mainloop
+        _assert_mla_fwd_close(o, o2, l, l2, f"sequence {i}: 1CTA kb64 vs 2CTA")
         q_r = qs[i][None] if has_qk else None
         k_r = ks[i][None] if has_qk else vs[i][None]
         ref_q = q_r if has_qk else qvs[i][None]
