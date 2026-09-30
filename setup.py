@@ -391,11 +391,11 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
             "/D_USE_MATH_DEFINES",
         ]
         # /std:c++20 implies /permissive-. MSVC 2022 (<19.50) then rejects CuTe
-        # templates (C3545 in cute/stride.hpp) with CUDA 13.x; opt back out so
-        # the build is self-contained.
+        # templates (C3545 in cute/stride.hpp) with CUDA 13.x, so relax conformance
+        # for nvcc's host compilation only. Do not add it to the cl flags: torch's
+        # C++20 headers fail to compile under /permissive (C2666/C2139).
         if cxx_standard == "c++20":
             nvcc_flags += ["-Xcompiler", "/permissive"]
-            compiler_cxx_flag += ["/permissive"]
 
     # Opt-in: disable building dropout and its dependent headers (ATen philox/RNG
     # headers) from the FA2 build. This flag must be shared across both cxx and nvcc
