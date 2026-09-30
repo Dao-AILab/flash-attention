@@ -83,7 +83,6 @@ from flash_attn.cute.tile_scheduler import (
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
 
 
-
 class FlashAttentionMLAForward1CtaSm100:
     # Extra ptxas flags (part of the compile key): the default level spills 352 B/thread on the
     # sparse forward, -O2 none, median +15-17% on GB300 (AI/SPARSE_MLA_1CTA.md, "ptxas levels").
@@ -423,9 +422,7 @@ class FlashAttentionMLAForward1CtaSm100:
         # Layout E packed: 64 x N occupies N // 2 columns of all 128 lanes.
         self.tmem_cols_S = self.tile_n // self.num_acc_halves
         self.tmem_cols_Oi = (self.hdimv // self.num_hdimv_splits) // self.num_acc_halves
-        self.tmem_offset_S = [
-            self.tmem_cols_S * stage for stage in range(self.num_stages_S)
-        ]
+        self.tmem_offset_S = [self.tmem_cols_S * stage for stage in range(self.num_stages_S)]
         self.tmem_offset_O0 = self.tmem_cols_S * self.num_stages_S
         self.tmem_offset_O1 = self.tmem_offset_O0 + self.tmem_cols_Oi
         self.tmem_offsets_O = [self.tmem_offset_O0, self.tmem_offset_O1]
@@ -435,9 +432,7 @@ class FlashAttentionMLAForward1CtaSm100:
         # and m + 64 -- the PTX Layout E A-operand organization, decoded empirically).
         self.tmem_offset_Q = self.total_tmem
         # 32 // width elements per 32-bit TMEM word (bf16: hdim/2 cols, fp8: hdim/4)
-        self.tmem_cols_Q = (
-            self.hdim * self.dtype_ab_width // 32 if self.has_qk else 0
-        )
+        self.tmem_cols_Q = self.hdim * self.dtype_ab_width // 32 if self.has_qk else 0
         self.total_tmem += self.tmem_cols_Q
         assert self.total_tmem <= self.tmem_alloc_cols, (
             f"Total TMEM columns allocated {self.total_tmem} exceeds capacity {self.tmem_alloc_cols}"
@@ -475,9 +470,7 @@ class FlashAttentionMLAForward1CtaSm100:
         _acc_tmem_layout's (64, (n/2, 2)) profile, for tmem-copy partitioning."""
         n2 = n // self.num_acc_halves
         cS = cute.make_identity_tensor((64, n))
-        return cute.composition(
-            cS, cute.make_layout((64, (n2, 2)), stride=(1, (64, 64 * n2)))
-        )
+        return cute.composition(cS, cute.make_layout((64, (n2, 2)), stride=(1, (64, 64 * n2))))
 
     def _get_shared_storage_cls(self):
         self.buffer_align_bytes = 1024
@@ -556,9 +549,7 @@ class FlashAttentionMLAForward1CtaSm100:
             mbar_ptr_bitmask: mbar_ptr_bitmask_struct
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
             # the CLC response is read with a 16-byte copy
-            clc_response: cute.struct.Align[
-                cute.struct.MemRange[Int32, clc_response_size], 16
-            ]
+            clc_response: cute.struct.Align[cute.struct.MemRange[Int32, clc_response_size], 16]
             tmem_holding_buf: Int32
             sO_empty_mbar_ptr: cutlass.Int64
             # "Q staging consumed" (with a rope part). The staging tile aliases the first half

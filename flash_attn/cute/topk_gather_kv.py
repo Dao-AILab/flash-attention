@@ -353,7 +353,9 @@ class CpasyncGatherKVManagerH64(ParamsBase):
     ):
         assert num_threads == 128, "H64 gather: 128 producer threads"
         assert (page_size_divmod is None) == (mPageTable is None)
-        assert page_size_divmod is None or disable_bitmask, "paged KV: positional masking, no bitmask"
+        assert page_size_divmod is None or disable_bitmask, (
+            "paged KV: positional masking, no bitmask"
+        )
         assert tile_n == 64, "H64 gather: 64-key stages"
         assert hdim % 64 == 0 and hdim_v % 64 == 0, "rows are whole 128-B chunks"
         universal_copy_bits = 128
