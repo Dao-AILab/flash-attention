@@ -5,8 +5,7 @@ import math
 import pytest
 import torch
 
-from flash_attn.cute import flash_attn_func
-from flash_attn.cute import interface
+from flash_attn.cute import flash_attn_func, interface
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

@@ -1,5 +1,9 @@
 # Native SM110 short packed-GQA prefill — test result
 
+The final dispatch plus scheduling revision and its complete-model gains are recorded in
+[TEST_RESULT_INFERENCE_PERFORMANCE.md](TEST_RESULT_INFERENCE_PERFORMANCE.md).
+This report retains the earlier scheduling-only measurements.
+
 Tested 2026-10-01 on native NVIDIA Thor/aarch64, driver 595.78, Torch 2.13.0+cu130,
 CUTLASS DSL 4.8.0, TVM FFI 0.1.12 and Quack 0.5.3. Dependencies use task-local targets;
 existing environments were retained. Baseline: `616b0e8abab13b87b01525b3916d5a863ab02ae0`.

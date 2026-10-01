@@ -1,0 +1,4345 @@
+{
+  "contract": {
+    "baseline": "616b0e8abab13b87b01525b3916d5a863ab02ae0",
+    "tested_patch": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+    "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+    "order": [
+      "A",
+      "P",
+      "P",
+      "A",
+      "A",
+      "P",
+      "P",
+      "A",
+      "A",
+      "P",
+      "P",
+      "A"
+    ],
+    "independent_blocks": 3,
+    "samples_per_process_workload": 11,
+    "warm_generations": 3,
+    "mes": 0.01,
+    "mode": "offline full original model greedy generation",
+    "cuda_graph": false,
+    "persistent_fa4_cache": false
+  },
+  "summary": {
+    "node": "Thor",
+    "processes": 12,
+    "independent_blocks": 3,
+    "method": "Geometric means of process medians; exact nonparametric block bootstrap (27 draws)",
+    "mes": 0.01,
+    "results": [
+      {
+        "workload": "128 full-model prefill",
+        "baseline_ms": 23.209762385956083,
+        "patch_ms": 22.094561956956984,
+        "speedup": 1.0504739777675454,
+        "latency_reduction_pct": 4.804876544853776,
+        "block_speedups": [
+          1.0154895403502717,
+          1.0785247462962952,
+          1.058401208319654
+        ],
+        "speedup_ci95": [
+          1.0246590966229305,
+          1.0741372442776176
+        ],
+        "process_medians_ms": [
+          22.706004965584725,
+          23.25399499386549,
+          21.913358999881893,
+          23.142842983361334,
+          22.503634972963482,
+          21.995437040459365,
+          21.111173962708563,
+          24.002282007131726,
+          24.343336990568787,
+          21.71207801438868,
+          22.644329990725964,
+          22.624625999014825
+        ],
+        "mes_1pct_pass": true
+      },
+      {
+        "workload": "128 input + 32 greedy tokens",
+        "baseline_ms": 766.2722487011681,
+        "patch_ms": 717.495445196954,
+        "speedup": 1.0679820392320745,
+        "latency_reduction_pct": 6.365466527972375,
+        "block_speedups": [
+          1.0392009374934783,
+          1.0952150563276826,
+          1.0702689142567452
+        ],
+        "speedup_ci95": [
+          1.0458663442153466,
+          1.0897684943222405
+        ],
+        "process_medians_ms": [
+          753.4132660366595,
+          746.0736209759489,
+          706.5674909972586,
+          755.6159790256061,
+          749.1385179455392,
+          705.2979120053351,
+          696.863773977384,
+          786.9681760203093,
+          802.8686689794995,
+          706.8626609980129,
+          744.9446850223467,
+          751.2774959905073
+        ],
+        "mes_1pct_pass": true,
+        "output_tokens_s": [
+          41.76061452602521,
+          44.59958626108899
+        ]
+      },
+      {
+        "workload": "512 full-model prefill",
+        "baseline_ms": 23.867599781358717,
+        "patch_ms": 21.787462210887306,
+        "speedup": 1.095474064410859,
+        "latency_reduction_pct": 8.715319468763916,
+        "block_speedups": [
+          1.067625296956773,
+          1.1065529149870763,
+          1.1127952360783855
+        ],
+        "speedup_ci95": [
+          1.0759591312091685,
+          1.1114401962702303
+        ],
+        "process_medians_ms": [
+          23.97380501497537,
+          22.135824023280293,
+          21.642405015882105,
+          22.77728501940146,
+          24.206647998653352,
+          22.41318899905309,
+          21.428618987556547,
+          24.294477014336735,
+          24.815207987558097,
+          21.571938996203244,
+          21.550217003095895,
+          23.198153998237103
+        ],
+        "mes_1pct_pass": true
+      },
+      {
+        "workload": "512 input + 32 greedy tokens",
+        "baseline_ms": 758.4521147551485,
+        "patch_ms": 699.2234856077833,
+        "speedup": 1.0847062925752302,
+        "latency_reduction_pct": 7.809145494503101,
+        "block_speedups": [
+          1.0395881270167378,
+          1.0965629007496303,
+          1.1195451665452276
+        ],
+        "speedup_ci95": [
+          1.0517137717888903,
+          1.1145312082753713
+        ],
+        "process_medians_ms": [
+          737.5139099895023,
+          726.4521489851177,
+          694.1465430427343,
+          738.9423950226046,
+          759.8984700161964,
+          710.7769610011019,
+          680.4565949714743,
+          765.3239369974472,
+          793.6429330147803,
+          692.5124229746871,
+          691.9528869912028,
+          756.7669890122488
+        ],
+        "mes_1pct_pass": true,
+        "output_tokens_s": [
+          42.191193586862866,
+          45.76505317492985
+        ]
+      }
+    ],
+    "complete_generation_gate": true
+  },
+  "models": [
+    {
+      "label": "final-model-00-base",
+      "pid": 2916685,
+      "mode": "generation",
+      "load_s": 1.4108818499953486,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "616b0e8abab13b87b01525b3916d5a863ab02ae0",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3300.370557990391,
+          "e2e_ms": [
+            752.7591629768722,
+            750.4645980079658,
+            752.1414440125227,
+            760.9432470053434,
+            754.596346989274,
+            752.3840690264478,
+            753.4132660366595,
+            756.4868009649217,
+            749.9220669851638,
+            754.5859580277465,
+            759.3246839824133
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            22.918217990081757,
+            22.708801028784364,
+            22.57865300634876,
+            22.554550028871745,
+            22.55089400568977,
+            22.706004965584725,
+            22.833032999187708,
+            22.87826599786058,
+            22.716337989550084,
+            22.546022024471313,
+            22.43491099216044
+          ],
+          "median_ms": 753.4132660366595,
+          "correctness": "PASS",
+          "correctness_details": {}
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 35.59829399455339,
+          "e2e_ms": [
+            740.5712189502083,
+            737.3970240005292,
+            736.2771129701287,
+            737.6750120311044,
+            739.700294972863,
+            737.1283230022527,
+            736.889127001632,
+            740.1480889529921,
+            738.6055910028517,
+            734.0951879741624,
+            737.5139099895023
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            24.577797041274607,
+            24.135370971634984,
+            24.47866799775511,
+            23.97380501497537,
+            24.39149998826906,
+            24.023443984333426,
+            23.902934044599533,
+            22.65951398294419,
+            23.438534000888467,
+            22.749884985387325,
+            22.980745998211205
+          ],
+          "median_ms": 737.5139099895023,
+          "correctness": "PASS",
+          "correctness_details": {}
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/interface.py",
+          "sha256": "f498a42080b5c1e475b976ef163e78c90d72ad938f69b54df28d6345118982ed"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    {
+      "label": "final-model-01-thor-sink",
+      "pid": 2917131,
+      "mode": "generation",
+      "load_s": 1.3146818350069225,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3258.235152985435,
+          "e2e_ms": [
+            748.5202730167657,
+            745.9452920011245,
+            748.0424550012685,
+            745.9258079761639,
+            746.0736209759489,
+            751.733498997055,
+            748.0058750370517,
+            742.3368290183134,
+            746.060875011608,
+            741.5730549837463,
+            747.0144950202666
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            23.25399499386549,
+            22.944910975638777,
+            22.832837013993412,
+            22.915633977390826,
+            22.956874046940356,
+            22.80847600195557,
+            23.583912989124656,
+            24.644211982376873,
+            24.55531497253105,
+            23.951533949002624,
+            23.709598986897618
+          ],
+          "median_ms": 746.0736209759489,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 35.13189096702263,
+          "e2e_ms": [
+            726.4521489851177,
+            728.8153589470312,
+            721.4946689782664,
+            736.4425809937529,
+            723.076755006332,
+            721.0769689991139,
+            731.2518879771233,
+            723.2498609810136,
+            725.1599120208994,
+            731.4068280393258,
+            728.3389369840734
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            23.975310032255948,
+            23.951293027494103,
+            23.410875000990927,
+            22.205999994184822,
+            22.221010993234813,
+            22.125508985482156,
+            22.052360989619046,
+            22.135824023280293,
+            22.053417982533574,
+            21.95430500432849,
+            21.968971996102482
+          ],
+          "median_ms": 726.4521489851177,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/interface.py",
+          "sha256": "04346763cbe832dcc6b6139c98005ceb6eb986ab666cc6a823a278138e88f69f"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    {
+      "label": "final-model-02-thor-sink",
+      "pid": 2917530,
+      "mode": "generation",
+      "load_s": 1.352089366002474,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3115.909695974551,
+          "e2e_ms": [
+            705.2888990147039,
+            706.492995028384,
+            702.1382679813541,
+            708.0639229970984,
+            706.5674909972586,
+            705.64178499626,
+            710.0709890364669,
+            710.8407959458418,
+            708.6344370036386,
+            707.5434690341353,
+            705.3489160025492
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            21.928101021330804,
+            21.695033996365964,
+            21.626784990075976,
+            21.811479004099965,
+            22.14598096907139,
+            22.090378974098712,
+            22.296009003184736,
+            21.953516989015043,
+            21.789184014778584,
+            21.797830995637923,
+            21.913358999881893
+          ],
+          "median_ms": 706.5674909972586,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 33.12922501936555,
+          "e2e_ms": [
+            692.4097050214186,
+            695.7751209847629,
+            692.596593988128,
+            694.5825600414537,
+            694.3426700308919,
+            693.6133890412748,
+            695.9522169781849,
+            690.8087210031226,
+            693.3669779682532,
+            694.1465430427343,
+            694.1483849659562
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            21.642405015882105,
+            21.628876973409206,
+            21.527727018110454,
+            21.652163995895535,
+            21.61197899840772,
+            21.584421978332102,
+            21.673312003258616,
+            21.470719017088413,
+            21.66731999022886,
+            22.111943049822003,
+            21.704218990635127
+          ],
+          "median_ms": 694.1465430427343,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/interface.py",
+          "sha256": "04346763cbe832dcc6b6139c98005ceb6eb986ab666cc6a823a278138e88f69f"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    {
+      "label": "final-model-03-base",
+      "pid": 2917932,
+      "mode": "generation",
+      "load_s": 1.4401448729913682,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "616b0e8abab13b87b01525b3916d5a863ab02ae0",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3302.743122971151,
+          "e2e_ms": [
+            757.1653709746897,
+            757.9098450369202,
+            754.5875100186095,
+            753.2677730196156,
+            756.3677720027044,
+            757.1892539854161,
+            754.6448390348814,
+            755.6159790256061,
+            752.2797270212322,
+            758.5590310045518,
+            753.075310960412
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            22.99606497399509,
+            22.847314015962183,
+            22.782841988373548,
+            23.270833014976233,
+            23.23361102025956,
+            23.352462972979993,
+            23.87693600030616,
+            23.04937900044024,
+            23.142842983361334,
+            23.253351042512804,
+            23.048565024510026
+          ],
+          "median_ms": 755.6159790256061,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 35.24633898632601,
+          "e2e_ms": [
+            739.5161179592833,
+            740.2538959868252,
+            740.285923006013,
+            739.888735988643,
+            731.6700450028293,
+            733.8880320312455,
+            736.9322149897926,
+            738.9423950226046,
+            738.9212269918062,
+            736.7056270013563,
+            741.8010190012865
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            23.965889995452017,
+            23.70987000176683,
+            24.185270012822002,
+            23.795426997821778,
+            23.58675899449736,
+            22.73922902531922,
+            22.77728501940146,
+            22.403942013625056,
+            22.37095101736486,
+            22.363514988683164,
+            22.512432013172656
+          ],
+          "median_ms": 738.9423950226046,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/interface.py",
+          "sha256": "f498a42080b5c1e475b976ef163e78c90d72ad938f69b54df28d6345118982ed"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    {
+      "label": "final-model-04-base",
+      "pid": 2918362,
+      "mode": "generation",
+      "load_s": 1.2213811340043321,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "616b0e8abab13b87b01525b3916d5a863ab02ae0",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3295.627304993104,
+          "e2e_ms": [
+            748.1762749957852,
+            751.2349580065347,
+            750.428324972745,
+            751.4476049691439,
+            747.8595480206423,
+            748.8268720335327,
+            748.8861409947276,
+            748.1651190319099,
+            749.1385179455392,
+            769.2273579887114,
+            779.9007840221748
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            22.631608007941395,
+            22.61278301011771,
+            22.634071006905288,
+            22.49585697427392,
+            22.425614995881915,
+            22.455366037320346,
+            22.491987037938088,
+            22.487754991743714,
+            22.503634972963482,
+            22.71920902421698,
+            23.084006970748305
+          ],
+          "median_ms": 749.1385179455392,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 36.38032905291766,
+          "e2e_ms": [
+            759.4385839765891,
+            761.2059660023078,
+            760.3368340060115,
+            759.8984700161964,
+            757.9935929970816,
+            761.567093024496,
+            767.060465994291,
+            762.0933799771592,
+            759.5277309883386,
+            759.7198230214417,
+            758.2899669650942
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            24.884001992177218,
+            24.660474038682878,
+            24.246371001936495,
+            24.11355503136292,
+            24.206647998653352,
+            24.610880995169282,
+            24.97156703611836,
+            23.286229989025742,
+            23.09176599374041,
+            23.07567303068936,
+            23.16133095882833
+          ],
+          "median_ms": 759.8984700161964,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/interface.py",
+          "sha256": "f498a42080b5c1e475b976ef163e78c90d72ad938f69b54df28d6345118982ed"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    {
+      "label": "final-model-05-thor-sink",
+      "pid": 2918745,
+      "mode": "generation",
+      "load_s": 1.3317317330511287,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3122.2456310060807,
+          "e2e_ms": [
+            703.2301630242728,
+            704.0486260084435,
+            714.1571710235439,
+            703.3706410438754,
+            707.9981989809312,
+            707.4793350184336,
+            705.2979120053351,
+            706.1741270008497,
+            705.067798960954,
+            710.9851919813082,
+            703.9232940296642
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            22.009779990185052,
+            21.995437040459365,
+            22.804540989454836,
+            22.597846982534975,
+            22.121058020275086,
+            21.57551102573052,
+            21.66054700501263,
+            22.0241229981184,
+            21.64710301440209,
+            21.60400996217504,
+            21.57603797968477
+          ],
+          "median_ms": 705.2979120053351,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 33.520031021907926,
+          "e2e_ms": [
+            704.7133730375208,
+            708.5995590314269,
+            707.8715370153077,
+            710.7769610011019,
+            713.8587259687483,
+            708.3612480200827,
+            705.3805369650945,
+            711.42259798944,
+            718.3278360171244,
+            716.4455240126699,
+            716.4601910044439
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            24.16448900476098,
+            24.181896005757153,
+            23.93322897842154,
+            22.32942800037563,
+            22.41318899905309,
+            23.007178970146924,
+            22.545346000697464,
+            22.247836051974446,
+            21.66947297519073,
+            21.58239798154682,
+            21.667974011506885
+          ],
+          "median_ms": 710.7769610011019,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/interface.py",
+          "sha256": "04346763cbe832dcc6b6139c98005ceb6eb986ab666cc6a823a278138e88f69f"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    {
+      "label": "final-model-06-thor-sink",
+      "pid": 2919170,
+      "mode": "generation",
+      "load_s": 1.2031898540444672,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3102.337924996391,
+          "e2e_ms": [
+            690.017301007174,
+            698.113645950798,
+            721.3754270342179,
+            713.2127109798603,
+            694.0746229956858,
+            692.1221740194596,
+            694.6972550358623,
+            699.1653559962288,
+            693.2987020118162,
+            698.1898789526895,
+            696.863773977384
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            21.601545973680913,
+            21.35062898742035,
+            21.135961986146867,
+            21.035980025772005,
+            21.111173962708563,
+            21.05686900904402,
+            21.209480008110404,
+            21.20610000565648,
+            21.04161900933832,
+            21.061952982563525,
+            21.06697903946042
+          ],
+          "median_ms": 696.863773977384,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 32.922908023465425,
+          "e2e_ms": [
+            681.4677389920689,
+            679.9438550369814,
+            684.2829119996168,
+            680.4565949714743,
+            684.0633730171248,
+            678.6536640138365,
+            678.6214769817889,
+            678.2397910137661,
+            682.5081529677846,
+            678.6511229583994,
+            687.5266450224444
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            21.470720996148884,
+            21.55160898109898,
+            21.428618987556547,
+            21.385527041275054,
+            21.401202015113086,
+            21.40815695747733,
+            21.481009025592357,
+            21.37366501847282,
+            21.34642394958064,
+            21.572110010311007,
+            21.944491018075496
+          ],
+          "median_ms": 680.4565949714743,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/interface.py",
+          "sha256": "04346763cbe832dcc6b6139c98005ceb6eb986ab666cc6a823a278138e88f69f"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    {
+      "label": "final-model-07-base",
+      "pid": 2919552,
+      "mode": "generation",
+      "load_s": 1.4590946600073949,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "616b0e8abab13b87b01525b3916d5a863ab02ae0",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3329.316357965581,
+          "e2e_ms": [
+            786.9313799892552,
+            784.3351020128466,
+            784.4830380054191,
+            789.1907700104639,
+            790.0737440213561,
+            790.8277260139585,
+            787.9437350202352,
+            786.7424730211496,
+            786.9681760203093,
+            784.7509559942409,
+            788.4161039837636
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            24.28220002911985,
+            24.03807797236368,
+            23.888123978395015,
+            23.90685596037656,
+            23.84242002153769,
+            23.65209598792717,
+            24.002282007131726,
+            24.384773976635188,
+            23.83279101923108,
+            24.21864401549101,
+            24.250568996649235
+          ],
+          "median_ms": 786.9681760203093,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 37.06928598694503,
+          "e2e_ms": [
+            765.2828359859996,
+            761.72167097684,
+            765.3239369974472,
+            759.5348850009032,
+            761.3697220222093,
+            764.0429399907589,
+            768.1965620140545,
+            771.8673280323856,
+            768.0926419561729,
+            769.2667089868337,
+            769.6505970088765
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            24.786875990685076,
+            24.736940977163613,
+            24.567571002990007,
+            24.285949009936303,
+            24.689922982361168,
+            23.453697038348764,
+            24.294477014336735,
+            23.61790998838842,
+            23.90146703692153,
+            23.760335985571146,
+            24.74363596411422
+          ],
+          "median_ms": 765.3239369974472,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/interface.py",
+          "sha256": "f498a42080b5c1e475b976ef163e78c90d72ad938f69b54df28d6345118982ed"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    {
+      "label": "final-model-08-base",
+      "pid": 2919969,
+      "mode": "generation",
+      "load_s": 1.0749421039945446,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "616b0e8abab13b87b01525b3916d5a863ab02ae0",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3330.78492898494,
+          "e2e_ms": [
+            810.9494600212201,
+            800.8066110196523,
+            801.4674070291221,
+            805.0862299860455,
+            802.8686689794995,
+            802.7255829656497,
+            799.3175090523437,
+            804.9322359729558,
+            803.3788970205933,
+            805.1567239454016,
+            798.6012070323341
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            24.510402989108115,
+            24.395105021540076,
+            24.403005023486912,
+            24.35852203052491,
+            24.343336990568787,
+            24.129066965542734,
+            24.19941104017198,
+            24.443059985060245,
+            24.03426100499928,
+            24.08496697898954,
+            24.310319044161588
+          ],
+          "median_ms": 802.8686689794995,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 38.25749002862722,
+          "e2e_ms": [
+            784.3781220144592,
+            784.1154439956881,
+            781.7700020386837,
+            795.2472459874116,
+            804.2334070196375,
+            795.0531230308115,
+            794.2174909985624,
+            791.6779009974562,
+            793.6429330147803,
+            790.2604140108451,
+            797.0159109681845
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            25.39293101290241,
+            24.90332897286862,
+            24.93272698484361,
+            24.815207987558097,
+            24.860569974407554,
+            25.102052022702992,
+            24.364437034819275,
+            24.47184600168839,
+            24.119161011185497,
+            23.894750978797674,
+            23.9425859763287
+          ],
+          "median_ms": 793.6429330147803,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/interface.py",
+          "sha256": "f498a42080b5c1e475b976ef163e78c90d72ad938f69b54df28d6345118982ed"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    {
+      "label": "final-model-09-thor-sink",
+      "pid": 2920411,
+      "mode": "generation",
+      "load_s": 1.2396630410221405,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3097.1819719998166,
+          "e2e_ms": [
+            706.1284779920243,
+            703.1517020077445,
+            708.5045099956915,
+            708.5936669609509,
+            705.8582520112395,
+            710.052938957233,
+            706.6311319940723,
+            706.8626609980129,
+            708.1229030154645,
+            707.3000019881874,
+            706.1979610007256
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            22.007886960636824,
+            21.71321801142767,
+            21.71207801438868,
+            21.716422052122653,
+            21.604162000585347,
+            21.55794994905591,
+            21.555254992563277,
+            21.711606008466333,
+            21.72560599865392,
+            21.762598014902323,
+            21.679949015378952
+          ],
+          "median_ms": 706.8626609980129,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 33.60154200345278,
+          "e2e_ms": [
+            689.8257160210051,
+            690.7613379880786,
+            693.3030660147779,
+            690.0639189989306,
+            695.153530978132,
+            692.5124229746871,
+            689.7198689985089,
+            695.4510760260746,
+            691.3304739864543,
+            692.6939760451205,
+            698.2062840252183
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            21.581356995739043,
+            21.642634004820138,
+            21.571938996203244,
+            21.519950008951128,
+            21.63080096943304,
+            21.472254011314362,
+            21.524615993257612,
+            21.668920991942286,
+            21.688243956305087,
+            21.553587983362377,
+            21.54431998496875
+          ],
+          "median_ms": 692.5124229746871,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/interface.py",
+          "sha256": "04346763cbe832dcc6b6139c98005ceb6eb986ab666cc6a823a278138e88f69f"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    {
+      "label": "final-model-10-thor-sink",
+      "pid": 2920801,
+      "mode": "generation",
+      "load_s": 1.37967411900172,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3117.966322985012,
+          "e2e_ms": [
+            741.1332740448415,
+            752.8511330019683,
+            748.1858440442011,
+            748.1114909751341,
+            749.2950950399972,
+            740.3673609951511,
+            747.1090699546039,
+            744.9446850223467,
+            742.8133549983613,
+            741.8471110286191,
+            739.2762620002031
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            23.0447209905833,
+            22.644329990725964,
+            22.486450034193695,
+            22.60272001149133,
+            22.592302004341036,
+            22.777599981054664,
+            22.811163973528892,
+            22.548357024788857,
+            22.59356202557683,
+            22.7447830257006,
+            22.68427499802783
+          ],
+          "median_ms": 744.9446850223467,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 35.157192032784224,
+          "e2e_ms": [
+            692.5788539811037,
+            691.0731560201384,
+            689.1623819828965,
+            690.8839690149762,
+            690.2199849719182,
+            691.9528869912028,
+            693.8744549988769,
+            696.8626939924434,
+            694.2144179483876,
+            689.754018036183,
+            695.4125490156002
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            21.585142007097602,
+            21.582994027994573,
+            21.53738302877173,
+            21.622457017656416,
+            21.529401012230664,
+            21.550217003095895,
+            21.480586961843073,
+            21.577928971964866,
+            21.537336986511946,
+            21.44317899364978,
+            21.73215296352282
+          ],
+          "median_ms": 691.9528869912028,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/interface.py",
+          "sha256": "04346763cbe832dcc6b6139c98005ceb6eb986ab666cc6a823a278138e88f69f"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    },
+    {
+      "label": "final-model-11-base",
+      "pid": 2921191,
+      "mode": "generation",
+      "load_s": 1.214794191007968,
+      "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+      "git_sha": "616b0e8abab13b87b01525b3916d5a863ab02ae0",
+      "python": "/home/jwipc/projects/host-gateway/.vllm/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": "13.0",
+      "dsl": "4.8.0",
+      "ffi": "0.1.12",
+      "quack": "0.5.3",
+      "gpu": "NVIDIA Thor",
+      "sm": [
+        11,
+        0
+      ],
+      "fa4_calls": 27608,
+      "rows": [
+        {
+          "input_tokens": 128,
+          "output_tokens": 32,
+          "first_prefill_ms": 3357.0763589814305,
+          "e2e_ms": [
+            752.5340209831484,
+            751.6195460339077,
+            748.1410100008361,
+            751.9960000063293,
+            749.8737520072609,
+            751.2774959905073,
+            750.8416709606536,
+            750.0089649693109,
+            752.7370989555493,
+            753.140895976685,
+            748.750580009073
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 1
+          },
+          "steady_prefill_ms": [
+            22.903144010342658,
+            22.624625999014825,
+            22.561902995221317,
+            22.568542044609785,
+            22.530031972564757,
+            22.570264001842588,
+            22.823727980721742,
+            22.75569102494046,
+            22.690912010148168,
+            22.747801966033876,
+            22.612319968175143
+          ],
+          "median_ms": 751.2774959905073,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        },
+        {
+          "input_tokens": 512,
+          "output_tokens": 32,
+          "first_prefill_ms": 35.87727597914636,
+          "e2e_ms": [
+            749.328012985643,
+            731.4763229805976,
+            733.0427250126377,
+            737.2515120077878,
+            752.5291930069216,
+            756.7669890122488,
+            758.221028954722,
+            759.5077899750322,
+            763.4211229742505,
+            757.66989501426,
+            765.5255059944466
+          ],
+          "prefill_cache": {
+            "load_attempts": 0,
+            "disk_hits": 0,
+            "compiles": 0
+          },
+          "steady_prefill_ms": [
+            24.353684973903,
+            24.257258977741003,
+            24.03090597363189,
+            23.41551601421088,
+            23.238477995619178,
+            23.036736994981766,
+            23.198153998237103,
+            23.032072000205517,
+            23.009255004581064,
+            23.009108030237257,
+            22.976644977461547
+          ],
+          "median_ms": 756.7669890122488,
+          "correctness": "PASS",
+          "correctness_details": {
+            "logits": {
+              "max_abs": 0.0,
+              "exact": true
+            },
+            "tokens": {
+              "exact": true
+            },
+            "teacher_logits": {
+              "max_abs": 0.0,
+              "exact": true
+            }
+          }
+        }
+      ],
+      "cache_counts": {
+        "load_attempts": 0,
+        "disk_hits": 0,
+        "compiles": 3
+      },
+      "sources": {
+        "softmax": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/softmax.py",
+          "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+        },
+        "backward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_bwd_sm90.py",
+          "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+        },
+        "cache": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/cache_utils.py",
+          "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+        },
+        "interface": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/interface.py",
+          "sha256": "f498a42080b5c1e475b976ef163e78c90d72ad938f69b54df28d6345118982ed"
+        },
+        "forward": {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/flash_fwd_sm100.py",
+          "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+        }
+      },
+      "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    }
+  ],
+  "status": [
+    {
+      "name": "final-correctness-thor",
+      "state": "FINISHED",
+      "queued": 1790842377.9396985,
+      "started": 1790842378.2037666,
+      "cpu_load_before": [
+        0.73095703125,
+        0.8369140625,
+        0.7421875
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 38, [N/A], 2.16 W",
+      "pid": 2915872,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-correctness-thor.log",
+      "exit_code": 0,
+      "elapsed_s": 91.1235945224762,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.25634765625,
+        0.97705078125,
+        0.80224609375
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 39, [N/A], 1.68 W"
+    },
+    {
+      "name": "final-model-00-base",
+      "state": "FINISHED",
+      "queued": 1790842469.3796673,
+      "started": 1790842469.4092472,
+      "cpu_load_before": [
+        1.25634765625,
+        0.97705078125,
+        0.80224609375
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 39, [N/A], 1.68 W",
+      "pid": 2916685,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-00-base.log",
+      "exit_code": 0,
+      "elapsed_s": 39.845402240753174,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.22119140625,
+        0.998046875,
+        0.81884765625
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 40, [N/A], 3.84 W"
+    },
+    {
+      "name": "final-model-01-thor-sink",
+      "state": "FINISHED",
+      "queued": 1790842509.2957435,
+      "started": 1790842509.3152592,
+      "cpu_load_before": [
+        1.22119140625,
+        0.998046875,
+        0.81884765625
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 41, [N/A], 3.84 W",
+      "pid": 2917131,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-01-thor-sink.log",
+      "exit_code": 0,
+      "elapsed_s": 38.502498388290405,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.318359375,
+        1.04541015625,
+        0.841796875
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 41, [N/A], 3.84 W"
+    },
+    {
+      "name": "final-model-02-thor-sink",
+      "state": "FINISHED",
+      "queued": 1790842547.8610651,
+      "started": 1790842547.8845134,
+      "cpu_load_before": [
+        1.318359375,
+        1.04541015625,
+        0.841796875
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 41, [N/A], 3.84 W",
+      "pid": 2917530,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-02-thor-sink.log",
+      "exit_code": 0,
+      "elapsed_s": 37.95172119140625,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.08154296875,
+        1.02099609375,
+        0.84375
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 4.08 W"
+    },
+    {
+      "name": "final-model-03-base",
+      "state": "FINISHED",
+      "queued": 1790842585.879945,
+      "started": 1790842585.9012837,
+      "cpu_load_before": [
+        1.08154296875,
+        1.02099609375,
+        0.84375
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 3.84 W",
+      "pid": 2917932,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-03-base.log",
+      "exit_code": 0,
+      "elapsed_s": 38.92742133140564,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.255859375,
+        1.07958984375,
+        0.873046875
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 3.84 W"
+    },
+    {
+      "name": "final-model-04-base",
+      "state": "FINISHED",
+      "queued": 1790842624.8679202,
+      "started": 1790842624.8918426,
+      "cpu_load_before": [
+        1.255859375,
+        1.07958984375,
+        0.873046875
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 3.84 W",
+      "pid": 2918362,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-04-base.log",
+      "exit_code": 0,
+      "elapsed_s": 38.88426685333252,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.29052734375,
+        1.1015625,
+        0.8916015625
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.84 W"
+    },
+    {
+      "name": "final-model-05-thor-sink",
+      "state": "FINISHED",
+      "queued": 1790842663.8193488,
+      "started": 1790842663.8425934,
+      "cpu_load_before": [
+        1.29052734375,
+        1.1015625,
+        0.8916015625
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.60 W",
+      "pid": 2918745,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-05-thor-sink.log",
+      "exit_code": 0,
+      "elapsed_s": 38.424702405929565,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.38671875,
+        1.1513671875,
+        0.91796875
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.84 W"
+    },
+    {
+      "name": "final-model-06-thor-sink",
+      "state": "FINISHED",
+      "queued": 1790842702.3077831,
+      "started": 1790842702.3309622,
+      "cpu_load_before": [
+        1.38671875,
+        1.1513671875,
+        0.91796875
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.84 W",
+      "pid": 2919170,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-06-thor-sink.log",
+      "exit_code": 0,
+      "elapsed_s": 36.25597405433655,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.421875,
+        1.19482421875,
+        0.94287109375
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 4.08 W"
+    },
+    {
+      "name": "final-model-07-base",
+      "state": "FINISHED",
+      "queued": 1790842738.629403,
+      "started": 1790842738.6521451,
+      "cpu_load_before": [
+        1.421875,
+        1.19482421875,
+        0.94287109375
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 4.08 W",
+      "pid": 2919552,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-07-base.log",
+      "exit_code": 0,
+      "elapsed_s": 39.905699729919434,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.5908203125,
+        1.2646484375,
+        0.97900390625
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.84 W"
+    },
+    {
+      "name": "final-model-08-base",
+      "state": "FINISHED",
+      "queued": 1790842778.6020203,
+      "started": 1790842778.6248147,
+      "cpu_load_before": [
+        1.5908203125,
+        1.2646484375,
+        0.97900390625
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.84 W",
+      "pid": 2919969,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-08-base.log",
+      "exit_code": 0,
+      "elapsed_s": 40.888919830322266,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.521484375,
+        1.30224609375,
+        1.00537109375
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.84 W"
+    },
+    {
+      "name": "final-model-09-thor-sink",
+      "state": "FINISHED",
+      "queued": 1790842819.5551019,
+      "started": 1790842819.578243,
+      "cpu_load_before": [
+        1.521484375,
+        1.30224609375,
+        1.00537109375
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.84 W",
+      "pid": 2920411,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-09-thor-sink.log",
+      "exit_code": 0,
+      "elapsed_s": 37.83448648452759,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.400390625,
+        1.298828125,
+        1.013671875
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 44, [N/A], 4.08 W"
+    },
+    {
+      "name": "final-model-10-thor-sink",
+      "state": "FINISHED",
+      "queued": 1790842857.4564416,
+      "started": 1790842857.4745138,
+      "cpu_load_before": [
+        1.400390625,
+        1.298828125,
+        1.013671875
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 44, [N/A], 4.08 W",
+      "pid": 2920801,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-10-thor-sink.log",
+      "exit_code": 0,
+      "elapsed_s": 37.47173857688904,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.513671875,
+        1.34033203125,
+        1.03857421875
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 44, [N/A], 4.07 W"
+    },
+    {
+      "name": "final-model-11-base",
+      "state": "FINISHED",
+      "queued": 1790842894.9877698,
+      "started": 1790842895.0122323,
+      "cpu_load_before": [
+        1.513671875,
+        1.34033203125,
+        1.03857421875
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 44, [N/A], 3.83 W",
+      "pid": 2921191,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-model-11-base.log",
+      "exit_code": 0,
+      "elapsed_s": 40.18711543083191,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.43017578125,
+        1.3427734375,
+        1.0517578125
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 44, [N/A], 3.60 W"
+    }
+  ],
+  "eager_api": [
+    {
+      "scope": "public eager API wall latency; includes CPU dispatch and device work",
+      "git_sha": "616b0e8abab13b87b01525b3916d5a863ab02ae0",
+      "interface_sha256": "f498a42080b5c1e475b976ef163e78c90d72ad938f69b54df28d6345118982ed",
+      "driver_sha256": "8b1d59e7df4fbee73913eaf2c45fd6ce6ba35d776794ef6af55fdcef6ef655e0",
+      "rows": [
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 1,
+          "sk": 129,
+          "median_us": 48.56607498368248,
+          "samples_us": [
+            49.92187023162842,
+            56.471514981240034,
+            49.471264937892556,
+            49.079224991146475,
+            48.893209896050394,
+            48.538994742557406,
+            48.56607498368248,
+            48.50330500630662,
+            47.95098502654582,
+            49.01848500594497,
+            49.72752009052783,
+            48.370664881076664,
+            47.976954956538975,
+            47.963300021365285,
+            48.481315025128424
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 1,
+          "sk": 512,
+          "median_us": 48.58700500335544,
+          "samples_us": [
+            49.97487994842231,
+            49.20681501971558,
+            49.9138148734346,
+            48.31358004594222,
+            49.05002017039806,
+            48.46232506679371,
+            49.12422999041155,
+            48.58700500335544,
+            48.70765493251383,
+            48.361445078626275,
+            48.716680030338466,
+            48.283619980793446,
+            48.336074978578836,
+            48.020019894465804,
+            48.42792986892164
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 128,
+          "sk": 128,
+          "median_us": 50.54076493252069,
+          "samples_us": [
+            51.52743018697947,
+            51.31334997713566,
+            51.01909511722624,
+            50.79117516288534,
+            50.54076493252069,
+            50.33877008827403,
+            50.46061996836215,
+            52.43488005362451,
+            50.78793503344059,
+            49.73543487722054,
+            50.37622002419084,
+            49.51677517965436,
+            50.45756493927911,
+            49.527469964232296,
+            50.69724022177979
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 512,
+          "sk": 512,
+          "median_us": 50.99798523588106,
+          "samples_us": [
+            84.98879498802125,
+            84.92689492413774,
+            64.72658016718924,
+            52.84446495352313,
+            50.99798523588106,
+            51.84534500585869,
+            50.91408995212987,
+            51.65539012523368,
+            50.26057478971779,
+            50.73581007309258,
+            50.06992520065978,
+            50.709369825199246,
+            50.58089998783544,
+            50.542104872874916,
+            51.02890485431999
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 1,
+          "sk": 129,
+          "median_us": 49.51565992087126,
+          "samples_us": [
+            51.03408999275416,
+            50.46594509622082,
+            49.930434906855226,
+            50.04548525903374,
+            49.51565992087126,
+            49.554370052646846,
+            49.00797997834161,
+            49.518574960529804,
+            49.10682502668351,
+            50.249600026290864,
+            49.41811988828704,
+            49.40154496580362,
+            48.947879986371845,
+            49.44321000948548,
+            48.903769929893315
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 1,
+          "sk": 512,
+          "median_us": 49.25927001750097,
+          "samples_us": [
+            49.52070506988093,
+            48.978860140778124,
+            49.111075059045106,
+            48.712100251577795,
+            50.3583051613532,
+            51.77501996513456,
+            51.402524986770004,
+            51.56585481017828,
+            49.26752008032054,
+            49.246175040025264,
+            49.25927001750097,
+            49.537190061528236,
+            49.01469510514289,
+            49.07487513264641,
+            48.759880010038614
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 128,
+          "sk": 128,
+          "median_us": 50.42923003202304,
+          "samples_us": [
+            52.22251988016069,
+            51.13941995659843,
+            50.91372499009594,
+            50.73372507467866,
+            50.30483502196148,
+            50.49071507528424,
+            50.0416848808527,
+            50.42923003202304,
+            49.39011007081717,
+            50.62872020062059,
+            49.49020018102601,
+            50.34946516389027,
+            50.623815041035414,
+            50.20404496463016,
+            50.21955497795716
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 512,
+          "sk": 512,
+          "median_us": 51.2573349988088,
+          "samples_us": [
+            84.92060995195061,
+            84.7874052124098,
+            63.89939517248422,
+            52.328589954413474,
+            50.84538977826014,
+            51.38317006640136,
+            50.4260350135155,
+            51.28121993038803,
+            50.18613504944369,
+            51.322194922249764,
+            50.13830494135618,
+            51.00886017316952,
+            50.58899987488985,
+            51.2573349988088,
+            50.75729510281235
+          ]
+        }
+      ]
+    },
+    {
+      "scope": "public eager API wall latency; includes CPU dispatch and device work",
+      "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+      "interface_sha256": "04346763cbe832dcc6b6139c98005ceb6eb986ab666cc6a823a278138e88f69f",
+      "driver_sha256": "8b1d59e7df4fbee73913eaf2c45fd6ce6ba35d776794ef6af55fdcef6ef655e0",
+      "rows": [
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 1,
+          "sk": 129,
+          "median_us": 32.7751599252224,
+          "samples_us": [
+            34.205495030619204,
+            43.51217998191714,
+            34.099794866051525,
+            33.88451994396746,
+            33.89566991245374,
+            32.963595003820956,
+            33.54391490574926,
+            32.7751599252224,
+            31.9842851604335,
+            32.081179961096495,
+            32.220809953287244,
+            31.781455036252737,
+            31.50206001009792,
+            32.096364884637296,
+            31.79418999934569
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 1,
+          "sk": 512,
+          "median_us": 32.486180134583265,
+          "samples_us": [
+            33.19404990179464,
+            32.82864025095478,
+            32.486180134583265,
+            32.94539521448314,
+            32.670490036252886,
+            32.58141485275701,
+            32.64035010943189,
+            32.633494993206114,
+            31.633310136385262,
+            31.608130084350705,
+            32.44895982788876,
+            32.418500049971044,
+            32.01733488822356,
+            32.218544802162796,
+            31.569139973726124
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 128,
+          "sk": 128,
+          "median_us": 36.78086504805833,
+          "samples_us": [
+            37.449020019266754,
+            36.78086504805833,
+            36.332529853098094,
+            36.86184005346149,
+            36.59119480289519,
+            36.22850519604981,
+            37.226700223982334,
+            37.0128100621514,
+            37.067855009809136,
+            37.28401992702857,
+            36.383880069479346,
+            36.801374808419496,
+            36.71382990432903,
+            36.262350040487945,
+            36.68012504931539
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 512,
+          "sk": 512,
+          "median_us": 33.670029952190816,
+          "samples_us": [
+            85.15926019754261,
+            65.45769021613523,
+            46.59829486627132,
+            35.671835066750646,
+            33.41326490044594,
+            34.03456474188715,
+            33.64331991178915,
+            33.28146005515009,
+            33.91053498489782,
+            33.670029952190816,
+            33.43581018270925,
+            33.81641989108175,
+            33.194239949807525,
+            33.00132026197389,
+            33.34109002025798
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 1,
+          "sk": 129,
+          "median_us": 32.583495194558054,
+          "samples_us": [
+            33.41720497701317,
+            33.26261998154223,
+            32.93034998932853,
+            32.96173526905477,
+            32.97609509900212,
+            32.62520505813882,
+            32.583495194558054,
+            32.625854946672916,
+            32.557900121901184,
+            32.460904913023114,
+            32.28534507798031,
+            32.13932504877448,
+            32.09095011698082,
+            32.043175015132874,
+            32.49520988902077
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 1,
+          "sk": 512,
+          "median_us": 31.94895980414003,
+          "samples_us": [
+            32.269929943140596,
+            32.021554943639785,
+            32.08571986760944,
+            31.978774932213128,
+            32.022889936342835,
+            31.94895980414003,
+            32.177290122490376,
+            31.980809872038662,
+            31.834280234761536,
+            31.824230100028217,
+            31.879559974186122,
+            31.713035132270306,
+            31.86835499946028,
+            31.847989885136485,
+            31.861410243436694
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 128,
+          "sk": 128,
+          "median_us": 36.44665499450639,
+          "samples_us": [
+            37.35883510671556,
+            36.986560153309256,
+            36.90484503749758,
+            36.59938491182402,
+            37.36387501703575,
+            36.415405047591776,
+            36.18804505094886,
+            36.22767486376688,
+            36.3553999341093,
+            36.44665499450639,
+            36.59878013422713,
+            36.508829798549414,
+            36.164479970466346,
+            35.85928992833942,
+            36.095399991609156
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 512,
+          "sk": 512,
+          "median_us": 33.47275487612933,
+          "samples_us": [
+            47.247470065485686,
+            47.22866491647437,
+            48.88793017016724,
+            49.58793491823599,
+            45.9095899714157,
+            45.34787993179634,
+            33.47275487612933,
+            33.368779986631125,
+            33.49002479808405,
+            33.39942515594885,
+            33.39896007673815,
+            33.17016497021541,
+            33.196459989994764,
+            33.09687977889553,
+            33.07975013740361
+          ]
+        }
+      ]
+    },
+    {
+      "scope": "public eager API wall latency; includes CPU dispatch and device work",
+      "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+      "interface_sha256": "04346763cbe832dcc6b6139c98005ceb6eb986ab666cc6a823a278138e88f69f",
+      "driver_sha256": "8b1d59e7df4fbee73913eaf2c45fd6ce6ba35d776794ef6af55fdcef6ef655e0",
+      "rows": [
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 1,
+          "sk": 129,
+          "median_us": 31.899235036689788,
+          "samples_us": [
+            33.90622994629666,
+            43.80972502985969,
+            33.83896517334506,
+            33.98817003471777,
+            33.068594930227846,
+            32.87590021500364,
+            31.99322003638372,
+            31.893769919406623,
+            31.851365056354553,
+            31.899235036689788,
+            31.43391018966213,
+            31.38326486805454,
+            31.3040500623174,
+            31.330994970630854,
+            31.413819815497845
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 1,
+          "sk": 512,
+          "median_us": 31.84993489412591,
+          "samples_us": [
+            32.15312521206215,
+            32.1273400913924,
+            32.0661801379174,
+            32.07456000382081,
+            31.84993489412591,
+            32.003770174924284,
+            31.957800092641264,
+            31.923679925967008,
+            31.769050110597163,
+            31.513909925706685,
+            31.59372485242784,
+            31.781269935891032,
+            31.63937508361414,
+            31.41302993753925,
+            31.388725037686527
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 128,
+          "sk": 128,
+          "median_us": 37.066560180392116,
+          "samples_us": [
+            37.58739505428821,
+            37.42152010090649,
+            36.57813504105434,
+            37.33096498763189,
+            37.34142490429804,
+            37.12225501658395,
+            36.555124970618635,
+            37.22993977135047,
+            37.04466507770121,
+            36.94452519994229,
+            37.04817994730547,
+            36.91309015266597,
+            36.863275163341314,
+            37.066560180392116,
+            37.144754896871746
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 512,
+          "sk": 512,
+          "median_us": 33.74261490534991,
+          "samples_us": [
+            85.07124992320314,
+            86.0636550351046,
+            69.01009997818619,
+            42.50370984664187,
+            35.62878002412617,
+            33.74261490534991,
+            33.660674816928804,
+            33.52012514369562,
+            33.541454758960754,
+            33.61057984875515,
+            33.52225001435727,
+            33.596974972169846,
+            33.52761501446366,
+            33.76123000634834,
+            33.799519878812134
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 1,
+          "sk": 129,
+          "median_us": 32.34094998333603,
+          "samples_us": [
+            32.70757006248459,
+            32.59104472817853,
+            32.74942486314103,
+            32.56136493291706,
+            32.59840508690104,
+            32.26970002287999,
+            32.45516505558044,
+            32.34094998333603,
+            32.19835489289835,
+            32.39993005990982,
+            31.964655208867043,
+            32.09896007319912,
+            32.157059758901596,
+            32.04609005479142,
+            32.04358508810401
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 1,
+          "sk": 512,
+          "median_us": 31.999235216062516,
+          "samples_us": [
+            32.289700175169855,
+            32.36539021600038,
+            32.3608098551631,
+            32.07187517546117,
+            31.999235216062516,
+            31.970019917935133,
+            32.02894993592054,
+            31.97701502358541,
+            31.996460165828466,
+            31.935579900164157,
+            32.02905005309731,
+            31.911554979160428,
+            32.11705508874729,
+            31.951459823176265,
+            31.916869920678437
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 128,
+          "sk": 128,
+          "median_us": 36.28693491918966,
+          "samples_us": [
+            37.03600523294881,
+            36.729665007442236,
+            36.80290508782491,
+            37.121514906175435,
+            36.63151495857164,
+            36.28693491918966,
+            36.78966488223523,
+            35.97373521188274,
+            36.32554493378848,
+            36.106140178162605,
+            35.84817983210087,
+            35.86684004403651,
+            35.70701490389183,
+            35.82762001315132,
+            35.82739504054189
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 512,
+          "sk": 512,
+          "median_us": 34.19757500523701,
+          "samples_us": [
+            47.87014506291598,
+            47.988625010475516,
+            48.67195995757356,
+            49.87321502994746,
+            47.68945014802739,
+            43.19847503211349,
+            34.346414904575795,
+            34.19757500523701,
+            33.96807995159179,
+            34.16831488721073,
+            34.04891991522163,
+            33.981784945353866,
+            34.033035044558346,
+            33.69859477970749,
+            33.990024821832776
+          ]
+        }
+      ]
+    },
+    {
+      "scope": "public eager API wall latency; includes CPU dispatch and device work",
+      "git_sha": "616b0e8abab13b87b01525b3916d5a863ab02ae0",
+      "interface_sha256": "f498a42080b5c1e475b976ef163e78c90d72ad938f69b54df28d6345118982ed",
+      "driver_sha256": "8b1d59e7df4fbee73913eaf2c45fd6ce6ba35d776794ef6af55fdcef6ef655e0",
+      "rows": [
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 1,
+          "sk": 129,
+          "median_us": 48.3704250655137,
+          "samples_us": [
+            49.820799904409796,
+            56.41443014610559,
+            48.922049754764885,
+            48.75584505498409,
+            48.58218977460638,
+            47.951259766705334,
+            47.840289771556854,
+            48.40394511120394,
+            48.213014961220324,
+            48.14700019778684,
+            47.28227504529059,
+            47.72404005052522,
+            48.3704250655137,
+            48.072645149659365,
+            48.61010500462726
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 1,
+          "sk": 512,
+          "median_us": 47.647835162933916,
+          "samples_us": [
+            50.29524996643886,
+            49.04764995444566,
+            49.05843990854919,
+            48.07079501915723,
+            48.04792522918433,
+            47.905340034049004,
+            48.30793011933565,
+            47.527280112262815,
+            47.33204492367804,
+            47.23736987216398,
+            47.647835162933916,
+            47.041949874255806,
+            47.57352522574365,
+            47.504040121566504,
+            47.282415034715086
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 128,
+          "sk": 128,
+          "median_us": 49.351305060554296,
+          "samples_us": [
+            50.77654495835304,
+            49.84427476301789,
+            50.4946950240992,
+            49.6935797855258,
+            50.26159022236243,
+            48.98755985777825,
+            49.351305060554296,
+            48.886075092013925,
+            49.33297517709434,
+            49.22209511278197,
+            49.52181479893625,
+            48.570385260973126,
+            49.428440106566995,
+            48.39964007260278,
+            49.25371496938169
+          ]
+        },
+        {
+          "dtype": "torch.bfloat16",
+          "sq": 512,
+          "sk": 512,
+          "median_us": 50.26358499890193,
+          "samples_us": [
+            85.143934993539,
+            85.25823999661952,
+            70.45107486192137,
+            55.39808014873415,
+            50.79506023321301,
+            50.714694953057915,
+            49.86631480278447,
+            50.360524910502136,
+            49.60996506270021,
+            50.18108000513166,
+            50.12047506170347,
+            49.68561988789588,
+            49.95473485905677,
+            49.39056496368721,
+            50.26358499890193
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 1,
+          "sk": 129,
+          "median_us": 48.511819913983345,
+          "samples_us": [
+            49.536399892531335,
+            48.74334525084123,
+            49.320890102535486,
+            48.511819913983345,
+            48.647604999132454,
+            48.78107487456873,
+            48.205149942077696,
+            48.80325519479811,
+            47.78302012709901,
+            48.756260075606406,
+            47.389869869221,
+            48.26593998586759,
+            47.90542501723394,
+            48.2281600125134,
+            48.314364976249635
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 1,
+          "sk": 512,
+          "median_us": 48.16204484086484,
+          "samples_us": [
+            48.48880984354764,
+            48.000475217122585,
+            48.16204484086484,
+            47.92251012986526,
+            48.27996512176469,
+            48.08347497601062,
+            48.497279931325465,
+            48.242509947158396,
+            47.981259995140135,
+            48.57320513110608,
+            47.69575025420636,
+            48.323950031772256,
+            47.92922001797706,
+            48.34260500501841,
+            48.02145005669445
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 128,
+          "sk": 128,
+          "median_us": 49.66149979736656,
+          "samples_us": [
+            51.6868699924089,
+            51.232285040896386,
+            50.64927478088066,
+            50.839465111494064,
+            49.95519993826747,
+            49.66149979736656,
+            49.36459503369406,
+            49.34223514283076,
+            49.37065998092294,
+            49.5717249577865,
+            49.39278995152563,
+            48.88899013167247,
+            50.174135249108076,
+            49.14829507470131,
+            49.87339489161968
+          ]
+        },
+        {
+          "dtype": "torch.float16",
+          "sq": 512,
+          "sk": 512,
+          "median_us": 49.62802515365183,
+          "samples_us": [
+            84.95504007441923,
+            73.18964489968494,
+            57.81614483566955,
+            49.951954861171544,
+            49.91515481378883,
+            49.62802515365183,
+            49.53459516400471,
+            49.153855070471764,
+            49.43496489431709,
+            49.722839903552085,
+            49.28866488626227,
+            49.219919892493635,
+            48.60020009800792,
+            50.07251485949382,
+            48.80844004219398
+          ]
+        }
+      ]
+    }
+  ],
+  "interop": {
+    "final-interop-eager-contiguous": {
+      "environment": {
+        "python": "3.12.3",
+        "machine": "aarch64",
+        "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+        "distributions": {
+          "torch": "2.13.0+cu130",
+          "nvidia-cutlass-dsl": "4.8.0",
+          "apache-tvm-ffi": "0.1.12",
+          "torch-c-dlpack-ext": "0.1.5",
+          "quack-kernels": "0.5.3"
+        },
+        "torch_version": "2.13.0+cu130",
+        "torch_cuda_build": "13.0",
+        "gpu": "NVIDIA Thor",
+        "sm": [
+          11,
+          0
+        ],
+        "python_path": [
+          "/home/jwipc/experiments/flashattention-direct-20261001/tools",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-lite",
+          "/usr/lib/python312.zip",
+          "/usr/lib/python3.12",
+          "/usr/lib/python3.12/lib-dynload",
+          "/home/jwipc/projects/host-gateway/.vllm/lib/python3.12/site-packages",
+          "__editable__.vllm-0.1.dev1+g1cfd97281.d20260913.cu132.finder.__path_hook__"
+        ]
+      },
+      "arguments": {
+        "mode": "eager",
+        "layout": "contiguous",
+        "expected_sm": 110,
+        "output": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-interop-eager-contiguous.json"
+      },
+      "status": "PASS",
+      "checks": [
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.002468838736309764,
+          "lse_max_abs": 9.402100805466773e-06
+        },
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.0024751903107150808,
+          "lse_max_abs": 1.0018248085330583e-05
+        }
+      ],
+      "tensor_metadata": [
+        {
+          "shape": [
+            1,
+            128,
+            16,
+            128
+          ],
+          "stride": [
+            262144,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        }
+      ],
+      "scope": "dense forward only; graph is warm forward capture; compile is diagnostic fullgraph=True"
+    },
+    "final-interop-eager-offset8": {
+      "environment": {
+        "python": "3.12.3",
+        "machine": "aarch64",
+        "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+        "distributions": {
+          "torch": "2.13.0+cu130",
+          "nvidia-cutlass-dsl": "4.8.0",
+          "apache-tvm-ffi": "0.1.12",
+          "torch-c-dlpack-ext": "0.1.5",
+          "quack-kernels": "0.5.3"
+        },
+        "torch_version": "2.13.0+cu130",
+        "torch_cuda_build": "13.0",
+        "gpu": "NVIDIA Thor",
+        "sm": [
+          11,
+          0
+        ],
+        "python_path": [
+          "/home/jwipc/experiments/flashattention-direct-20261001/tools",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-lite",
+          "/usr/lib/python312.zip",
+          "/usr/lib/python3.12",
+          "/usr/lib/python3.12/lib-dynload",
+          "/home/jwipc/projects/host-gateway/.vllm/lib/python3.12/site-packages",
+          "__editable__.vllm-0.1.dev1+g1cfd97281.d20260913.cu132.finder.__path_hook__"
+        ]
+      },
+      "arguments": {
+        "mode": "eager",
+        "layout": "offset8",
+        "expected_sm": 110,
+        "output": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-interop-eager-offset8.json"
+      },
+      "status": "PASS",
+      "checks": [
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.002468838736309764,
+          "lse_max_abs": 9.402100805466773e-06
+        },
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.0024751903107150808,
+          "lse_max_abs": 1.0018248085330583e-05
+        }
+      ],
+      "tensor_metadata": [
+        {
+          "shape": [
+            1,
+            128,
+            16,
+            128
+          ],
+          "stride": [
+            262144,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        }
+      ],
+      "scope": "dense forward only; graph is warm forward capture; compile is diagnostic fullgraph=True"
+    },
+    "final-interop-graph-offset8": {
+      "environment": {
+        "python": "3.12.3",
+        "machine": "aarch64",
+        "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+        "distributions": {
+          "torch": "2.13.0+cu130",
+          "nvidia-cutlass-dsl": "4.8.0",
+          "apache-tvm-ffi": "0.1.12",
+          "torch-c-dlpack-ext": "0.1.5",
+          "quack-kernels": "0.5.3"
+        },
+        "torch_version": "2.13.0+cu130",
+        "torch_cuda_build": "13.0",
+        "gpu": "NVIDIA Thor",
+        "sm": [
+          11,
+          0
+        ],
+        "python_path": [
+          "/home/jwipc/experiments/flashattention-direct-20261001/tools",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-lite",
+          "/usr/lib/python312.zip",
+          "/usr/lib/python3.12",
+          "/usr/lib/python3.12/lib-dynload",
+          "/home/jwipc/projects/host-gateway/.vllm/lib/python3.12/site-packages",
+          "__editable__.vllm-0.1.dev1+g1cfd97281.d20260913.cu132.finder.__path_hook__"
+        ]
+      },
+      "arguments": {
+        "mode": "graph",
+        "layout": "offset8",
+        "expected_sm": 110,
+        "output": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-interop-graph-offset8.json"
+      },
+      "status": "PASS",
+      "checks": [
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.002468838736309764,
+          "lse_max_abs": 9.402100805466773e-06
+        },
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.0024751903107150808,
+          "lse_max_abs": 1.0018248085330583e-05
+        }
+      ],
+      "tensor_metadata": [
+        {
+          "shape": [
+            1,
+            128,
+            16,
+            128
+          ],
+          "stride": [
+            262144,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        }
+      ],
+      "scope": "dense forward only; graph is warm forward capture; compile is diagnostic fullgraph=True"
+    },
+    "final-interop-stream-offset8": {
+      "environment": {
+        "python": "3.12.3",
+        "machine": "aarch64",
+        "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+        "distributions": {
+          "torch": "2.13.0+cu130",
+          "nvidia-cutlass-dsl": "4.8.0",
+          "apache-tvm-ffi": "0.1.12",
+          "torch-c-dlpack-ext": "0.1.5",
+          "quack-kernels": "0.5.3"
+        },
+        "torch_version": "2.13.0+cu130",
+        "torch_cuda_build": "13.0",
+        "gpu": "NVIDIA Thor",
+        "sm": [
+          11,
+          0
+        ],
+        "python_path": [
+          "/home/jwipc/experiments/flashattention-direct-20261001/tools",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-lite",
+          "/usr/lib/python312.zip",
+          "/usr/lib/python3.12",
+          "/usr/lib/python3.12/lib-dynload",
+          "/home/jwipc/projects/host-gateway/.vllm/lib/python3.12/site-packages",
+          "__editable__.vllm-0.1.dev1+g1cfd97281.d20260913.cu132.finder.__path_hook__"
+        ]
+      },
+      "arguments": {
+        "mode": "stream",
+        "layout": "offset8",
+        "expected_sm": 110,
+        "output": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-interop-stream-offset8.json"
+      },
+      "status": "PASS",
+      "checks": [
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.002468838736309764,
+          "lse_max_abs": 9.402100805466773e-06
+        },
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.0024751903107150808,
+          "lse_max_abs": 1.0018248085330583e-05
+        }
+      ],
+      "tensor_metadata": [
+        {
+          "shape": [
+            1,
+            128,
+            16,
+            128
+          ],
+          "stride": [
+            262144,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        }
+      ],
+      "scope": "dense forward only; graph is warm forward capture; compile is diagnostic fullgraph=True"
+    },
+    "final-interop-eager-outer-strided": {
+      "environment": {
+        "python": "3.12.3",
+        "machine": "aarch64",
+        "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+        "distributions": {
+          "torch": "2.13.0+cu130",
+          "nvidia-cutlass-dsl": "4.8.0",
+          "apache-tvm-ffi": "0.1.12",
+          "torch-c-dlpack-ext": "0.1.5",
+          "quack-kernels": "0.5.3"
+        },
+        "torch_version": "2.13.0+cu130",
+        "torch_cuda_build": "13.0",
+        "gpu": "NVIDIA Thor",
+        "sm": [
+          11,
+          0
+        ],
+        "python_path": [
+          "/home/jwipc/experiments/flashattention-direct-20261001/tools",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-lite",
+          "/usr/lib/python312.zip",
+          "/usr/lib/python3.12",
+          "/usr/lib/python3.12/lib-dynload",
+          "/home/jwipc/projects/host-gateway/.vllm/lib/python3.12/site-packages",
+          "__editable__.vllm-0.1.dev1+g1cfd97281.d20260913.cu132.finder.__path_hook__"
+        ]
+      },
+      "arguments": {
+        "mode": "eager",
+        "layout": "outer-strided",
+        "expected_sm": 110,
+        "output": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-interop-eager-outer-strided.json"
+      },
+      "status": "PASS",
+      "checks": [
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.002468838736309764,
+          "lse_max_abs": 9.402100805466773e-06
+        },
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.0024751903107150808,
+          "lse_max_abs": 1.0018248085330583e-05
+        }
+      ],
+      "tensor_metadata": [
+        {
+          "shape": [
+            1,
+            128,
+            16,
+            128
+          ],
+          "stride": [
+            524288,
+            4096,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            264192,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            264192,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        }
+      ],
+      "scope": "dense forward only; graph is warm forward capture; compile is diagnostic fullgraph=True"
+    }
+  },
+  "after_model_status": [
+    {
+      "name": "profile-model-final-cpu",
+      "state": "FINISHED",
+      "queued": 1790842841.3481362,
+      "started": 1790842941.6092606,
+      "cpu_load_before": [
+        1.3154296875,
+        1.3203125,
+        1.0458984375
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 2.40 W",
+      "pid": 2921662,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/profile-model-final-cpu.log",
+      "exit_code": 0,
+      "elapsed_s": 15.898335456848145,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.2451171875,
+        1.30419921875,
+        1.04443359375
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.83 W"
+    },
+    {
+      "name": "clean-completed-thor-model",
+      "state": "FINISHED",
+      "queued": 1790842957.551143,
+      "started": 1790842957.5751379,
+      "cpu_load_before": [
+        1.2451171875,
+        1.30419921875,
+        1.04443359375
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.60 W",
+      "pid": 2921887,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/clean-completed-thor-model.log",
+      "exit_code": 0,
+      "elapsed_s": 0.23473834991455078,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.2451171875,
+        1.30419921875,
+        1.04443359375
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 1 %, 43, [N/A], 3.12 W"
+    },
+    {
+      "name": "final-dispatch-bench-0-base",
+      "state": "FINISHED",
+      "queued": 1790842957.8502614,
+      "started": 1790842957.8764887,
+      "cpu_load_before": [
+        1.2451171875,
+        1.30419921875,
+        1.04443359375
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 1 %, 43, [N/A], 3.12 W",
+      "pid": 2921898,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-dispatch-bench-0-base.log",
+      "exit_code": 0,
+      "elapsed_s": 19.50383472442627,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.23681640625,
+        1.2998046875,
+        1.04833984375
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.60 W"
+    },
+    {
+      "name": "final-dispatch-bench-1-thor-sink",
+      "state": "FINISHED",
+      "queued": 1790842977.4191182,
+      "started": 1790842977.442782,
+      "cpu_load_before": [
+        1.23681640625,
+        1.2998046875,
+        1.04833984375
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.60 W",
+      "pid": 2922085,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-dispatch-bench-1-thor-sink.log",
+      "exit_code": 0,
+      "elapsed_s": 18.94335627555847,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.59033203125,
+        1.3779296875,
+        1.08056640625
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.60 W"
+    },
+    {
+      "name": "final-dispatch-bench-2-thor-sink",
+      "state": "FINISHED",
+      "queued": 1790842996.4250877,
+      "started": 1790842996.4486358,
+      "cpu_load_before": [
+        1.59033203125,
+        1.3779296875,
+        1.08056640625
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.60 W",
+      "pid": 2922299,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-dispatch-bench-2-thor-sink.log",
+      "exit_code": 0,
+      "elapsed_s": 18.40246820449829,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.80517578125,
+        1.43603515625,
+        1.1064453125
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.84 W"
+    },
+    {
+      "name": "final-dispatch-bench-3-base",
+      "state": "FINISHED",
+      "queued": 1790843014.8920472,
+      "started": 1790843014.915706,
+      "cpu_load_before": [
+        1.80517578125,
+        1.43603515625,
+        1.1064453125
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 43, [N/A], 3.84 W",
+      "pid": 2922510,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-dispatch-bench-3-base.log",
+      "exit_code": 0,
+      "elapsed_s": 19.56265091896057,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.638671875,
+        1.42333984375,
+        1.1083984375
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 3.60 W"
+    },
+    {
+      "name": "final-interop-eager-contiguous",
+      "state": "FINISHED",
+      "queued": 1790843034.518818,
+      "started": 1790843034.5426548,
+      "cpu_load_before": [
+        1.638671875,
+        1.42333984375,
+        1.1083984375
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 3.60 W",
+      "pid": 2922693,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-interop-eager-contiguous.log",
+      "exit_code": 0,
+      "elapsed_s": 6.5785205364227295,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.66796875,
+        1.43310546875,
+        1.11328125
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 1.68 W"
+    },
+    {
+      "name": "final-interop-eager-offset8",
+      "state": "FINISHED",
+      "queued": 1790843041.1736138,
+      "started": 1790843041.2035844,
+      "cpu_load_before": [
+        1.66796875,
+        1.43310546875,
+        1.11328125
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 1.68 W",
+      "pid": 2922801,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-interop-eager-offset8.log",
+      "exit_code": 0,
+      "elapsed_s": 6.725880861282349,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.6142578125,
+        1.42578125,
+        1.1123046875
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 1.68 W"
+    },
+    {
+      "name": "final-interop-eager-outer-strided",
+      "state": "FINISHED",
+      "queued": 1790843047.9799318,
+      "started": 1790843048.0093217,
+      "cpu_load_before": [
+        1.6142578125,
+        1.42578125,
+        1.1123046875
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 1.68 W",
+      "pid": 2922907,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-interop-eager-outer-strided.log",
+      "exit_code": 0,
+      "elapsed_s": 6.719752311706543,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.51953125,
+        1.4111328125,
+        1.1103515625
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 1.68 W"
+    },
+    {
+      "name": "final-interop-stream-offset8",
+      "state": "FINISHED",
+      "queued": 1790843054.7835104,
+      "started": 1790843054.8121986,
+      "cpu_load_before": [
+        1.51953125,
+        1.4111328125,
+        1.1103515625
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 1.68 W",
+      "pid": 2923017,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-interop-stream-offset8.log",
+      "exit_code": 0,
+      "elapsed_s": 6.720134735107422,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.4775390625,
+        1.404296875,
+        1.109375
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 1.68 W"
+    },
+    {
+      "name": "final-interop-graph-offset8",
+      "state": "FINISHED",
+      "queued": 1790843061.5848064,
+      "started": 1790843061.6132543,
+      "cpu_load_before": [
+        1.4775390625,
+        1.404296875,
+        1.109375
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 1.68 W",
+      "pid": 2923124,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-interop-graph-offset8.log",
+      "exit_code": 0,
+      "elapsed_s": 6.637197494506836,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.51953125,
+        1.41455078125,
+        1.1142578125
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 1.68 W"
+    },
+    {
+      "name": "final-summary-thor",
+      "state": "FINISHED",
+      "queued": 1790843068.3073983,
+      "started": 1790843068.3391237,
+      "cpu_load_before": [
+        1.51953125,
+        1.41455078125,
+        1.1142578125
+      ],
+      "gpu_before": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 1.68 W",
+      "pid": 2923229,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/final-summary-thor.log",
+      "exit_code": 0,
+      "elapsed_s": 0.07323169708251953,
+      "foreign_gpu_processes_after": "",
+      "cpu_load_after": [
+        1.51953125,
+        1.41455078125,
+        1.1142578125
+      ],
+      "gpu_after": "0, GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600, [N/A], 0 %, 42, [N/A], 1.68 W"
+    }
+  ],
+  "checkpoint": {
+    "model": "Qwen/Qwen3-0.6B",
+    "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+    "files": [
+      {
+        "name": "config.json",
+        "bytes": 726,
+        "sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd"
+      },
+      {
+        "name": "generation_config.json",
+        "bytes": 239,
+        "sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
+      },
+      {
+        "name": "merges.txt",
+        "bytes": 1671853,
+        "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+      },
+      {
+        "name": "model.safetensors",
+        "bytes": 1503300328,
+        "sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b"
+      },
+      {
+        "name": "tokenizer.json",
+        "bytes": 11422654,
+        "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+      },
+      {
+        "name": "tokenizer_config.json",
+        "bytes": 9732,
+        "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+      },
+      {
+        "name": "vocab.json",
+        "bytes": 2776833,
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      }
+    ]
+  },
+  "cleanup": {
+    "state": "COMPLETE",
+    "finished": 1790842957.62595,
+    "files_removed": 7,
+    "bytes_removed": 1519182365,
+    "model_directory_exists": false
+  },
+  "profile": {
+    "base": {
+      "git_sha": "616b0e8abab13b87b01525b3916d5a863ab02ae0",
+      "driver_sha256": "68793c8911506e0c87ce95285a37e1533ee9b14df858e3e41996f4dabd378218",
+      "interface_sha256": "f498a42080b5c1e475b976ef163e78c90d72ad938f69b54df28d6345118982ed",
+      "fa4_calls": 2772,
+      "attention_host_median_us": 196.6540003195405,
+      "selected_functions": [
+        {
+          "path": "/home/jwipc/projects/host-gateway/.vllm/lib/python3.12/site-packages/torch/autograd/function.py",
+          "line": 609,
+          "function": "apply",
+          "calls": 2772,
+          "self_s": 0.011174706000000001,
+          "cumulative_s": 0.481950062
+        },
+        {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/interface.py",
+          "line": 3728,
+          "function": "forward",
+          "calls": 2772,
+          "self_s": 0.021915671,
+          "cumulative_s": 0.382035526
+        },
+        {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/interface.py",
+          "line": 677,
+          "function": "_flash_attn_fwd",
+          "calls": 2772,
+          "self_s": 0.09294437000000001,
+          "cumulative_s": 0.357951097
+        },
+        {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/base/flash_attn/cute/cute_dsl_utils.py",
+          "line": 52,
+          "function": "get_num_sms_for_selection",
+          "calls": 2772,
+          "self_s": 0.005149603,
+          "cumulative_s": 0.036418854
+        }
+      ]
+    },
+    "patch": {
+      "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+      "driver_sha256": "68793c8911506e0c87ce95285a37e1533ee9b14df858e3e41996f4dabd378218",
+      "interface_sha256": "04346763cbe832dcc6b6139c98005ceb6eb986ab666cc6a823a278138e88f69f",
+      "fa4_calls": 2772,
+      "attention_host_median_us": 136.65351434610784,
+      "selected_functions": [
+        {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/interface.py",
+          "line": 3739,
+          "function": "forward",
+          "calls": 2772,
+          "self_s": 0.012698636000000001,
+          "cumulative_s": 0.31649403200000004
+        },
+        {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/interface.py",
+          "line": 686,
+          "function": "_flash_attn_fwd",
+          "calls": 2772,
+          "self_s": 0.083512656,
+          "cumulative_s": 0.303795396
+        },
+        {
+          "path": "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink/flash_attn/cute/cute_dsl_utils.py",
+          "line": 52,
+          "function": "get_num_sms_for_selection",
+          "calls": 168,
+          "self_s": 0.000282264,
+          "cumulative_s": 0.002118156
+        }
+      ]
+    }
+  },
+  "h20_progress": {
+    "models": [
+      {
+        "label": "final-model-00-base",
+        "pid": 170379,
+        "mode": "generation",
+        "load_s": 0.6417592987418175,
+        "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+        "git_sha": "616b0e8abab13b87b01525b3916d5a863ab02ae0",
+        "python": "/root/autodl-tmp/flashattention-sm90-h20/runtime/bin/python",
+        "torch": "2.7.0+cu128",
+        "cuda": "12.8",
+        "dsl": "4.8.0",
+        "ffi": "0.1.12",
+        "quack": "0.5.3",
+        "gpu": "NVIDIA H20",
+        "sm": [
+          9,
+          0
+        ],
+        "fa4_calls": 27608,
+        "rows": [
+          {
+            "input_tokens": 128,
+            "output_tokens": 32,
+            "first_prefill_ms": 2099.4269736111164,
+            "e2e_ms": [
+              739.6337650716305,
+              737.4425418674946,
+              741.6608668863773,
+              734.8235100507736,
+              740.620594471693,
+              732.8653074800968,
+              734.3179620802402,
+              733.718641102314,
+              733.3004772663116,
+              733.4543317556381,
+              734.204214066267
+            ],
+            "prefill_cache": {
+              "load_attempts": 0,
+              "disk_hits": 0,
+              "compiles": 1
+            },
+            "steady_prefill_ms": [
+              22.216614335775375,
+              21.904613822698593,
+              21.14509791135788,
+              22.673729807138443,
+              22.651106119155884,
+              22.135987877845764,
+              21.513041108846664,
+              21.789278835058212,
+              22.122755646705627,
+              22.033240646123886,
+              21.255020052194595
+            ],
+            "median_ms": 734.3179620802402,
+            "correctness": "PASS",
+            "correctness_details": {}
+          },
+          {
+            "input_tokens": 512,
+            "output_tokens": 32,
+            "first_prefill_ms": 31.98903426527977,
+            "e2e_ms": [
+              736.466258764267,
+              737.5879101455212,
+              740.1224374771118,
+              737.1754497289658,
+              738.047432154417,
+              735.9491139650345,
+              735.5501614511013,
+              735.3325672447681,
+              734.0418919920921,
+              739.1987964510918,
+              740.6576164066792
+            ],
+            "prefill_cache": {
+              "load_attempts": 0,
+              "disk_hits": 0,
+              "compiles": 0
+            },
+            "steady_prefill_ms": [
+              23.06271344423294,
+              22.458691149950027,
+              22.760849446058273,
+              22.600971162319183,
+              22.114112973213196,
+              22.939734160900116,
+              22.54430204629898,
+              22.856317460536957,
+              22.61016145348549,
+              23.103952407836914,
+              22.611480206251144
+            ],
+            "median_ms": 737.1754497289658,
+            "correctness": "PASS",
+            "correctness_details": {}
+          }
+        ],
+        "cache_counts": {
+          "load_attempts": 0,
+          "disk_hits": 0,
+          "compiles": 2
+        },
+        "sources": {
+          "softmax": {
+            "path": "/root/autodl-tmp/flashattention-sm90-h20/imports/base/flash_attn/cute/softmax.py",
+            "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+          },
+          "backward": {
+            "path": "/root/autodl-tmp/flashattention-sm90-h20/imports/base/flash_attn/cute/flash_bwd_sm90.py",
+            "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+          },
+          "cache": {
+            "path": "/root/autodl-tmp/flashattention-sm90-h20/imports/base/flash_attn/cute/cache_utils.py",
+            "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+          },
+          "interface": {
+            "path": "/root/autodl-tmp/flashattention-sm90-h20/imports/base/flash_attn/cute/interface.py",
+            "sha256": "f498a42080b5c1e475b976ef163e78c90d72ad938f69b54df28d6345118982ed"
+          },
+          "forward": {
+            "path": "/root/autodl-tmp/flashattention-sm90-h20/imports/base/flash_attn/cute/flash_fwd_sm100.py",
+            "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+          }
+        },
+        "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+      },
+      {
+        "label": "final-model-01-inference-final",
+        "pid": 170581,
+        "mode": "generation",
+        "load_s": 0.5316847823560238,
+        "driver_sha256": "4d84f06873b9526344ee17d6670335799c70019e610aeaa5dba210431ad3befd",
+        "git_sha": "9267a996522e33e9fdb2117acb75c50d6d0f7602",
+        "python": "/root/autodl-tmp/flashattention-sm90-h20/runtime/bin/python",
+        "torch": "2.7.0+cu128",
+        "cuda": "12.8",
+        "dsl": "4.8.0",
+        "ffi": "0.1.12",
+        "quack": "0.5.3",
+        "gpu": "NVIDIA H20",
+        "sm": [
+          9,
+          0
+        ],
+        "fa4_calls": 27608,
+        "rows": [
+          {
+            "input_tokens": 128,
+            "output_tokens": 32,
+            "first_prefill_ms": 2255.4129287600517,
+            "e2e_ms": [
+              724.9705791473389,
+              723.3910076320171,
+              716.9735170900822,
+              728.0525602400303,
+              722.4949821829796,
+              722.400926053524,
+              722.6443849503994,
+              720.6937521696091,
+              734.8164692521095,
+              759.9531337618828,
+              762.8235705196857
+            ],
+            "prefill_cache": {
+              "load_attempts": 0,
+              "disk_hits": 0,
+              "compiles": 1
+            },
+            "steady_prefill_ms": [
+              22.214125841856003,
+              21.76499366760254,
+              21.52004837989807,
+              21.708115935325623,
+              21.349191665649414,
+              21.422553807497025,
+              20.868077874183655,
+              20.76711505651474,
+              20.60961350798607,
+              21.67520299553871,
+              21.700654178857803
+            ],
+            "median_ms": 723.3910076320171,
+            "correctness": "PASS",
+            "correctness_details": {
+              "logits": {
+                "max_abs": 0.0,
+                "exact": true
+              },
+              "tokens": {
+                "exact": true
+              },
+              "teacher_logits": {
+                "max_abs": 0.0,
+                "exact": true
+              }
+            }
+          },
+          {
+            "input_tokens": 512,
+            "output_tokens": 32,
+            "first_prefill_ms": 36.29091754555702,
+            "e2e_ms": [
+              752.4046376347542,
+              811.3311231136322,
+              719.1899158060551,
+              844.780683517456,
+              732.9943589866161,
+              723.7918339669704,
+              708.5783146321774,
+              715.0895893573761,
+              703.3332958817482,
+              713.7761414051056,
+              731.5054126083851
+            ],
+            "prefill_cache": {
+              "load_attempts": 0,
+              "disk_hits": 0,
+              "compiles": 0
+            },
+            "steady_prefill_ms": [
+              23.32136780023575,
+              22.765468806028366,
+              23.23513850569725,
+              23.318849503993988,
+              23.06688204407692,
+              23.418329656124115,
+              23.121509701013565,
+              23.272257298231125,
+              23.361295461654663,
+              23.176267743110657,
+              23.7775519490242
+            ],
+            "median_ms": 723.7918339669704,
+            "correctness": "PASS",
+            "correctness_details": {
+              "logits": {
+                "max_abs": 0.0,
+                "exact": true
+              },
+              "tokens": {
+                "exact": true
+              },
+              "teacher_logits": {
+                "max_abs": 0.0,
+                "exact": true
+              }
+            }
+          }
+        ],
+        "cache_counts": {
+          "load_attempts": 0,
+          "disk_hits": 0,
+          "compiles": 2
+        },
+        "sources": {
+          "softmax": {
+            "path": "/root/autodl-tmp/flashattention-sm90-h20/imports/inference-final/flash_attn/cute/softmax.py",
+            "sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49"
+          },
+          "backward": {
+            "path": "/root/autodl-tmp/flashattention-sm90-h20/imports/inference-final/flash_attn/cute/flash_bwd_sm90.py",
+            "sha256": "4e8e5bd4518714e0de39635d0e5b09d3ceba619b731437a82ebfad1a3ef90e4c"
+          },
+          "cache": {
+            "path": "/root/autodl-tmp/flashattention-sm90-h20/imports/inference-final/flash_attn/cute/cache_utils.py",
+            "sha256": "520eecc83e466061f786c09ffd2c3e638720fd997837219fd0e62b6532c05a01"
+          },
+          "interface": {
+            "path": "/root/autodl-tmp/flashattention-sm90-h20/imports/inference-final/flash_attn/cute/interface.py",
+            "sha256": "04346763cbe832dcc6b6139c98005ceb6eb986ab666cc6a823a278138e88f69f"
+          },
+          "forward": {
+            "path": "/root/autodl-tmp/flashattention-sm90-h20/imports/inference-final/flash_attn/cute/flash_fwd_sm100.py",
+            "sha256": "24ff53a4d10d92ac0f86f3484cc978462686b795b62fd15c13d7c3cb001889b3"
+          }
+        },
+        "checkpoint_revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+      }
+    ],
+    "status": [
+      {
+        "name": "final-correctness-h20",
+        "state": "FINISHED",
+        "queued": 1790842380.6467214,
+        "started": 1790842571.2973068,
+        "cpu_load_before": [
+          4.66162109375,
+          5.90576171875,
+          5.49609375
+        ],
+        "gpu_before": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 0 %, 31, 345 MHz, 73.06 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 0 %, 70, 345 MHz, 91.69 W",
+        "pid": 170191,
+        "log": "/root/autodl-tmp/flashattention-sm90-h20/evidence/final-correctness-h20.log",
+        "exit_code": 0,
+        "elapsed_s": 20.025362014770508,
+        "foreign_gpu_processes_after": "",
+        "cpu_load_after": [
+          4.126953125,
+          5.701171875,
+          5.4365234375
+        ],
+        "gpu_after": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 1 %, 32, 1980 MHz, 117.23 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 0 %, 66, 345 MHz, 88.82 W"
+      },
+      {
+        "name": "final-model-00-base",
+        "state": "FINISHED",
+        "queued": 1790842591.4006202,
+        "started": 1790842591.433747,
+        "cpu_load_before": [
+          4.126953125,
+          5.701171875,
+          5.4365234375
+        ],
+        "gpu_before": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 0 %, 32, 1980 MHz, 117.43 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 0 %, 66, 345 MHz, 88.80 W",
+        "pid": 170379,
+        "log": "/root/autodl-tmp/flashattention-sm90-h20/evidence/final-model-00-base.log",
+        "exit_code": 0,
+        "elapsed_s": 32.502877950668335,
+        "foreign_gpu_processes_after": "",
+        "cpu_load_after": [
+          9.9892578125,
+          7.01025390625,
+          5.88525390625
+        ],
+        "gpu_after": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 0 %, 32, 1980 MHz, 117.74 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 0 %, 59, 345 MHz, 84.65 W"
+      },
+      {
+        "name": "final-model-01-inference-final",
+        "state": "FINISHED",
+        "queued": 1790842624.015647,
+        "started": 1790842624.0484166,
+        "cpu_load_before": [
+          9.9892578125,
+          7.01025390625,
+          5.88525390625
+        ],
+        "gpu_before": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 5 %, 32, 1980 MHz, 117.93 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 0 %, 59, 345 MHz, 84.66 W",
+        "pid": 170581,
+        "log": "/root/autodl-tmp/flashattention-sm90-h20/evidence/final-model-01-inference-final.log",
+        "exit_code": 0,
+        "elapsed_s": 33.168169260025024,
+        "foreign_gpu_processes_after": "171137",
+        "cpu_load_after": [
+          7.97216796875,
+          6.80126953125,
+          5.8515625
+        ],
+        "gpu_after": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 4 MiB, 6 %, 32, 1980 MHz, 117.67 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 20571 MiB, 1 %, 58, 1980 MHz, 139.11 W"
+      },
+      {
+        "name": "final-model-02-inference-final",
+        "state": "WAITING",
+        "queued": 1790842657.2934515
+      }
+    ],
+    "claim": "correctness only; incomplete and foreign-GPU-process timing excluded"
+  },
+  "archive_sha256": "fe38c50f3411a28f5553a6b9e7b39dca970d1673071f035cf84b2666304dd0ae",
+  "harnesses": {
+    "model_e2e_final.py": "\"\"\"Full Qwen3 inference or training on one immutable FA4 source tree per process.\"\"\"\n\nimport argparse\nimport hashlib\nimport json\nimport os\nimport statistics\nimport subprocess\nimport time\nfrom importlib import metadata\nfrom pathlib import Path\n\nimport torch\nimport cutlass.cute as cute\nfrom transformers import AttentionInterface, AutoModelForCausalLM, AutoTokenizer\nfrom transformers.masking_utils import AttentionMaskInterface, sdpa_mask\nfrom flash_attn.cute import flash_attn_func, cache_utils, softmax, flash_bwd_sm90, interface, flash_fwd_sm100\n\ncalls = 0\ncache_counts = {\"load_attempts\": 0, \"disk_hits\": 0, \"compiles\": 0}\noriginal_load = cache_utils.JITPersistentCache._try_load_from_storage\noriginal_compile = cute.compile\n\n\ndef observed_load(self, key):\n    cache_counts[\"load_attempts\"] += 1\n    hit = original_load(self, key)\n    cache_counts[\"disk_hits\"] += int(hit)\n    return hit\n\n\ndef observed_compile(*args, **kwargs):\n    cache_counts[\"compiles\"] += 1\n    return original_compile(*args, **kwargs)\n\n\ncache_utils.JITPersistentCache._try_load_from_storage = observed_load\ncute.compile = observed_compile\n\n\ndef fa4_attention(module, query, key, value, attention_mask, scaling, dropout=0.0,\n                  sliding_window=None, **kwargs):\n    global calls\n    assert dropout == 0.0 and sliding_window is None\n    calls += 1\n    out, _ = flash_attn_func(query.transpose(1, 2), key.transpose(1, 2),\n                           value.transpose(1, 2), softmax_scale=scaling,\n                           causal=True, pack_gqa=True, num_splits=1)\n    return out, None\n\n\nparser = argparse.ArgumentParser()\nparser.add_argument(\"--label\", required=True)\nparser.add_argument(\"--model\", type=Path, required=True)\nparser.add_argument(\"--reference\", type=Path, required=True)\nparser.add_argument(\"--output\", type=Path, required=True)\nparser.add_argument(\"--write-reference\", action=\"store_true\")\nparser.add_argument(\"--mode\", choices=[\"generation\", \"train\"], default=\"generation\")\nparser.add_argument(\"--expected-sm\", type=int, required=True)\nparser.add_argument(\"--rounds\", type=int, default=11)\nparser.add_argument(\"--warm-generations\", type=int, default=3)\nargs = parser.parse_args()\ndriver_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()\nmajor, minor = torch.cuda.get_device_capability()\nassert 10 * major + minor == args.expected_sm\ntorch.set_num_threads(8)\ntorch.manual_seed(20261001)\nAttentionInterface.register(\"fa4\", fa4_attention)\nAttentionMaskInterface.register(\"fa4\", sdpa_mask)\nreference = {} if args.write_reference else torch.load(args.reference, weights_only=True)\ntokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)\nstart = time.perf_counter()\nmodel = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16,\n                                           attn_implementation=\"fa4\", local_files_only=True)\nmodel = model.cuda()\nmodel.train(args.mode == \"train\")\ntorch.cuda.synchronize()\nload_s = time.perf_counter() - start\nstorages = tuple(p.data_ptr() for p in model.parameters())\nprefix = tokenizer(\"Explain why the sky looks blue and give a short example. \",\n                   return_tensors=\"pt\").input_ids.cuda()\nrows = []\nfor length in ((256, 2048) if args.mode == \"train\" else (128, 512)):\n    ids = prefix.repeat(1, (length + prefix.shape[1] - 1) // prefix.shape[1])[:, :length]\n    mask = torch.ones_like(ids)\n    key = str(length)\n\n    def run():\n        if args.mode == \"train\":\n            model.zero_grad(set_to_none=True)\n            result = model(input_ids=ids, attention_mask=mask, labels=ids, use_cache=False)\n            result.loss.backward()\n            return result\n        with torch.no_grad():\n            return model.generate(ids, attention_mask=mask, do_sample=False,\n                                  min_new_tokens=32, max_new_tokens=32, use_cache=True)\n\n    torch.cuda.synchronize()\n    before_cache = cache_counts.copy()\n    start = time.perf_counter()\n    with torch.no_grad():\n        first = model(input_ids=ids, attention_mask=mask, use_cache=False)\n    torch.cuda.synchronize()\n    first_prefill_ms = 1000 * (time.perf_counter() - start)\n    prefill_cache = {k: v - before_cache[k] for k, v in cache_counts.items()}\n    logits = first.logits[:, -1].float().cpu()\n    del first\n    result = run()\n    actual = {\"logits\": logits}\n    if args.mode == \"generation\":\n        assert result.shape[1] - length == 32\n        actual[\"tokens\"] = result.cpu()\n        with torch.no_grad():\n            forced = model(input_ids=result, attention_mask=torch.ones_like(result), use_cache=False)\n        actual[\"teacher_logits\"] = forced.logits[:, length-1:-1].float().cpu()\n        assert actual[\"teacher_logits\"].shape[1] == 32\n        del forced\n    else:\n        actual[\"loss\"] = result.loss.detach().float().cpu()\n        for name, p in model.named_parameters():\n            assert p.grad is not None and torch.isfinite(p.grad).all()\n            g = p.grad.detach().flatten()\n            positions = torch.linspace(0, g.numel() - 1, min(64, g.numel()), device=g.device).long()\n            actual[\"grad:\" + name] = torch.cat((g[positions].float(), g.float().norm().view(1))).cpu()\n    correctness_details = {}\n    if args.write_reference:\n        reference[key] = actual\n    else:\n        for name, value in actual.items():\n            if name == \"tokens\":\n                assert torch.equal(value, reference[key][name])\n                correctness_details[name] = {\"exact\": True}\n            else:\n                torch.testing.assert_close(value, reference[key][name], rtol=0.02, atol=0.003)\n                correctness_details[name] = {\"max_abs\": float((value-reference[key][name]).abs().max()),\n                                             \"exact\": bool(torch.equal(value, reference[key][name]))}\n    del result\n    for _ in range(args.warm_generations):\n        run()\n    torch.cuda.synchronize()\n    prefill_timings = []\n    if args.mode == \"generation\":\n        with torch.no_grad():\n            for _ in range(args.rounds):\n                start = time.perf_counter()\n                prefill = model(input_ids=ids, attention_mask=mask, use_cache=False)\n                torch.cuda.synchronize()\n                prefill_timings.append(1000 * (time.perf_counter() - start))\n                del prefill\n    timings = []\n    for _ in range(args.rounds):\n        start = time.perf_counter()\n        run()\n        torch.cuda.synchronize()\n        timings.append(1000 * (time.perf_counter() - start))\n    assert tuple(p.data_ptr() for p in model.parameters()) == storages\n    rows.append({\"input_tokens\": length, \"output_tokens\": 32 if args.mode == \"generation\" else 0,\n                 \"first_prefill_ms\": first_prefill_ms, \"e2e_ms\": timings,\n                 \"prefill_cache\": prefill_cache, \"steady_prefill_ms\": prefill_timings,\n                 \"median_ms\": statistics.median(timings), \"correctness\": \"PASS\",\n                 \"correctness_details\": correctness_details})\n    print(length, rows[-1][\"median_ms\"], flush=True)\nif args.write_reference:\n    torch.save(reference, args.reference)\nmodules = {\"softmax\": softmax, \"backward\": flash_bwd_sm90, \"cache\": cache_utils, \"interface\": interface, \"forward\": flash_fwd_sm100}\npayload = {\"label\": args.label, \"pid\": os.getpid(), \"mode\": args.mode, \"load_s\": load_s,\n           \"driver_sha256\": driver_sha256,\n           \"git_sha\": subprocess.check_output([\"git\", \"rev-parse\", \"HEAD\"], text=True).strip(),\n           \"python\": __import__(\"sys\").executable,\n           \"torch\": torch.__version__, \"cuda\": torch.version.cuda,\n           \"dsl\": metadata.version(\"nvidia-cutlass-dsl\"),\n           \"ffi\": metadata.version(\"apache-tvm-ffi\"),\n           \"quack\": metadata.version(\"quack-kernels\"),\n           \"gpu\": torch.cuda.get_device_name(), \"sm\": [major, minor],\n           \"fa4_calls\": calls, \"rows\": rows,\n           \"cache_counts\": cache_counts,\n           \"sources\": {n: {\"path\": m.__file__, \"sha256\": hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()}\n                       for n, m in modules.items()},\n           \"checkpoint_revision\": \"c1899de289a04d12100db370d81485cdf75e47ca\"}\nassert calls > 0\nargs.output.write_text(json.dumps(payload, indent=2))\n",
+    "bench_inference_dispatch.py": "\"\"\"Measure the public eager API, including host dispatch and synchronized device work.\"\"\"\n\nimport argparse\nimport hashlib\nimport json\nimport statistics\nimport subprocess\nimport time\nfrom functools import partial\nfrom pathlib import Path\n\nimport torch\nfrom flash_attn.cute import flash_attn_func, interface\n\nparser = argparse.ArgumentParser()\nparser.add_argument(\"--output\", type=Path, required=True)\nargs = parser.parse_args()\ntorch.set_num_threads(8)\ntorch.manual_seed(20261001)\nrows = []\nwith torch.no_grad():\n    for dtype in (torch.bfloat16, torch.float16):\n        for sq, sk in ((1, 129), (1, 512), (128, 128), (512, 512)):\n            q = torch.randn(1, 16, sq, 128, device=\"cuda\", dtype=dtype).transpose(1, 2)\n            k = torch.randn(1, 8, sk, 128, device=\"cuda\", dtype=dtype).transpose(1, 2)\n            v = torch.randn_like(k)\n\n            call = partial(flash_attn_func, q, k, v, causal=True, pack_gqa=True, num_splits=1)\n\n            for _ in range(20):\n                result = call()\n            torch.cuda.synchronize()\n            samples = []\n            for _ in range(15):\n                start = time.perf_counter()\n                for _ in range(200):\n                    result = call()\n                torch.cuda.synchronize()\n                samples.append(1e6 * (time.perf_counter() - start) / 200)\n            assert torch.isfinite(result[0]).all()\n            rows.append({\"dtype\": str(dtype), \"sq\": sq, \"sk\": sk,\n                         \"median_us\": statistics.median(samples), \"samples_us\": samples})\npayload = {\"scope\": \"public eager API wall latency; includes CPU dispatch and device work\",\n           \"git_sha\": subprocess.check_output([\"git\", \"rev-parse\", \"HEAD\"], text=True).strip(),\n           \"interface_sha256\": hashlib.sha256(Path(interface.__file__).read_bytes()).hexdigest(),\n           \"driver_sha256\": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), \"rows\": rows}\nargs.output.write_text(json.dumps(payload, indent=2))\n",
+    "summarize_final.py": "\"\"\"Summarize three independent APPA blocks without treating inner samples as replicas.\"\"\"\n\nimport itertools\nimport json\nimport math\nimport statistics\nimport sys\nfrom pathlib import Path\n\nroot = Path(sys.argv[1])\nnode = sys.argv[2]\npaths = sorted(root.glob(\"final-model-[0-9][0-9]-*.json\"))\nassert len(paths) == 12\narms = [json.loads(path.read_text()) for path in paths]\nassert len({a[\"driver_sha256\"] for a in arms}) == 1\nassert all(a[\"fa4_calls\"] == 27608 for a in arms)\nassert len({a[\"gpu\"] for a in arms}) == 1\nstatus = json.loads((root / \"final-model.status.json\").read_text())\nassert all(row[\"state\"] == \"FINISHED\" and row[\"exit_code\"] == 0 for row in status)\nassert all(not row[\"foreign_gpu_processes_after\"] for row in status)\nfor i, arm in enumerate(arms):\n    assert (arm[\"git_sha\"] == \"616b0e8abab13b87b01525b3916d5a863ab02ae0\") == (i % 4 in (0, 3))\n    for row in arm[\"rows\"]:\n        assert row[\"correctness\"] == \"PASS\" and row[\"output_tokens\"] == 32\n        assert len(row[\"e2e_ms\"]) == len(row[\"steady_prefill_ms\"]) == 11\n        assert row[\"median_ms\"] == statistics.median(row[\"e2e_ms\"])\n\n\ndef geometric(values):\n    return math.exp(statistics.mean(map(math.log, values)))\n\n\ndef quantile(values, p):\n    pos = (len(values) - 1) * p\n    lower = math.floor(pos)\n    upper = math.ceil(pos)\n    return values[lower] + (values[upper] - values[lower]) * (pos - lower)\n\n\nresults = []\nlines = [f\"| {node} workload | Baseline ms | Patch ms | Speedup | 95% block-bootstrap CI | Output tokens/s A \u2192 P |\",\n         \"|---|---:|---:|---:|---:|---:|\"]\nfor row_index, length in enumerate((128, 512)):\n    for field, name in ((\"steady_prefill_ms\", f\"{length} full-model prefill\"),\n                        (\"e2e_ms\", f\"{length} input + 32 greedy tokens\")):\n        medians = [statistics.median(a[\"rows\"][row_index][field]) for a in arms]\n        baseline = geometric([v for i, v in enumerate(medians) if i % 4 in (0, 3)])\n        patch = geometric([v for i, v in enumerate(medians) if i % 4 in (1, 2)])\n        blocks = [geometric(medians[i:i+1] + medians[i+3:i+4]) / geometric(medians[i+1:i+3])\n                  for i in range(0, 12, 4)]\n        bootstrap = sorted(geometric(draw) for draw in itertools.product(blocks, repeat=3))\n        ci = [quantile(bootstrap, 0.025), quantile(bootstrap, 0.975)]\n        row = {\"workload\": name, \"baseline_ms\": baseline, \"patch_ms\": patch,\n               \"speedup\": baseline / patch, \"latency_reduction_pct\": 100 * (1-patch/baseline),\n               \"block_speedups\": blocks, \"speedup_ci95\": ci,\n               \"process_medians_ms\": medians, \"mes_1pct_pass\": ci[0] > 1.01}\n        throughput = \"\u2014\"\n        if field == \"e2e_ms\":\n            row[\"output_tokens_s\"] = [32000/baseline, 32000/patch]\n            throughput = f\"{32000/baseline:.2f} \u2192 {32000/patch:.2f}\"\n        results.append(row)\n        lines.append(f\"| {name} | {baseline:.3f} | {patch:.3f} | {baseline/patch:.4f}\u00d7 | {ci[0]:.4f}\u2013{ci[1]:.4f}\u00d7 | {throughput} |\")\nsummary = {\"node\": node, \"processes\": 12, \"independent_blocks\": 3,\n           \"method\": \"Geometric means of process medians; exact nonparametric block bootstrap (27 draws)\",\n           \"mes\": 0.01, \"results\": results,\n           \"complete_generation_gate\": all(row[\"mes_1pct_pass\"] for row in results if \"greedy\" in row[\"workload\"])}\n(root / \"final-summary.json\").write_text(json.dumps(summary, indent=2))\n(root / \"final-table.md\").write_text(\"\\n\".join(lines) + \"\\n\")\nprint(\"\\n\".join(lines))\nprint(\"Complete generation gate:\", summary[\"complete_generation_gate\"])\n",
+    "run_jobs_final.py": "\"\"\"Run frozen jobs in fresh processes after their files and GPU are ready.\"\"\"\n\nimport json\nimport os\nimport subprocess\nimport sys\nimport time\nfrom pathlib import Path\n\npath = Path(sys.argv[1])\nstatus = path.with_suffix(\".status.json\")\nrows = []\n\n\ndef gpu_processes() -> str:\n    return subprocess.check_output(\n        [\"nvidia-smi\", \"--query-compute-apps=pid\", \"--format=csv,noheader\"], text=True\n    ).strip()\n\n\nfor job in json.loads(path.read_text()):\n    row = {\"name\": job[\"name\"], \"state\": \"WAITING\", \"queued\": time.time()}\n    rows.append(row)\n    status.write_text(json.dumps(rows, indent=2))\n    while not all(Path(p).exists() for p in job.get(\"requires\", [])) or gpu_processes():\n        time.sleep(10)\n    log_path = path.parent / (job[\"name\"] + \".log\")\n    row.update(started=time.time(), cpu_load_before=os.getloadavg(),\n               gpu_before=subprocess.check_output([\"nvidia-smi\", \"--query-gpu=index,uuid,memory.used,utilization.gpu,temperature.gpu,clocks.sm,power.draw\", \"--format=csv,noheader\"], text=True).strip())\n    with log_path.open(\"w\") as log:\n        proc = subprocess.Popen(job[\"command\"], cwd=job[\"cwd\"], env=os.environ | job[\"env\"],\n                                stdout=log, stderr=log, stdin=subprocess.DEVNULL)\n        row.update(pid=proc.pid, state=\"RUNNING\", log=str(log_path))\n        status.write_text(json.dumps(rows, indent=2))\n        row[\"exit_code\"] = proc.wait()\n    row.update(state=\"FINISHED\", elapsed_s=time.time() - row[\"started\"],\n               foreign_gpu_processes_after=gpu_processes(), cpu_load_after=os.getloadavg(),\n               gpu_after=subprocess.check_output([\"nvidia-smi\", \"--query-gpu=index,uuid,memory.used,utilization.gpu,temperature.gpu,clocks.sm,power.draw\", \"--format=csv,noheader\"], text=True).strip())\n    status.write_text(json.dumps(rows, indent=2))\n    allowed = job.get(\"expected_exit\", [0])\n    if row[\"exit_code\"] not in allowed:\n        sys.exit(row[\"exit_code\"] or 1)\n"
+  }
+}
