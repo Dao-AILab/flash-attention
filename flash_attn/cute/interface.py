@@ -84,7 +84,7 @@ BIN_BATCH_SEARCH_THRESH = 256  # above this batch size SingleTileVarlenScheduler
 # Where the cu hint applies, use an O(1) flat-block -> batch lookup instead of the binary search.
 USE_BLOCKS_TO_BATCH: bool = True
 
-# Enable the S ping-pong only when each split's mainloop is at least this many n_blocks.
+# Minimum KV blocks per split for S ping-pong; hd256 SplitKV stays disabled.
 S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT = {64: 16, 128: 64}
 
 
@@ -1433,11 +1433,10 @@ def _flash_attn_fwd(
         not requested_disable_s_ping_pong
         and arch in (100, 110)
         and q_stage == 1
-        and head_dim in (64, 128)
+        and head_dim in (64, 128, 256)
         and head_dim_v == head_dim
         and tile_m == 128
         and tile_n == 128
-        and not use_2cta_instrs
         and page_size in (None, tile_n)
         and score_mod is None
         and mask_mod is None
@@ -1445,7 +1444,7 @@ def _flash_attn_fwd(
         and learnable_sink is None
         and (
             num_splits == 1
-            or num_n_blocks_per_split >= S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT[head_dim]
+            or num_n_blocks_per_split >= S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT.get(head_dim, math.inf)
         )
     )
 
