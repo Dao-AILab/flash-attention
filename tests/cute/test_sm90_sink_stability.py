@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from flash_attn.cute import flash_attn_func
+from flash_attn.cute.testing import check_dsink_vs_ref, check_tensor_vs_ref
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
@@ -13,16 +14,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _reference(q, k, v, sink, *, causal=False, window=(None, None), scale=None):
+def _reference(
+    q, k, v, sink, *, causal=False, window=(None, None), scale=None, upcast=True, reorder_ops=False
+):
     """Small FP64 reference; ordinary logits are scaled, the sink logit is not."""
     batch, sq, hq, dim = q.shape
     sk, hkv = k.shape[1:3]
     assert hq % hkv == 0
     scale = dim**-0.5 if scale is None else scale
-    qh = q.double().transpose(1, 2)
-    kh = k.double().repeat_interleave(hq // hkv, dim=2).transpose(1, 2)
-    vh = v.double().repeat_interleave(hq // hkv, dim=2).transpose(1, 2)
-    scores = (qh @ kh.transpose(-2, -1)) * scale
+    dtype = torch.float64 if upcast else q.dtype
+    qh = q.to(dtype).transpose(1, 2)
+    kh = k.to(dtype).repeat_interleave(hq // hkv, dim=2).transpose(1, 2)
+    vh = v.to(dtype).repeat_interleave(hq // hkv, dim=2).transpose(1, 2)
+    scores = (
+        qh @ (kh * scale).transpose(-2, -1) if reorder_ops else (qh @ kh.transpose(-2, -1)) * scale
+    )
     anchor = torch.arange(sq, device=q.device)[:, None] + sk - sq
     col = torch.arange(sk, device=q.device)[None, :]
     valid = torch.ones((sq, sk), device=q.device, dtype=torch.bool)
@@ -34,10 +40,11 @@ def _reference(q, k, v, sink, *, causal=False, window=(None, None), scale=None):
     if right is not None:
         valid &= col <= anchor + right
     scores = scores.masked_fill(~valid[None, None], -torch.inf)
-    sink_col = sink.double().view(1, hq, 1, 1).expand(batch, hq, sq, 1)
+    sink_col = sink.to(torch.float64 if upcast else torch.float32)
+    sink_col = sink_col.view(1, hq, 1, 1).expand(batch, hq, sq, 1)
     lse = torch.logsumexp(torch.cat((scores, sink_col), dim=-1), dim=-1)
     # This reference's backward tests always use finite sinks, so LSE is finite.
-    prob = torch.exp(scores - lse[..., None])
+    prob = torch.exp(scores - lse[..., None]).to(vh.dtype)
     return (prob @ vh).transpose(1, 2), lse
 
 
@@ -174,9 +181,25 @@ def test_sink_random_forward_backward(dtype, pack_gqa, sq, sk, dim, causal, wind
         ref_inputs,
         (dout.double(), dlse.double()),
     )
-    for actual, expected in zip(grads, ref_grads):
+    # Use the unchanged upstream gradient error criteria against a reordered
+    # low-precision reference, including cancellation in the reduced dsink.
+    pt_inputs = tuple(x.detach().clone().requires_grad_() for x in inputs)
+    pt_out, pt_lse = _reference(
+        *pt_inputs, causal=causal, window=window, scale=scale, upcast=False, reorder_ops=True
+    )
+    pt_grads = torch.autograd.grad((pt_out, pt_lse), pt_inputs, (dout, dlse))
+    # The saved low-precision O also enters dsink through dot(O, dO).
+    # Bound this reference-only forward rounding before the head reduction;
+    # cancellation must not erase the precision floor. No FA output is used.
+    sink_mass = torch.exp(sink.double().view(1, 4, 1) - ref_lse).transpose(1, 2)
+    output_error = (pt_out.double() - ref_out).abs() * dout.double().abs()
+    dsink_rounding = 2 * (sink_mass * output_error.sum(-1)).sum((0, 1))
+    for name, actual, expected, pt in zip(("dq", "dk", "dv", "dsink"), grads, ref_grads, pt_grads):
         assert torch.isfinite(actual).all()
-        torch.testing.assert_close(actual.double(), expected, rtol=rtol, atol=atol)
+        if name == "dsink":
+            check_dsink_vs_ref(actual.float(), expected.float(), pt.float(), atol=dsink_rounding)
+        else:
+            check_tensor_vs_ref(name, actual.double(), expected, pt.double())
 
 
 def test_minus_inf_sink_matches_no_sink_including_masked_rows():
