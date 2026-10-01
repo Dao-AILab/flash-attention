@@ -971,22 +971,24 @@ def _flash_attn_fwd(
 
     # MLA (qv): 1CTA or 2CTA kernel. Decided here: the sparse head padding below and the
     # MLA plan (_mla_fwd_plan) depend on it.
-    mla_route = partial(
-        _mla_1cta_route,
-        gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p,
-        seqlen_q_hint=seqlen_q_hint,
-        needs_1cta=(
-            v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-            or any(t is not None for t in (q_descale, k_descale, v_descale))
-            or num_splits > 1
-        ),
-        # 2CTA tiles: one per token (sparse) or per batch element (dense decode), 2 CTAs each
-        ctas_2cta=2 * num_head_kv * (total_q if gather_kv_indices is not None else batch_size),
-        num_sms=get_num_sms_for_selection(v.device.index, arch),
-    )
-    # num_splits < 1 (the split heuristic): 1CTA provisionally, re-decided after planning
+    mla_1cta = False
     num_splits_auto = num_splits < 1
-    mla_1cta = qv is not None and mla_route(split_kv=num_splits_auto)
+    if qv is not None:
+        mla_route = partial(
+            _mla_1cta_route,
+            gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p,
+            seqlen_q_hint=seqlen_q_hint,
+            needs_1cta=(
+                v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                or any(t is not None for t in (q_descale, k_descale, v_descale))
+                or num_splits > 1
+            ),
+            # 2CTA tiles: one per token (sparse) or per batch element (dense decode), 2 CTAs each
+            ctas_2cta=2 * num_head_kv * (total_q if gather_kv_indices is not None else batch_size),
+            num_sms=get_num_sms_for_selection(v.device.index, arch),
+        )
+        # num_splits < 1 (the split heuristic): 1CTA provisionally, re-decided after planning
+        mla_1cta = mla_route(split_kv=num_splits_auto)
     
     # Sparse MLA pads a token's heads to the kernel's tile (pack_gqa.qheads_first_tma_view); the
     # kernel takes the real count, the interface needs the tile width for its grid math.
