@@ -1,0 +1,477 @@
+{
+  "runtime": {
+    "versions": {
+      "torch": "2.7.0+cu128",
+      "nvidia-cutlass-dsl": "4.8.0",
+      "quack-kernels": "0.5.3",
+      "apache-tvm-ffi": "0.1.12",
+      "torch-c-dlpack-ext": "0.1.5",
+      "transformers": "4.57.1",
+      "pytest": "9.1.1",
+      "cuda-bindings": "13.4.3"
+    },
+    "torch_file": "/root/miniconda3/lib/python3.12/site-packages/torch/__init__.py",
+    "torch_cuda": "12.8",
+    "cutlass_file": "/root/autodl-tmp/flashattention-sm90-h20/runtime/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/__init__.py",
+    "tvm_ffi_file": "/root/autodl-tmp/flashattention-sm90-h20/runtime/lib/python3.12/site-packages/tvm_ffi/__init__.py",
+    "source": "/root/autodl-tmp/flashattention-sm90-h20/imports/base/flash_attn/cute/interface.py",
+    "gpu": "NVIDIA H20",
+    "capability": [
+      9,
+      0
+    ],
+    "original_torch": "2.7.0+cu128 12.8 /root/miniconda3/lib/python3.12/site-packages/torch/__init__.py",
+    "pip_check_exit": 1
+  },
+  "micro_lifecycle": [
+    {
+      "cache_source_sha256": "67c9639cd211460629a9cecbd564fcbfe701909492a2e53bb0652ca2eea75e37",
+      "fingerprint": "8d09da739af75b8f584712913c4355729b909c7d58d791821dca1c0caef9e52f",
+      "first_forward_backward_s": 3.2761847116053104,
+      "gpu": "NVIDIA H20",
+      "installed_quack": "0.5.3",
+      "out_checksum": -132.5250244140625,
+      "output_gradient_sha256": "2b3945185282aa48d26f235b0f7e8a4456de46e541709019b0e574a9aa49f973",
+      "pid": 24103,
+      "probe_s": 6.105342503637075,
+      "sha": "ce65708e6254395996e4720eb07fabb2b643c13d",
+      "simulated_stamp": "A",
+      "visible_devices": "1",
+      "disk_misses": 4,
+      "successful_exports": 4,
+      "disk_loads": 0,
+      "load_failures": 0,
+      "arm": "A1"
+    },
+    {
+      "cache_source_sha256": "67c9639cd211460629a9cecbd564fcbfe701909492a2e53bb0652ca2eea75e37",
+      "fingerprint": "8d09da739af75b8f584712913c4355729b909c7d58d791821dca1c0caef9e52f",
+      "first_forward_backward_s": 0.018821746110916138,
+      "gpu": "NVIDIA H20",
+      "installed_quack": "0.5.3",
+      "out_checksum": -132.5250244140625,
+      "output_gradient_sha256": "2b3945185282aa48d26f235b0f7e8a4456de46e541709019b0e574a9aa49f973",
+      "pid": 24238,
+      "probe_s": 2.902781128883362,
+      "sha": "ce65708e6254395996e4720eb07fabb2b643c13d",
+      "simulated_stamp": "A",
+      "visible_devices": "1",
+      "disk_misses": 0,
+      "successful_exports": 0,
+      "disk_loads": 4,
+      "load_failures": 0,
+      "arm": "A2"
+    },
+    {
+      "cache_source_sha256": "67c9639cd211460629a9cecbd564fcbfe701909492a2e53bb0652ca2eea75e37",
+      "fingerprint": "d89fd62604ae3b1d0be3bbc727d9cff011e5e2c39f2c41d239259fc77aa5ec61",
+      "first_forward_backward_s": 3.3969573192298412,
+      "gpu": "NVIDIA H20",
+      "installed_quack": "0.5.3",
+      "out_checksum": -132.5250244140625,
+      "output_gradient_sha256": "2b3945185282aa48d26f235b0f7e8a4456de46e541709019b0e574a9aa49f973",
+      "pid": 24473,
+      "probe_s": 6.221598215401173,
+      "sha": "ce65708e6254395996e4720eb07fabb2b643c13d",
+      "simulated_stamp": "B",
+      "visible_devices": "1",
+      "disk_misses": 4,
+      "successful_exports": 4,
+      "disk_loads": 0,
+      "load_failures": 0,
+      "arm": "B1"
+    },
+    {
+      "cache_source_sha256": "67c9639cd211460629a9cecbd564fcbfe701909492a2e53bb0652ca2eea75e37",
+      "fingerprint": "d89fd62604ae3b1d0be3bbc727d9cff011e5e2c39f2c41d239259fc77aa5ec61",
+      "first_forward_backward_s": 0.017627544701099396,
+      "gpu": "NVIDIA H20",
+      "installed_quack": "0.5.3",
+      "out_checksum": -132.5250244140625,
+      "output_gradient_sha256": "2b3945185282aa48d26f235b0f7e8a4456de46e541709019b0e574a9aa49f973",
+      "pid": 24882,
+      "probe_s": 2.61914449185133,
+      "sha": "ce65708e6254395996e4720eb07fabb2b643c13d",
+      "simulated_stamp": "B",
+      "visible_devices": "1",
+      "disk_misses": 0,
+      "successful_exports": 0,
+      "disk_loads": 4,
+      "load_failures": 0,
+      "arm": "B2"
+    }
+  ],
+  "model": [
+    {"label": "model-cache-A1", "sha": "ce65708e6254395996e4720eb07fabb2b643c13d", "softmax_sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49", "pid": 46700, "gpu": "NVIDIA H20", "visible_devices": "1", "model": "Qwen/Qwen3-0.6B", "input_sha256": "4318a0af984b2dd7c93996e0526b51318702b6acafeee95fd35ccdf991770f8d", "logits_sha256": "dc4ec6562478e8d61db34e5c08e74dc4c192bf4a471c265829db2b6c1f756dce", "token_sha256": "4f8702e84daa0dbdf478ef7c7a25dceaed93a18d8b9a133cceb2f6752eee5e35", "quack": "0.5.3", "simulated_quack_stamp": "A", "persistent_cache": true, "cache_fingerprint": "8d09da739af75b8f584712913c4355729b909c7d58d791821dca1c0caef9e52f", "load_s": 0.42835282161831856, "first_fa4_prefill_s": 2.2438520528376102, "first_fa4_generate_s": 2.3532444164156914, "mode": "transformers_eager_fa4", "prefill_tokens": 128, "output_tokens": 32, "median_s": 0.6349087171256542, "samples_s": [0.6442181281745434, 0.6316451691091061, 0.6342852674424648, 0.6472228020429611, 0.6349087171256542], "observed_fa4_calls": 4480, "expected_fa4_calls": 4480, "native_fa4_reference_match": true},
+    {"label": "model-cache-A1", "sha": "ce65708e6254395996e4720eb07fabb2b643c13d", "softmax_sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49", "pid": 46700, "gpu": "NVIDIA H20", "visible_devices": "1", "model": "Qwen/Qwen3-0.6B", "input_sha256": "1b0352d82cfebd21e77fd0d44f6c411214e4edf7000e33bc462d43245f7794e2", "logits_sha256": "5935a475c75fb1286b60bd1cd05949835d5e11b2bf34207ff8b998c1de58449d", "token_sha256": "79a29b3b5b103182832ce2ef250113bd4de0ccf3d4628d5c1b3cdb00f1e228d4", "quack": "0.5.3", "simulated_quack_stamp": "A", "persistent_cache": true, "cache_fingerprint": "8d09da739af75b8f584712913c4355729b909c7d58d791821dca1c0caef9e52f", "load_s": 0.42835282161831856, "first_fa4_prefill_s": 0.029649805277585983, "first_fa4_generate_s": 0.6475768759846687, "mode": "transformers_eager_fa4", "prefill_tokens": 512, "output_tokens": 32, "median_s": 0.641542449593544, "samples_s": [0.641542449593544, 0.6518431827425957, 0.638726893812418, 0.6705875657498837, 0.6341312006115913], "observed_fa4_calls": 4480, "expected_fa4_calls": 4480, "native_fa4_reference_match": true},
+    {"label": "model-cache-A2", "sha": "ce65708e6254395996e4720eb07fabb2b643c13d", "softmax_sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49", "pid": 46923, "gpu": "NVIDIA H20", "visible_devices": "1", "model": "Qwen/Qwen3-0.6B", "input_sha256": "4318a0af984b2dd7c93996e0526b51318702b6acafeee95fd35ccdf991770f8d", "logits_sha256": "dc4ec6562478e8d61db34e5c08e74dc4c192bf4a471c265829db2b6c1f756dce", "token_sha256": "4f8702e84daa0dbdf478ef7c7a25dceaed93a18d8b9a133cceb2f6752eee5e35", "quack": "0.5.3", "simulated_quack_stamp": "A", "persistent_cache": true, "cache_fingerprint": "8d09da739af75b8f584712913c4355729b909c7d58d791821dca1c0caef9e52f", "load_s": 0.4291098602116108, "first_fa4_prefill_s": 0.325719740241766, "first_fa4_generate_s": 0.7133657969534397, "mode": "transformers_eager_fa4", "prefill_tokens": 128, "output_tokens": 32, "median_s": 0.6336649060249329, "samples_s": [0.6324165873229504, 0.635856743901968, 0.6436159387230873, 0.6336649060249329, 0.6334757506847382], "observed_fa4_calls": 4480, "expected_fa4_calls": 4480, "native_fa4_reference_match": true},
+    {"label": "model-cache-A2", "sha": "ce65708e6254395996e4720eb07fabb2b643c13d", "softmax_sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49", "pid": 46923, "gpu": "NVIDIA H20", "visible_devices": "1", "model": "Qwen/Qwen3-0.6B", "input_sha256": "1b0352d82cfebd21e77fd0d44f6c411214e4edf7000e33bc462d43245f7794e2", "logits_sha256": "5935a475c75fb1286b60bd1cd05949835d5e11b2bf34207ff8b998c1de58449d", "token_sha256": "79a29b3b5b103182832ce2ef250113bd4de0ccf3d4628d5c1b3cdb00f1e228d4", "quack": "0.5.3", "simulated_quack_stamp": "A", "persistent_cache": true, "cache_fingerprint": "8d09da739af75b8f584712913c4355729b909c7d58d791821dca1c0caef9e52f", "load_s": 0.4291098602116108, "first_fa4_prefill_s": 0.02876562997698784, "first_fa4_generate_s": 0.6375875845551491, "mode": "transformers_eager_fa4", "prefill_tokens": 512, "output_tokens": 32, "median_s": 0.6373166553676128, "samples_s": [0.6407823227345943, 0.6291065663099289, 0.6435503661632538, 0.6343522556126118, 0.6373166553676128], "observed_fa4_calls": 4480, "expected_fa4_calls": 4480, "native_fa4_reference_match": true},
+    {"label": "model-cache-B1", "sha": "ce65708e6254395996e4720eb07fabb2b643c13d", "softmax_sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49", "pid": 47154, "gpu": "NVIDIA H20", "visible_devices": "1", "model": "Qwen/Qwen3-0.6B", "input_sha256": "4318a0af984b2dd7c93996e0526b51318702b6acafeee95fd35ccdf991770f8d", "logits_sha256": "dc4ec6562478e8d61db34e5c08e74dc4c192bf4a471c265829db2b6c1f756dce", "token_sha256": "4f8702e84daa0dbdf478ef7c7a25dceaed93a18d8b9a133cceb2f6752eee5e35", "quack": "0.5.3", "simulated_quack_stamp": "B", "persistent_cache": true, "cache_fingerprint": "d89fd62604ae3b1d0be3bbc727d9cff011e5e2c39f2c41d239259fc77aa5ec61", "load_s": 0.4415482021868229, "first_fa4_prefill_s": 2.245410420000553, "first_fa4_generate_s": 2.3358628153800964, "mode": "transformers_eager_fa4", "prefill_tokens": 128, "output_tokens": 32, "median_s": 0.6432322077453136, "samples_s": [0.6462491899728775, 0.6413147933781147, 0.6471487209200859, 0.6432322077453136, 0.6406101621687412], "observed_fa4_calls": 4480, "expected_fa4_calls": 4480, "native_fa4_reference_match": true},
+    {"label": "model-cache-B1", "sha": "ce65708e6254395996e4720eb07fabb2b643c13d", "softmax_sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49", "pid": 47154, "gpu": "NVIDIA H20", "visible_devices": "1", "model": "Qwen/Qwen3-0.6B", "input_sha256": "1b0352d82cfebd21e77fd0d44f6c411214e4edf7000e33bc462d43245f7794e2", "logits_sha256": "5935a475c75fb1286b60bd1cd05949835d5e11b2bf34207ff8b998c1de58449d", "token_sha256": "79a29b3b5b103182832ce2ef250113bd4de0ccf3d4628d5c1b3cdb00f1e228d4", "quack": "0.5.3", "simulated_quack_stamp": "B", "persistent_cache": true, "cache_fingerprint": "d89fd62604ae3b1d0be3bbc727d9cff011e5e2c39f2c41d239259fc77aa5ec61", "load_s": 0.4415482021868229, "first_fa4_prefill_s": 0.029821697622537613, "first_fa4_generate_s": 0.6491928547620773, "mode": "transformers_eager_fa4", "prefill_tokens": 512, "output_tokens": 32, "median_s": 0.6444172337651253, "samples_s": [0.6440847031772137, 0.6444172337651253, 0.6452656425535679, 0.6460315361618996, 0.6439678631722927], "observed_fa4_calls": 4480, "expected_fa4_calls": 4480, "native_fa4_reference_match": true},
+    {"label": "model-cache-B2", "sha": "ce65708e6254395996e4720eb07fabb2b643c13d", "softmax_sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49", "pid": 47377, "gpu": "NVIDIA H20", "visible_devices": "1", "model": "Qwen/Qwen3-0.6B", "input_sha256": "4318a0af984b2dd7c93996e0526b51318702b6acafeee95fd35ccdf991770f8d", "logits_sha256": "dc4ec6562478e8d61db34e5c08e74dc4c192bf4a471c265829db2b6c1f756dce", "token_sha256": "4f8702e84daa0dbdf478ef7c7a25dceaed93a18d8b9a133cceb2f6752eee5e35", "quack": "0.5.3", "simulated_quack_stamp": "B", "persistent_cache": true, "cache_fingerprint": "d89fd62604ae3b1d0be3bbc727d9cff011e5e2c39f2c41d239259fc77aa5ec61", "load_s": 0.44145964086055756, "first_fa4_prefill_s": 0.3194394074380398, "first_fa4_generate_s": 0.7382105998694897, "mode": "transformers_eager_fa4", "prefill_tokens": 128, "output_tokens": 32, "median_s": 0.6451760232448578, "samples_s": [0.6456305496394634, 0.6352669037878513, 0.6553681641817093, 0.6451760232448578, 0.6384982764720917], "observed_fa4_calls": 4480, "expected_fa4_calls": 4480, "native_fa4_reference_match": true},
+    {"label": "model-cache-B2", "sha": "ce65708e6254395996e4720eb07fabb2b643c13d", "softmax_sha256": "aaddf3030dba7b9809c4fefae3caab22d0f22b9ecf5050601d6646aefb611a49", "pid": 47377, "gpu": "NVIDIA H20", "visible_devices": "1", "model": "Qwen/Qwen3-0.6B", "input_sha256": "1b0352d82cfebd21e77fd0d44f6c411214e4edf7000e33bc462d43245f7794e2", "logits_sha256": "5935a475c75fb1286b60bd1cd05949835d5e11b2bf34207ff8b998c1de58449d", "token_sha256": "79a29b3b5b103182832ce2ef250113bd4de0ccf3d4628d5c1b3cdb00f1e228d4", "quack": "0.5.3", "simulated_quack_stamp": "B", "persistent_cache": true, "cache_fingerprint": "d89fd62604ae3b1d0be3bbc727d9cff011e5e2c39f2c41d239259fc77aa5ec61", "load_s": 0.44145964086055756, "first_fa4_prefill_s": 0.028215978294610977, "first_fa4_generate_s": 0.649500198662281, "mode": "transformers_eager_fa4", "prefill_tokens": 512, "output_tokens": 32, "median_s": 0.6566880531609058, "samples_s": [0.6658824570477009, 0.6480920426547527, 0.6566880531609058, 0.6568055674433708, 0.6544539630413055], "observed_fa4_calls": 4480, "expected_fa4_calls": 4480, "native_fa4_reference_match": true}
+  ],
+  "model_cache_log_counts": [
+    {
+      "arm": "A1",
+      "misses": 2,
+      "exports": 2,
+      "loads": 0,
+      "load_failures": 0
+    },
+    {
+      "arm": "A2",
+      "misses": 0,
+      "exports": 0,
+      "loads": 2,
+      "load_failures": 0
+    },
+    {
+      "arm": "B1",
+      "misses": 2,
+      "exports": 2,
+      "loads": 0,
+      "load_failures": 0
+    },
+    {
+      "arm": "B2",
+      "misses": 0,
+      "exports": 0,
+      "loads": 2,
+      "load_failures": 0
+    }
+  ],
+  "model_manifest": {
+    "model": "Qwen/Qwen3-0.6B",
+    "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+    "files": [
+      {
+        "name": "config.json",
+        "bytes": 726,
+        "sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd"
+      },
+      {
+        "name": "generation_config.json",
+        "bytes": 239,
+        "sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
+      },
+      {
+        "name": "merges.txt",
+        "bytes": 1671853,
+        "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+      },
+      {
+        "name": "model.safetensors",
+        "bytes": 1503300328,
+        "sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b"
+      },
+      {
+        "name": "tokenizer.json",
+        "bytes": 11422654,
+        "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+      },
+      {
+        "name": "tokenizer_config.json",
+        "bytes": 9732,
+        "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+      },
+      {
+        "name": "vocab.json",
+        "bytes": 2776833,
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      }
+    ]
+  },
+  "model_cleanup": {
+    "deleted_path": "/root/autodl-tmp/flashattention-sm90-h20/models/qwen3-0.6b",
+    "bytes_removed": 1519184758,
+    "files": [
+      {
+        "path": "generation_config.json",
+        "bytes": 239
+      },
+      {
+        "path": "config.json",
+        "bytes": 726
+      },
+      {
+        "path": "merges.txt",
+        "bytes": 1671853
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 11422654
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 9732
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 2776833
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 1503300328
+      },
+      {
+        "path": ".cache/huggingface/CACHEDIR.TAG",
+        "bytes": 191
+      },
+      {
+        "path": ".cache/huggingface/.gitignore",
+        "bytes": 1
+      },
+      {
+        "path": ".cache/huggingface/trees/c1899de289a04d12100db370d81485cdf75e47ca.json",
+        "bytes": 1448
+      },
+      {
+        "path": ".cache/huggingface/download/generation_config.json.lock",
+        "bytes": 0
+      },
+      {
+        "path": ".cache/huggingface/download/config.json.lock",
+        "bytes": 0
+      },
+      {
+        "path": ".cache/huggingface/download/generation_config.json.metadata",
+        "bytes": 101
+      },
+      {
+        "path": ".cache/huggingface/download/merges.txt.lock",
+        "bytes": 0
+      },
+      {
+        "path": ".cache/huggingface/download/config.json.metadata",
+        "bytes": 101
+      },
+      {
+        "path": ".cache/huggingface/download/model.safetensors.lock",
+        "bytes": 0
+      },
+      {
+        "path": ".cache/huggingface/download/merges.txt.metadata",
+        "bytes": 101
+      },
+      {
+        "path": ".cache/huggingface/download/tokenizer.json.lock",
+        "bytes": 0
+      },
+      {
+        "path": ".cache/huggingface/download/tokenizer.json.metadata",
+        "bytes": 124
+      },
+      {
+        "path": ".cache/huggingface/download/tokenizer_config.json.lock",
+        "bytes": 0
+      },
+      {
+        "path": ".cache/huggingface/download/tokenizer_config.json.metadata",
+        "bytes": 101
+      },
+      {
+        "path": ".cache/huggingface/download/vocab.json.lock",
+        "bytes": 0
+      },
+      {
+        "path": ".cache/huggingface/download/vocab.json.metadata",
+        "bytes": 100
+      },
+      {
+        "path": ".cache/huggingface/download/model.safetensors.metadata",
+        "bytes": 125
+      }
+    ],
+    "completed_model_pids": [
+      44981,
+      45200,
+      45396,
+      45599,
+      45820,
+      46054,
+      46273,
+      46488,
+      46700,
+      46923,
+      47154,
+      47377
+    ],
+    "completed_arms": 28,
+    "utc": "2026-10-01T05:47:56.365598+00:00",
+    "exists_after": false,
+    "scope": "Task-owned checkpoint only; checksum manifest retained"
+  },
+  "process_status": [
+    {
+      "name": "model-cache-A1",
+      "pid": 46700,
+      "started": 1790833586.556793,
+      "log": "/root/autodl-tmp/flashattention-sm90-h20/evidence/model-cache-A1.log",
+      "gpu_before": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 0 %, 30, 345 MHz, 72.90 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 6 %, 64, 1980 MHz, 147.98 W",
+      "cpu_load_before": [
+        5.07373046875,
+        4.97998046875,
+        4.875
+      ],
+      "exit_code": 0,
+      "elapsed_s": 20.181516647338867,
+      "gpu_after": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 0 %, 30, 345 MHz, 72.83 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 6 %, 64, 1980 MHz, 148.09 W"
+    },
+    {
+      "name": "model-cache-A2",
+      "pid": 46923,
+      "started": 1790833606.836077,
+      "log": "/root/autodl-tmp/flashattention-sm90-h20/evidence/model-cache-A2.log",
+      "gpu_before": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 0 %, 30, 345 MHz, 72.84 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 6 %, 64, 1980 MHz, 148.15 W",
+      "cpu_load_before": [
+        5.001953125,
+        4.9658203125,
+        4.87255859375
+      ],
+      "exit_code": 0,
+      "elapsed_s": 16.593428134918213,
+      "gpu_after": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 0 %, 30, 345 MHz, 72.89 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 6 %, 64, 1980 MHz, 148.26 W"
+    },
+    {
+      "name": "model-cache-B1",
+      "pid": 47154,
+      "started": 1790833623.5263295,
+      "log": "/root/autodl-tmp/flashattention-sm90-h20/evidence/model-cache-B1.log",
+      "gpu_before": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 0 %, 30, 345 MHz, 72.89 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 6 %, 64, 1980 MHz, 148.12 W",
+      "cpu_load_before": [
+        5.11962890625,
+        4.99951171875,
+        4.88671875
+      ],
+      "exit_code": 0,
+      "elapsed_s": 20.25152587890625,
+      "gpu_after": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 0 %, 30, 345 MHz, 72.79 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 0 %, 64, 1980 MHz, 147.82 W"
+    },
+    {
+      "name": "model-cache-B2",
+      "pid": 47377,
+      "started": 1790833643.8757198,
+      "log": "/root/autodl-tmp/flashattention-sm90-h20/evidence/model-cache-B2.log",
+      "gpu_before": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 0 %, 30, 345 MHz, 72.80 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 6 %, 64, 1980 MHz, 147.88 W",
+      "cpu_load_before": [
+        5.02880859375,
+        4.984375,
+        4.88427734375
+      ],
+      "exit_code": 0,
+      "elapsed_s": 16.734698057174683,
+      "gpu_after": "0, GPU-edf64e5f-21ef-a1f2-6601-e8620b5664ff, 0 MiB, 0 %, 30, 345 MHz, 72.87 W\n1, GPU-8ee84e7d-143f-dd29-1097-85943783e027, 0 MiB, 0 %, 64, 1980 MHz, 147.87 W"
+    }
+  ],
+  "ordered_plan": [
+    {
+      "name": "model-cache-A1",
+      "command": [
+        "/root/autodl-tmp/flashattention-sm90-h20/runtime/bin/python",
+        "/root/autodl-tmp/flashattention-sm90-h20/tools/model_e2e.py",
+        "--label",
+        "model-cache-A1",
+        "--model",
+        "/root/autodl-tmp/flashattention-sm90-h20/models/qwen3-0.6b",
+        "--rounds",
+        "5",
+        "--reference",
+        "/root/autodl-tmp/flashattention-sm90-h20/evidence/model-native-reference-gpu1.json"
+      ],
+      "cwd": "/root/autodl-tmp/flashattention-sm90-h20/cache",
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
+        "FA_LOG_LEVEL": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "CUDA_VISIBLE_DEVICES": "1",
+        "PYTHONPATH": "/root/autodl-tmp/flashattention-sm90-h20/imports/cache",
+        "FA_TEST_QUACK_STAMP": "A",
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": "/root/autodl-tmp/flashattention-sm90-h20/jit-cache-model"
+      }
+    },
+    {
+      "name": "model-cache-A2",
+      "command": [
+        "/root/autodl-tmp/flashattention-sm90-h20/runtime/bin/python",
+        "/root/autodl-tmp/flashattention-sm90-h20/tools/model_e2e.py",
+        "--label",
+        "model-cache-A2",
+        "--model",
+        "/root/autodl-tmp/flashattention-sm90-h20/models/qwen3-0.6b",
+        "--rounds",
+        "5",
+        "--reference",
+        "/root/autodl-tmp/flashattention-sm90-h20/evidence/model-native-reference-gpu1.json"
+      ],
+      "cwd": "/root/autodl-tmp/flashattention-sm90-h20/cache",
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
+        "FA_LOG_LEVEL": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "CUDA_VISIBLE_DEVICES": "1",
+        "PYTHONPATH": "/root/autodl-tmp/flashattention-sm90-h20/imports/cache",
+        "FA_TEST_QUACK_STAMP": "A",
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": "/root/autodl-tmp/flashattention-sm90-h20/jit-cache-model"
+      }
+    },
+    {
+      "name": "model-cache-B1",
+      "command": [
+        "/root/autodl-tmp/flashattention-sm90-h20/runtime/bin/python",
+        "/root/autodl-tmp/flashattention-sm90-h20/tools/model_e2e.py",
+        "--label",
+        "model-cache-B1",
+        "--model",
+        "/root/autodl-tmp/flashattention-sm90-h20/models/qwen3-0.6b",
+        "--rounds",
+        "5",
+        "--reference",
+        "/root/autodl-tmp/flashattention-sm90-h20/evidence/model-native-reference-gpu1.json"
+      ],
+      "cwd": "/root/autodl-tmp/flashattention-sm90-h20/cache",
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
+        "FA_LOG_LEVEL": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "CUDA_VISIBLE_DEVICES": "1",
+        "PYTHONPATH": "/root/autodl-tmp/flashattention-sm90-h20/imports/cache",
+        "FA_TEST_QUACK_STAMP": "B",
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": "/root/autodl-tmp/flashattention-sm90-h20/jit-cache-model"
+      }
+    },
+    {
+      "name": "model-cache-B2",
+      "command": [
+        "/root/autodl-tmp/flashattention-sm90-h20/runtime/bin/python",
+        "/root/autodl-tmp/flashattention-sm90-h20/tools/model_e2e.py",
+        "--label",
+        "model-cache-B2",
+        "--model",
+        "/root/autodl-tmp/flashattention-sm90-h20/models/qwen3-0.6b",
+        "--rounds",
+        "5",
+        "--reference",
+        "/root/autodl-tmp/flashattention-sm90-h20/evidence/model-native-reference-gpu1.json"
+      ],
+      "cwd": "/root/autodl-tmp/flashattention-sm90-h20/cache",
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
+        "FA_LOG_LEVEL": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "CUDA_VISIBLE_DEVICES": "1",
+        "PYTHONPATH": "/root/autodl-tmp/flashattention-sm90-h20/imports/cache",
+        "FA_TEST_QUACK_STAMP": "B",
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": "/root/autodl-tmp/flashattention-sm90-h20/jit-cache-model"
+      }
+    }
+  ],
+  "harness_sha256": {
+    "cache_smoke.py": "de9659abe5147630d09b429ef52e2a6a1bb3406245da94bab19a8099a2fe0a5c",
+    "model_e2e.py": "6efbfbe74201e319d0b0bd49adac1b8f40c5587f72fb2ddc5c9a566a575c5b5e"
+  }
+}
