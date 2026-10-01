@@ -104,4 +104,6 @@ Benchmark driver SHA256: `9380461de5cd39d390fd2f665e0b52f591f49d82870ebcdaf14672
 Model driver SHA256: `c109f3f9b8f09171bfe0b127eddf9c4ec3702bc54f6e7678b8533e610cba58d8`.
 Full NCU reports and drivers are retained in the execution audit.
 The verified checkpoint weight file was removed immediately after all four model workers
-exited naturally. Original background downloads and pre-existing processes were retained.
+exited naturally. The original download writer also exited naturally; the cleanup worker
+removed its remaining 1,519,184,759 bytes and all 24 files in the task-owned model directory.
+The model directory no longer exists. Pre-existing processes and environments were retained.

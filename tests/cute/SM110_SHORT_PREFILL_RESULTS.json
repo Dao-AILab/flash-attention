@@ -4180,5 +4180,19 @@
       "elapsed_s": 6.750799894332886,
       "foreign_gpu_processes_after": ""
     }
-  ]
+  ],
+  "final_download_cleanup": {
+    "state": "COMPLETE",
+    "started": 1790840911.1036825,
+    "writers": {
+      "2884481": [
+        "Thu Oct  1 15:19:15 2026",
+        "Ssl"
+      ]
+    },
+    "bytes_removed": 1519184759,
+    "files_removed": 24,
+    "finished": 1790841161.8972838,
+    "model_directory_exists": false
+  }
 }
