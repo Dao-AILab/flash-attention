@@ -3791,6 +3791,8 @@ class FlashAttnFunc(torch.autograd.Function):
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
         )
+        if ctx is None:
+            return out, lse
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
         ctx.shared_kv = shared_kv
@@ -4140,7 +4142,8 @@ def flash_attn_func(
             "the backward will run unchunked (full-size dS transient).",
             stacklevel=2,
         )
-    return FlashAttnFunc.apply(
+    forward = FlashAttnFunc.apply if torch.is_grad_enabled() else partial(FlashAttnFunc.forward, None)
+    return forward(
         q,
         k,
         v,
