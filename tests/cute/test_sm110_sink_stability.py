@@ -78,3 +78,29 @@ def test_sink_random_gradients(dtype, pack_gqa, sq, sk, causal):
     for actual, wanted in zip(grads, expected):
         assert torch.isfinite(actual).all()
         torch.testing.assert_close(actual.double().cpu(), wanted, rtol=0.03, atol=3e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("splits", [2, 3])
+@pytest.mark.parametrize("sq,sk,sink_value", [(7, 3, 100.0), (19, 257, 8.0), (19, 257, 100.0),
+                                             (19, 257, -float("inf"))])
+def test_sink_splitkv(dtype, splits, sq, sk, sink_value):
+    q = torch.zeros(1, sq, 4, 64, device="cuda", dtype=dtype)
+    k = torch.zeros(1, sk, 2, 64, device="cuda", dtype=dtype)
+    v = torch.ones_like(k)
+    sink = torch.full((4,), sink_value, device="cuda")
+    wanted_out, wanted_lse = reference(*(x.double().cpu() for x in (q, k, v, sink)), True, 1.0)
+    out, lse = flash_attn_func(q, k, v, learnable_sink=sink, causal=True, softmax_scale=1.0,
+                              pack_gqa=True, num_splits=splits, return_lse=True)
+    torch.testing.assert_close(out.double().cpu(), wanted_out, rtol=0.01, atol=2e-4)
+    torch.testing.assert_close(lse.double().cpu(), wanted_lse, rtol=1e-5, atol=2e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_sink_empty_keys(dtype):
+    q = torch.zeros(1, 7, 4, 64, device="cuda", dtype=dtype)
+    k = torch.empty(1, 0, 2, 64, device="cuda", dtype=dtype)
+    sink = torch.full((4,), 100.0, device="cuda")
+    out, lse = flash_attn_func(q, k, k, learnable_sink=sink, causal=True, return_lse=True)
+    torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+    torch.testing.assert_close(lse, torch.full_like(lse, 100.0), rtol=0, atol=0)
