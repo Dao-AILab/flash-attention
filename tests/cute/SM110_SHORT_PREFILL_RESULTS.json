@@ -3566,5 +3566,619 @@
       2896416
     ],
     "background_download_retained": 2884481
-  }
+  },
+  "interop": [
+    {
+      "environment": {
+        "python": "3.12.3",
+        "machine": "aarch64",
+        "git_sha": "9eb202c6162e8cc408cc2ffe9071131692e80252",
+        "distributions": {
+          "torch": "2.13.0+cu130",
+          "nvidia-cutlass-dsl": "4.8.0",
+          "apache-tvm-ffi": "0.1.12",
+          "torch-c-dlpack-ext": "0.1.5",
+          "quack-kernels": "0.5.3"
+        },
+        "torch_version": "2.13.0+cu130",
+        "torch_cuda_build": "13.0",
+        "gpu": "NVIDIA Thor",
+        "sm": [
+          11,
+          0
+        ],
+        "python_path": [
+          "/home/jwipc/experiments/flashattention-direct-20261001/tools",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-lite",
+          "/usr/lib/python312.zip",
+          "/usr/lib/python3.12",
+          "/usr/lib/python3.12/lib-dynload",
+          "/home/jwipc/projects/host-gateway/.vllm/lib/python3.12/site-packages",
+          "__editable__.vllm-0.1.dev1+g1cfd97281.d20260913.cu132.finder.__path_hook__"
+        ]
+      },
+      "arguments": {
+        "mode": "eager",
+        "layout": "contiguous",
+        "expected_sm": 110,
+        "output": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/prefill-interop-eager-contiguous.json"
+      },
+      "status": "PASS",
+      "checks": [
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.002468838736309764,
+          "lse_max_abs": 9.402100805466773e-06
+        },
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.0024751903107150808,
+          "lse_max_abs": 1.0018248085330583e-05
+        }
+      ],
+      "tensor_metadata": [
+        {
+          "shape": [
+            1,
+            128,
+            16,
+            128
+          ],
+          "stride": [
+            262144,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        }
+      ],
+      "scope": "dense forward only; graph is warm forward capture; compile is diagnostic fullgraph=True"
+    },
+    {
+      "environment": {
+        "python": "3.12.3",
+        "machine": "aarch64",
+        "git_sha": "9eb202c6162e8cc408cc2ffe9071131692e80252",
+        "distributions": {
+          "torch": "2.13.0+cu130",
+          "nvidia-cutlass-dsl": "4.8.0",
+          "apache-tvm-ffi": "0.1.12",
+          "torch-c-dlpack-ext": "0.1.5",
+          "quack-kernels": "0.5.3"
+        },
+        "torch_version": "2.13.0+cu130",
+        "torch_cuda_build": "13.0",
+        "gpu": "NVIDIA Thor",
+        "sm": [
+          11,
+          0
+        ],
+        "python_path": [
+          "/home/jwipc/experiments/flashattention-direct-20261001/tools",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-lite",
+          "/usr/lib/python312.zip",
+          "/usr/lib/python3.12",
+          "/usr/lib/python3.12/lib-dynload",
+          "/home/jwipc/projects/host-gateway/.vllm/lib/python3.12/site-packages",
+          "__editable__.vllm-0.1.dev1+g1cfd97281.d20260913.cu132.finder.__path_hook__"
+        ]
+      },
+      "arguments": {
+        "mode": "eager",
+        "layout": "offset8",
+        "expected_sm": 110,
+        "output": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/prefill-interop-eager-offset8.json"
+      },
+      "status": "PASS",
+      "checks": [
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.002468838736309764,
+          "lse_max_abs": 9.402100805466773e-06
+        },
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.0024751903107150808,
+          "lse_max_abs": 1.0018248085330583e-05
+        }
+      ],
+      "tensor_metadata": [
+        {
+          "shape": [
+            1,
+            128,
+            16,
+            128
+          ],
+          "stride": [
+            262144,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        }
+      ],
+      "scope": "dense forward only; graph is warm forward capture; compile is diagnostic fullgraph=True"
+    },
+    {
+      "environment": {
+        "python": "3.12.3",
+        "machine": "aarch64",
+        "git_sha": "9eb202c6162e8cc408cc2ffe9071131692e80252",
+        "distributions": {
+          "torch": "2.13.0+cu130",
+          "nvidia-cutlass-dsl": "4.8.0",
+          "apache-tvm-ffi": "0.1.12",
+          "torch-c-dlpack-ext": "0.1.5",
+          "quack-kernels": "0.5.3"
+        },
+        "torch_version": "2.13.0+cu130",
+        "torch_cuda_build": "13.0",
+        "gpu": "NVIDIA Thor",
+        "sm": [
+          11,
+          0
+        ],
+        "python_path": [
+          "/home/jwipc/experiments/flashattention-direct-20261001/tools",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-lite",
+          "/usr/lib/python312.zip",
+          "/usr/lib/python3.12",
+          "/usr/lib/python3.12/lib-dynload",
+          "/home/jwipc/projects/host-gateway/.vllm/lib/python3.12/site-packages",
+          "__editable__.vllm-0.1.dev1+g1cfd97281.d20260913.cu132.finder.__path_hook__"
+        ]
+      },
+      "arguments": {
+        "mode": "eager",
+        "layout": "outer-strided",
+        "expected_sm": 110,
+        "output": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/prefill-interop-eager-outer-strided.json"
+      },
+      "status": "PASS",
+      "checks": [
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.002468838736309764,
+          "lse_max_abs": 9.402100805466773e-06
+        },
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.0024751903107150808,
+          "lse_max_abs": 1.0018248085330583e-05
+        }
+      ],
+      "tensor_metadata": [
+        {
+          "shape": [
+            1,
+            128,
+            16,
+            128
+          ],
+          "stride": [
+            524288,
+            4096,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            264192,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            264192,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 0,
+          "pointer_mod_16": 0
+        }
+      ],
+      "scope": "dense forward only; graph is warm forward capture; compile is diagnostic fullgraph=True"
+    },
+    {
+      "environment": {
+        "python": "3.12.3",
+        "machine": "aarch64",
+        "git_sha": "9eb202c6162e8cc408cc2ffe9071131692e80252",
+        "distributions": {
+          "torch": "2.13.0+cu130",
+          "nvidia-cutlass-dsl": "4.8.0",
+          "apache-tvm-ffi": "0.1.12",
+          "torch-c-dlpack-ext": "0.1.5",
+          "quack-kernels": "0.5.3"
+        },
+        "torch_version": "2.13.0+cu130",
+        "torch_cuda_build": "13.0",
+        "gpu": "NVIDIA Thor",
+        "sm": [
+          11,
+          0
+        ],
+        "python_path": [
+          "/home/jwipc/experiments/flashattention-direct-20261001/tools",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-lite",
+          "/usr/lib/python312.zip",
+          "/usr/lib/python3.12",
+          "/usr/lib/python3.12/lib-dynload",
+          "/home/jwipc/projects/host-gateway/.vllm/lib/python3.12/site-packages",
+          "__editable__.vllm-0.1.dev1+g1cfd97281.d20260913.cu132.finder.__path_hook__"
+        ]
+      },
+      "arguments": {
+        "mode": "graph",
+        "layout": "offset8",
+        "expected_sm": 110,
+        "output": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/prefill-interop-graph-offset8.json"
+      },
+      "status": "PASS",
+      "checks": [
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.002468838736309764,
+          "lse_max_abs": 9.402100805466773e-06
+        },
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.0024751903107150808,
+          "lse_max_abs": 1.0018248085330583e-05
+        }
+      ],
+      "tensor_metadata": [
+        {
+          "shape": [
+            1,
+            128,
+            16,
+            128
+          ],
+          "stride": [
+            262144,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        }
+      ],
+      "scope": "dense forward only; graph is warm forward capture; compile is diagnostic fullgraph=True"
+    },
+    {
+      "environment": {
+        "python": "3.12.3",
+        "machine": "aarch64",
+        "git_sha": "9eb202c6162e8cc408cc2ffe9071131692e80252",
+        "distributions": {
+          "torch": "2.13.0+cu130",
+          "nvidia-cutlass-dsl": "4.8.0",
+          "apache-tvm-ffi": "0.1.12",
+          "torch-c-dlpack-ext": "0.1.5",
+          "quack-kernels": "0.5.3"
+        },
+        "torch_version": "2.13.0+cu130",
+        "torch_cuda_build": "13.0",
+        "gpu": "NVIDIA Thor",
+        "sm": [
+          11,
+          0
+        ],
+        "python_path": [
+          "/home/jwipc/experiments/flashattention-direct-20261001/tools",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48/nvidia_cutlass_dsl/dsl_packages",
+          "/home/jwipc/experiments/flashattention-direct-20261001/imports/thor-sink",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-48",
+          "/home/jwipc/experiments/flashattention-direct-20261001/deps-lite",
+          "/usr/lib/python312.zip",
+          "/usr/lib/python3.12",
+          "/usr/lib/python3.12/lib-dynload",
+          "/home/jwipc/projects/host-gateway/.vllm/lib/python3.12/site-packages",
+          "__editable__.vllm-0.1.dev1+g1cfd97281.d20260913.cu132.finder.__path_hook__"
+        ]
+      },
+      "arguments": {
+        "mode": "stream",
+        "layout": "offset8",
+        "expected_sm": 110,
+        "output": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/prefill-interop-stream-offset8.json"
+      },
+      "status": "PASS",
+      "checks": [
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.002468838736309764,
+          "lse_max_abs": 9.402100805466773e-06
+        },
+        {
+          "passed": true,
+          "all_finite": true,
+          "out_max_abs": 0.0024751903107150808,
+          "lse_max_abs": 1.0018248085330583e-05
+        }
+      ],
+      "tensor_metadata": [
+        {
+          "shape": [
+            1,
+            128,
+            16,
+            128
+          ],
+          "stride": [
+            262144,
+            2048,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        },
+        {
+          "shape": [
+            1,
+            129,
+            8,
+            128
+          ],
+          "stride": [
+            132096,
+            1024,
+            128,
+            1
+          ],
+          "storage_offset": 8,
+          "pointer_mod_16": 0
+        }
+      ],
+      "scope": "dense forward only; graph is warm forward capture; compile is diagnostic fullgraph=True"
+    }
+  ],
+  "interop_status": [
+    {
+      "name": "prefill-interop-eager-contiguous",
+      "state": "FINISHED",
+      "queued": 1790840911.90603,
+      "started": 1790840912.1692662,
+      "cpu_load_before": [
+        0.388671875,
+        0.56396484375,
+        0.75341796875
+      ],
+      "pid": 2901914,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/prefill-interop-eager-contiguous.log",
+      "exit_code": 0,
+      "elapsed_s": 6.65026330947876,
+      "foreign_gpu_processes_after": ""
+    },
+    {
+      "name": "prefill-interop-eager-offset8",
+      "state": "FINISHED",
+      "queued": 1790840918.847015,
+      "started": 1790840918.8771102,
+      "cpu_load_before": [
+        0.63720703125,
+        0.61181640625,
+        0.76708984375
+      ],
+      "pid": 2902003,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/prefill-interop-eager-offset8.log",
+      "exit_code": 0,
+      "elapsed_s": 6.568612098693848,
+      "foreign_gpu_processes_after": ""
+    },
+    {
+      "name": "prefill-interop-eager-outer-strided",
+      "state": "FINISHED",
+      "queued": 1790840925.4702437,
+      "started": 1790840925.5022192,
+      "cpu_load_before": [
+        0.66650390625,
+        0.61865234375,
+        0.7685546875
+      ],
+      "pid": 2902089,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/prefill-interop-eager-outer-strided.log",
+      "exit_code": 0,
+      "elapsed_s": 6.651742458343506,
+      "foreign_gpu_processes_after": ""
+    },
+    {
+      "name": "prefill-interop-stream-offset8",
+      "state": "FINISHED",
+      "queued": 1790840932.1802206,
+      "started": 1790840932.2045646,
+      "cpu_load_before": [
+        0.693359375,
+        0.625,
+        0.77001953125
+      ],
+      "pid": 2902185,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/prefill-interop-stream-offset8.log",
+      "exit_code": 0,
+      "elapsed_s": 6.624053716659546,
+      "foreign_gpu_processes_after": ""
+    },
+    {
+      "name": "prefill-interop-graph-offset8",
+      "state": "FINISHED",
+      "queued": 1790840938.85507,
+      "started": 1790840938.885246,
+      "cpu_load_before": [
+        0.7412109375,
+        0.6376953125,
+        0.77294921875
+      ],
+      "pid": 2902284,
+      "log": "/home/jwipc/experiments/flashattention-direct-20261001/evidence/prefill-interop-graph-offset8.log",
+      "exit_code": 0,
+      "elapsed_s": 6.750799894332886,
+      "foreign_gpu_processes_after": ""
+    }
+  ]
 }

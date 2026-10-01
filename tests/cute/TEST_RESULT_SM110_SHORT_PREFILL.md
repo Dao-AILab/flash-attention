@@ -14,6 +14,9 @@ Longer sequences, larger batches and other head dimensions keep the existing sel
 Both baseline and patch pass all 28 native FP16/BF16 cases comparing output, LSE, dQ, dK,
 dV and optional dSink with independent FP32 attention. Cases cover GQA ratios 2/4/8,
 nonmultiple sequence lengths, the packed-Q threshold, batch 2 and sink=8.
+Aligned contiguous, offset-8 and outer-strided views pass independent CPU FP64 checks on
+the selected Q=128, K=129, GQA=2 configuration. Offset-8 also passes nondefault-stream
+ordering and warmed CUDA-graph checks with mutated inputs. No torch.compile fullgraph claim.
 
 ## Steady forward timing
 
