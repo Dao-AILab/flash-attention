@@ -48,8 +48,10 @@ Runtime: Torch 2.13.0+cu130, CUDA 13.0, DSL 4.8.0, FFI 0.1.12, Quack 0.5.3.
 
 `TRAINING_INTEGRATION_RESULTS.json` preserves raw process samples, losses,
 correctness, graph topology summaries, source hashes, runner contention, JUnit hashes,
-contracts and the exact harness texts. The task-owned round-4 checkpoint is
-still needed by the subsequent backward iteration; cleanup remains pending.
+contracts and the exact harness texts. After this training integration and the separate backward candidate investigation,
+the task-owned Thor checkpoint was removed: 1,519,182,365 bytes in seven files.
+No reader/writer remained and the model directory is absent. Evidence and working
+runtimes are preserved.
 
 Full raw graph and JUnit data remain in the local audit snapshot
-`thor-training-round4-audit-v1.tar.gz`, SHA-256 `7fd9a4ae53363a0d632ff7cf070e6835cb8f12b52e62fafa22560b9446d97c2f`.
+`thor-training-round4-audit-v2.tar.gz`, SHA-256 `8aa9396b904bc48188e9ac8d6ace05a8be2231dec877a8491cc7b84bc00d0ae7`.

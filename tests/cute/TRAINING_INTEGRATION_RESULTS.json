@@ -3959,9 +3959,18 @@
     }
   },
   "audit_archive": {
-    "name": "thor-training-round4-audit-v1.tar.gz",
-    "bytes": 6579844,
-    "sha256": "7fd9a4ae53363a0d632ff7cf070e6835cb8f12b52e62fafa22560b9446d97c2f",
+    "name": "thor-training-round4-audit-v2.tar.gz",
+    "bytes": 6583387,
+    "sha256": "8aa9396b904bc48188e9ac8d6ace05a8be2231dec877a8491cc7b84bc00d0ae7",
     "contents": "Raw graph topology, JUnit, profiling files, stdout/stderr and result contracts"
+  },
+  "model_cleanup": {
+    "state": "COMPLETE",
+    "finished": 1790854834.733874,
+    "reason": "Training/native integration complete; single-CTA candidate rejected after adverse profile; incomplete reboot-interrupted screening excluded",
+    "active_readers_writers": [],
+    "bytes_removed": 1519182365,
+    "files_removed": 7,
+    "model_directory_exists": false
   }
 }
