@@ -76,6 +76,21 @@ TEST_BWD_ONLY = False
 VERBOSE = True
 
 
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 SplitKV heuristic")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_auto_splits_more_tiles_than_sms():
+    """num_splits=0 asks for the heuristic; with more tiles than SMs it must pick one split."""
+    torch.manual_seed(0)
+    q = torch.randn(256, 1, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(256, 2048, 16, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    out, _ = flash_attn_func(q, k, v, num_splits=0)
+    ref, _ = flash_attn_func(q, k, v, num_splits=1)
+    if is_fake_mode():
+        return
+    assert torch.equal(out, ref)
+
+
 @pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
 def test_flash_attn_sm120_rejects_splitkv():
     q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
