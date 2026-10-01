@@ -1,0 +1,26 @@
+{
+  "scope": "standalone Softmax.finalize, native Blackwell target; no whole-attention throughput claim",
+  "pid": 209089,
+  "gpu": "NVIDIA Thor",
+  "arch": 110,
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "softmax_sha256": "7783cfc6a0596261e0d9020c3bb4fa32fd5b6c1cd9701ecb00ba28e8858c58da",
+  "harness_sha256": "4e90e1f9bc8cb9e725956b00898bc3caf037e94e681007596dfcbbd51d722e9d",
+  "cases": [
+    {
+      "has_sink": false,
+      "rows": 24,
+      "input_sha256": "f8944d1ae4e21028d13f8e77856bb0ed54c9c5e0aa44aec9440d1e2b2fab0e4a",
+      "output_sha256": "8576ddf69a7449d978497c5fbe34da4dbcf754d49e24df523e8ec3bc2351f408",
+      "max_scale_error": 3.3306690738754696e-15
+    },
+    {
+      "has_sink": true,
+      "rows": 24,
+      "input_sha256": "f8944d1ae4e21028d13f8e77856bb0ed54c9c5e0aa44aec9440d1e2b2fab0e4a",
+      "output_sha256": "3ea70a1517bc1cc9ebb96d417c3a525aa512e8cf728acdc01cc73e696e776549",
+      "max_scale_error": 3.750129469112795e-10
+    }
+  ]
+}

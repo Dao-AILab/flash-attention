@@ -1,0 +1,22 @@
+[
+  {
+    "distribution": "torch",
+    "version": "2.13.0+cu130",
+    "metadata_sha256": "7477a1e61a4ecc055e52577f79be3dcc6d4d2ef6d423089469c9366cf4191a80"
+  },
+  {
+    "distribution": "nvidia-cutlass-dsl",
+    "version": "4.8.0",
+    "metadata_sha256": "72ef42ba16fafda63a9855d5117428641ac8f555a2fc4cdf627317b3dfd00429"
+  },
+  {
+    "distribution": "quack-kernels",
+    "version": "0.5.3",
+    "metadata_sha256": "45c0391eaa2cde12e03e37b8307fcdf7979f011a2dbab6c69549f3f77a3e79c9"
+  },
+  {
+    "distribution": "apache-tvm-ffi",
+    "version": "0.1.12",
+    "metadata_sha256": "2248b339aa5f78915a8d4ec9a13848e99b05195edba56e438c6b6d19d3974cdb"
+  }
+]

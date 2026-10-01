@@ -165,3 +165,29 @@ Run each baseline/patch arm in its own source checkout and Python process;
 disable persistent caching for these timing arms. Model arms use
 `--model <checkpoint-directory> --label <arm> --rounds 5 --reference <json>`;
 only the first baseline arm also uses `--write-reference`.
+
+## Native Blackwell finalizer follow-up
+
+The published stability patch at4a86547f7e7f51e6c4c35734142a8bfe3e28b2dd
+passes a direct Softmax.finalize kernel on the actual SM110 and SM120 targets.
+Each run tests24 scalar states with a sink and24 without one, using four lanes
+per row. The independent FP64 reference checks both final output scaling and
+LSE, including empty rows, sink=-inf, equal/dominant/negligible sinks and
+finite sink10000. Both architectures produce identical input/output hashes.
+
+| GPU | Actual architecture | Torch/CUDA | CuTeDSL | Quack | FP64 checks | Maximum scale error |
+| :--- | :--- | :--- | :--- | :--- | :--- | ---: |
+| NVIDIA Thor | SM110 | 2.13.0+cu130 /13.0 | 4.8.0 | 0.5.3 | 48/48 pass | 3.751e-10 |
+| NVIDIA GeForce RTX5080 | SM120 | 2.13.0+cu132 /13.2 | 4.7.1 | 0.6.5 | 48/48 pass | 3.751e-10 |
+
+This is native finalizer unit evidence, not full SM90 attention or a throughput
+comparison. The SM100 sink helper and SM120 ordinary attention call sites are
+separate; these runs do not establish a full-attention sink gain on Blackwell.
+The different hardware/stacks do not constitute a controlled DSL4.7.1/4.8.0
+compiler comparison. H20 results above retain their original scope.
+
+[Raw results, dependency metadata hashes and exact harness](results/native_finalizer/RAW_INDEX.json).
+Each finite queue holds its actual shared performance lock and visible parent
+CUDA reservation until all workers naturally terminate. Sampled before/after
+GPU observations contain no foreign process. No other process, existing
+environment, clock or power setting was changed.

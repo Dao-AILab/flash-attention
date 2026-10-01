@@ -1,0 +1,22 @@
+[
+  {
+    "file": "harness-source.json",
+    "sha256": "b357bc99cd66fb3e8db217c8b714a283ab0ef9346ea85da33beb9dafce2b96cf"
+  },
+  {
+    "file": "sm120-dependencies.json",
+    "sha256": "4f470f9efa09c288c496782a0e4ffee3039b6f0325fbeebec8f78a7993b767da"
+  },
+  {
+    "file": "sm120-published-patch.json",
+    "sha256": "581e66ebc391fe5d306f8980e3ba9c4864e48a8c1c330598a5e2009586ddad22"
+  },
+  {
+    "file": "thor-dependencies.json",
+    "sha256": "f631f8501406304aed13a6f7b4e7663ef8ece9142393715da09f8db1cdb0d304"
+  },
+  {
+    "file": "thor-published-patch.json",
+    "sha256": "8dad159fe613cd8f34bf9239722b8ac6f13e611700a0b7d3a59c2fff1a541d18"
+  }
+]
