@@ -386,6 +386,15 @@ def _get_fwd_config(
     else:
         q_stage = 1
 
+    # On Thor, spread a short packed-GQA prefill across one wave of single-Q CTAs.
+    if (
+        arch == 110 and head_dim == head_dim_v == 128
+        and causal and not local and pack_gqa and block_sparse_tensors is None
+        and tile_mn is None and q_stage == 2 and seqlen_q_packgqa <= 2 * tile_m
+        and 2 * batch_size * num_head_kv <= get_num_sms_for_selection(device.index, arch)
+    ):
+        q_stage = 1
+
     m_block_size_effective = q_stage * tile_m
     # Only None is unbounded; preserve 0 (e.g. the right bound of a causal window).
     window_right_loaded = max_seqlen_k if window_size_right is None else window_size_right

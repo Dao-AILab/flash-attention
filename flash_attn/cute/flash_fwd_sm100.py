@@ -2739,10 +2739,9 @@ class FlashAttentionForwardSm100:
                         row_max = None
                     pipeline_sm_stats.consumer_release_w_index(stage)
                     if const_expr(learnable_sink is not None):
-                        sink_output_scale = Float32(1.0)
                         # Only the first split owns the sink column; empty rows occur with splitKV.
                         if const_expr(not self.is_split_kv) or split_idx == 0:
-                            row_max, row_sum, sink_output_scale = apply_learnable_sink(
+                            row_max, row_sum = apply_learnable_sink(
                                 row_max,
                                 row_sum,
                                 learnable_sink_val[stage],
@@ -2753,8 +2752,6 @@ class FlashAttentionForwardSm100:
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
-                    if const_expr(learnable_sink is not None):
-                        scale = scale * sink_output_scale
                     scale = scale * v_descale
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)

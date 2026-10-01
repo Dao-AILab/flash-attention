@@ -51,8 +51,8 @@ def apply_learnable_sink(
     scale_log2: Float32,
     max_offset: Float32 = 0.0,
     empty_row_sum: Float32 = 1.0,
-) -> tuple[Float32, Float32, Float32]:
-    """Fold a sink into the final stats and return the old numerator's rescaling factor.
+) -> tuple[Float32, Float32]:
+    """Fold a learnable sink logit into the final (unscaled row_max, row_sum) softmax stats.
 
     A learnable sink is one extra softmax column per Q head with logit `sink_val` (natural-log
     units, not multiplied by softmax_scale) and no value vector: it enlarges the normalizer
@@ -66,20 +66,14 @@ def apply_learnable_sink(
     `max_offset` is the fp8 exponent offset and `empty_row_sum == 2**max_offset` (0 and 1 for
     bf16/fp16). `Softmax.finalize` (SM80/SM90) applies the same fold in the scaled domain.
     """
-    output_scale = Float32(1.0)
     if row_max == -Float32.inf:
         row_max = sink_val * (utils.LOG2_E / scale_log2)
         row_sum = empty_row_sum
     else:
-        row_max_scaled = row_max * scale_log2
-        sink_scaled = sink_val * utils.LOG2_E
-        new_max_scaled = cute.arch.fmax(row_max_scaled, sink_scaled)
-        output_scale = cute.math.exp2(row_max_scaled - new_max_scaled, fastmath=True)
-        row_sum = row_sum * output_scale + cute.math.exp2(
-            sink_scaled - new_max_scaled + max_offset, fastmath=True
+        row_sum += cute.math.exp2(
+            sink_val * utils.LOG2_E - row_max * scale_log2 + max_offset, fastmath=True
         )
-        row_max = new_max_scaled / scale_log2
-    return row_max, row_sum, output_scale
+    return row_max, row_sum
 
 
 @cute.jit
