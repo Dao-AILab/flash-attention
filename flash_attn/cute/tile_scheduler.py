@@ -593,7 +593,11 @@ class SingleTileLPTScheduler:
             return SingleTileLPTScheduler(
                 params, cute.arch.block_idx()[0], Int32(0), ctx, loc=loc, ip=ip
             )
-        tile_idx, split_idx, _ = cute.arch.block_idx()
+        if const_expr(params.cluster_shape_m > 1 and params.use_cluster_idx):
+            # Both CTAs share one m block.
+            tile_idx, split_idx, _ = cute.arch.cluster_idx()
+        else:
+            tile_idx, split_idx, _ = cute.arch.block_idx()
         return SingleTileLPTScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
     @staticmethod
@@ -605,7 +609,11 @@ class SingleTileLPTScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         if const_expr(params.scheduling_mode == SchedulingMode.CLC):
             return SingleTileLPTScheduler._clc_grid_shape(params)
-        return (params.total_blocks, params.num_splits, Int32(1))
+        grid_x = params.total_blocks
+        if const_expr(params.cluster_shape_m > 1 and params.use_cluster_idx):
+            # Convert clusters to CTAs.
+            grid_x = grid_x * params.cluster_shape_m
+        return (grid_x, params.num_splits, Int32(1))
 
     @cute.jit
     def clc_work_to_coords(self, work) -> WorkTileInfo:
