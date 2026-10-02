@@ -999,11 +999,17 @@ def _flash_attn_fwd(
             arch // 10 in [10, 11]
             and is_hdim256
             and 128 % qhead_per_kvhead != 0
-            and cu_seqlens_q is None
             and seqused_q is None
-            and seqlen_q > 128
+            and (
+                max_seqlen_q > 128
+                or (
+                    num_splits == 1
+                    and 2 * batch_size * num_head <= get_num_sms_for_selection(device.index, arch)
+                )
+            )
         ):
-            # Prefer 2CTA over cp.async-Q PackGQA for multi-tile hd256 queries.
+            # Prefer 2CTA over cp.async-Q PackGQA for multi-tile hd256 queries and for
+            # unsplit decode that fits one 2CTA wave (see hd256_decode_2cta).
             pack_gqa = False
 
     fwd_cfg = _get_fwd_config(
@@ -1057,6 +1063,11 @@ def _flash_attn_fwd(
     max_m_blocks_leq_one = seqlen_q_packgqa <= q_stage * tile_m
 
     is_split_kv = num_splits > 1
+    # hd256 single-M-block (decode) 2CTA halves each CTA's K/V loads; worth it while the
+    # doubled grid still fits in one wave.
+    hd256_decode_2cta = is_hdim256 and 2 * batch_size * (
+        num_head_kv if pack_gqa else num_head
+    ) <= get_num_sms_for_selection(device.index, arch)
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         # Combine needs LSE partials seqlen-contiguous, (..., h, s); the MLA kernels take
@@ -1073,11 +1084,12 @@ def _flash_attn_fwd(
         arch // 10 in [10, 11]
         and not requested_disable_2cta
         and not is_split_kv
-        and cu_seqlens_q is None
+        # hd256 also supports varlen Q (cu_seqlens_q) with 2CTA.
+        and (is_hdim256 or cu_seqlens_q is None)
         and seqused_q is None
         and not use_block_sparsity
         and page_size in [None, 128]
-        and not max_m_blocks_leq_one
+        and (not max_m_blocks_leq_one or hd256_decode_2cta)
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
         and (
             # hd256 also supports causal/local 2CTA.
@@ -1361,6 +1373,8 @@ def _flash_attn_fwd(
         and max_m_blocks_leq_one
         and not is_split_kv
         and (cu_seqlens_q is None or host_max_seqlen_q is not None)
+        # Dense causal/local runs the LPT scheduler, which maps 2CTA clusters only when not persistent.
+        and not (use_2cta_instrs and cu_seqlens_q is None and (causal or local))
     )
 
     # CuTe keeps stride-zero modes static when marking layouts dynamic.
@@ -1416,7 +1430,7 @@ def _flash_attn_fwd(
     num_n_blocks_per_split = cute.ceil_div(cute.ceil_div(s_ping_pong_seqlen_k_loaded, tile_n), num_splits)
     use_s_ping_pong = (
         not requested_disable_s_ping_pong
-        and arch in (100, 110)
+        and arch // 10 in (10, 11)
         and q_stage == 1
         and head_dim in (64, 128, 256)
         and head_dim_v == head_dim
