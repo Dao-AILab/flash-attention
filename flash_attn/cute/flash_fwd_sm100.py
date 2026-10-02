@@ -978,7 +978,8 @@ class FlashAttentionForwardSm100:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_alloc_barrier = pipeline.NamedBarrier(
+        # TMEM handoffs span warp-role branches, so all waits and arrivals must be unaligned.
+        tmem_alloc_barrier = pipeline_custom.NamedBarrier(
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
             num_threads=cute.arch.WARP_SIZE * len(
                 (self.mma_warp_id,
@@ -1339,7 +1340,7 @@ class FlashAttentionForwardSm100:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tensor memory buffer
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.mma(
                 tiled_mma_qk,
@@ -1364,7 +1365,7 @@ class FlashAttentionForwardSm100:
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
-            tmem_alloc_barrier.arrive_and_wait()
+            tmem_alloc_barrier.arrive_and_wait_unaligned()
             tmem.free(tmem_ptr)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1398,7 +1399,7 @@ class FlashAttentionForwardSm100:
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
@@ -1435,7 +1436,7 @@ class FlashAttentionForwardSm100:
                 if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
                     softmax_loop(stage=1, tStS=tStS)
 
-            tmem_alloc_barrier.arrive()
+            tmem_alloc_barrier.arrive_unaligned()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
@@ -1447,7 +1448,7 @@ class FlashAttentionForwardSm100:
             else:
                 cute.arch.setmaxregister_decrease(self.num_regs_correction)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait_unaligned()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.correction_loop(
                 thr_mma_qk,
@@ -1475,7 +1476,7 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
             )
-            tmem_alloc_barrier.arrive()
+            tmem_alloc_barrier.arrive_unaligned()
 
         return
 
