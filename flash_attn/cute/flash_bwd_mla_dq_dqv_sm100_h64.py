@@ -1,34 +1,36 @@
 # Copyright (c) 2026, Colfax International.
 
 """
-CuTe DSL implementation of dQ+dQv gemm for DSA backward.
-Performs both dQ = dS @ K and dQv = dS @ V, where K and V are
-gathered according to index tensor mIdxTopK.
+CuTe DSL implementation of the dQ+dQv gemm of the sparse-MLA (DSA) backward for up to
+64 Q heads per KV head (see AI/SPARSE_MLA_64H.md, "dQdQvGemmKernelH64"). Fewer heads pad the 64-row
+tile: the head mode has the real (dynamic) extent, so TMA zero-fills the dS rows past it and
+drops those rows of the dQ / dQv stores (as in the generic dQdQvGemmKernel).
 
-This uses MQA with 1 to 128 heads and a fixed 128-row GEMM tile.
+    dQ  = dS @ K_rope   (per token: [64 heads, top_k] x [top_k gathered rows, hdim])
+    dQv = dS @ V        (per token: [64 heads, top_k] x [top_k gathered rows, hdim_v])
+
+where the K/V rows are gathered according to the top-k index tensor mIdxTopK.
 
 Inputs:
-    - dS:      [batch, seqlen_q, nheads, top_k] or [total_q, nheads, top_k]
-    - K:       [batch, seqlen_k, hdim]          or [total_k, hdim]
-    - V:       [batch, seqlen_k, hdim_v]        or [total_k, hdim_v]
-    - IdxTopK: [batch, seqlen_q, top_k]         or [total_q, top_k]
+    - dS:      [batch, seqlen_q, 64, top_k] or [total_q, 64, top_k]
+    - K:       [batch, seqlen_k, hdim]      or [total_k, hdim]      (optional)
+    - V:       [batch, seqlen_k, hdim_v]    or [total_k, hdim_v]
+    - IdxTopK: [batch, seqlen_q, top_k]     or [total_q, top_k]
 
 Outputs:
-    - dQ:  [batch, seqlen_q, nheads, hdim]   or [total_q, nheads, hdim]
-    - dQv: [batch, seqlen_q, nheads, hdim_v] or [total_q, nheads, hdim_v]
+    - dQ:  [batch, seqlen_q, 64, hdim]   or [total_q, 64, hdim]
+    - dQv: [batch, seqlen_q, 64, hdim_v] or [total_q, 64, hdim_v]
 
-All sizes are known at compile time except seqlen_q, which is the batch dimension.
-Representative numbers are:
-    - nheads = 128
-    - hdim   = 64
-    - hdim_v = 512
-    - top_k  = 2048
-
-We launch a cluster of shape (1, 2) with mma tile 128x256, so that one cluster
-covers the full dQv mma. dS is loaded via TMA and multicast across the CTAs.
-Cluster 0 also performs the dQ mma with tile size 128x64.
-
-K and V are loaded via CpAsync, with logic according to CpasyncGatherKVManager.
+One token per CTA, no cluster: the 64 heads are the M=64 of ``tcgen05.mma.cta_group::1``
+instructions (dQv as two N=256 tiles accumulated in the two TMEM lane halves, dQ as one N=64
+tile), and each top-k key's whole latent + rope row is gathered exactly once per CTA by the
+64-key whole-row producer ``CpasyncGatherKVManagerH64`` (shared with the 64-head forward):
+16-B ``cp.async.cg`` copies from 128 threads, the indices of block n+2 loaded while block n
+is in flight, completion signalled with ``cp.async.mbarrier.arrive.noinc``. The same gathered
+stage is the B operand of both GEMMs: K-major for the gather, re-viewed MN-major (dims
+contiguous per key row, same bytes and swizzle) for the MMAs. dS is TMA-loaded per 64-key
+block. The epilogue drains the accumulators through dedicated smem tiles and TMA stores, so
+the next token's gather never waits for it.
 """
 
 from functools import partial
@@ -45,13 +47,12 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile
-from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
+from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManagerH64
 from flash_attn.cute.utils import get_batch_from_cu_tensor
 
 
-class dQdQvGemmKernel:
-    # Extra ptxas flags (part of the compile key): 4064 B/thread spilled at the default level,
-    # 0 at -O2, 3.0-4.2x faster on GB300.
+class dQdQvGemmKernelH64:
+    # Extra ptxas flags (part of the compile key): no spills at either level, -O2 +0.3-1%.
     ptxas_options = "-O2"
 
     def __init__(
@@ -64,22 +65,30 @@ class dQdQvGemmKernel:
     ):
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.nheads = nheads
-        # Head padding: see pack_gqa.qheads_first_tma_view.
-        self.tile_m = sparse_mla_qhead_tile(nheads)
+        # one 64-row tile per token; fewer heads are padded rows (pack_gqa.sparse_mla_qhead_tile)
+        self.tile_m = sparse_mla_qhead_tile(nheads, min_tile=64)
+        assert self.tile_m == 64, f"dQdQvGemmKernelH64 serves 1..64 Q heads, got {nheads}"
         self.head_dim_k = head_dim_k or 0  # when head_dim_k not provided, dQ is not computed
         self.head_dim_v = head_dim_v
         self.top_k = top_k
-        self.tile_k = 128
+        # keys per gathered stage / MMA k-tile (whole rows of 64 keys, E1 producer rule)
+        self.tile_k = 64
+        assert self.top_k % (2 * self.tile_k) == 0, "top_k must be a multiple of 128"
+        assert self.head_dim_v % 256 == 0 and self.head_dim_v // 256 == 2, (
+            "dQv is accumulated as two N=256 tiles (hdim_v == 512)"
+        )
+        assert self.head_dim_k in (0, 64), "dQ tile is one N=64 MMA"
 
-        self.cluster_shape_mn = (1, 2)
+        self.cluster_shape_mn = (1, 1)
+        self.hdimv_ntile = self.head_dim_v // 2
+        self.num_hdimv_ntiles = 2
         self.mma_tiler_dQ = (self.tile_m, self.head_dim_k, self.tile_k)
-        self.mma_tiler_dQv = (self.tile_m, self.head_dim_v // 2, self.tile_k)
+        self.mma_tiler_dQv = (self.tile_m, self.hdimv_ntile, self.tile_k)
         self.num_mainloop_iters = self.top_k // self.tile_k
         self.arch = "sm_100"
 
         self.cta_group = tcgen05.CtaGroup.ONE
 
-        self.occupancy = 1
         self.threads_per_warp = cute.arch.WARP_SIZE
 
         # ---- Set specialized warp ids ----
@@ -97,33 +106,26 @@ class dQdQvGemmKernel:
                 *self.kv_load_warp_ids,
             )
         )
-        # ---- Set barrier id for cta sync, epilogue sync and tmem ptr sync ----
+        self.num_kv_load_threads = 32 * len(self.kv_load_warp_ids)
+        # ---- Set barrier id for epilogue sync and tmem ptr sync ----
         self.epilog_sync_bar_id = 1
         self.tmem_alloc_sync_bar_id = 2
-        self.tmem_dealloc_sync_bar_id = 3
-        self.kv_load_sync_bar_id = 4
 
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             barrier_id=self.epilog_sync_bar_id,
             num_threads=self.threads_per_warp * len(self.epilogue_warp_ids),
         )
-        self.kv_load_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=self.kv_load_sync_bar_id,
-            num_threads=self.threads_per_warp * len(self.kv_load_warp_ids),
-        )
 
-        self.is_persistent = False
-
-        # ---- pipeline stages ---- TODO: tune these
-        self.num_stages_dS = 2
+        # ---- pipeline stages ----
+        # 2 whole-row KV stages (72 KiB each): a third does not fit beside the dS ring under
+        # the 232,448-B cap (3 x 73,728 + 2 x 8,192 = 237,568).
+        self.num_stages_dS = 4
         self.num_stages_KV = 2
         self.num_stages_acc = 1
+        self.num_stages_epi = 2  # dQv epilogue smem tiles (dQ has one)
         self.num_stages_clc = 1
-
-        # ---- register allocation ----
-        self.num_regs_KV = 224
-        self.num_regs_epi = 128
-        self.num_regs_other = 112
+        # No per-role register budgets (setmaxnreg): every role runs at the count ptxas assigns
+        # (AI/SPARSE_MLA_64H.md, "dQdQvGemmKernelH64", Registers).
 
     @cute.jit
     def __call__(
@@ -146,7 +148,7 @@ class dQdQvGemmKernel:
         self.kv_dtype: Type[cutlass.Numeric] = mV.element_type
         self.dq_dtype: Type[cutlass.Numeric] = mdQv.element_type
         if const_expr(self.compute_dQ):
-            assert self.kv_dtype == mV.element_type
+            assert self.kv_dtype == mK.element_type
             assert self.dq_dtype == mdQ.element_type
 
         varlen_q = const_expr(mCuSeqlensQ is not None)
@@ -191,19 +193,28 @@ class dQdQvGemmKernel:
                 ),
             )
 
-        # Dynamic head extent for the fixed tile; see pack_gqa.qheads_first_tma_view.
+        # (tokens, head_dim) with a static head dim: the whole-row gather addresses rows.
+        def rows_static_hdim(t: cute.Tensor, head_dim: int) -> cute.Tensor:
+            return cute.make_tensor(
+                t.iterator,
+                cute.make_layout((t.shape[0], head_dim), stride=(t.stride[0], t.stride[1])),
+            )
+
+        # Dynamic head extent for a padded tile; see pack_gqa.qheads_first_tma_view.
         nheads = self.nheads if self.nheads == self.tile_m else Int32(self.nheads)
         mdS = static_reshape(mdS, nheads, self.top_k)
         mdQv = static_reshape(mdQv, nheads, self.head_dim_v)
-        mV = static_reshape(mV, self.head_dim_v)
+        mV = rows_static_hdim(mV, self.head_dim_v)
         mIdxTopK = static_reshape(mIdxTopK, self.top_k)
         if const_expr(self.compute_dQ):
             mdQ = static_reshape(mdQ, nheads, self.head_dim_k)
-            mK = static_reshape(mK, self.head_dim_k)
+            mK = rows_static_hdim(mK, self.head_dim_k)
 
         # ---- layout info ----
         self.ds_major_mode = utils.LayoutEnum.from_tensor(mdS).mma_major_mode()
-        self.kv_major_mode = utils.LayoutEnum.from_tensor(mV).mma_major_mode()
+        assert self.ds_major_mode == tcgen05.OperandMajorMode.K
+        # gathered rows are dims-contiguous: MN-major B of both GEMMs
+        self.kv_major_mode = tcgen05.OperandMajorMode.MN
         self.dq_layout = utils.LayoutEnum.from_tensor(mdQv)
         if const_expr(self.compute_dQ):
             assert self.dq_layout == utils.LayoutEnum.from_tensor(mdQ)
@@ -220,6 +231,7 @@ class dQdQvGemmKernel:
             self.cta_group,
             self.mma_tiler_dQv[:2],
         )
+        tiled_mma_k = None
         if const_expr(self.compute_dQ):
             tiled_mma_k = utils.sm100.make_trivial_tiled_mma(
                 self.ds_dtype,
@@ -230,25 +242,29 @@ class dQdQvGemmKernel:
                 self.cta_group,
                 self.mma_tiler_dQ[:2],
             )
-
-        self.cta_tile_shape_dQv = (
-            self.mma_tiler_dQv[0],
-            self.mma_tiler_dQv[1],
-            self.mma_tiler_dQv[2],
+        # K-major (keys x dims) views of the same stage buffers for the gather: the tiled
+        # MMA is a dummy (M=64, N=64 keys, K=dims, K-major B) used only for the layout.
+        tiled_mma_gather_v = utils.sm100.make_trivial_tiled_mma(
+            self.kv_dtype,
+            self.kv_dtype,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
+            self.acc_dtype,
+            self.cta_group,
+            (self.tile_m, self.tile_k),
         )
 
-        # ---- Compute cluster layout ----
+        self.cta_tile_shape_dQv = (self.tile_m, self.head_dim_v, self.tile_k)
+
+        # ---- Compute cluster layout (1,1): one CTA per token ----
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma_v.thr_id.shape,),
         )
 
-        # ---- Compute number of multicast CTAs for A/B ----
-        self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
-
-        # ---- Compute epi tiles for dQ/dQv ----
+        # ---- Compute epi tiles for dQ/dQv (per 256-dim N tile) ----
         self.epi_tile_dQv = utils.sm100.compute_epilogue_tile_shape(
-            self.cta_tile_shape_dQv,
+            self.mma_tiler_dQv,
             False,  # use_2cta_instrs
             self.dq_layout,
             self.dq_dtype,
@@ -272,43 +288,71 @@ class dQdQvGemmKernel:
         # ------------------------------------------------------------------ #
         sdS_layout = utils.sm100.make_smem_layout_a(
             tiled_mma_v,
-            self.mma_tiler_dQ,
+            self.mma_tiler_dQv,
             self.ds_dtype,
             self.num_stages_dS,
         )
+        # gather view: 64 keys x hdim_v, K-major SW128 (what CpasyncGatherKVManagerH64 fills)
         sV_layout = utils.sm100.make_smem_layout_b(
+            tiled_mma_gather_v,
+            (self.tile_m, self.tile_k, self.head_dim_v),
+            self.kv_dtype,
+            self.num_stages_KV,
+        )
+        # MMA view: one 256-dim N tile of the stage, MN-major (dims contiguous per key row).
+        # Same bytes and swizzle as the gather view: N tile 1 starts 256 x 64 elements in.
+        sVt_layout = utils.sm100.make_smem_layout_b(
             tiled_mma_v,
             self.mma_tiler_dQv,
             self.kv_dtype,
             self.num_stages_KV,
         )
+        sV_stage_elems = cute.cosize(cute.select(sV_layout, mode=[0, 1, 2]))
+        self.sVt_ntile_offset = self.hdimv_ntile * self.tile_k
+        assert cute.cosize(cute.select(sVt_layout, mode=[0, 1, 2])) == self.sVt_ntile_offset
+        assert self.num_hdimv_ntiles * self.sVt_ntile_offset == sV_stage_elems
+        assert sV_layout.inner == sVt_layout.inner, "gather / MMA views must share the swizzle"
+        # the N-tile view's stages must step by the whole latent stage, not by one N tile
+        sVt_layout_outer = cute.append(
+            cute.select(sVt_layout.outer, mode=[0, 1, 2]),
+            cute.make_layout(self.num_stages_KV, stride=sV_stage_elems),
+        )
         sdQv_layout = utils.sm100.make_smem_layout_epi(
             self.dq_dtype,
             self.dq_layout,
             self.epi_tile_dQv,
-            self.num_stages_acc,
+            self.num_stages_epi,
         )
-        sK_layout, sdQ_layout = None, None
+        sK_layout, sKt_layout, sdQ_layout = None, None, None
         if const_expr(self.compute_dQ):
             sK_layout = utils.sm100.make_smem_layout_b(
+                tiled_mma_gather_v,
+                (self.tile_m, self.tile_k, self.head_dim_k),
+                self.kv_dtype,
+                self.num_stages_KV,
+            )
+            sKt_layout = utils.sm100.make_smem_layout_b(
                 tiled_mma_k,
                 self.mma_tiler_dQ,
                 self.kv_dtype,
                 self.num_stages_KV,
             )
+            assert cute.cosize(sK_layout) == cute.cosize(sKt_layout)
+            assert cute.cosize(cute.select(sK_layout, mode=[0, 1, 2])) == cute.cosize(
+                cute.select(sKt_layout, mode=[0, 1, 2])
+            )
+            assert sK_layout.inner == sKt_layout.inner
             sdQ_layout = utils.sm100.make_smem_layout_epi(
                 self.dq_dtype,
                 self.dq_layout,
                 self.epi_tile_dQ,
-                self.num_stages_acc,
+                1,
             )
 
         # ------------------------------------------------------------------ #
         # Set up TMA load/stores                                             #
         # ------------------------------------------------------------------ #
-        atom_thr_size = cute.size(tiled_mma_v.thr_id.shape)
-
-        # ---- Setup TMA load for dS ----
+        # ---- Setup TMA load for dS (no multicast: one CTA per token) ----
         dS_op = utils.sm100.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, tiled_mma_v.thr_id)
         dS_smem_layout = cute.slice_(sdS_layout, (None, None, None, 0))
         tma_atom_dS, tma_tensor_dS = cute.nvgpu.make_tiled_tma_atom_A(
@@ -319,9 +363,7 @@ class dQdQvGemmKernel:
             tiled_mma_v,
             self.cluster_layout_vmnk.shape,
         )
-
-        dS_copy_size = cute.size_in_bytes(self.ds_dtype, dS_smem_layout)
-        self.num_tma_load_bytes = dS_copy_size * atom_thr_size
+        self.num_tma_load_bytes = cute.size_in_bytes(self.ds_dtype, dS_smem_layout)
 
         # ---- Setup TMA store for dQ and dQV ----
         dQv_epi_smem_layout = cute.select(sdQv_layout, mode=[0, 1])
@@ -346,21 +388,12 @@ class dQdQvGemmKernel:
         sV_size = cute.cosize(sV_layout)
         sdQ_size = cute.cosize(sdQ_layout) if const_expr(self.compute_dQ) else 0
         sdQv_size = cute.cosize(sdQv_layout)
-        assert sdQ_size <= sK_size, f"require {sdQ_size=} <= {sK_size=}"
-        assert sdQv_size <= sV_size, f"require {sdQv_size=} <= {sV_size=}"
-
-        self.overlap_kv_epi = self.compute_dQ
-        if const_expr(self.overlap_kv_epi):
-            sdQ_size = 0
-            sdQv_size = 0
 
         @cute.struct
         class SharedStorage:
             mbar_ptr_dS: cute.struct.MemRange[cutlass.Int64, self.num_stages_dS * 2]
             mbar_ptr_KV: cute.struct.MemRange[cutlass.Int64, self.num_stages_KV * 2]
             mbar_ptr_dQ_dQv: cute.struct.MemRange[cutlass.Int64, self.num_stages_acc * 2]
-            mbar_ptr_KV_cpasync: cute.struct.MemRange[cutlass.Int64, self.num_stages_KV * 2]
-            mbar_ptr_load_kv_epi: cute.struct.MemRange[cutlass.Int64, 2]
             # Tmem holding buffer
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
@@ -392,8 +425,11 @@ class dQdQvGemmKernel:
             ]
 
         self.shared_storage = SharedStorage
+        assert self.shared_storage.size_in_bytes() <= self.smem_capacity, (
+            f"smem {self.shared_storage.size_in_bytes()} > {self.smem_capacity}"
+        )
 
-        # ---- Compute grid size ----
+        # ---- Compute grid size: (1, 1, tokens) ----
         self.tile_sched_params, grid = self._compute_grid(
             mdQv,
             self.cta_tile_shape_dQv,
@@ -404,11 +440,9 @@ class dQdQvGemmKernel:
         # this is undone in the kernel
         grid = (grid[2], grid[1], grid[0])
 
-        # cute.printf("dQ/dQv grid: {}", grid)
-        # print("dQ/dQv SMEM: ", self.shared_storage.size_in_bytes())
         # ---- Launch the kernel synchronously ----
         self.kernel(
-            tiled_mma_k if const_expr(self.compute_dQ) else None,
+            tiled_mma_k,
             tiled_mma_v,
             tma_atom_dS,
             tma_tensor_dS,
@@ -425,7 +459,10 @@ class dQdQvGemmKernel:
             self.cluster_layout_vmnk,
             sdS_layout,
             sK_layout,
+            sKt_layout,
             sV_layout,
+            sVt_layout,
+            sVt_layout_outer,
             sdQ_layout,
             sdQv_layout,
             self.epi_tile_dQ,
@@ -435,9 +472,10 @@ class dQdQvGemmKernel:
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
-            cluster=(*self.cluster_shape_mn, 1),
+            cluster=None,
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
+            min_blocks_per_mp=1,
         )
 
     # GPU device kernel
@@ -461,7 +499,10 @@ class dQdQvGemmKernel:
         cluster_layout_vmnk: cute.Layout,
         sdS_layout: cute.ComposedLayout,
         sK_layout: Optional[cute.ComposedLayout],
+        sKt_layout: Optional[cute.ComposedLayout],
         sV_layout: cute.ComposedLayout,
+        sVt_layout: cute.ComposedLayout,
+        sVt_layout_outer: cute.Layout,
         sdQ_layout: Optional[cute.ComposedLayout],
         sdQv_layout: cute.ComposedLayout,
         epi_tile_dQ: Optional[cute.Tile],
@@ -470,7 +511,7 @@ class dQdQvGemmKernel:
         seqlen_k_static: Int32,
     ):
         """
-        GPU device kernel performing the Persistent batched GEMM computation.
+        GPU device kernel performing the persistent per-token gather GEMMs.
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -484,17 +525,6 @@ class dQdQvGemmKernel:
             if const_expr(self.compute_dQ):
                 cpasync.prefetch_descriptor(tma_atom_dQ)
 
-        # ------------------------------------------------------------------ #
-        # Cluster coordinates                                                #
-        # ------------------------------------------------------------------ #
-        bidx, bidy, bidz = cute.arch.block_idx()
-        gridx, gridy, gridz = cute.arch.grid_dim()
-        mma_v_tile_coord_v = bidx % cute.size(tiled_mma_v.thr_id.shape)
-        if const_expr(self.compute_dQ):
-            mma_k_tile_coord_v = bidx % cute.size(tiled_mma_k.thr_id.shape)
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
-        is_first_cta = cta_rank_in_cluster == 0
         tidx, _, _ = cute.arch.thread_idx()
 
         # ------------------------------------------------------------------ #
@@ -507,36 +537,35 @@ class dQdQvGemmKernel:
         # Initialize pipelines                                               #
         # ------------------------------------------------------------------ #
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
-        kv_commit_group = ThreadCooperativeGroup(1)
         clc_producer_group = ThreadCooperativeGroup(1)
         num_clc_consumer_threads = 32 * (
-            1  # sched warp on CTA0 only
-            + cute.size(self.cluster_shape_mn)
-            * (1 + len(self.epilogue_warp_ids) + len(self.kv_load_warp_ids) + 1)
-            # tma + epi + kv_load + mma, on BOTH CTAs
+            1  # sched warp
+            + (1 + len(self.epilogue_warp_ids) + len(self.kv_load_warp_ids) + 1)
+            # tma + epi + kv_load + mma
         )
         clc_consumer_group = ThreadCooperativeGroup(num_clc_consumer_threads)
         mma_warp = ThreadCooperativeGroup(1)
-        tma_warp = ThreadCooperativeGroup(cute.size(self.cluster_shape_mn))
-        tma_warp_local = ThreadCooperativeGroup(1)
+        tma_warp = ThreadCooperativeGroup(1)
         epilogue_warps = ThreadCooperativeGroup(len(self.epilogue_warp_ids))
-        load_warps = ThreadCooperativeGroup(len(self.kv_load_warp_ids))
+        gather_threads = ThreadCooperativeGroup(self.num_kv_load_threads)
 
         pipeline_dS = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.mbar_ptr_dS.data_ptr(),
             num_stages=self.num_stages_dS,
-            producer_group=mma_warp,
-            consumer_group=tma_warp,
+            producer_group=tma_warp,
+            consumer_group=mma_warp,
             tx_count=self.num_tma_load_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
 
+        # the 128 gather threads arrive on the full barrier with cp.async.mbarrier.arrive.noinc
         pipeline_KV = pipeline.PipelineAsyncUmma.create(
             barrier_storage=storage.mbar_ptr_KV.data_ptr(),
             num_stages=self.num_stages_KV,
-            producer_group=kv_commit_group,
+            producer_group=gather_threads,
             consumer_group=mma_warp,
+            cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
 
@@ -545,6 +574,7 @@ class dQdQvGemmKernel:
             num_stages=self.num_stages_acc,
             producer_group=mma_warp,
             consumer_group=epilogue_warps,
+            cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
 
@@ -557,16 +587,6 @@ class dQdQvGemmKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-
-        pipeline_load_kv_epi = None
-        if const_expr(self.overlap_kv_epi):
-            pipeline_load_kv_epi = pipeline.PipelineAsync.create(
-                barrier_storage=storage.mbar_ptr_load_kv_epi.data_ptr(),
-                num_stages=1,
-                producer_group=epilogue_warps,
-                consumer_group=load_warps,
-                defer_sync=True,
-            )
 
         # ------------------------------------------------------------------ #
         # TMEM Allocation                                                    #
@@ -599,24 +619,25 @@ class dQdQvGemmKernel:
         # ------------------------------------------------------------------ #
         # (MMA, MMA_M, MMA_K, STAGE)
         sdS = storage.sdS.get_tensor(sdS_layout.outer, swizzle=sdS_layout.inner)
+        # gather views (MMA, MMA_N=keys, MMA_K=dims, STAGE), K-major
+        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        # MMA views of the two 256-dim N tiles: same bytes, MN-major, stages stepped by the
+        # whole latent stage
+        sVt0 = cute.make_tensor(
+            cute.recast_ptr(sV.iterator, sVt_layout.inner, self.kv_dtype), sVt_layout_outer
+        )
+        sVt1 = cute.make_tensor(
+            cute.recast_ptr(sV.iterator + self.sVt_ntile_offset, sVt_layout.inner, self.kv_dtype),
+            sVt_layout_outer,
+        )
+        sK, sKt, sdQ = None, None, None
         if const_expr(self.compute_dQ):
             sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
-        # sdQ = storage.sdQ.get_tensor(sdQ_layout.outer, swizzle=sdQ_layout.inner)
-        if const_expr(self.compute_dQ):
-            sdQ = cute.make_tensor(
-                cute.recast_ptr(sK.iterator, sdQ_layout.inner, self.dq_dtype), sdQ_layout.outer
+            sKt = cute.make_tensor(
+                cute.recast_ptr(sK.iterator, sKt_layout.inner, self.kv_dtype), sKt_layout.outer
             )
-        if const_expr(not self.compute_dQ):
-            sdQv = storage.sdQv.get_tensor(sdQv_layout.outer, swizzle=sdQv_layout.inner)
-        else:
-            sdQv = cute.make_tensor(
-                cute.recast_ptr(sV.iterator, sdQv_layout.inner, self.dq_dtype), sdQv_layout.outer
-            )
-
-        dS_full_mcast_mask = cpasync.create_tma_multicast_mask(
-            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
-        )
+            sdQ = storage.sdQ.get_tensor(sdQ_layout.outer, swizzle=sdQ_layout.inner)
+        sdQv = storage.sdQv.get_tensor(sdQv_layout.outer, swizzle=sdQv_layout.inner)
 
         # ------------------------------------------------------------------ #
         # Global tile partitioning                                           #
@@ -626,6 +647,7 @@ class dQdQvGemmKernel:
             mdS, cute.slice_(self.mma_tiler_dQv, (None, 0, None)), (None, None, None)
         )
         # (bM, bN, RestM, RestN, RestL)
+        gdQ = None
         if const_expr(self.compute_dQ):
             gdQ = cute.local_tile(
                 mdQ, cute.slice_(self.mma_tiler_dQ, (None, None, 0)), (None, None, None)
@@ -638,13 +660,14 @@ class dQdQvGemmKernel:
         # ------------------------------------------------------------------ #
         # TiledMMA partitioning                                              #
         # ------------------------------------------------------------------ #
-        thr_mma_v = tiled_mma_v.get_slice(mma_v_tile_coord_v)
+        thr_mma_v = tiled_mma_v.get_slice(0)
         # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
         tdQvgdS = thr_mma_v.partition_A(gdS)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tdQvgdQv = thr_mma_v.partition_C(gdQv)
+        tdQgdQ = None
         if const_expr(self.compute_dQ):
-            thr_mma_k = tiled_mma_k.get_slice(mma_k_tile_coord_v)
+            thr_mma_k = tiled_mma_k.get_slice(0)
             tdQgdQ = thr_mma_k.partition_C(gdQ)
 
         # ------------------------------------------------------------------ #
@@ -655,7 +678,7 @@ class dQdQvGemmKernel:
         # ((atom_v, rest_v), RestM, RestK, RestL)
         tdSsdS, tdSgdS = cpasync.tma_partition(
             tma_atom_dS,
-            block_in_cluster_coord_vmnk[2],
+            0,
             dS_cta_layout,
             cute.group_modes(sdS, 0, 3),
             cute.group_modes(tdQvgdS, 0, 3),
@@ -666,21 +689,32 @@ class dQdQvGemmKernel:
         # ------------------------------------------------------------------ #
         # (MMA, MMA_M, MMA_K, STAGE)
         tdQvrdS = tiled_mma_v.make_fragment_A(sdS)
-        # (MMA, MMA_N, MMA_K, STAGE)
-        tdQvrV = tiled_mma_v.make_fragment_B(sV)
+        # (MMA, MMA_N, MMA_K, STAGE) per 256-dim N tile
+        tdQvrV0 = tiled_mma_v.make_fragment_B(sVt0)
+        tdQvrV1 = tiled_mma_v.make_fragment_B(sVt1)
         # (MMA, MMA_M, MMA_N)
         acc_v_shape = tiled_mma_v.partition_shape_C(self.mma_tiler_dQv[:2])
-        # (MMA, MMA_M, MMA_N, STAGE)
+        # (MMA, MMA_M, MMA_N, STAGE): one N tile; tile 1 sits in the other TMEM lane half
         tdQvtAcc_fake = tiled_mma_v.make_fragment_C(cute.append(acc_v_shape, self.num_stages_acc))
+        tdQrK, tdQtAcc_fake = None, None
         if const_expr(self.compute_dQ):
             # (MMA, MMA_N, MMA_K, STAGE)
-            tdQrK = tiled_mma_k.make_fragment_B(sK)
+            tdQrK = tiled_mma_k.make_fragment_B(sKt)
             # (MMA, MMA_M, MMA_N)
             acc_k_shape = tiled_mma_k.partition_shape_C(self.mma_tiler_dQ[:2])
             # (MMA, MMA_M, MMA_N, STAGE)
             tdQtAcc_fake = tiled_mma_k.make_fragment_C(
                 cute.append(acc_k_shape, self.num_stages_acc)
             )
+        # TMEM column plan: dQ [0, 64) then dQv N tile 0 / 1 (lane halves) [64, 320)
+        tmem_cols_dQ = (
+            tcgen05.find_tmem_tensor_col_offset(tdQtAcc_fake) if const_expr(self.compute_dQ) else 0
+        )
+        tmem_cols_dQv = tcgen05.find_tmem_tensor_col_offset(tdQvtAcc_fake)
+        assert tmem_cols_dQ + tmem_cols_dQv <= self.num_tmem_alloc_cols
+        # the second 256-dim N tile: same columns, lanes 16-31 of each 32-lane subpartition
+        # (the M=64 accumulator occupies lanes 0-15; TMEM address lane field = bits [31:16])
+        tmem_lane_half_offset = 16 << 16
 
         # ------------------------------------------------------------------ #
         # Cluster wait before tensor memory alloc                            #
@@ -699,18 +733,16 @@ class dQdQvGemmKernel:
         work_tile = tile_sched.initial_work_tile_info()
 
         # ------------------------------------------------------------------ #
-        # TMA load warp                                                      #
+        # TMA load warp: dS, one 64 x 64 tile per k-tile                      #
         # ------------------------------------------------------------------ #
         if warp_idx == self.tma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_other)
-
             producer_state_dS = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, stages=self.num_stages_dS
             )
 
             while work_tile.is_valid_tile:
                 # ---- Get tile coord from tile scheduler ----
-                token, cta, _ = work_tile.tile_idx
+                token, _, _ = work_tile.tile_idx
 
                 # ((atom_v, rest_v), RestK)
                 tdSgdS_slice = tdSgdS[(None, 0, None, token)]
@@ -726,7 +758,6 @@ class dQdQvGemmKernel:
                         tdSgdS_slice[(None, k_tile)],
                         tdSsdS[(None, index_dS)],
                         tma_bar_ptr=pipeline_dS.producer_get_barrier(producer_state_dS),
-                        mcast_mask=dS_full_mcast_mask,
                     )
 
                     producer_state_dS.advance()
@@ -743,8 +774,7 @@ class dQdQvGemmKernel:
         # ------------------------------------------------------------------ #
         # Clc Scheduler warp                                                 #
         # ------------------------------------------------------------------ #
-        if warp_idx == self.sched_warp_id and is_first_cta:
-            cute.arch.setmaxregister_decrease(self.num_regs_other)
+        if warp_idx == self.sched_warp_id:
             clc_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.ProducerConsumer, self.num_stages_clc
             )
@@ -763,29 +793,23 @@ class dQdQvGemmKernel:
             pipeline_clc.producer_tail(clc_producer_state)
 
         # ------------------------------------------------------------------ #
-        # CpAsync KV load warps                                              #
+        # CpAsync KV gather warps: whole rows, 64 keys per stage             #
         # ------------------------------------------------------------------ #
         if warp_idx >= self.kv_load_warp_ids[0] and warp_idx <= self.kv_load_warp_ids[-1]:
-            cute.arch.setmaxregister_increase(self.num_regs_KV)
             find_batch = partial(
                 self.find_batch_from_q, seqlen_q_divmod=seqlen_q_divmod, mCuSeqlensQ=mCuSeqlensQ
             )
 
-            load_epi_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, 1
-            )
             producer_state_KV = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, stages=self.num_stages_KV
             )
 
-            kv_tidx = tidx % (len(self.kv_load_warp_ids) * self.threads_per_warp)
+            kv_tidx = tidx % self.num_kv_load_threads
             kv_warp_idx = warp_idx % len(self.kv_load_warp_ids)
-
-            mV_cta = cute.domain_offset((cta_rank_in_cluster * (self.head_dim_v // 2), 0), mV)
 
             while work_tile.is_valid_tile:
                 # ---- Get tile coord from tile scheduler ----
-                token, cta, _ = work_tile.tile_idx
+                token, _, _ = work_tile.tile_idx
 
                 batch_idx = find_batch(token)
                 k_batch_offset = (
@@ -796,63 +820,55 @@ class dQdQvGemmKernel:
                     if const_expr(mCuSeqlensK is not None)
                     else seqlen_k_static
                 )
+                # (seqlen_k, head_dim) of this batch; rows addressed by the top-k index
+                mK_cur = None
                 if const_expr(mCuSeqlensK is not None):
                     if const_expr(self.compute_dQ):
-                        mK_cur = cute.domain_offset((0, k_batch_offset), mK)[None, None]
-                    mV_cur = cute.domain_offset((0, k_batch_offset), mV_cta)[None, None]
+                        mK_cur = cute.domain_offset((k_batch_offset, 0), mK)
+                    mV_cur = cute.domain_offset((k_batch_offset, 0), mV)
                 else:
                     if const_expr(self.compute_dQ):
-                        mK_cur = cute.domain_offset((0, (0, batch_idx)), mK)[None, None]
-                    mV_cur = cute.domain_offset((0, (0, batch_idx)), mV_cta)[None, None]
+                        mK_cur = cute.domain_offset(((0, batch_idx), 0), mK)
+                    mV_cur = cute.domain_offset(((0, batch_idx), 0), mV)
                 mIdxTopK_cur = mIdxTopK[None, token]
 
-                cpasync_gather_kv_manager = CpasyncGatherKVManager.create(
+                # no causal limit here (out-of-limit slots carry dS = 0); rows with index -1 or
+                # >= seqlen_k are zero-filled by the predicated cp.async
+                gather = CpasyncGatherKVManagerH64.create(
                     mIdxTopK_cur,
-                    0,
                     kv_tidx,
                     kv_warp_idx,
-                    self.top_k,
                     seqlen_k,
-                    self.mma_tiler_dQv[2],
-                    self.head_dim_k,
-                    self.mma_tiler_dQv[1],
-                    1,
-                    len(self.kv_load_warp_ids) * self.threads_per_warp,
+                    self.tile_k,
+                    self.head_dim_k if const_expr(self.compute_dQ) else 64,
+                    self.head_dim_v,
+                    self.num_kv_load_threads,
                     mV.element_type,
-                    1,
+                    None,
+                    False,
+                    None,
+                    None,
                 )
 
-                # ---- K/V load mainloop ----
-                for k_tile in cutlass.range_constexpr(k_tile_cnt):
-                    # ---- Load top-k index tensor ----
-                    cpasync_gather_kv_manager.load_index_topk(k_tile, transpose=True)
-
-                    stage = producer_state_KV.index
-                    pipeline_KV.producer_acquire(producer_state_KV)
-
-                    # ---- Load V (and optionally load K) ----
-                    cpasync_gather_kv_manager.load_X(mV_cur, sV[None, None, None, stage], True, "V")
-                    if const_expr(self.compute_dQ):
-                        if is_first_cta:
-                            cpasync_gather_kv_manager.load_X(
-                                mK_cur, sK[None, None, None, stage], True, "K"
-                            )
-
-                    cute.arch.cp_async_commit_group()
-                    cute.arch.cp_async_wait_group(0)
-                    self.kv_load_sync_barrier.arrive_and_wait()
-
-                    cute.arch.fence_proxy("async.shared", space="cta")
-                    if kv_warp_idx == 0:
-                        with cute.arch.elect_one():
-                            pipeline_KV.producer_commit(producer_state_KV)
-                    producer_state_KV.advance()
-
-                if const_expr(self.overlap_kv_epi):
-                    pipeline_load_kv_epi.consumer_wait(load_epi_consumer_state)
-                    with cute.arch.elect_one():
-                        pipeline_load_kv_epi.consumer_release(load_epi_consumer_state)
-                    load_epi_consumer_state.advance()
+                # ---- K/V gather mainloop: indices two blocks ahead in two register sets ----
+                gather.load_index_topk(Int32(0), 0)
+                gather.load_index_topk(Int32(1), 1)
+                for it in cutlass.range(k_tile_cnt // 2, unroll=1):
+                    for buf in cutlass.range_constexpr(2):
+                        stage = producer_state_KV.index
+                        pipeline_KV.producer_acquire(producer_state_KV)
+                        if const_expr(self.compute_dQ):
+                            gather.load_X(mK_cur, sK[None, None, None, stage], "K", buf)
+                        gather.load_X(mV_cur, sV[None, None, None, stage], "V", buf)
+                        cute.arch.cp_async_commit_group()
+                        # fires once every copy this thread issued so far has landed
+                        pipeline_KV.sync_object_full.arrive_cp_async_mbarrier(stage)
+                        producer_state_KV.advance()
+                        n_prefetch = 2 * it + buf + 2
+                        n_prefetch = (
+                            n_prefetch if n_prefetch < k_tile_cnt else Int32(k_tile_cnt - 1)
+                        )
+                        gather.load_index_topk(n_prefetch, buf)
 
                 # ---- Advance to next tile ----
                 pipeline_clc.consumer_wait(clc_consumer_state)
@@ -866,19 +882,17 @@ class dQdQvGemmKernel:
         # MMA warp                                                           #
         # ------------------------------------------------------------------ #
         if warp_idx == self.mma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_other)
             # --- Retrieve TMEM ptr and make accumulator tensors
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
+            tdQtAcc_base = None
             if const_expr(self.compute_dQ):
                 tdQtAcc_base = cute.make_tensor(tmem_ptr, tdQtAcc_fake.layout)
-            tdQvtAcc_ptr = tmem_ptr + (
-                tcgen05.find_tmem_tensor_col_offset(tdQtAcc_base)
-                if const_expr(self.compute_dQ)
-                else 0
+            tdQvtAcc0_base = cute.make_tensor(tmem_ptr + tmem_cols_dQ, tdQvtAcc_fake.layout)
+            tdQvtAcc1_base = cute.make_tensor(
+                tmem_ptr + (tmem_cols_dQ + tmem_lane_half_offset), tdQvtAcc_fake.layout
             )
-            tdQvtAcc_base = cute.make_tensor(tdQvtAcc_ptr, tdQvtAcc_fake.layout)
 
             consumer_state_dS = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, stages=self.num_stages_dS
@@ -891,14 +905,13 @@ class dQdQvGemmKernel:
             )
 
             while work_tile.is_valid_tile:
-                # ---- Get tile coord from tile scheduler ----
-                token, cta, _ = work_tile.tile_idx
-
                 # ---- Set tensor memory buffer for current tile ----
                 # (MMA, MMA_M, MMA_N)
-                tdQvtAcc = tdQvtAcc_base[(None, None, None, producer_state_dQ_dQv.index)]
+                acc_idx = producer_state_dQ_dQv.index
+                tdQvtAcc0 = tdQvtAcc0_base[(None, None, None, acc_idx)]
+                tdQvtAcc1 = tdQvtAcc1_base[(None, None, None, acc_idx)]
                 if const_expr(self.compute_dQ):
-                    tdQtAcc = tdQtAcc_base[(None, None, None, producer_state_dQ_dQv.index)]
+                    tdQtAcc = tdQtAcc_base[(None, None, None, acc_idx)]
 
                 # ---- Wait for accumulator buffer empty ----
                 pipeline_dQ_dQv.producer_acquire(producer_state_dQ_dQv)
@@ -909,7 +922,7 @@ class dQdQvGemmKernel:
                     tiled_mma_k.set(tcgen05.Field.ACCUMULATE, False)
 
                 # ---- Mma mainloop ----
-                for k_tile in cutlass.range_constexpr(k_tile_cnt):
+                for k_tile in cutlass.range(k_tile_cnt, unroll=1):
                     pipeline_dS.consumer_wait(consumer_state_dS)
                     pipeline_KV.consumer_wait(consumer_state_KV)
                     dS_stage = consumer_state_dS.index
@@ -917,29 +930,35 @@ class dQdQvGemmKernel:
 
                     num_kblocks = cute.size(tdQvrdS, mode=[2])
                     for kblk_idx in cutlass.range(num_kblocks, unroll_full=True):
-                        # dQv += dS @ V
+                        # dQv[:, 0:256] += dS @ V[:, 0:256]; dQv[:, 256:512] += dS @ V[:, 256:512]
                         cute.gemm(
                             tiled_mma_v,
-                            tdQvtAcc,
+                            tdQvtAcc0,
                             tdQvrdS[(None, None, kblk_idx, dS_stage)],
-                            tdQvrV[(None, None, kblk_idx, KV_stage)],
-                            tdQvtAcc,
+                            tdQvrV0[(None, None, kblk_idx, KV_stage)],
+                            tdQvtAcc0,
                         )
-                        # Enable accumulate on tdQvtAcc after first kblock
+                        cute.gemm(
+                            tiled_mma_v,
+                            tdQvtAcc1,
+                            tdQvrdS[(None, None, kblk_idx, dS_stage)],
+                            tdQvrV1[(None, None, kblk_idx, KV_stage)],
+                            tdQvtAcc1,
+                        )
+                        # Enable accumulate on both dQv tiles after the first kblock
                         tiled_mma_v.set(tcgen05.Field.ACCUMULATE, True)
 
                         if const_expr(self.compute_dQ):
-                            if is_first_cta:
-                                # dQ += dS @ K
-                                cute.gemm(
-                                    tiled_mma_k,
-                                    tdQtAcc,
-                                    tdQvrdS[(None, None, kblk_idx, dS_stage)],
-                                    tdQrK[(None, None, kblk_idx, KV_stage)],
-                                    tdQtAcc,
-                                )
-                                # Enable accumulate on tdQtAcc after first kblock
-                                tiled_mma_k.set(tcgen05.Field.ACCUMULATE, True)
+                            # dQ += dS @ K
+                            cute.gemm(
+                                tiled_mma_k,
+                                tdQtAcc,
+                                tdQvrdS[(None, None, kblk_idx, dS_stage)],
+                                tdQrK[(None, None, kblk_idx, KV_stage)],
+                                tdQtAcc,
+                            )
+                            # Enable accumulate on tdQtAcc after first kblock
+                            tiled_mma_k.set(tcgen05.Field.ACCUMULATE, True)
 
                     pipeline_dS.consumer_release(consumer_state_dS)
                     pipeline_KV.consumer_release(consumer_state_KV)
@@ -961,7 +980,6 @@ class dQdQvGemmKernel:
         # Epilogue warps                                                     #
         # ------------------------------------------------------------------ #
         if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
-            cute.arch.setmaxregister_increase(self.num_regs_epi)
             # ---- Alloc tensor memory buffer ----
             tmem.allocate(self.num_tmem_alloc_cols)
 
@@ -969,22 +987,20 @@ class dQdQvGemmKernel:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
+            tdQtAcc_base = None
             if const_expr(self.compute_dQ):
                 tdQtAcc_base = cute.make_tensor(tmem_ptr, tdQtAcc_fake.layout)
-            tdQvtAcc_ptr = tmem_ptr + (
-                tcgen05.find_tmem_tensor_col_offset(tdQtAcc_base)
-                if const_expr(self.compute_dQ)
-                else 0
+            tdQvtAcc0_base = cute.make_tensor(tmem_ptr + tmem_cols_dQ, tdQvtAcc_fake.layout)
+            tdQvtAcc1_base = cute.make_tensor(
+                tmem_ptr + (tmem_cols_dQ + tmem_lane_half_offset), tdQvtAcc_fake.layout
             )
-            tdQvtAcc_base = cute.make_tensor(tdQvtAcc_ptr, tdQvtAcc_fake.layout)
 
             epi_idx = tidx
-            # print(f"tdQvtAcc_base.layout = {tdQvtAcc_base.layout}")
             # ---- TMEM -> RMEM -> SMEM -> GMEM copies + partitions ----
-            tiled_copy_dQv_t2r, tTR_dQvtAcc_base, tTR_dQvrAcc = (
+            tiled_copy_dQv_t2r, tTR_dQvtAcc0_base, tTR_dQvrAcc = (
                 self.epilogue_tmem_copy_and_partition(
                     epi_idx,
-                    tdQvtAcc_base,
+                    tdQvtAcc0_base,
                     tdQvgdQv,
                     epi_tile_dQv,
                     self.mma_tiler_dQv,
@@ -992,7 +1008,15 @@ class dQdQvGemmKernel:
                     self.dq_dtype,
                 )
             )
-            # print(f"tTR_tdQvtAcc_base.layout = {tTR_dQvtAcc_base.layout}")
+            _, tTR_dQvtAcc1_base, _ = self.epilogue_tmem_copy_and_partition(
+                epi_idx,
+                tdQvtAcc1_base,
+                tdQvgdQv,
+                epi_tile_dQv,
+                self.mma_tiler_dQv,
+                self.dq_layout,
+                self.dq_dtype,
+            )
             tTR_rdQv = cute.make_rmem_tensor(tTR_dQvrAcc.shape, self.dq_dtype)
             (
                 tiled_copy_dQv_r2s,
@@ -1048,130 +1072,89 @@ class dQdQvGemmKernel:
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_stages_acc
             )
-            load_epi_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, 1
-            )
 
             epi_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
                 cute.arch.WARP_SIZE,
             )
             pipeline_epi = pipeline.PipelineTmaStore.create(
-                num_stages=self.num_stages_acc,
+                num_stages=self.num_stages_epi,
                 producer_group=epi_producer_group,
             )
 
             # ---- Persistent tile scheduling loop for epilogue ----
             while work_tile.is_valid_tile:
                 # ---- Get current work tile ----
-                token, cta, bid_x = work_tile.tile_idx
+                token, _, _ = work_tile.tile_idx
 
-                bSG_gdQv = bSG_gdQv_partitioned[
-                    (None, None, None, bid_x, cta_rank_in_cluster, token)
-                ]
-                tTR_dQvtAcc = tTR_dQvtAcc_base[
-                    (None, None, None, None, None, acc_consumer_state.index)
-                ]
-                tTR_dQvtAcc = cute.group_modes(tTR_dQvtAcc, 3, cute.rank(tTR_dQvtAcc))
-                bSG_gdQv = cute.group_modes(bSG_gdQv, 1, cute.rank(bSG_gdQv))
-
-                subtile_cnt_v = cute.size(tTR_dQvtAcc.shape, mode=[3])
-                epi_subtile_counter_v = 0
+                acc_idx = acc_consumer_state.index
+                # dQv: (T2R, T2R_M, T2R_N, EPI_M*EPI_N) per N tile; gmem tiles per (N tile, token)
+                tTR_dQvtAccs = []
+                bSG_gdQvs = []
+                for n_tile in cutlass.range_constexpr(self.num_hdimv_ntiles):
+                    tTR_base = tTR_dQvtAcc0_base if n_tile == 0 else tTR_dQvtAcc1_base
+                    t = tTR_base[(None, None, None, None, None, acc_idx)]
+                    tTR_dQvtAccs.append(cute.group_modes(t, 3, cute.rank(t)))
+                    g = bSG_gdQv_partitioned[(None, None, None, 0, n_tile, token)]
+                    bSG_gdQvs.append(cute.group_modes(g, 1, cute.rank(g)))
+                subtile_cnt_v = cute.size(tTR_dQvtAccs[0].shape, mode=[3])
+                epi_subtile_counter = 0
 
                 if const_expr(self.compute_dQ):
-                    bSG_gdQ = bSG_gdQ_partitioned[(None, None, None, bid_x, cta, token)]
-                    tTR_dQtAcc = tTR_dQtAcc_base[
-                        (None, None, None, None, None, acc_consumer_state.index)
-                    ]
+                    bSG_gdQ = bSG_gdQ_partitioned[(None, None, None, 0, 0, token)]
+                    tTR_dQtAcc = tTR_dQtAcc_base[(None, None, None, None, None, acc_idx)]
                     tTR_dQtAcc = cute.group_modes(tTR_dQtAcc, 3, cute.rank(tTR_dQtAcc))
                     bSG_gdQ = cute.group_modes(bSG_gdQ, 1, cute.rank(bSG_gdQ))
-
                     subtile_cnt_k = cute.size(tTR_dQtAcc.shape, mode=[3])
-                    epi_subtile_counter_k = 0
 
                 pipeline_dQ_dQv.consumer_wait(acc_consumer_state)
 
-                for subtile_idx in cutlass.range(subtile_cnt_v, unroll_full=True):
-                    store_dQ = (
-                        const_expr(self.compute_dQ)
-                        and is_first_cta
-                        and (subtile_idx < subtile_cnt_k)
-                    )
+                # ---- dQ: its own smem tile (one subtile of 64 x 64) ----
+                if const_expr(self.compute_dQ):
+                    for subtile_idx in cutlass.range(subtile_cnt_k, unroll_full=True):
+                        tTR_dQtAcc_mn = tTR_dQtAcc[(None, None, None, subtile_idx)]
+                        cute.copy(tiled_copy_dQ_t2r, tTR_dQtAcc_mn, tTR_dQrAcc)
+                        cute.arch.fence_view_async_tmem_load()
+                        tRS_rdQ.store(tiled_copy_dQ_r2s.retile(tTR_dQrAcc).load().to(self.dq_dtype))
+                        if warp_idx == self.epilogue_warp_ids[0]:
+                            # the dQ tile of the previous token must have left smem
+                            pipeline_epi.producer_acquire()
+                        self.epilog_sync_barrier.arrive_and_wait()
+                        cute.copy(tiled_copy_dQ_r2s, tRS_rdQ, tRS_sdQ[(None, None, None, 0)])
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self.epilog_sync_barrier.arrive_and_wait()
+                        if warp_idx == self.epilogue_warp_ids[0]:
+                            cute.copy(tma_atom_dQ, bSG_sdQ[(None, 0)], bSG_gdQ[(None, subtile_idx)])
+                            pipeline_epi.producer_commit()
 
-                    if not store_dQ:
-                        tTR_dQvtAcc_mn = tTR_dQvtAcc[(None, None, None, subtile_idx)]
+                # ---- dQv: two N tiles x subtiles through the 2-stage smem ring ----
+                for n_tile in cutlass.range_constexpr(self.num_hdimv_ntiles):
+                    for subtile_idx in cutlass.range(subtile_cnt_v, unroll_full=True):
+                        tTR_dQvtAcc_mn = tTR_dQvtAccs[n_tile][(None, None, None, subtile_idx)]
                         cute.copy(tiled_copy_dQv_t2r, tTR_dQvtAcc_mn, tTR_dQvrAcc)
                         cute.arch.fence_view_async_tmem_load()
-
                         # convert to output dtype
                         tRS_rdQv.store(
                             tiled_copy_dQv_r2s.retile(tTR_dQvrAcc).load().to(self.dq_dtype)
                         )
-
-                        epi_buffer = epi_subtile_counter_v % self.num_stages_acc
+                        epi_buffer = epi_subtile_counter % self.num_stages_epi
+                        if warp_idx == self.epilogue_warp_ids[0]:
+                            # the TMA store that read this buffer two subtiles ago is done
+                            pipeline_epi.producer_acquire()
+                        self.epilog_sync_barrier.arrive_and_wait()
                         cute.copy(
                             tiled_copy_dQv_r2s, tRS_rdQv, tRS_sdQv[(None, None, None, epi_buffer)]
                         )
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
-
                         if warp_idx == self.epilogue_warp_ids[0]:
                             cute.copy(
                                 tma_atom_dQv,
                                 bSG_sdQv[(None, epi_buffer)],
-                                bSG_gdQv[(None, subtile_idx)],
+                                bSG_gdQvs[n_tile][(None, subtile_idx)],
                             )
                             pipeline_epi.producer_commit()
-                            pipeline_epi.producer_acquire()
-
-                        self.epilog_sync_barrier.arrive_and_wait()
-                        epi_subtile_counter_v += 1
-                    elif const_expr(self.compute_dQ):
-                        tTR_dQtAcc_mn = tTR_dQtAcc[(None, None, None, subtile_idx)]
-                        tTR_dQvtAcc_mn = tTR_dQvtAcc[(None, None, None, subtile_idx)]
-                        cute.copy(tiled_copy_dQ_t2r, tTR_dQtAcc_mn, tTR_dQrAcc)
-                        cute.copy(tiled_copy_dQv_t2r, tTR_dQvtAcc_mn, tTR_dQvrAcc)
-
-                        # convert to output dtype
-                        tRS_rdQ.store(tiled_copy_dQ_r2s.retile(tTR_dQrAcc).load().to(self.dq_dtype))
-                        tRS_rdQv.store(
-                            tiled_copy_dQv_r2s.retile(tTR_dQvrAcc).load().to(self.dq_dtype)
-                        )
-
-                        epi_buffer = epi_subtile_counter_v % self.num_stages_acc
-                        epi_buffer_k = epi_subtile_counter_k % self.num_stages_acc
-                        cute.copy(
-                            tiled_copy_dQv_r2s, tRS_rdQv, tRS_sdQv[(None, None, None, epi_buffer)]
-                        )
-                        cute.copy(
-                            tiled_copy_dQ_r2s, tRS_rdQ, tRS_sdQ[(None, None, None, epi_buffer_k)]
-                        )
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        self.epilog_sync_barrier.arrive_and_wait()
-
-                        if warp_idx == self.epilogue_warp_ids[0]:
-                            cute.copy(
-                                tma_atom_dQv,
-                                bSG_sdQv[(None, epi_buffer)],
-                                bSG_gdQv[(None, subtile_idx)],
-                            )
-                            cute.copy(
-                                tma_atom_dQ,
-                                bSG_sdQ[(None, epi_buffer_k)],
-                                bSG_gdQ[(None, subtile_idx)],
-                            )
-                            pipeline_epi.producer_commit()
-                            pipeline_epi.producer_acquire()
-
-                        self.epilog_sync_barrier.arrive_and_wait()
-                        epi_subtile_counter_v += 1
-                        epi_subtile_counter_k += 1
-
-                if const_expr(self.overlap_kv_epi):
-                    pipeline_load_kv_epi.producer_acquire(load_epi_producer_state)
-                    with cute.arch.elect_one():
-                        pipeline_load_kv_epi.producer_commit(load_epi_producer_state)
-                    load_epi_producer_state.advance()
+                        epi_subtile_counter += 1
 
                 with cute.arch.elect_one():
                     pipeline_dQ_dQv.consumer_release(acc_consumer_state)

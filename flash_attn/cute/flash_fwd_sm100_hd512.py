@@ -648,8 +648,10 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
         tile_scheduler: TileSchedulerProtocol,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         learnable_sink: Optional[cute.Tensor] = None,
+        mOlo: Optional[cute.Tensor] = None,
     ):
         assert learnable_sink is None, "D512 does not support learnable sinks"
+        assert mOlo is None, "D512 does not produce an output rounding residual"
         ### ==== correction/epilogue warpgroup ====
         # Correction: copy scale smem -> rmem, copy O tmem -> rmem, rescale O, store O rmem -> tmem
         # Epilogue:   copy O tmem -> rmem, do final scaling of O, store O rmem -> gmem,
@@ -933,9 +935,11 @@ def forward_sm100_d512(q, k, v, out, lse, scale, causal, *, arch: int):
         None,  # mSeqUsedK
         None,  # mIndexTopk
         None,  # mPageTable
+        None,  # descale_tensors
         None,  # window_size_left
         None,  # window_size_right
         None,  # learnable_sink
+        None,  # mOlo
     )
     return out, lse
 

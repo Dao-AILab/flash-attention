@@ -934,6 +934,9 @@ def handle_block_sparse_empty_tile_correction_sm100(
             mO_cur,
             gO_stage,
             gmem_tiled_copy_O,
+            # SM100 only: SM90 has no equivalent flag, it zeroes acc_O inline in the
+            # mainloop because its O accumulator lives in registers, not TMEM.
+            zero_fill=True,
         )
         if const_expr(gmem_tiled_copy_O is None):
             pipeline_o_epi.producer_commit_w_index(stage)

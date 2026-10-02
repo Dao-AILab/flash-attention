@@ -27,6 +27,7 @@ Dependencies: `nvidia-cutlass-dsl>=4.6.2`, `torch`, `einops`, `apache-tvm-ffi`, 
 ```bash
 pytest tests/cute/test_flash_attn.py
 pytest tests/cute/test_flash_attn.py -k "test_flash_attn_output" -x  # single test
+pytest tests/cute/test_flash_attn_mla.py  # MLA (qv): dense / sparse / paged, 1CTA (FLASH_ATTENTION_MLA_1CTA=1) and 2CTA
 pytest tests/cute/test_flash_attn_varlen.py
 pytest tests/cute/test_mask_mod.py
 pytest tests/cute/test_score_mod.py
@@ -35,7 +36,7 @@ pytest tests/cute/test_block_sparsity.py
 
 ### Fast two-pass testing
 
-Compilation dominates test time. The fast workflow separates compilation (parallel, no GPU needed) from execution (uses cached binaries):
+Compilation dominates test time. The fast workflow separates compilation (parallel, no GPU work) from execution (uses cached binaries). The compilation pass still opens a CUDA context per xdist worker (a few hundred MB each), so set `CUDA_VISIBLE_DEVICES` for both passes:
 
 ```bash
 # Pass 1: compile all kernels in parallel using FakeTensorMode (no GPU memory allocation)
@@ -48,6 +49,22 @@ FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x
 - `FLASH_ATTENTION_FAKE_TENSOR=1` — uses PyTorch FakeTensorMode to compile kernels without allocating GPU memory or running them.
 - `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` — enables persistent disk cache at `/tmp/${USER}/flash_attention_cute_dsl_cache/`.
 - `-n 256` — pytest-xdist parallel workers (only useful in the compilation pass).
+- `tools/two_pass_tests.sh -k EXPR -g 0,1 [-f FILES]` runs both passes, both limited to the `-g` GPUs. The execution pass runs with
+  `FLASH_ATTENTION_TEST_EXPECT_CACHED=1`, which fails any test that still compiles a kernel.
+  `FLASH_ATTENTION_TEST_COUNT_COMPILES=1` only reports the compiles.
+- Tests must support the compilation pass: decorate with
+  `@maybe_fake_tensor_mode(USE_FAKE_TENSOR)`, issue every kernel variant (every env /
+  monkeypatch knob) before the first data-dependent check, then `if is_fake_mode(): return`.
+- `FLASH_ATTENTION_TEST_RECORD_KEYS=path` records every compile-cache lookup, for diffing the
+  kernel set of a selection across changes.
+- **Most test files do not support the compilation pass yet.** Only `test_flash_attn_mla.py`
+  is fully converted; `test_flash_attn.py` mostly is, and `test_flash_attn_fast.py` and
+  `test_flash_attn_combine.py` partly. The mask_mod, score_mod, block-sparsity, varlen, hd256
+  scheduler and race-condition files are not converted at all. Their tests run with real tensors in pass 1 and
+  can compile again in pass 2, so `FLASH_ATTENTION_TEST_EXPECT_CACHED=1` (and
+  `tools/two_pass_tests.sh`) reports them as failures even when the results are correct. Run
+  those files in a single pass, or check that a failure is "kernel(s) compiled during the
+  execution pass" before treating it as a regression.
 
 Tests are parametrized over dtype (fp16/bf16), head dimension (64, 96, 128), sequence length, causal/non-causal, and MHA/GQA/MQA.
 

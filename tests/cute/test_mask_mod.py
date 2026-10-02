@@ -1015,6 +1015,64 @@ def test_sm100_block_sparse_sink_all_masked():
     assert torch.allclose(lse, expected, atol=0.0, rtol=0.0)
 
 
+def test_sm100_block_sparse_empty_tile_writes_real_zeros():
+    """Regression for #2906: an empty block-sparse Q tile must write real zeros,
+    not scale unread TMEM residue (0.0 * inf = NaN)."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-only test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, nheads, headdim = 2, 16, 128
+    tile_m, tile_n = 128, 128
+    sparse_tile_m = 2 * tile_m  # SM100 block-sparse metadata is 2-CTA-grouped
+    num_m_groups = 32
+    seqlen_q = num_m_groups * sparse_tile_m
+    seqlen_k = tile_n
+
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, seqlen_q, nheads, headdim, dtype=dtype, device=device)
+    # K == 0 ⇒ uniform attention; V at bf16-max then overflows the O accumulator.
+    k = torch.zeros(batch_size, seqlen_k, nheads, headdim, dtype=dtype, device=device)
+    v = torch.full(
+        (batch_size, seqlen_k, nheads, headdim),
+        torch.finfo(torch.bfloat16).max,
+        dtype=dtype,
+        device=device,
+    )
+
+    full_cnt = torch.zeros((batch_size, nheads, num_m_groups), dtype=torch.int32, device=device)
+    full_idx = torch.zeros((batch_size, nheads, num_m_groups, 1), dtype=torch.int32, device=device)
+    mask_cnt = torch.zeros_like(full_cnt)
+    mask_idx = torch.zeros_like(full_idx)
+    full_cnt[:, :, 0] = 1  # only the first Q tile of each (batch, head) is live
+
+    sparse = BlockSparseTensorsTorch(
+        mask_block_cnt=mask_cnt,
+        mask_block_idx=mask_idx,
+        full_block_cnt=full_cnt,
+        full_block_idx=full_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        window_size_left=None,
+        window_size_right=None,
+        learnable_sink=None,
+        tile_mn=(tile_m, tile_n),
+        pack_gqa=False,
+        block_sparse_tensors=sparse,
+    )
+    empty = out[:, sparse_tile_m:]
+    assert torch.equal(empty, torch.zeros_like(empty)), (
+        "empty block-sparse tile must write real zeros, not NaN leaked from a "
+        "reused tcgen05 buffer"
+    )
+
+
 def make_empty_block_sparse_tensors(sparse_block_size_kv: int) -> BlockSparseTensorsTorch:
     """Build shape-only metadata for block-sparse dispatch helper tests."""
     return BlockSparseTensorsTorch(
@@ -1888,6 +1946,88 @@ def test_sm90_block_sparse_explicit_192_block_size():
         dtype,
         min(seqlen_q, seqlen_k),
     )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90-only test")
+@pytest.mark.parametrize(
+    "headdim,block_size,check_bwd",
+    [
+        (64, (64, 128), False),  # sparse Q block smaller than the default tile_m
+        (64, (128, 64), False),  # sparse KV block smaller than the default tile_n
+        (128, (64, 128), True),
+        (128, (128, 112), False),
+        (192, (128, 96), True),  # default fwd tile_n=112, bwd tile_n=96
+        (256, (128, 64), True),  # default fwd tile_n=80, bwd tile_n=64
+        (256, (64, 64), True),
+    ],
+)
+def test_sm90_block_sparse_fwd_tile_fits_block_size(headdim, block_size, check_bwd):
+    """flash_attn_func takes no tile sizes, so the SM90 forward must pick a tile that
+    matches the block-sparse block size instead of rejecting it."""
+    torch.manual_seed(0)
+    batch_size, nheads, seqlen = 1, 4, 512
+    dtype = torch.bfloat16
+    block_q, block_kv = block_size
+
+    def block_causal(b, h, q_idx, kv_idx):
+        # Block-aligned: every block is fully kept or fully dropped, so no mask_mod is needed.
+        return (kv_idx // block_kv) * block_kv <= (q_idx // block_q) * block_q + block_q - 1
+
+    bm = create_block_mask(
+        block_causal, batch_size, nheads, seqlen, seqlen, device="cuda", BLOCK_SIZE=block_size
+    )
+    (
+        _seq_q,
+        _seq_k,
+        kv_mask_cnt,
+        kv_mask_idx,
+        full_kv_cnt,
+        full_kv_idx,
+        q_mask_cnt,
+        q_mask_idx,
+        full_q_cnt,
+        full_q_idx,
+        *_,
+    ) = bm.as_tuple()
+    block_sparse_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx,
+        block_size=block_size,
+    )
+    block_sparse_bwd = BlockSparseTensorsTorch(
+        mask_block_cnt=q_mask_cnt,
+        mask_block_idx=q_mask_idx,
+        full_block_cnt=full_q_cnt,
+        full_block_idx=full_q_idx,
+        block_size=block_size,
+    )
+
+    q, k, v = [
+        torch.randn(batch_size, seqlen, nheads, headdim, device="cuda", dtype=dtype, requires_grad=True)
+        for _ in range(3)
+    ]
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=1.0 / math.sqrt(headdim),
+        block_sparse_tensors=block_sparse_fwd,
+        block_sparse_tensors_bwd=block_sparse_bwd,
+        return_lse=True,
+    )
+    grad_out = torch.randn_like(out)
+    out_ref, dq_ref, dk_ref, dv_ref = run_flex_reference_bwd(
+        q, k, v, bm, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(q, k, v, bm, grad_out)
+    assert_fwd_matches_reference(out, out_ref, out_pt)
+    if check_bwd:
+        dq, dk, dv = torch.autograd.grad(out, (q, k, v), grad_out)
+        assert_bwd_matches_reference(
+            dq, dk, dv, dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt, dtype, seqlen
+        )
 
 
 def test_gqa_block_sparse_broadcast_pattern_recompilation():

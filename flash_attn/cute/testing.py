@@ -490,3 +490,22 @@ def maybe_fake_tensor_mode(fake: bool = True):
 
 def is_fake_mode() -> bool:
     return active_fake_mode() is not None
+
+
+def check_tensor_vs_ref(name, actual, ref, pt, rtol=2, atol=None):
+    if actual is None:
+        return
+    if atol is None:
+        atol = 2 * (ref + 0.3 - 0.3 - ref).abs().max().item()
+    diff_max = (actual - ref).abs().max().item()
+    diff_pt_max = (pt - ref).abs().max().item()
+    assert diff_max <= rtol * diff_pt_max + atol, (
+        f"{name}: {diff_max=} too large compared to {diff_pt_max=} for {rtol=}, {atol=}"
+    )
+
+
+def check_dsink_vs_ref(actual, ref, pt, rtol=2, atol=0.0):
+    ulp = torch.nextafter(ref.abs(), torch.full_like(ref, float("inf"))) - ref.abs()
+    diff = (actual - ref).abs()
+    tolerance = rtol * (pt - ref).abs().max().item() + 2 * ulp + atol
+    assert torch.all(diff <= tolerance), f"dSink: {diff=} exceeds {tolerance=}"

@@ -1867,16 +1867,19 @@ def compute_sm100_fmha_varlen_grid(
     shape: cute.Shape,
     cu_seqlens: cute.Tensor,
     tile_shape_mn: Tuple[int, int],
+    num_splits: Int32 = Int32(1),
+    is_split_kv: bool = False,
 ) -> Tuple[SingleTileVarlenScheduler.Params, Tuple[Int32, Int32, Int32]]:
     """Build a flat grid with each CTA pair confined to one sequence.
 
     ``shape`` is (token_capacity, head_dim, ((head_ratio, num_heads), batch)).
+    With ``is_split_kv``, grid dim y enumerates the KV splits.
     """
     args = TileSchedulerArguments(
         num_block=Int32(0),
         num_head=cute.size(shape[2][0]),
         num_batch=cute.size(shape[2][1]),
-        num_splits=Int32(1),
+        num_splits=num_splits,
         seqlen_k=Int32(0),
         headdim=cute.size(shape[1]),
         headdim_v=cute.size(shape[1]),
@@ -1884,6 +1887,7 @@ def compute_sm100_fmha_varlen_grid(
         tile_shape_mn=tile_shape_mn,
         cluster_shape_mn=(2, 1),
         mCuSeqlensQ=cu_seqlens,
+        is_split_kv=is_split_kv,
     )
     params = SingleTileVarlenScheduler.to_underlying_arguments(args)
     return params, SingleTileVarlenScheduler.get_grid_shape(params)

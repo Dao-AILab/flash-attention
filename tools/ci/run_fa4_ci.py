@@ -16,7 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_TEST_FILTER = ""  # empty = run all; CI overrides via --test-filter
-DEFAULT_TEST_TARGETS = ["tests/cute/test_flash_attn.py", "tests/cute/test_flash_attn_dim512.py"]
+DEFAULT_TEST_TARGETS = [
+    "tests/cute/test_flash_attn.py",
+    "tests/cute/test_flash_attn_mla.py",
+    "tests/cute/test_flash_attn_dim512.py",
+]
 
 
 @dataclass(frozen=True)

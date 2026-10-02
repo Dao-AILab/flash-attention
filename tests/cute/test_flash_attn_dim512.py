@@ -267,7 +267,7 @@ def test_explicit_forward_tile(tile_n):
         torch.randn(1, 193, 2, 512, device="cuda", dtype=torch.bfloat16)
         for _ in range(2)
     ]
-    out, lse, _, _ = _flash_attn_fwd(
+    out, lse, *_ = _flash_attn_fwd(
         q, k, v, causal=True, tile_mn=(128, tile_n), return_lse=True
     )
     ref, ref_lse = reference(q, k, v, causal=True)
@@ -284,7 +284,7 @@ def test_native_output_buffers(dtype, layout):
     torch.manual_seed(901)
     q = torch.randn(1, 137, 4, 512, device="cuda", dtype=dtype)
     k, v = [torch.randn(1, 149, 2, 512, device="cuda", dtype=dtype) for _ in range(2)]
-    out, lse, _, _ = _flash_attn_fwd(q, k, v, causal=True, return_lse=True)
+    out, lse, *_ = _flash_attn_fwd(q, k, v, causal=True, return_lse=True)
     dout = torch.randn_like(out)
 
     def make_buffer(t):
@@ -328,7 +328,7 @@ def test_native_dense_used_lengths(dtype, causal):
     k, v = [torch.randn(2, 149, 2, 512, device="cuda", dtype=dtype) for _ in range(2)]
     uq = torch.tensor([113, 0], device="cuda", dtype=torch.int32)
     uk = torch.tensor([117, 13], device="cuda", dtype=torch.int32)
-    out, lse, _, _ = _flash_attn_fwd(
+    out, lse, *_ = _flash_attn_fwd(
         q, k, v, seqused_q=uq, seqused_k=uk, causal=causal, return_lse=True
     )
     dout = torch.randn_like(q)
@@ -350,7 +350,7 @@ def test_native_window_tile_skipping(dtype, window):
     torch.manual_seed(903)
     q = torch.randn(1, 769, 4, 512, device="cuda", dtype=dtype)
     k, v = [torch.randn(1, 641, 2, 512, device="cuda", dtype=dtype) for _ in range(2)]
-    out, lse, _, _ = _flash_attn_fwd(
+    out, lse, *_ = _flash_attn_fwd(
         q,
         k,
         v,
@@ -699,7 +699,7 @@ def test_dense_inference_without_lse(dtype, causal):
     k, v = [torch.randn(2, 193, 2, 512, device="cuda", dtype=dtype) for _ in range(2)]
     scale = 0.03125
     supplied = torch.empty_like(q)
-    out, lse, _, _ = interface._flash_attn_fwd(
+    out, lse, *_ = interface._flash_attn_fwd(
         q,
         k,
         v,
@@ -826,7 +826,7 @@ def test_native_gradient_write_isolation(dtype, batch, seq, hq, hk, causal, maxs
     torch.manual_seed(921)
     q = torch.randn(batch, seq, hq, 512, device="cuda", dtype=dtype)
     k, v = [torch.randn(batch, seq, hk, 512, device="cuda", dtype=dtype) for _ in range(2)]
-    out, lse, _, _ = _flash_attn_fwd(q, k, v, causal=causal, return_lse=True)
+    out, lse, *_ = _flash_attn_fwd(q, k, v, causal=causal, return_lse=True)
     dout = torch.randn_like(out)
     cache = native._native_cache
     seen = []

@@ -203,6 +203,86 @@ def test_hd256_varlen_maxima(q_lens, k_lens, dtype, max_mode, causal):
     check_against_reference(second, q, k, v, dout, q_lens, k_lens, causal, dtype)
 
 
+@pytest.mark.parametrize("layout", ["packed", "dense", "packed_q"])
+@pytest.mark.parametrize("used", ["q", "k", "qk"])
+@pytest.mark.parametrize("max_mode", ["none", "int"])
+@pytest.mark.parametrize(
+    "dtype, heads_q, heads_kv",
+    [
+        pytest.param(torch.bfloat16, 4, 1, id="bf16_gqa"),
+        pytest.param(torch.float16, 2, 2, id="fp16_mha"),
+    ],
+)
+@CAUSAL
+def test_hd256_seqused_backward(
+    layout,
+    used,
+    max_mode,
+    dtype,
+    heads_q,
+    heads_kv,
+    causal,
+):
+    """Check seqused outputs and gradients across layouts with static and varlen scheduling."""
+    if layout == "dense" and max_mode == "int":
+        pytest.skip("dense integer maxima match shape-derived defaults in max_mode='none'")
+    torch.manual_seed(SEED)
+    packed_q, packed_k = layout != "dense", layout == "packed"
+    q_capacity = (193, 257, 385) if packed_q else (384,) * 3
+    k_capacity = (577, 513, 641) if packed_k else (640,) * 3
+    q_lens = (65, 0, 257) if "q" in used else q_capacity
+    k_lens = (449, 385, 513) if "k" in used else k_capacity
+    if used == "qk":
+        k_lens = (449, 0, 513)
+    cu_q = make_cu_seqlens(q_capacity) if packed_q else None
+    cu_k = make_cu_seqlens(k_capacity) if packed_k else None
+    used_q = torch.tensor(q_lens, device="cuda", dtype=torch.int32) if "q" in used else None
+    used_k = torch.tensor(k_lens, device="cuda", dtype=torch.int32) if "k" in used else None
+    q_shape = (sum(q_capacity),) if packed_q else (len(q_capacity), q_capacity[0])
+    k_shape = (sum(k_capacity),) if packed_k else (len(k_capacity), k_capacity[0])
+    q = torch.randn(*q_shape, heads_q, HEAD_DIM, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(*k_shape, heads_kv, HEAD_DIM, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    dout = torch.randn_like(q)
+
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        seqused_q=used_q,
+        seqused_k=used_k,
+        max_seqlen_q=max(q_capacity) if max_mode != "none" else None,
+        max_seqlen_k=max(k_capacity) if max_mode != "none" else None,
+        causal=causal,
+    )
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+    torch.cuda.synchronize()
+
+    def compact(t, capacity, lengths):
+        batches = t.split(capacity) if t.ndim == 3 else t.unbind(0)
+        return torch.cat([batch[:length] for batch, length in zip(batches, lengths)])
+
+    actual = (
+        compact(out.detach(), q_capacity, q_lens),
+        compact(dq, q_capacity, q_lens),
+        compact(dk, k_capacity, k_lens),
+        compact(dv, k_capacity, k_lens),
+    )
+    check_against_reference(
+        actual,
+        compact(q, q_capacity, q_lens),
+        compact(k, k_capacity, k_lens),
+        compact(v, k_capacity, k_lens),
+        compact(dout, q_capacity, q_lens),
+        q_lens,
+        k_lens,
+        causal,
+        dtype,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Compile-key behaviour: none/cuda share one specialization, int selects another.
 # ---------------------------------------------------------------------------

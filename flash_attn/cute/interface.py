@@ -5,8 +5,8 @@ import os
 import math
 import operator
 import warnings
-from dataclasses import dataclass
-from functools import lru_cache
+from dataclasses import dataclass, replace
+from functools import lru_cache, partial
 from typing import Optional, Tuple, Callable
 
 import torch
@@ -57,8 +57,12 @@ from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
 from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
+from flash_attn.cute.flash_fwd_mla_1cta_sm100 import FlashAttentionMLAForward1CtaSm100
+from flash_attn.cute.flash_fwd_mla_1cta_kb64_sm100 import FlashAttentionMLAForward1CtaKb64Sm100
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
+from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
+from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100_h64 import dQdQvGemmKernelH64
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
 # SM100 head_dim=256 2CTA kernel imports
@@ -176,6 +180,20 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
 
+
+def _fit_sm90_fwd_tile_to_block_sparsity(cfg, sparse_block_size_q, sparse_block_size_kv):
+    """Shrink SM90 forward tiles to fit explicit sparse blocks.
+
+    Sparse Q blocks may span multiple M tiles, but SM90 requires tile_n to match the
+    sparse KV block. Unsupported sizes are rejected by normalize_block_sparse_config.
+    """
+    tile_m, tile_n = cfg.m_block_size, cfg.n_block_size
+    if sparse_block_size_q % tile_m != 0 and sparse_block_size_q % 64 == 0:
+        tile_m = 64
+    if sparse_block_size_kv < tile_n and sparse_block_size_kv % 16 == 0:
+        tile_n = sparse_block_size_kv
+    return FwdConfig(tile_m, tile_n, cfg.mma_pv_is_rs, cfg.intra_wg_overlap)
+
 @dataclass(frozen=True)
 class BwdConfig:
     m_block_size: int
@@ -287,6 +305,11 @@ torch2cute_dtype_map = {
 _LEARNABLE_SINK_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
+def _compile_options(ptxas_options: str = "") -> str:
+    """cute.compile options; ptxas_options is a kernel class's `ptxas_options` attribute."""
+    return "--enable-tvm-ffi" + (f" --ptxas-options '{ptxas_options}'" if ptxas_options else "")
+
+
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if num_n_blocks <= 4:
@@ -359,6 +382,10 @@ def _get_fwd_config(
             cfg = _tile_size_fwd_sm90(
                 head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q
             )
+            if block_sparse_tensors is not None and block_sparse_tensors.block_size is not None:
+                cfg = _fit_sm90_fwd_tile_to_block_sparsity(
+                    cfg, sparse_q, block_sparse_tensors.block_size[1]
+                )
     else:
         cfg = FwdConfig(tile_mn[0], tile_mn[1], cfg.mma_pv_is_rs, cfg.intra_wg_overlap)
 
@@ -394,6 +421,11 @@ def _get_fwd_config(
     )
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
+    if arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256:
+        # The dedicated hd256 kernel never packs GQA and runs one 2CTA cluster per
+        # 2 * tile_m Q rows of each Q head: count its CTAs.
+        num_clusters_m = cute.ceil_div(max_seqlen_q, 2 * tile_m)
+        total_mblocks = 2 * batch_size * num_head_kv * qhead_per_kvhead * num_clusters_m
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = None
     if arch // 10 == 12:
@@ -551,6 +583,112 @@ def _compute_blocks_to_batch(cu_total_blocks, num_blocks, device):
 _compute_blocks_to_batch.compile_cache = get_jit_cache("blocks_to_batch")
 
 
+def _mla_1cta_route(
+    is_topk_gather, nheads_per_kv, requires_grad, gather_bwd_recompute_p, *,
+    seqlen_q_hint, needs_1cta, split_kv=False, ctas_2cta=None, num_sms=None,
+):
+    """Whether an MLA call runs the 1CTA (tcgen05.mma.ws) kernel rather than the 2CTA one.
+
+    Support: dense MLA at any shape; sparse up to 64 Q heads (one 64-row tile per token),
+    training only with recompute-P (the 1CTA forward emits no P / row_max).
+
+    Heuristic (measurements: AI/SPARSE_MLA_1CTA.md "Dispatch heuristic"):
+      - fp8, descales or explicit split-KV (needs_1cta; 2CTA has none) -> 1CTA.
+      - One-wave rule: 2CTA spends 2 CTAs on each token (sparse) or batch element (dense
+        decode), ctas_2cta in all; 1CTA beats it only once that exceeds one wave of num_sms.
+      - Sparse -> the one-wave rule.
+      - Dense with the split heuristic (split_kv) -> 1CTA provisionally: the caller sizes the
+        split for 1CTA and asks again with split_kv=False if that gives too few splits.
+      - Dense unsplit -> the one-wave rule on decode shapes (seqlen_q x heads per KV head
+        <= 64), else 2CTA. Varlen without a host max_seqlen_q counts as prefill.
+    FLASH_ATTENTION_MLA_1CTA=1 / 0 overrides it (1: wherever supported; 0: never).
+    """
+    supported = not is_topk_gather or (
+        nheads_per_kv <= 64 and (not requires_grad or gather_bwd_recompute_p)
+    )
+    override = os.environ.get("FLASH_ATTENTION_MLA_1CTA")
+    if override is not None:
+        return override == "1" and supported
+    if not supported:
+        return False
+    if needs_1cta:
+        return True
+    past_one_wave = ctas_2cta is None or num_sms is None or ctas_2cta > num_sms
+    if is_topk_gather:
+        return past_one_wave
+    if split_kv:
+        return True
+    if seqlen_q_hint is None or seqlen_q_hint * nheads_per_kv > 64:
+        return False
+    return past_one_wave
+
+def _mla_fwd_plan(
+    cfg, mla_1cta, route, *, num_splits, is_topk_gather, is_fp8, nheads_per_kv, num_head_kv,
+    seqlen_q_hint, rows_per_token, max_seqlen_q, max_seqlen_k, batch_size, total_q, tile_mn,
+    num_sms,
+):
+    """(mla_1cta, kernel class, config) for an MLA forward, on top of the generic config
+    (computed unsplit). The 2CTA kernel takes it as is (it never splits: hdimv 512). 1CTA
+    runs the kb64 mainloop where it applies (Kb64.can_implement), else the 128-key one, with
+    its own split count.
+
+    With the split heuristic (num_splits < 1) dense MLA is routed 1CTA provisionally; if the
+    split is too small for 1CTA to beat 2CTA -- 2 splits on kb64, about 5 on the 128-key
+    mainloop (AI/SPARSE_MLA_1CTA.md "Auto split") -- it is routed again unsplit.
+    """
+    Kb64 = FlashAttentionMLAForward1CtaKb64Sm100
+    kb64_ok = Kb64.can_implement(
+        is_topk_gather=is_topk_gather, is_fp8=is_fp8, nheads_per_kv=nheads_per_kv,
+        num_head_kv=num_head_kv, seqlen_q_hint=seqlen_q_hint,
+    )
+    if is_topk_gather and num_splits > 1:
+        raise ValueError(
+            f"num_splits={num_splits} is not supported with gather_kv_indices "
+            "(sparse MLA runs without split-KV)"
+        )
+
+    def plan(mla_1cta):
+        if not mla_1cta:
+            return FlashAttentionMLAForwardSm100, cfg
+        cls = Kb64 if kb64_ok else FlashAttentionMLAForward1CtaSm100
+        if kb64_ok:  # one token per 64-row tile (heads padded to 64), 64-key blocks
+            tile_m, tile_n = Kb64.TILE_MN if is_topk_gather or tile_mn is None else tile_mn
+            q_stage, token_rows = 1, Kb64.TILE_MN[0]
+            min_blocks = Kb64.MIN_BLOCKS_PER_SPLIT
+        else:
+            tile_m, tile_n, q_stage = cfg.m_block_size, cfg.n_block_size, cfg.q_stage
+            token_rows, min_blocks = rows_per_token, 1
+        splits = 1 if is_topk_gather else num_splits
+        if splits < 1:
+            num_n_blocks = cute.ceil_div(max_seqlen_k, tile_n)
+            # Tiles per KV head: at most batch x ceil(max rows / tile), and at most the token
+            # rows plus one partial tile per extra sequence (varlen without a host max_seqlen_q
+            # has max_seqlen_q = total_q, which only bounds a single sequence). Whole-token
+            # tiles (kb64: one token per tile) have no partial tiles.
+            m_rows = q_stage * tile_m
+            partial = 0 if token_rows % m_rows == 0 else batch_size - 1
+            num_tiles = num_head_kv * min(
+                batch_size * cute.ceil_div(max_seqlen_q * token_rows, m_rows),
+                cute.ceil_div(total_q * token_rows, m_rows) + partial,
+            )
+            max_splits = min(128, max(1, num_n_blocks // min_blocks))
+            splits = num_splits_heuristic(num_tiles, num_sms, num_n_blocks, max_splits)
+        return cls, replace(
+            cfg, m_block_size=tile_m, n_block_size=tile_n, q_stage=q_stage, num_splits=splits
+        )
+
+    cls, cfg_mla = plan(mla_1cta)
+    if (
+        mla_1cta and num_splits < 1 and not is_topk_gather
+        and cfg_mla.num_splits < (2 if cls is Kb64 else 5)
+    ):
+        mla_1cta = route(split_kv=False)
+        if not mla_1cta:
+            cls, cfg_mla = plan(False)
+    return mla_1cta, cls, cfg_mla
+
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -593,7 +731,9 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[
+    torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
+]:
     """Forward pass for FlashAttention.
 
     Args:
@@ -616,9 +756,13 @@ def _flash_attn_fwd(
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
+    # MLA needs K and V to share one descale tensor: check identity before maybe_contiguous
+    kv_descale_shared = k_descale is not None and k_descale is v_descale
     q_descale, k_descale, v_descale = [
         maybe_contiguous(t, align_bytes=4) for t in (q_descale, k_descale, v_descale)
     ]
+    if kv_descale_shared:
+        v_descale = k_descale
     page_table = maybe_contiguous(page_table, align_bytes=4)
     learnable_sink = maybe_contiguous(learnable_sink, align_bytes=4)
     gather_kv_indices = maybe_contiguous(gather_kv_indices, align_bytes=16)
@@ -725,8 +869,6 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
-    if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and requires_grad:
@@ -753,7 +895,8 @@ def _flash_attn_fwd(
             out_torch_dtype,
             device,
         )
-        validate_output_layout(out, "out", align_bytes=16)
+        out_align_bytes = 32 if head_dim_v == 512 else 16
+        validate_output_layout(out, "out", align_bytes=out_align_bytes)
 
     if lse is None:
         lse = (
@@ -774,7 +917,7 @@ def _flash_attn_fwd(
                 # Empty rows have lse == sink (see softmax.apply_learnable_sink). Heads are the
                 # last dim for the qv layout (lse_shape above) and second-to-last otherwise.
                 lse.copy_(learnable_sink if qv is not None else learnable_sink[:, None])
-        return out, lse, None, None
+        return out, lse, None, None, None
 
     if arch // 10 == 10 and qv is None and head_dim == head_dim_v == 512:
         if any(x is not None for x in (
@@ -808,7 +951,7 @@ def _flash_attn_fwd(
         ):
             from flash_attn.cute.flash_fwd_sm100_hd512 import forward_sm100_d512
             forward_sm100_d512(q, k, v, out, lse, softmax_scale, causal, arch=arch)
-            return out, lse, None, None
+            return out, lse, None, None, None
         for start in range(0, 512, 256):
             _flash_attn_fwd(
                 q, k, v[..., start:start + 256],
@@ -824,7 +967,7 @@ def _flash_attn_fwd(
                 return_lse=return_lse, out=out[..., start:start + 256], lse=lse,
                 disable_scheduler_metadata=True,
             )
-        return out, lse, None, None
+        return out, lse, None, None, None
 
     if is_fp8:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
@@ -870,14 +1013,51 @@ def _flash_attn_fwd(
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
-        # Bound each sequence by its page-table row, not the shared pool.
+        # Bound by the page-table row, not the shared pool.
         max_seqlen_k = (
             page_table.shape[1] * page_size
-            if use_dedicated_hd256_kernel and page_table is not None
+            if page_table is not None
             else seqlen_k
         )
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
+    # Separate use of provided and replacement max_seqlen_q as host-side hint.
+    seqlen_q_hint = seqlen_q if cu_seqlens_q is None else max_seqlen_q
+    seqlen_q_known = seqlen_q if cu_seqlens_q is None else host_max_seqlen_q
+
+    # MLA (qv): 1CTA or 2CTA kernel. Decided here: the sparse head padding below and the
+    # MLA plan (_mla_fwd_plan) depend on it.
+    mla_route = partial(
+        _mla_1cta_route,
+        gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p,
+        seqlen_q_hint=seqlen_q_hint,
+        needs_1cta=(
+            v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            or any(t is not None for t in (q_descale, k_descale, v_descale))
+            or num_splits > 1
+        ),
+        # 2CTA tiles: one per token (sparse) or per batch element (dense decode), 2 CTAs each
+        ctas_2cta=2 * num_head_kv * (total_q if gather_kv_indices is not None else batch_size),
+        num_sms=get_num_sms_for_selection(v.device.index, arch),
+    )
+    # num_splits < 1 (the split heuristic): 1CTA provisionally, re-decided after planning
+    num_splits_auto = num_splits < 1
+    mla_1cta = qv is not None and mla_route(split_kv=num_splits_auto)
+    
+    # Sparse MLA pads a token's heads to the kernel's tile (pack_gqa.qheads_first_tma_view); the
+    # kernel takes the real count, the interface needs the tile width for its grid math.
+    nheads_per_kv = qhead_per_kvhead
+    if qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
+        assert num_head_kv == 1, "sparse MLA requires a single KV head"
+        qhead_per_kvhead = sparse_mla_qhead_tile(
+            qhead_per_kvhead,
+            min_tile=(
+                FlashAttentionMLAForward1CtaSm100 if mla_1cta else FlashAttentionMLAForwardSm100
+            ).SPARSE_HEAD_TILE,
+        )
+        pack_gqa = True
+    if pack_gqa is None:
+        pack_gqa = qhead_per_kvhead > 1
 
     if use_dedicated_hd256_kernel and page_table is not None:
         # The kernel derives KV capacity from the page-table width. Normalize
@@ -913,7 +1093,7 @@ def _flash_attn_fwd(
         pack_gqa=pack_gqa,
         batch_size=batch_size,
         num_head_kv=num_head_kv,
-        num_splits=num_splits,
+        num_splits=num_splits if qv is None else 1,  # MLA: split by _mla_fwd_plan
         device=device,
         seqlen_q=seqlen_q,
         tile_mn=tile_mn,
@@ -921,6 +1101,25 @@ def _flash_attn_fwd(
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
     )
+    mla_fwd_cls = None
+    if qv is not None:
+        mla_1cta, mla_fwd_cls, fwd_cfg = _mla_fwd_plan(
+            fwd_cfg, mla_1cta, mla_route,
+            num_splits=num_splits,
+            is_topk_gather=gather_kv_indices is not None,
+            is_fp8=is_fp8,
+            nheads_per_kv=nheads_per_kv,
+            num_head_kv=num_head_kv,
+            seqlen_q_hint=seqlen_q_hint,
+            rows_per_token=qhead_per_kvhead if pack_gqa else 1,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            batch_size=batch_size,
+            total_q=total_q,
+            tile_mn=tile_mn,
+            num_sms=get_num_sms_for_selection(device.index, arch),
+        )
+    mla_1cta_kb64 = mla_fwd_cls is FlashAttentionMLAForward1CtaKb64Sm100
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     q_stage = fwd_cfg.q_stage
     num_splits = fwd_cfg.num_splits
@@ -933,7 +1132,15 @@ def _flash_attn_fwd(
     is_split_kv = num_splits > 1
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
-        lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+        # Combine needs LSE partials seqlen-contiguous, (..., h, s); the MLA kernels take
+        # (..., s, h) modes, so they get a transposed view (their LSE writes are scatters).
+        lse_partial_shape = (
+            lse_shape
+            if qv is None
+            else ((batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q))
+        )
+        lse_partial = torch.empty(num_splits, *lse_partial_shape, dtype=torch.float32, device=device)
+        lse_partial_kernel = lse_partial if qv is None else lse_partial.transpose(-1, -2)
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
@@ -1029,15 +1236,37 @@ def _flash_attn_fwd(
         assert head_dim_v == 512
         assert q is None or head_dim == 64
         assert not local, "local not yet supported with qv"
-        assert q_descale is None and k_descale is None and v_descale is None, (
-            "q_descale/k_descale/v_descale are not yet supported with qv"
-        )
-        assert tile_n == 128
+        if not mla_1cta:
+            assert q_descale is None and k_descale is None and v_descale is None, (
+                "q_descale/k_descale/v_descale with qv are only supported by the 1CTA "
+                "MLA kernel (FLASH_ATTENTION_MLA_1CTA=1)"
+            )
+        elif q is not None and (k_descale is not None or v_descale is not None):
+            # one tensor, not equal values: comparing values would sync the device
+            assert k_descale is not None and v_descale is not None, (
+                "MLA absorbed needs k_descale and v_descale together (or neither)"
+            )
+            assert kv_descale_shared, (
+                "MLA absorbed requires k_descale and v_descale to be the same tensor: "
+                "Q@K^T and Qv@V^T share one accumulator, so one descale must fold into "
+                "the softmax scale"
+            )
+        elif k_descale is not None:
+            # without a rope part S = Qv @ V^T only: the latent cache's descale is v_descale
+            assert kv_descale_shared, (
+                "MLA without q / k (no rope part) reads the latent cache as v: pass its "
+                "descale as v_descale (k_descale, if given, must be the same tensor)"
+            )
+        assert tile_n == (64 if mla_1cta_kb64 else 128)
 
-        assert not is_split_kv, "split kv not supported with qv"
+        assert not is_split_kv or mla_1cta, (
+            "split kv with qv is only supported by the 1CTA MLA kernel "
+            "(FLASH_ATTENTION_MLA_1CTA=1)"
+        )
         assert softcap is None
         assert score_mod is None
         assert mask_mod is None
+        assert block_sparse_tensors is None, "block sparsity is not supported with qv"
 
         if page_table is not None:
             assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
@@ -1071,17 +1300,23 @@ def _flash_attn_fwd(
                 row_max = torch.empty(total_q, gather_kv_length//128, num_head, dtype=torch.float32, device=device)
         else:
             p = row_max = None
+        # Rounding residual fp32(O) - bf16(O), saved so the backward forms dpsum from a
+        # near-fp32 O. See AI/SPARSE_MLA_DPSUM_PRECISION.md.
+        o_lo = torch.empty_like(out) if requires_grad and sparse_kv else None
     else:
         assert gather_kv_indices is None, "gather_kv_indices is only supported with qv"
         gather_kv_length = None
         sparse_kv = None
         disable_sparse_kv_bitmask = None
-        p = row_max = None
+        p = row_max = o_lo = None
 
 
     reuse_scheduler_metadata = scheduler_metadata is not None
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
     cluster_shape_m = 2 if use_2cta_instrs else 1
+    if qv is not None:
+        # the MLA kernels write all num_splits partials (no per-batch dynamic split counts)
+        assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
     if use_dedicated_hd256_kernel:
         # The hd=256 2CTA fwd kernel does not support the dynamic-persistent scheduler.
         scheduler_metadata = None
@@ -1092,6 +1327,7 @@ def _flash_attn_fwd(
         and scheduler_metadata is None
         and not disable_scheduler_metadata
         and not use_dedicated_hd256_kernel
+        and qv is None
     ):
         scheduler_metadata = _get_scheduler_metadata(
             num_batch=batch_size,
@@ -1157,6 +1393,7 @@ def _flash_attn_fwd(
         and use_single_tile_varlen_scheduler
         and batch_size > BIN_BATCH_SEARCH_THRESH
         and not use_dedicated_hd256_kernel
+        and qv is None
     )
     if (
         use_cu_hint
@@ -1217,11 +1454,34 @@ def _flash_attn_fwd(
         )
     )
 
+    # Sparse-MLA training uses the exact running max: the lazy rescale (threshold 8) leaves a
+    # coherent bf16 gain error on peaked rows. See AI/SPARSE_MLA_EXACT_SOFTMAX_MAX.md.
+    mla_fwd_rescale_threshold = 0.0 if (requires_grad and sparse_kv) else 8.0
+
+    if mla_1cta:  # the 1CTA MLA kernels own their CLC policy
+        use_clc_scheduler = mla_fwd_cls.use_clc(
+            is_topk_gather=bool(sparse_kv),
+            seqlen_q_hint=seqlen_q_known,
+            clc_default=use_clc_scheduler if use_clc_scheduler is not None else True,
+        )
+    mla_1cta_s_ahead = mla_1cta and mla_fwd_cls.use_s_ahead(
+        is_fp8=is_fp8, seqlen_q_hint=seqlen_q_known, nheads=nheads_per_kv
+    )
+
+    paged_kv_tma = (
+        None if page_table is None
+        else page_size % 64 == 0 if mla_1cta_kb64
+        else page_size == tile_n
+    )
+    
     compile_key = (
+        mla_1cta,
+        mla_1cta_kb64,
+        mla_1cta_s_ahead if mla_1cta else None,
         dtype,
         head_dim,
         head_dim_v,
-        qhead_per_kvhead,
+        nheads_per_kv,  # the real count; qhead_per_kvhead must follow from the key
         causal,
         score_mod_hash,
         mask_mod_hash,
@@ -1255,7 +1515,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        page_size not in [None, tile_n],  # paged KV non-TMA
+        paged_kv_tma,
         use_2cta_instrs,
         q_subtile_factor,
         kv_subtile_factor,
@@ -1263,6 +1523,8 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         use_clc_scheduler,
         num_splits_dynamic is not None,
+        mla_fwd_rescale_threshold,
+        o_lo is not None,
         virtual_batch_idx is not None,
         num_nheads_in_l2 is not None,
         tile_count_semaphore is not None,
@@ -1301,11 +1563,19 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
-        q_tensor, k_tensor, v_tensor, o_tensor = [
-            to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
-        ]
+        q_tensor, k_tensor, v_tensor = [to_cute_tensor(t) for t in (q, k, v)]
+        o_align = 32 if head_dim_v == 512 else 16
+        o_tensor = to_cute_tensor(out if not is_split_kv else out_partial, assumed_align=o_align)
         if is_split_kv:
-            lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
+            # MLA: the transposed lse_partial view, whose seqlen mode is the contiguous one
+            lse_tensor = (
+                to_cute_tensor(lse_partial, assumed_align=4)
+                if qv is None
+                else to_cute_tensor(
+                    lse_partial_kernel, assumed_align=4,
+                    leading_dim=lse_partial_kernel.ndim - 2,
+                )
+            )
         else:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
@@ -1359,6 +1629,7 @@ def _flash_attn_fwd(
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices)
         p_tensor = to_cute_tensor(p)
         row_max_tensor = to_cute_tensor(row_max)
+        o_lo_tensor = to_cute_tensor(o_lo, assumed_align=o_align)
 
         if arch // 10 == 8:
             assert page_table is None, "paged KV not supported on SM 8.0"
@@ -1406,21 +1677,75 @@ def _flash_attn_fwd(
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
-                paged_kv_cpasync = page_table is not None and page_size != tile_n
                 has_qk = q is not None
-                fa_fwd = FlashAttentionMLAForwardSm100(
-                    is_causal=causal,
-                    use_cpasync_load_KV=sparse_kv or paged_kv_cpasync,
-                    topk_length=gather_kv_length,
-                    is_topk_gather=sparse_kv,
-                    pack_gqa=pack_gqa,
-                    qhead_per_kvhead=qhead_per_kvhead,
-                    nheads_kv=num_head_kv,
-                    has_seqused_q=seqused_q is not None,
-                    has_cu_seqlens_q=cu_seqlens_q is not None,
-                    disable_bitmask=disable_sparse_kv_bitmask,
-                    has_qk=has_qk,
-                )
+                if mla_1cta:
+                    # 1CTA (tcgen05.mma.ws) MLA kernel; support and routing: _mla_1cta_route
+                    for feat, name in [
+                        (p is not None, "P emission"),
+                        (row_max is not None, "row_max emission"),
+                        (local, "local attention"),
+                    ]:
+                        assert not feat, f"1CTA MLA kernel does not support {name}"
+                    if sparse_kv:
+                        assert gather_kv_indices.dtype == torch.int32, (
+                            "gather_kv_indices must be int32"
+                        )
+                    if mla_1cta_kb64:
+                        fa_fwd = FlashAttentionMLAForward1CtaKb64Sm100(
+                            is_causal=causal,
+                            qhead_per_kvhead=nheads_per_kv,
+                            nheads_kv=num_head_kv,
+                            hdim=head_dim,
+                            hdimv=head_dim_v,
+                            use_clc_scheduler=use_clc_scheduler,
+                            has_qk=has_qk,
+                            has_seqused_q=seqused_q is not None,
+                            has_cu_seqlens_q=cu_seqlens_q is not None,
+                            topk_length=gather_kv_length if sparse_kv else 0,
+                            rescale_threshold=mla_fwd_rescale_threshold,
+                            is_topk_gather=bool(sparse_kv),
+                            is_split_kv=is_split_kv,
+                            paged_kv_tma=paged_kv_tma,
+                        )
+                    else:
+                        fa_fwd = FlashAttentionMLAForward1CtaSm100(
+                            is_causal=causal,
+                            # the REAL head count: sparse pads to the 64-row tile in-kernel
+                            qhead_per_kvhead=nheads_per_kv,
+                            nheads_kv=num_head_kv,
+                            hdim=head_dim,
+                            hdimv=head_dim_v,
+                            use_clc_scheduler=use_clc_scheduler,
+                            has_qk=has_qk,
+                            pack_gqa=pack_gqa,
+                            has_seqused_q=seqused_q is not None,
+                            has_cu_seqlens_q=cu_seqlens_q is not None,
+                            # picks the KV loader (TMA, or cp.async for partial-block pages)
+                            page_size=page_size if page_table is not None else None,
+                            is_split_kv=is_split_kv,
+                            is_fp8=is_fp8,
+                            is_topk_gather=sparse_kv,
+                            topk_length=gather_kv_length if sparse_kv else 0,
+                            rescale_threshold=mla_fwd_rescale_threshold,
+                            s_ahead=mla_1cta_s_ahead,
+                        )
+                else:
+                    fa_fwd = FlashAttentionMLAForwardSm100(
+                        is_causal=causal,
+                        use_cpasync_load_KV=sparse_kv or (
+                            page_table is not None and page_size != tile_n
+                        ),
+                        topk_length=gather_kv_length,
+                        is_topk_gather=sparse_kv,
+                        pack_gqa=pack_gqa,
+                        qhead_per_kvhead=nheads_per_kv,
+                        nheads_kv=num_head_kv,
+                        has_seqused_q=seqused_q is not None,
+                        has_cu_seqlens_q=cu_seqlens_q is not None,
+                        disable_bitmask=disable_sparse_kv_bitmask,
+                        has_qk=has_qk,
+                        rescale_threshold=mla_fwd_rescale_threshold,
+                    )
             else:
                 if use_dedicated_hd256_kernel:
                     # hd=256 2CTA forward: check for currently unsupported features
@@ -1515,11 +1840,13 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 gather_kv_indices_tensor,
                 page_table_tensor,
+                descale_tensors_tensor,
                 window_size_left,
                 window_size_right,
                 learnable_sink=learnable_sink_tensor,
+                mOlo=o_lo_tensor,
                 stream=current_stream,
-                options="--enable-tvm-ffi",
+                options=_compile_options(fa_fwd.ptxas_options),
             )
         else:
             compile_args = [
@@ -1592,8 +1919,8 @@ def _flash_attn_fwd(
                 qv_call,
                 k_call,
                 v_call,
-                out.detach(),
-                lse,
+                out.detach() if not is_split_kv else out_partial,
+                lse_partial_kernel if is_split_kv else lse,
                 softmax_scale,
                 p,
                 row_max,
@@ -1603,9 +1930,11 @@ def _flash_attn_fwd(
                 seqused_k,
                 gather_kv_indices,
                 page_table,
+                descale_tensors,
                 window_size_left,
                 window_size_right,
                 learnable_sink,
+                o_lo,
             )
         else:
             call_args = [
@@ -1665,23 +1994,35 @@ def _flash_attn_fwd(
                 ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
+        # Combine writes a seqlen-contiguous LSE. The MLA LSE is (..., s, h) contiguous, so
+        # it goes through a seqlen-major staging buffer, copied back below (b*s*h floats).
+        lse_combine = None
+        if lse is not None:
+            if qv is None:
+                lse_combine = lse.transpose(-1, -2)
+            else:
+                lse_combine = torch.empty(
+                    lse.transpose(-1, -2).shape, dtype=lse.dtype, device=lse.device
+                ).transpose(-1, -2)
         _flash_attn_fwd_combine(
             out_partial,
             lse_partial.transpose(-1, -2),
             out,
-            lse.transpose(-1, -2) if lse is not None else None,
+            lse_combine,
             cu_seqlens_q,
             seqused_q,
             num_splits_dynamic_ptr=num_splits_dynamic if has_scheduler_metadata else None,
             virtual_batch_idx=virtual_batch_idx if has_scheduler_metadata else None,
             _arch=arch,
         )
+        if lse is not None and qv is not None:
+            lse.copy_(lse_combine)
     if reuse_scheduler_metadata and tile_count_semaphore is not None:
         # TODO: pass tile_count_semaphore to the combine kernel and zero it there when
         # is_split_kv (using CTA 0, since a later CTA may have exited prematurely), so
         # that this host-side zeroing is only needed when is_split_kv=False.
         tile_count_semaphore.zero_()
-    return out, lse, p, row_max
+    return out, lse, p, row_max, o_lo
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
@@ -1755,6 +2096,7 @@ def _compile_bwd_preprocess(
     nheads_kv,
     has_cu_total_m_blocks,
     hdim_multiple_of,
+    has_o_lo=False,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1771,6 +2113,7 @@ def _compile_bwd_preprocess(
     mScaleP = fake_tensor(Float32, mScaleP.shape, divisibility=1) if has_scaleP else None
     softmax_scale = Float32(1.0)
     mCuTotalMBlocks = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cu_total_m_blocks else None
+    mOlo = fake_tensor(dtype, mO.shape, divisibility=128 // dtype.width) if has_o_lo else None
     fa_bwd_pre = FlashAttentionBackwardPreprocess(
         dtype, head_dim, head_dim_v, m_block_size,
         use_padded_offsets=use_padded_offsets,
@@ -1782,7 +2125,7 @@ def _compile_bwd_preprocess(
     )
     return cute.compile(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
-        mRowMax, mScaleP, softmax_scale, mCuTotalMBlocks,
+        mRowMax, mScaleP, softmax_scale, mCuTotalMBlocks, mOlo,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1802,10 +2145,14 @@ def _bwd_preprocess(
     softmax_scale=1.0,   # only used with scale_p
     cu_total_m_blocks=None,
     hdim_multiple_of=32,
+    o_lo=None,
     *,
     fake_mode,
 ):
-    """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
+    """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
+
+    If o_lo (the bf16 rounding residual of out) is given, dpsum is formed from out + o_lo.
+    """
     if row_max is not None:
         assert scale_p is not None
         # scale_p (load-p) mode and lse_log2 (recompute-P) mode are mutually
@@ -1841,13 +2188,14 @@ def _bwd_preprocess(
         nheads_kv,
         cu_total_m_blocks is not None,
         hdim_multiple_of,
+        o_lo is not None,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
     if not fake_mode:
         _bwd_preprocess.compile_cache[compile_key](
             out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse,
-            row_max, scale_p, softmax_scale, cu_total_m_blocks,
+            row_max, scale_p, softmax_scale, cu_total_m_blocks, o_lo,
         )
 
 
@@ -2649,8 +2997,6 @@ def _flash_attn_bwd(
                     "SM100 backward with head_dim=256 does not support block sparsity"
                 assert dlse is None, \
                     "SM100 backward with head_dim=256 does not support dlse"
-                assert seqused_q is None and seqused_k is None, \
-                    "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
 
                 dq_tile_mn = (128, 128)
                 dkdv_tile_mn = (128, 64)
@@ -2911,6 +3257,7 @@ def _flash_attn_bwd_sparse_mla(
     dqv: Optional[torch.Tensor] = None,
     recompute_p: bool = False,
     token_chunk: Optional[int] = None,
+    o_lo: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
@@ -2928,7 +3275,14 @@ def _flash_attn_bwd_sparse_mla(
     nheads_kv, head_dim_v = v.shape[-2:]
     qhead_per_kvhead = nheads // nheads_kv
     gather_kv_length = gather_kv_indices.shape[-1]
-    assert nheads_kv == 1 and qhead_per_kvhead == 128, f"sparse MLA bwd: only MQA 128 supported for now"
+    assert nheads_kv == 1, "sparse MLA bwd: MQA only"
+    # Backward head padding: see pack_gqa.qheads_first_tma_view. The kernel takes the real
+    # count; the interface needs the tile width for the dPsum/scaleP buffers.
+    qhead_tile = sparse_mla_qhead_tile(qhead_per_kvhead, min_tile=64)
+    pad_qheads = qhead_tile != qhead_per_kvhead
+    # 64-row recompute-P tiles (1..64 heads): the main kernel also computes and scatters dK_rope
+    # (AI/SPARSE_MLA_64H.md).
+    fuse_dk_rope = recompute_p and q is not None and k is not None and qhead_tile == 64
     assert gather_kv_length % 128 == 0, f"sparse MLA bwd: {gather_kv_length=} must be divisible by 128"
     assert deterministic is False, "sparse MLA bwd: deterministic mode not yet supported"
     assert seqused_q is None and seqused_k is None, "sparse MLA bwd: seqused_q,k not yet supported"
@@ -2939,10 +3293,12 @@ def _flash_attn_bwd_sparse_mla(
             else 1.0 / math.sqrt(head_dim + head_dim_v)
         )
 
-    q, k, v, qv, out, dout, lse, p, row_max = [
+    q, k, v, qv, out, dout, lse, p, row_max, o_lo = [
         maybe_contiguous(t)
-        for t in (q, k, v, qv, out, dout, lse, p, row_max)
+        for t in (q, k, v, qv, out, dout, lse, p, row_max, o_lo)
     ]
+    if o_lo is not None:
+        _validate_tensor(o_lo, "o_lo", out.shape, out.dtype, v.device)
     gather_kv_indices, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink = [
         maybe_contiguous(t)
         for t in (gather_kv_indices, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
@@ -3021,6 +3377,9 @@ def _flash_attn_bwd_sparse_mla(
 
     device = v.device
     dtype = v.dtype
+    # The dK kernel is bf16-only (flash_bwd_mla_dk_sm100.ab_dtype); fail before launching
+    # the preprocess and main backward instead of mid-way through.
+    assert k is None or dtype == torch.bfloat16, "sparse MLA dK requires bfloat16"
     if q is not None:
         _validate_tensor(dq, "dq", q.shape, dtype, device)
     if k is not None:
@@ -3030,17 +3389,17 @@ def _flash_attn_bwd_sparse_mla(
     if p is not None:
         _validate_tensor(p, "p", p_shape, dtype, device)
 
-    if cu_seqlens_q is None:
-        dpsum = torch.empty(batch_size, seqlen_q, nheads, dtype=torch.float32, device=device)
-    else:
-        dpsum = torch.empty(total_q, nheads, dtype=torch.float32, device=device)
+    # Finite tile-width padding: see pack_gqa.qheads_first_tma_view.
+    heads_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
+    alloc = torch.zeros if pad_qheads else torch.empty
+    dpsum = alloc(*heads_shape, qhead_tile, dtype=torch.float32, device=device)
     if recompute_p:
         scale_p = None
-        # lse in log2 units, written by the preprocess; consumed by the main
-        # bwd kernel to recompute P = exp2(scale_log2 * S - lse_log2).
-        lse_log2 = torch.empty_like(dpsum)
+        # lse in log2 units (from the preprocess) to recompute P = exp2(scale_log2*S - lse_log2).
+        # Padded head columns hold +inf: S = 0 there, so P = 0 exactly (garbage could be NaN).
+        lse_log2 = torch.full_like(dpsum, float("inf")) if pad_qheads else torch.empty_like(dpsum)
     else:
-        scale_p = torch.empty_like(row_max)
+        scale_p = alloc(*row_max.shape[:-1], qhead_tile, dtype=torch.float32, device=device)
         lse_log2 = None
 
     dtype = torch2cute_dtype_map[dout.dtype]
@@ -3051,18 +3410,22 @@ def _flash_attn_bwd_sparse_mla(
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), and scale_p (default
     # mode) or lse_log2 (recompute_p mode).
+    # Padded counts use trivial packing: not all head counts divide the 128-row tile.
+    # Non-power-of-two tiles (e.g. 48 rows for 24 heads) produced incorrect dpsum.
     _bwd_preprocess(
-        out, dout, dpsum, lse, lse_log2, None,
+        out, dout, dpsum[..., :nheads], lse,
+        lse_log2[..., :nheads] if lse_log2 is not None else None, None,
         cu_seqlens_q, seqused_q, None,
         dtype, head_dim, head_dim_v, m_block_size,
         row_max=row_max,
-        scale_p=scale_p,
+        scale_p=scale_p[..., :nheads] if scale_p is not None else None,
         use_padded_offsets=False,
         nheads_major=True,
         pack_gqa=True,
-        qhead_per_kvhead=qhead_per_kvhead,
-        nheads_kv=nheads_kv,
+        qhead_per_kvhead=1 if pad_qheads else qhead_per_kvhead,
+        nheads_kv=nheads if pad_qheads else nheads_kv,
         softmax_scale=softmax_scale,
+        o_lo=o_lo,
         fake_mode=fake_mode,
     )
 
@@ -3106,9 +3469,11 @@ def _flash_attn_bwd_sparse_mla(
             q_tensor,
             k_tensor,
             lse_log2_tensor,
+            dk_tensor,
          ) = [
             to_cute_tensor(t)
-            for t in (v, qv, dout, p, scale_p, dpsum, ds, dv, gather_kv_indices, q_kernel, k_kernel, lse_log2)
+            for t in (v, qv, dout, p, scale_p, dpsum, ds, dv, gather_kv_indices, q_kernel, k_kernel, lse_log2,
+                      dk if fuse_dk_rope else None)
         ]
 
         fa_bwd_obj = FlashAttentionSparseMLABackwardSm100(
@@ -3135,12 +3500,13 @@ def _flash_attn_bwd_sparse_mla(
             q_tensor,
             k_tensor,
             lse_log2_tensor,
+            dk_tensor,
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
             current_stream,
-            options="--enable-tvm-ffi",
+            options=_compile_options(FlashAttentionSparseMLABackwardSm100.ptxas_options),
         )
         _flash_attn_bwd_sparse_mla.compile_cache[compile_key] = fa_bwd_kernel
 
@@ -3184,6 +3550,7 @@ def _flash_attn_bwd_sparse_mla(
         # would unmask entries the forward masked (in load-p mode those entries
         # carry p = 0 and the relaxation is harmless).
         v_mk, dv_mk, k_mk = v, dv, k_kernel
+        dk_mk = dk if fuse_dk_rope else None
         cu_seqlens_k_mk = cu_seqlens_k
         skip_main = False
         if can_chunk and causal:
@@ -3197,6 +3564,7 @@ def _flash_attn_bwd_sparse_mla(
                     v_mk = v[:, :k_end]
                     dv_mk = dv[:, :k_end]
                     k_mk = k_kernel[:, :k_end] if k_kernel is not None else None
+                    dk_mk = dk[:, :k_end] if fuse_dk_rope else None
             else:
                 # Per doc, keep only the keys the forward's causal limit could
                 # reach from queries before tok1 (bottom-right alignment). Only
@@ -3242,6 +3610,7 @@ def _flash_attn_bwd_sparse_mla(
                 q_c if recompute_p else None,
                 k_mk,
                 lse_log2_c,
+                dk_mk,
                 cu_seqlens_q_c,
                 cu_seqlens_k_mk,
                 seqused_q,
@@ -3252,19 +3621,24 @@ def _flash_attn_bwd_sparse_mla(
             ds_c, k_sq, v_sq, dq_c, dqv_c, idx_c, cu_seqlens_q_c, cu_seqlens_k,
         )
 
-        if k is not None:
+        if k is not None and not fuse_dk_rope:
             _sparse_mla_dk(ds_c, idx_c, q_c, dk_sq, cu_seqlens_q_c, cu_seqlens_k)
 
     # return dk, dv in float32: all-reduce across sequence-parallel ranks must happen
     # before downcasting to avoid rounding error during inter-rank grad accumulation
-    dsink = _bwd_dsink_reduce(dpsum, lse, learnable_sink) if learnable_sink is not None else None
+    # dpsum is tile-width when heads are padded; the reducer pairs it with the real-head lse.
+    dsink = (
+        _bwd_dsink_reduce(dpsum[..., :nheads], lse, learnable_sink)
+        if learnable_sink is not None
+        else None
+    )
     return dq, dk, dv, dqv, dsink
 
 _flash_attn_bwd_sparse_mla.compile_cache = get_jit_cache("bwd_dsa")
 
 
 def _compile_sparse_mla_dq_dqv(
-    dtype, nheads, head_dim, head_dim_v, top_k, varlen_q, varlen_k, compute_dq,
+    kernel_cls, dtype, nheads, head_dim, head_dim_v, top_k, varlen_q, varlen_k, compute_dq,
 ):
     sym = cute.sym_int 
     b, b_plus_1, seqlen_q, seqlen_k = sym(), sym(), sym(), sym()
@@ -3284,7 +3658,7 @@ def _compile_sparse_mla_dq_dqv(
     mCuSeqlensQ = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_q else None 
     mCuSeqlensK = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_k else None 
     
-    dq_dqv_gemm = dQdQvGemmKernel(
+    dq_dqv_gemm = kernel_cls(
         acc_dtype=Float32,
         nheads=nheads,
         head_dim_k=head_dim,
@@ -3303,7 +3677,7 @@ def _compile_sparse_mla_dq_dqv(
         mCuSeqlensQ,
         mCuSeqlensK,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+        options=_compile_options(kernel_cls.ptxas_options),
     )
 
 
@@ -3322,12 +3696,19 @@ def _sparse_mla_dq_dqv(
     varlen_q = cu_seqlens_q is not None
     varlen_k = cu_seqlens_k is not None
     
+    # Up to 64 Q heads: the 1-CTA 64-row kernel with a whole-row gather (AI/SPARSE_MLA_64H.md);
+    # fewer heads pad the tile (TMA zero-fills dS rows past nheads and drops those dQ / dQv rows).
+    # The class name is keyed so a swapped class (tests compare the 64-row and generic kernels)
+    # never reuses the other's binary.
+    dq_dqv_cls = dQdQvGemmKernelH64 if nheads <= 64 else dQdQvGemmKernel
     compile_key = (
         dtype_cute, nheads, head_dim, head_dim_v, gather_kv_length, varlen_q, varlen_k, k is not None,
+        dq_dqv_cls.__name__,
     )
     if compile_key not in _sparse_mla_dq_dqv.compile_cache:
         _sparse_mla_dq_dqv.compile_cache[compile_key] = _compile_sparse_mla_dq_dqv(
-            *compile_key
+            dq_dqv_cls, dtype_cute, nheads, head_dim, head_dim_v, gather_kv_length,
+            varlen_q, varlen_k, k is not None,
         )
     if not is_fake_mode():
         _sparse_mla_dq_dqv.compile_cache[compile_key](
@@ -3380,7 +3761,7 @@ def _compile_sparse_mla_dk(
         mCuSeqlensQ,
         mCuSeqlensK,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+        options=_compile_options(dKGemmKernel.ptxas_options),
     )
 
 
@@ -3466,7 +3847,7 @@ class FlashAttnFunc(torch.autograd.Function):
             # by setting q, k to None
             qv = q if qv is None else qv
             q = k = None
-        out, lse, p, row_max = _flash_attn_fwd(
+        out, lse, p, row_max, o_lo = _flash_attn_fwd(
             q,
             k,
             v,
@@ -3488,7 +3869,7 @@ class FlashAttnFunc(torch.autograd.Function):
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
         )
-        ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
+        ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
         ctx.shared_kv = shared_kv
         ctx.softmax_scale = softmax_scale
@@ -3508,7 +3889,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
-        q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, *aux = ctx.saved_tensors
+        q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
@@ -3531,6 +3912,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 causal=ctx.causal,
                 recompute_p=ctx.gather_bwd_recompute_p,
                 token_chunk=ctx.gather_bwd_token_chunk,
+                o_lo=o_lo,
             )
             if ctx.shared_kv:
                 return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
@@ -3613,7 +3995,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             # by setting q, k to None
             qv = q if qv is None else qv
             q = k = None
-        out, lse, p, row_max = _flash_attn_fwd(
+        out, lse, p, row_max, o_lo = _flash_attn_fwd(
             q,
             k,
             v,
@@ -3655,6 +4037,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             lse,
             p,
             row_max,
+            o_lo,
             gather_kv_indices,
             learnable_sink,
             cu_seqlens_q,
@@ -3690,7 +4073,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, dlse):
         if ctx.d512_paged_kv:
             raise NotImplementedError("D512 paged KV supports forward only; use dense/varlen KV for backward")
-        q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
+        q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
@@ -3720,6 +4103,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 min_seqlen_k=ctx.min_seqlen_k,
                 recompute_p=ctx.gather_bwd_recompute_p,
                 token_chunk=ctx.gather_bwd_token_chunk,
+                o_lo=o_lo,
             )
             if ctx.shared_kv:
                 return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 16)
@@ -3930,6 +4314,12 @@ def flash_attn_varlen_func(
 
     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
 
+    page_table: paged KV. When pages load by TMA (a page holds whole key tiles), a tile loads
+        every row of its block, including rows past seqused_k in a sequence's last, partially
+        used page. Their scores are masked, but P = 0 times a NaN V row is still NaN, so those
+        rows must be finite (their values do not matter). Pages a sequence does not use may hold
+        anything, including NaN, also for a sequence with seqused_k = 0.
+
     max_seqlen_q/k: optional scalar length bounds. With Blackwell cumulative
         lengths, tensor hints are not read on the host. HD256 uses flat grids
         for omitted/tensor hints and rectangular grids for host integers.
@@ -3947,7 +4337,7 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: if True, ignores scheduler_metadata if it is passed and skips
         computing metadata fresh.
 
-    gather_bwd_recompute_p: (sparse MLA only) do not save p/row_max in the forward at all
+    gather_bwd_recompute_p: (sparse MLA, 1..128 Q heads) do not save p/row_max in the forward at all
         (~520 KiB per token at 128 heads, gather width 2048, held from forward to backward);
         the backward main kernel recomputes P = exp2(scale*S - lse*log2e) from (q, qv, k, v,
         lse) in-kernel. The train forward also gets faster (no p store). Grads are not

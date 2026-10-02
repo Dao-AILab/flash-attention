@@ -64,6 +64,9 @@ def elem_pointer(x: cute.Tensor, coord, *, loc=None, ip=None) -> cute.Pointer:
 
 
 class dKGemmKernel:
+    # Extra ptxas flags (part of the compile key): no spills either way, -O2 +3-4%.
+    ptxas_options = "-O2"
+
     def __init__(
         self,
         topk: int,

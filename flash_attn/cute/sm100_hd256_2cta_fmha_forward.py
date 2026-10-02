@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
 import math
+from functools import partial
 from typing import Tuple, Optional
 
 import cuda.bindings.driver as cuda
@@ -18,7 +19,6 @@ from flash_attn.cute.tile_scheduler import (
     SchedulerState,
     SingleTileVarlenScheduler,
     compute_sm100_fmha_varlen_grid,
-    sm100_fmha_block_coord,
     compute_sm100_fmha_grid as compute_grid,
     compute_sm100_fmha_grid_clc as compute_grid_clc,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
@@ -31,6 +31,8 @@ from flash_attn.cute.mask import (
     Sm100FusedMask as FusedMask,
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
+from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.utils import (
@@ -78,7 +80,9 @@ class BlackwellFusedMultiHeadAttentionForward:
             "SM100 hd256 2CTA supports TMA paged KV only (page_size must equal tile_n=128)"
         )
         assert not pack_gqa, "SM100 forward with head_dim=256 does not support pack_gqa"
-        assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
+        assert seqlen_k_per_split is None, (
+            "SM100 forward with head_dim=256 does not support dynamic SplitKV metadata"
+        )
         assert q_subtile_factor == 1, (
             "SM100 forward with head_dim=256 does not support q_subtile_factor"
         )
@@ -124,8 +128,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.is_persistent = False
         self.is_causal = is_causal
         self.is_local = is_local
+        self.is_split_kv = is_split_kv
         self.use_semantic_trip_range = is_causal or is_local
         self.use_clc_scheduler = False
+        # decode_work_tile has no split decoding for the CLC scheduler.
+        assert not (self.use_clc_scheduler and self.is_split_kv)
 
         self.softmax_warp_ids = (0, 1, 2, 3)
         self.correction_warp_ids = (4, 5, 6, 7)
@@ -225,6 +232,19 @@ class BlackwellFusedMultiHeadAttentionForward:
         q_tensor, k_tensor, v_tensor = mQ, mK, mV
         o_tensor = assume_tensor_aligned(mO, canonicalize_singletons=True)
         lse_tensor = mLSE
+        if cutlass.const_expr(self.is_split_kv):
+            # SplitKV writes fp32 partials with a leading split mode:
+            # O (num_splits, *o_shape) and LSE (num_splits, *lse_shape).
+            assert lse_tensor is not None, "SM100 hd256 SplitKV requires LSE partials"
+            num_splits = o_tensor.shape[0]
+            o_split_stride = o_tensor.stride[0]
+            lse_split_stride = lse_tensor.stride[0]
+            o_tensor = cute.make_tensor(
+                o_tensor.iterator,
+                cute.select(o_tensor.layout, mode=list(range(1, cute.rank(o_tensor.layout)))),
+            )
+        else:
+            num_splits = Int32(1)
         cum_seqlen_q = mCuSeqlensQ
         cum_seqlen_k = mCuSeqlensK
 
@@ -374,23 +394,28 @@ class BlackwellFusedMultiHeadAttentionForward:
             page_table = None
             max_seqlen_k_paged = None
         # (s, d, ((h_r, h_k), b))
-        o = cute.make_tensor(
-            o_norm.iterator,
-            cute.make_layout(
-                (s_q_total, d, ((h_r, h_k), b)),
-                stride=(
-                    o_norm.stride[1],
-                    o_norm.stride[4],
-                    ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0]),
-                ),
-            ),
+        o_shape = (s_q_total, d, ((h_r, h_k), b))
+        o_stride = (
+            o_norm.stride[1],
+            o_norm.stride[4],
+            ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0]),
         )
+        if cutlass.const_expr(self.is_split_kv):
+            # (s, d, ((h_r, h_k), b), num_splits)
+            o_layout = cute.make_layout((*o_shape, num_splits), stride=(*o_stride, o_split_stride))
+        else:
+            o_layout = cute.make_layout(o_shape, stride=o_stride)
+        o = cute.make_tensor(o_norm.iterator, o_layout)
         if cutlass.const_expr(lse_tensor is not None):
-            # (s, ((h_r, h_k), b))
-            lse_layout = cute.make_layout(
-                (s_lse64, ((h_r, h_k), b_lse)),
-                stride=(1, ((s_lse64, h_r64 * s_lse64), stride_b_lse)),
-            )
+            # (s, ((h_r, h_k), b)), plus a trailing num_splits mode for SplitKV
+            lse_shape = (s_lse64, ((h_r, h_k), b_lse))
+            lse_stride = (1, ((s_lse64, h_r64 * s_lse64), stride_b_lse))
+            if cutlass.const_expr(self.is_split_kv):
+                lse_layout = cute.make_layout(
+                    (*lse_shape, num_splits), stride=(*lse_stride, lse_split_stride)
+                )
+            else:
+                lse_layout = cute.make_layout(lse_shape, stride=lse_stride)
             lse = cute.make_tensor(lse_tensor.iterator, lse_layout)
         else:
             lse = None
@@ -407,18 +432,27 @@ class BlackwellFusedMultiHeadAttentionForward:
             max_seqlen_q if cutlass.const_expr(cum_seqlen_q is not None) else cute.size(o.shape[0])
         )
         if cutlass.const_expr(self.use_varlen_scheduler):
+            # SplitKV: the varlen scheduler puts split_idx on grid dim y.
             self.tile_sched_params, grid = compute_sm100_fmha_varlen_grid(
-                o.shape, cum_seqlen_q, self.cta_tiler[:2]
+                o_shape,
+                cum_seqlen_q,
+                self.cta_tiler[:2],
+                num_splits=num_splits,
+                is_split_kv=self.is_split_kv,
             )
         elif cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
-                (grid_q_extent, o.shape[1], o.shape[2]),
+                (grid_q_extent, o_shape[1], o_shape[2]),
                 self.cta_tiler,
                 (*self.cluster_shape_mn, 1),
             )
         else:
+            # SplitKV: fold splits into the head grid mode, y = head * num_splits + split.
+            # Grid y/z are limited to 65535, and heads * splits stays far below
+            # batch * splits. Both CTAs of a 2CTA cluster share y/z, hence the same split.
+            grid_hb = (h_q * num_splits, b) if cutlass.const_expr(self.is_split_kv) else o_shape[2]
             self.tile_sched_params, grid = compute_grid(
-                (grid_q_extent, o.shape[1], o.shape[2]),
+                (grid_q_extent, o_shape[1], grid_hb),
                 self.cta_tiler,
                 self.is_persistent,
             )
@@ -426,7 +460,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
         self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
         self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
-        self.o_layout = utils.LayoutEnum.from_tensor(o)
 
         if cutlass.const_expr(self.q_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
@@ -598,6 +631,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             p_tmem_layout,
             v_smem_layout_staged,
             self.tile_sched_params,
+            num_splits,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -641,6 +675,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             | FmhaClcDynamicTileSchedulerParams
             | SingleTileVarlenScheduler.Params
         ),
+        num_splits: Int32,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -858,6 +893,35 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
         work_tile = tile_sched.initial_work_tile_info()
 
+        # NOTE [Per-batch sequence lengths]
+        # All four warp roles derive lengths, offsets and KV block ranges from
+        # these two objects, so they agree on which tiles to skip. seqused
+        # overrides lengths, not cu_seqlens packing offsets.
+        # tile_m is one 2CTA cluster (2 * cta_tiler[0]); index it with mma_block_coord[0].
+        block_info = BlockInfo(
+            self.qk_mma_tiler[0],
+            self.qk_mma_tiler[1],
+            self.is_causal,
+            self.is_local and not self.is_causal,
+            self.is_split_kv,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            num_splits=num_splits,
+        )
+        SeqlenInfoCls = partial(
+            SeqlenInfoQK.create,
+            seqlen_q_static=mQ_qdl.shape[0],
+            seqlen_k_static=mK_kdl.shape[0]
+            if cutlass.const_expr(mPageTable is None)
+            else max_seqlen_k,
+            mCuSeqlensQ=cum_seqlen_q,
+            mCuSeqlensK=cum_seqlen_k,
+            mSeqUsedQ=mSeqUsedQ,
+            mSeqUsedK=mSeqUsedK,
+            tile_m=self.qk_mma_tiler[0],
+            tile_n=self.qk_mma_tiler[1],
+        )
+
         # Cluster wait
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
@@ -867,59 +931,29 @@ class BlackwellFusedMultiHeadAttentionForward:
         if warp_idx == self.load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
             while work_tile.is_valid_tile:
-                curr_block_coord = sm100_fmha_block_coord(
-                    work_tile, self.use_varlen_scheduler
-                )  # (q_tile_idx, 0, (head_idx, batch_idx))
+                # (q_tile_idx, 0, (head_idx, batch_idx))
+                curr_block_coord, split_idx = self.decode_work_tile(work_tile, num_splits)
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
                     curr_block_coord[2],
                 )
-                continue_cond = False
                 batch_coord = curr_block_coord[2][1]
-                seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = (
-                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
-                )
-                cuseqlen_q = Int32(0)
-                cuseqlen_k = Int32(0)
+                # See NOTE [Per-batch sequence lengths]
+                seqlen = SeqlenInfoCls(batch_coord)
                 block_offset = (
-                    Int32(0),
-                    Int32(0),
+                    seqlen.offset_q,
+                    seqlen.offset_k,
                     Int32(0),
                     ((Int32(0), Int32(0)), Int32(0)),
                 )
-                if cutlass.const_expr(cum_seqlen_q is not None):
-                    cuseqlen_q = cum_seqlen_q[batch_coord]
-                    seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                    block_offset = (
-                        cuseqlen_q,
-                        cuseqlen_k,
-                        Int32(0),
-                        ((Int32(0), Int32(0)), Int32(0)),
-                    )
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
-                # NOTE [Per-batch sequence lengths]
-                # seqused overrides lengths, not cu_seqlens packing offsets.
-                # All four warp roles must use the same effective Q length when
-                # deciding which tiles to skip.
-                if cutlass.const_expr(mSeqUsedQ is not None):
-                    seqlen_q = mSeqUsedQ[batch_coord]
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
-                if cutlass.const_expr(mSeqUsedK is not None):
-                    seqlen_k = mSeqUsedK[batch_coord]
-                if not continue_cond:
+                # See NOTE [SplitKV empty splits]
+                n_block_min, n_block_max = block_info.get_n_block_min_max(
+                    seqlen, mma_block_coord[0], split_idx
+                )
+                if self.tile_has_work(
+                    seqlen, mma_block_coord[0], block_info, n_block_min, n_block_max
+                ):
                     mQ_qdl_ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl)
                     # Local tile partition global tensors
                     q_cta_layout = cute.make_layout(
@@ -1003,19 +1037,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # ((atom_v, rest_v), RestK)
                     tQgQ = tQgQ_qdl[None, mma_block_coord[0], None, mma_block_coord[2]]
 
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                        FusedMask.get_trip_start_count_via_block_info(
-                            mma_block_coord,
-                            self.qk_mma_tiler,
-                            seqlen_q,
-                            seqlen_k,
-                            self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
-                        )
-                    )
-                    seqlen_kv_loop_end = seqlen_kv_loop_start + seqlen_kv_loop_steps
+                    seqlen_kv_loop_start, seqlen_kv_loop_end = n_block_min, n_block_max
+                    seqlen_kv_loop_steps = seqlen_kv_loop_end - seqlen_kv_loop_start
                     # Q
                     for iter in cutlass.range(self.iterations_qk, unroll=1):
                         q_handle = load_q_producer.acquire_and_advance()
@@ -1114,55 +1137,23 @@ class BlackwellFusedMultiHeadAttentionForward:
             is_leader_cta = cta_rank_in_cluster % 2 == 0
 
             while work_tile.is_valid_tile:
-                curr_block_coord = sm100_fmha_block_coord(work_tile, self.use_varlen_scheduler)
+                curr_block_coord, split_idx = self.decode_work_tile(work_tile, num_splits)
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
                     curr_block_coord[2],
                 )
-                continue_cond = False
-                seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = (
-                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
-                )
                 batch_coord = curr_block_coord[2][1]
-                if cutlass.const_expr(cum_seqlen_q is not None):
-                    cuseqlen_q = cum_seqlen_q[batch_coord]
-                    seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
                 # See NOTE [Per-batch sequence lengths]
-                if cutlass.const_expr(mSeqUsedQ is not None):
-                    seqlen_q = mSeqUsedQ[batch_coord]
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
-
-                if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                    if cutlass.const_expr(mSeqUsedK is not None):
-                        seqlen_k = mSeqUsedK[batch_coord]
-
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                        FusedMask.get_trip_start_count_via_block_info(
-                            mma_block_coord,
-                            self.qk_mma_tiler,
-                            seqlen_q,
-                            seqlen_k,
-                            self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
-                        )
-                    )
-                    seqlen_kv_loop_end = seqlen_kv_loop_start + seqlen_kv_loop_steps
+                seqlen = SeqlenInfoCls(batch_coord)
+                # See NOTE [SplitKV empty splits]
+                n_block_min, n_block_max = block_info.get_n_block_min_max(
+                    seqlen, mma_block_coord[0], split_idx
+                )
+                if self.tile_has_work(
+                    seqlen, mma_block_coord[0], block_info, n_block_min, n_block_max
+                ):
+                    seqlen_kv_loop_steps = n_block_max - n_block_min
 
                     load_q_releaser = load_q_consumer.clone()
                     pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -1371,73 +1362,56 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
 
             while work_tile.is_valid_tile:
-                curr_block_coord = sm100_fmha_block_coord(work_tile, self.use_varlen_scheduler)
+                curr_block_coord, split_idx = self.decode_work_tile(work_tile, num_splits)
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
                     curr_block_coord[2],
                 )
                 batch_coord = curr_block_coord[2][1]
-                continue_cond = False
-                seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = (
-                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
-                )
-                cuseqlen_q = Int32(0)
-                if cutlass.const_expr(cum_seqlen_q is not None):
-                    cuseqlen_q = cum_seqlen_q[batch_coord]
-                    seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
                 # See NOTE [Per-batch sequence lengths]
-                if cutlass.const_expr(mSeqUsedQ is not None):
-                    seqlen_q = mSeqUsedQ[batch_coord]
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
-                if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                    if cutlass.const_expr(mSeqUsedK is not None):
-                        seqlen_k = mSeqUsedK[batch_coord]
-
+                seqlen = SeqlenInfoCls(batch_coord)
+                seqlen_q, seqlen_k = seqlen.seqlen_q, seqlen.seqlen_k
+                # See NOTE [SplitKV empty splits]
+                n_block_min, n_block_max = block_info.get_n_block_min_max(
+                    seqlen, mma_block_coord[0], split_idx
+                )
+                mLSE_split = mLSE
+                if cutlass.const_expr(self.is_split_kv):
+                    mLSE_split = mLSE[None, None, split_idx]
+                    if not block_info.has_kv_work(n_block_min, n_block_max):
+                        # Only rows < seqlen_q are written; combine skips -inf partials.
+                        self.store_lse(
+                            -Float32.inf,
+                            mLSE_split,
+                            curr_block_coord,
+                            seqlen_q,
+                            cum_seqlen_q,
+                            seqlen.offset_q,
+                        )
+                if self.tile_has_work(
+                    seqlen, mma_block_coord[0], block_info, n_block_min, n_block_max
+                ):
                     row_max = -Float32.inf
                     row_max_prev = -Float32.inf
                     row_sum = 0.0
 
-                    start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        self.is_causal,
-                        self.is_local,
-                        window_size_left,
-                        window_size_right,
-                    )
-                    end_count = start_count + trip_count
+                    start_count = n_block_min
+                    end_count = n_block_max
                     # require at least one softmax iteration for zero trip_count case;
                     # rely on masking this iteration for correctness
                     if end_count <= start_count:
                         start_count = 0
                         end_count = 1
                     if cutlass.const_expr(self.use_semantic_trip_range):
-                        n_block_min_causal_local_mask, n_block_min_before_local_mask = (
-                            FusedMask.get_trip_mask_bounds_via_block_info(
-                                mma_block_coord,
-                                self.qk_mma_tiler,
-                                seqlen_q,
-                                seqlen_k,
-                                self.is_causal,
-                                self.is_local,
-                                window_size_left,
-                                window_size_right,
+                        n_block_min_causal_local_mask = (
+                            block_info.get_n_block_min_causal_local_mask(
+                                seqlen, mma_block_coord[0], n_block_min
+                            )
+                        )
+                        n_block_min_before_local_mask = (
+                            block_info.get_n_block_min_before_local_mask(
+                                seqlen, mma_block_coord[0], n_block_min
                             )
                         )
                     cS_base = cute.make_identity_tensor(
@@ -1480,14 +1454,14 @@ class BlackwellFusedMultiHeadAttentionForward:
                         row_max_prev = row_max
                     sum_producer = self.store_sum_max(
                         row_max,
-                        mLSE,
+                        mLSE_split,
                         row_sum,
                         sSum,
                         sum_producer,
                         curr_block_coord,
                         seqlen_q,
                         cum_seqlen_q,
-                        cuseqlen_q,
+                        seqlen.offset_q,
                         scale_softmax,
                     )
                 work_tile = tile_sched.advance_to_next_work()
@@ -1501,53 +1475,42 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
 
             while work_tile.is_valid_tile:
-                curr_block_coord = sm100_fmha_block_coord(work_tile, self.use_varlen_scheduler)
+                curr_block_coord, split_idx = self.decode_work_tile(work_tile, num_splits)
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
                     curr_block_coord[2],
                 )
                 batch_coord = curr_block_coord[2][1]
-                seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = (
-                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
-                )
-                continue_cond = False
-                cuseqlen_q = Int32(0)
-                if cutlass.const_expr(cum_seqlen_q is not None):
-                    cuseqlen_q = cum_seqlen_q[batch_coord]
-                    seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
                 # See NOTE [Per-batch sequence lengths]
-                if cutlass.const_expr(mSeqUsedQ is not None):
-                    seqlen_q = mSeqUsedQ[batch_coord]
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
-
-                if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                    if cutlass.const_expr(mSeqUsedK is not None):
-                        seqlen_k = mSeqUsedK[batch_coord]
-
+                seqlen = SeqlenInfoCls(batch_coord)
+                seqlen_q = seqlen.seqlen_q
+                # See NOTE [SplitKV empty splits]
+                n_block_min, n_block_max = block_info.get_n_block_min_max(
+                    seqlen, mma_block_coord[0], split_idx
+                )
+                if self.tile_has_work(
+                    seqlen, mma_block_coord[0], block_info, n_block_min, n_block_max
+                ):
                     mO_qdl_eff = mO_qdl
+                    if cutlass.const_expr(self.is_split_kv):
+                        # Keep the 16B alignment promise while dropping the split mode.
+                        mO_qdl_eff = domain_offset_aligned(
+                            (Int32(0), Int32(0), ((Int32(0), Int32(0)), Int32(0)), split_idx),
+                            mO_qdl,
+                        )
+                        mO_qdl_eff = cute.make_tensor(
+                            mO_qdl_eff.iterator, cute.select(mO_qdl_eff.layout, mode=[0, 1, 2])
+                        )
                     if cutlass.const_expr(cum_seqlen_q is not None):
                         block_offset_o = (
-                            cuseqlen_q,
+                            seqlen.offset_q,
                             Int32(0),
                             Int32(0),
                             ((Int32(0), Int32(0)), Int32(0)),
                         )
                         mO_qdl_eff = domain_offset_aligned(
-                            cute.select(block_offset_o, mode=[0, 2, 3]), mO_qdl
+                            cute.select(block_offset_o, mode=[0, 2, 3]), mO_qdl_eff
                         )
 
                     # (bM, bN, loopM, loopN, loopL)
@@ -1559,16 +1522,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.select(self.pv_block_tiler, mode=[0, 1]),
                     )
 
-                    _, seqlen_kv_loop_steps = FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        self.is_causal,
-                        self.is_local,
-                        window_size_left,
-                        window_size_right,
-                    )
+                    seqlen_kv_loop_steps = n_block_max - n_block_min
                     gO_staged = gO_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
                     cO_staged = cO_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
                     cS = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
@@ -1630,6 +1584,28 @@ class BlackwellFusedMultiHeadAttentionForward:
         tmem.free(tmem_ptr)
 
         return
+
+    @cute.jit
+    def tile_has_work(
+        self,
+        seqlen: SeqlenInfoQK,
+        m_block: Int32,
+        block_info: BlockInfo,
+        n_block_min: Int32,
+        n_block_max: Int32,
+    ):
+        """Whether this 2CTA cluster tile has Q rows and, with SplitKV, KV blocks.
+
+        See NOTE [Per-batch sequence lengths]. NOTE [SplitKV empty splits]: a split can own
+        no KV blocks; every warp role skips it, and the softmax warps only write LSE = -inf.
+        Without SplitKV, a zero count still runs one fully masked iteration.
+        """
+        has_work = True
+        if cutlass.const_expr(seqlen.has_cu_seqlens_q or seqlen.has_seqused_q):
+            has_work = FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                self.qk_mma_tiler[0], m_block, seqlen.seqlen_q
+            )
+        return block_info.has_kv_work(n_block_min, n_block_max) and has_work
 
     @cute.jit
     def softmax_step(
@@ -1974,20 +1950,58 @@ class BlackwellFusedMultiHeadAttentionForward:
         row_sum_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
 
         if cutlass.const_expr(mLSE is not None):
+            lse_value = (
+                scale_softmax * row_max + cute.math.log(row_sum, fastmath=True)
+                if not row_sum_is_zero_or_nan
+                else -Float32.inf
+            )
+            self.store_lse(lse_value, mLSE, current_block_coord, seqlen_q, cum_seqlen_q, cuseqlen_q)
+        return sum_producer
+
+    @cute.jit
+    def store_lse(
+        self,
+        lse_value: Float32,
+        mLSE: Optional[cute.Tensor],
+        current_block_coord,
+        seqlen_q: Int32,
+        cum_seqlen_q: Optional[cute.Tensor],
+        cuseqlen_q: Int32,
+    ):
+        # One softmax thread owns one Q row of this CTA's tile.
+        if cutlass.const_expr(mLSE is not None):
+            tidx, _, _ = cute.arch.thread_idx()
             q_idx = current_block_coord[0] * self.cta_tiler[0] + tidx
             hb_idx = (
                 (current_block_coord[2][0], Int32(0))
                 if cutlass.const_expr(cum_seqlen_q is not None)
                 else current_block_coord[2]
             )
-            lse_value = (
-                scale_softmax * row_max + cute.math.log(row_sum, fastmath=True)
-                if not row_sum_is_zero_or_nan
-                else -Float32.inf
-            )
             if cute.elem_less(q_idx, seqlen_q):
                 global_q_idx = (
                     q_idx + cuseqlen_q if cutlass.const_expr(cum_seqlen_q is not None) else q_idx
                 )
                 mLSE[global_q_idx, hb_idx] = lse_value
-        return sum_producer
+
+    @cute.jit
+    def decode_work_tile(self, work_tile, num_splits: Int32):
+        """Return ((m_block, 0, (head, batch)), split_idx) for a scheduler work tile."""
+        split_idx = Int32(0)
+        if cutlass.const_expr(self.use_varlen_scheduler):
+            block, head, batch, split = work_tile.tile_idx
+            curr_block_coord = (block, Int32(0), (head, batch))
+            if cutlass.const_expr(self.is_split_kv):
+                split_idx = split
+        else:
+            curr_block_coord = work_tile.tile_idx
+            if cutlass.const_expr(self.is_split_kv):
+                # The static grid folds splits into the head mode (see __call__).
+                head_split = curr_block_coord[2][0]
+                head = head_split // num_splits
+                split_idx = head_split - head * num_splits
+                curr_block_coord = (
+                    curr_block_coord[0],
+                    curr_block_coord[1],
+                    (head, curr_block_coord[2][1]),
+                )
+        return curr_block_coord, split_idx

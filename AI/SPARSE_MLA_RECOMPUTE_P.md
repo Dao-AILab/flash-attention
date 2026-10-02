@@ -58,11 +58,27 @@ rows are fully masked by the bitmask.
 ### Numerics
 
 P is reconstructed with a *single* rounding (`exp2(e) → bf16`), whereas the
-default path stores `p = exp2(scale·S − row_max_blk)` and multiplies by a
-bf16 `scale_p` in the backward — two roundings. Gradients are therefore not
+default path stores `p = exp2(scale·S − row_max_blk)` in bf16 and normalizes
+it by `scale_p` in the backward — two roundings. Gradients are therefore not
 bitwise-identical to the default path but measure *more* accurate against an
-fp32 reference (e.g. dq rel-err 3.41e-3 vs 3.95e-3 at T=1024, W=2048).
+fp64 reference (e.g. dq rel-L2 0.239% vs 0.285% at T=16K, W=2048).
 P ∈ [0,1] exactly (lse ≥ scale·max), no overflow concerns.
+
+In both modes the softmax warps keep an fp32 copy of P^T (after the fp32
+`scale_p` normalization in the default path, straight from `exp2` in the
+recompute path) and form `dS^T = P^T ⊙ (dP^T − dPsum) · softmax_scale` in
+fp32, rounding to bf16 exactly once for the dS store. Only the copy staged as
+the `dV += P^T·dO` mma operand is rounded to bf16 first. Rounding `scale_p`,
+the normalized P and `(dP − dPsum)·scale` to bf16 *before* the product (the
+original scheme) cost ~29% dq / ~22% dK+dV relative-L2 error at no measurable
+speed or register cost (128 regs/thread; fewer spills).
+
+Both modes form `dPsum = rowsum(dO ⊙ O)` in the preprocess. Training forwards
+also save the bf16 rounding residual of `out` and the preprocess reads
+`out + o_lo`, so this term does not carry the bf16 output rounding; with peaked
+attention (dP ≈ dPsum on the dominant slot) that rounding otherwise dominates dS
+and dq/dk. Training forwards also use an exact running softmax max. See
+`AI/SPARSE_MLA_DPSUM_PRECISION.md` for the decomposition and measurements.
 
 Because nothing saved is consumed, re-running the backward over the same
 graph (`retain_graph=True`) works in this mode (asserted in the test).
@@ -86,7 +102,7 @@ modes, and every grad (incl. dsink) within tolerance of the fp32 reference.
 The main backward kernel was already at the exact SM100 smem limit, so the
 recompute operands are funded by re-budgeting rather than growth:
 
-- **S^T UMMA reuses `tiled_mma_VdO`** (M = 128 topk rows, N = 128 heads):
+- **S^T UMMA reuses `tiled_mma_VdO`** (M = 128 topk rows, N = `tile_m` = 64 or 128 heads):
   A-operand is the already-gathered `sV` stages (each stage consumed by the
   S-chunk and then the dP-chunk before release), rope chunk accumulates from
   gathered `sKr` (new 8 KiB stage) × stationary `sQr` (8 KiB).
@@ -110,6 +126,60 @@ recompute operands are funded by re-budgeting rather than growth:
 
 Both paths coexist as a compile-time specialization
 (`recompute_P` constexpr); the default path's schedule is unchanged.
+
+### Head counts
+
+The backward tile is 64 or 128 rows: the real Q-head count per KV head,
+padded up (`pack_gqa.qheads_first_tma_view`). Both modes support 1..128 heads.
+With 64 or 128 heads nothing is padded: at 64, `tile_m = 64`, the S^T UMMA runs
+at N = 64 and `sLse`/`sQr` shrink with the tile.
+
+Padded counts (1..63 -> 64, 65..127 -> 128) need the recompute
+operands to read as zero in the padded rows, and P = 0 there exactly:
+- **Q_rope, and the QvB copy of Qv** that feeds the S^T GEMM, load through the
+  heads-first padded TMA views that `qv` / `dO` / `dS` already use, so their padded
+  rows are zero-filled. The dims-first Q_rope of the fused dK_rope GEMM (`sQr2`)
+  does the same.
+- **`lse_log2` is allocated at tile width filled with +inf** (`torch.full_like`,
+  about 2 us at 16K tokens). The preprocess writes only the real heads, through a
+  `[..., :nheads]` view, as for `dpsum`.
+
+In a padded row S = 0 and lse = +inf, so P = exp2(-inf) = 0. Its dO row is zero and
+its `dpsum` column is zero, so dS = 0, and the row adds nothing to dV / dK / dK_rope.
+Its dS / dQ / dQv stores are dropped by the TMA bounds. Uninitialized lse padding
+could be -inf or NaN (P = inf, then NaN); that is why the fill is needed.
+
+64-row tiles (1..64 heads) keep the fused dK_rope. 65..127 heads use the separate
+dK GEMM, as load-P does. `test_flash_attn_mla_sparse_bwd_recompute_p_padded` checks
+recompute-P against load-P at 24 / 1 heads, and checks that the padded rows
+contribute nothing. For the latter it compares against 64 heads with the extra
+heads' dO zeroed: dq / dqv are bitwise, and dk / dv agree up to atomic order.
+
+The preprocess tile is 128 packed (token, head) rows regardless of the head
+count, and the sparse-MLA path runs the preprocess without padded
+per-sequence offsets (`use_padded_offsets=False`): sequences sit back to back
+in `dpsum`/`lse_log2`. With 64 heads a tile spans two tokens, so a sequence
+with an odd token count ends in a half-filled tile whose tail rows are the
+next sequence's first token (or lie past the end of the buffer). Every
+per-row store in the preprocess therefore stops at the sequence's real row
+count in this mode (`tidx < seqlen_limit`, like `dpsum`); the tile-rounded
+store that pads `lse_log2` with `+inf` is only valid with padded offsets,
+where the slack exists. The main kernel never reads those rows: its tile is
+one token (`tile_m` = head count). 128 heads fill every tile exactly, which is
+why the tail was invisible before 64 heads were allowed.
+
+64-head train step (GB200, B=1, one causal document, 64 Q heads, head_dim
+64 rope + 512 latent, gather width 2048, `token_chunk=4096`):
+
+| tokens | load-P (ms / peak GiB / saved GiB) | recompute-P (ms / peak GiB / saved GiB) |
+|-------:|-----------------------------------:|----------------------------------------:|
+| 4k     | 8.2 / 2.6 / 1.3                    | 8.7 / 1.8 / 0.5                         |
+| 64k    | 144.3 / 41.2 / 20.3                | 150.8 / 13.7 / 8.0                      |
+| 128k   | 321.5 / 82.3 / 40.5                | 325.4 / 26.4 / 16.0                     |
+
+Saved activations in recompute mode are `out` + the `o_lo` residual
+(AI/SPARSE_MLA_DPSUM_PRECISION.md). Gradient error vs an fp64 reference is
+unchanged from the 128-head recompute path and slightly below load-P.
 
 ## Design: token-chunked backward
 
@@ -254,6 +324,10 @@ it entirely would require fusing the dq/dk GEMMs into the main kernel
   layouts.
 - `test_flash_attn_mla_sparse_bwd_learnable_sink` (varlen × shared_kv ×
   causal): sink + sentinel indices in every gather_bwd mode, see above.
+- `test_flash_attn_mla_sparse_bwd_preprocess_tile_tail` (varlen ×
+  recompute_p): 64 heads, many odd-length sequences (varlen and batched),
+  grads vs the fp32 reference per token, so a preprocess store that runs
+  past a sequence's rows into the next sequence's first token is caught.
 - Existing sparse-MLA sentinel tests (12) pass with and without the new
   flags; the absorbed-MLA suite (96 non-varlen params) passes with
   recompute-P enabled.
