@@ -518,8 +518,6 @@ def test_flash_attn_output(
             pytest.skip("SM100 head_dim=256 backward does not support local attention yet")
         if softcap > 0.0:
             pytest.skip("SM100 head_dim=256 backward does not support softcap yet")
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 backward does not support deterministic mode yet")
     device = "cuda"
     # set seed
     seed = 0
@@ -1103,6 +1101,32 @@ def test_flash_attn_hd256_sm100_noncontiguous_transpose():
     )
 
 
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads,nheads_kv", [(4, 4), (8, 2)])
+def test_flash_attn_hd256_sm100_deterministic_backward(causal, nheads, nheads_kv):
+    """deterministic=True on the dedicated hd256 backward: gradients are bitwise equal across runs."""
+    if not IS_SM100:
+        pytest.skip("SM100-specific hd256 backward test")
+    torch.random.manual_seed(0)
+    seqlens = [1000, 77, 2048]
+    cu_seqlens = torch.tensor([0, *itertools.accumulate(seqlens)], device="cuda", dtype=torch.int32)
+    q = torch.randn(sum(seqlens), nheads, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(sum(seqlens), nheads_kv, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    dout = torch.randn_like(q)
+
+    grads = []
+    for _ in range(3):
+        out, _ = flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens), causal=causal, deterministic=True,
+        )
+        grads.append(torch.autograd.grad(out, (q, k, v), dout))
+    for run in grads[1:]:
+        for grad, grad_first in zip(run, grads[0]):
+            assert torch.equal(grad, grad_first)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("layout", ["padded", "transposed"])
@@ -1338,8 +1362,6 @@ def test_flash_attn_varlen_output(
             pytest.skip("SM100 head_dim=256 backward does not support local attention yet")
         if softcap > 0.0:
             pytest.skip("SM100 head_dim=256 backward does not support softcap yet")
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 backward does not support deterministic mode yet")
         if not unpad_q and unpad_kv:
             pytest.skip("SM100 head_dim=256 backward: varlen-packed K without varlen Q is untested")
     if (
