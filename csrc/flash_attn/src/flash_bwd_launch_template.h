@@ -39,10 +39,10 @@ DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_kernel, bool Is_dropout, bo
     #endif
 }
 
-DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap) {
+DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Compute_alibi_grad=false) {
     #if defined(ARCH_SUPPORTS_FLASH)
         static_assert(!(Is_causal && Is_local));  // If Is_local is true, Is_causal should be false
-        FLASH_NAMESPACE::compute_dq_dk_dv_seqk_parallel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap>(params);
+        FLASH_NAMESPACE::compute_dq_dk_dv_seqk_parallel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Compute_alibi_grad>(params);
     #else
         FLASH_UNSUPPORTED_ARCH
     #endif
@@ -67,6 +67,37 @@ __global__ void flash_bwd_convert_dq_kernel(const Flash_bwd_params params, const
 template<typename Kernel_traits>
 __global__ void flash_bwd_convert_dkv_kernel(const Flash_bwd_params params) {
     FLASH_NAMESPACE::convert_dKV<Kernel_traits>(params);
+}
+
+// Each CTA owns one (batch, head) segment, with a fixed reduction order and no
+// atomics. Sequence padding was initialized to zero along with the partials.
+template<int kNThreads>
+__global__ void flash_bwd_reduce_dalibi_varlen_kernel(const Flash_bwd_params params) {
+    using index_t = Flash_bwd_params::index_t;
+    constexpr int kNWarps = kNThreads / 32;
+    static_assert(kNThreads % 32 == 0 && kNWarps <= 32);
+    const int tidx = threadIdx.x;
+    const int bidh = blockIdx.x;
+    const int bidb = blockIdx.y;
+    const index_t first_slot = params.cu_seqlens_k[bidb] / Flash_bwd_params::kAlibiGradMinBlockN + bidb;
+    const index_t last_slot = params.cu_seqlens_k[bidb + 1] / Flash_bwd_params::kAlibiGradMinBlockN + bidb + 1;
+    const float *partials = params.dalibi_slopes_accum_ptr
+        + bidh * params.dalibi_slopes_accum_head_stride;
+    float sum = 0.f;
+    for (index_t i = first_slot * Flash_bwd_params::kAlibiGradMaxWarps + tidx;
+         i < last_slot * Flash_bwd_params::kAlibiGradMaxWarps; i += kNThreads) {
+        sum += partials[i];
+    }
+    FLASH_NAMESPACE::SumOp<float> sum_op;
+    sum = FLASH_NAMESPACE::Allreduce<32>::run(sum, sum_op);
+    __shared__ float warp_sums[kNWarps];
+    if (tidx % 32 == 0) { warp_sums[tidx / 32] = sum; }
+    __syncthreads();
+    if (tidx < 32) {
+        sum = tidx < kNWarps ? warp_sums[tidx] : 0.f;
+        sum = FLASH_NAMESPACE::Allreduce<32>::run(sum, sum_op);
+        if (tidx == 0) { params.dalibi_slopes_batched_ptr[bidb * params.h + bidh] = sum; }
+    }
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
@@ -103,6 +134,11 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
                         // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
                         // If Is_local, set Is_causal to false
                         auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !Has_alibi && Kernel_traits::kHeadDim <= 128, IsEvenKConst && !Has_alibi, Is_softcap>;
+                        if constexpr (Has_alibi) {
+                            if (params.dalibi_slopes_accum_ptr != nullptr) {
+                                kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !Has_alibi && Kernel_traits::kHeadDim <= 128, IsEvenKConst && !Has_alibi, Is_softcap, /*Compute_alibi_grad=*/true>;
+                            }
+                        }
                         // auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, false, Is_causal, false, false, true, true>;
                         if (smem_size_dq_dk_dv >= 48 * 1024)  {
                             C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -123,6 +159,10 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
     }
     kernel_dq<<<grid_m, Kernel_traits::kNThreads, Kernel_traits::kSmemdQSize, stream>>>(params, !params.deterministic ? 1 : gridDimx);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (params.dalibi_slopes_batched_ptr != nullptr) {
+        flash_bwd_reduce_dalibi_varlen_kernel<128><<<dim3(params.h, params.b), 128, 0, stream>>>(params);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
