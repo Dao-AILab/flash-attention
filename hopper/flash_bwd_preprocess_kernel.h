@@ -146,12 +146,21 @@ public:
         static constexpr int kBlockM = get<0>(TileShape_MK{});
 
         int const thread_idx = threadIdx.x;
-        int const m_block = blockIdx.x;
         int const bidh = blockIdx.y;
-        int const bidb = blockIdx.z;
+        bool const is_varlen = Varlen && params.cu_seqlens;
+        // For varlen the grid is linearized over the padded layout: blockIdx.x
+        // indexes that layout directly and blockIdx.z is unused, so the grid no
+        // longer scales with max_seqlen * num_batch.
+        int m_block = blockIdx.x;
+        int bidb = blockIdx.z;
+        if (is_varlen) {
+            auto const seq_and_block =
+                flash::padded_block_to_seq<kBlockM>(blockIdx.x, params.num_batch, params.cu_seqlens);
+            bidb = cute::get<0>(seq_and_block);
+            m_block = cute::get<1>(seq_and_block);
+        }
 
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info(bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused);
-        bool const is_varlen = Varlen && params.cu_seqlens;
         int const seqlen_o = seqlen_info.seqlen;
         if (is_varlen && m_block * kBlockM >= seqlen_o) { return; }
 
