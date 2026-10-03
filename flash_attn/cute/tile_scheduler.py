@@ -208,6 +208,9 @@ class TileSchedulerArguments(ParamsBase):
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
+    clc_l2_swizzle: cutlass.Constexpr[bool] = False
+    lpt_global: cutlass.Constexpr[bool] = False
+    pair_tiles: cutlass.Constexpr[bool] = False
     num_splits_dynamic_ptr: Optional[cute.Tensor] = None
     num_m_blocks_ptr: Optional[cute.Tensor] = None
     virtual_batch_idx_ptr: Optional[cute.Tensor] = None
@@ -355,19 +358,37 @@ class StaticPersistentTileScheduler:
         num_block_cluster_divmod: FastDivmodDivisorV2
         num_head_divmod: FastDivmodDivisorV2
         total_blocks_cluster: Int32
+        grid_divmod: FastDivmodDivisorV2
+        num_hb_divmod: FastDivmodDivisorV2
+        grid_size: Int32
+        num_block: Int32
         cluster_shape_m: cutlass.Constexpr[int] = 1
+        pair_tiles: cutlass.Constexpr[bool] = False
 
         @staticmethod
+        @cute.jit
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "StaticPersistentTileScheduler.Params":
             num_block_cluster = cute.ceil_div(args.num_block, cute.size(args.cluster_shape_mn))
             total_blocks_cluster = num_block_cluster * args.num_head * args.num_batch
+            cluster_m = args.cluster_shape_mn[0]
+            # the launch grid, which is also the stride a CTA advances by
+            sm_count = cutlass.utils.HardwareInfo().get_device_multiprocessor_count()
+            max_ctas = (sm_count // cluster_m) * cluster_m
+            grid_size = cutlass.max(
+                cutlass.min(Int32(max_ctas), total_blocks_cluster * cluster_m), Int32(1)
+            )
             return StaticPersistentTileScheduler.Params(
                 FastDivmodDivisorV2(num_block_cluster),
                 FastDivmodDivisorV2(args.num_head),
                 total_blocks_cluster,
-                cluster_shape_m=args.cluster_shape_mn[0],
+                FastDivmodDivisorV2(grid_size),
+                FastDivmodDivisorV2(args.num_head * args.num_batch),
+                grid_size,
+                args.num_block,
+                cluster_shape_m=cluster_m,
+                pair_tiles=args.pair_tiles,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
@@ -406,13 +427,34 @@ class StaticPersistentTileScheduler:
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
-        hardware_info = cutlass.utils.HardwareInfo()
-        sm_count = hardware_info.get_device_multiprocessor_count()
-        max_ctas = (sm_count // params.cluster_shape_m) * params.cluster_shape_m
-        grid_x = cutlass.min(max_ctas, params.total_blocks_cluster * params.cluster_shape_m)
-        return (grid_x, Int32(1), Int32(1))
+        return (params.grid_size, Int32(1), Int32(1))
+
+    @cute.jit
+    def __paired_work(self) -> WorkTileInfo:
+        """Tiles ranked longest-first, traversed forwards on even rounds and backwards on
+        odd ones, so a CTA's long tile in one round is paired with a short one in the next.
+        """
+        params = self.params
+        round_idx, pos = divmod(self._tile_idx, params.grid_divmod)
+        remaining = params.total_blocks_cluster - round_idx * params.grid_size
+        nb_this_round = cutlass.max(cutlass.min(params.grid_size, remaining), Int32(1))
+        rank = round_idx * params.grid_size
+        if round_idx % 2 == 0:
+            rank = rank + pos
+        else:
+            rank = rank + (nb_this_round - 1 - pos)
+        m_rank, hb_idx = divmod(rank, params.num_hb_divmod)
+        batch_idx, head_idx = divmod(hb_idx, params.num_head_divmod)
+        is_valid = self._tile_idx < params.total_blocks_cluster
+        return WorkTileInfo(
+            (Int32(params.num_block - 1 - m_rank), Int32(head_idx), Int32(batch_idx),
+             Int32(0)),
+            is_valid,
+        )
 
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        if const_expr(self.params.pair_tiles):
+            return self.__paired_work()
         hn_idx, block_idx = divmod(self._tile_idx, self.params.num_block_cluster_divmod)
         batch_idx, head_idx = divmod(hn_idx, self.params.num_head_divmod)
         is_valid = self._tile_idx < self.params.total_blocks_cluster
@@ -475,6 +517,7 @@ class SingleTileLPTScheduler:
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
         lpt: cutlass.Constexpr[bool] = True
         use_cluster_idx: cutlass.Constexpr[bool] = True
+        clc_l2_swizzle: cutlass.Constexpr[bool] = False
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None
 
         @staticmethod
@@ -504,6 +547,10 @@ class SingleTileLPTScheduler:
             swizzle = (
                 1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
             )
+            # one section over the whole problem, so the heaviest tiles are ordered
+            # against each other rather than within each section
+            if const_expr(args.lpt_global):
+                swizzle = Int32(args.num_head * args.num_batch)
             # If we're in the last section (called residual), we don't want to divide by
             # swizzle. Instead we want to divide by the remainder.
             num_hb_quotient = (args.num_head * args.num_batch) // swizzle
@@ -526,6 +573,7 @@ class SingleTileLPTScheduler:
                 scheduling_mode=scheduling_mode,
                 lpt=args.lpt,
                 use_cluster_idx=args.use_cluster_idx,
+                clc_l2_swizzle=args.clc_l2_swizzle,
                 num_splits_dynamic_ptr=args.num_splits_dynamic_ptr,
             )
 
@@ -608,15 +656,50 @@ class SingleTileLPTScheduler:
         return (params.total_blocks, params.num_splits, Int32(1))
 
     @cute.jit
+    def _l2_swizzled_coords(self, tile_idx: Int32):
+        """The (block, head, batch) a linear work index names under the L2 swizzle."""
+        params = self.params
+        bidhb, l2_mod = divmod(tile_idx, params.l2_major_divmod)
+        block, bidhb_residual = 0, 0
+        if bidhb < params.num_hb_quotient:
+            block, bidhb_residual = divmod(l2_mod, params.l2_minor_divmod)
+        else:
+            block, bidhb_residual = divmod(l2_mod, params.l2_minor_residual_divmod)
+        bidhb_actual = bidhb * params.l2_minor + bidhb_residual
+        batch_idx, head_idx = divmod(bidhb_actual, params.num_head_divmod)
+        return Int32(block), Int32(head_idx), Int32(batch_idx)
+
     def clc_work_to_coords(self, work) -> WorkTileInfo:
         """Convert CLC response (block, head, batch_split) to WorkTileInfo.
 
-        CLC returns raw grid coordinates — no L2 swizzle (hardware decides order).
-        We only apply cluster division, optional LPT block reversal, and split_kv unpacking.
+        CLC decides the dispatch order, but which tile a coordinate names is still ours:
+        with clc_l2_swizzle it is decoded through the static path's swizzle. Both maps are
+        bijections, so every tile is issued exactly once.
         """
         block_idx = work.tile_idx[0]
         if const_expr(self.params.cluster_shape_m > 1):
             block_idx = block_idx // self.params.cluster_shape_m
+        if const_expr(self.params.clc_l2_swizzle):
+            split_raw = Int32(0)
+            if const_expr(self.params.is_split_kv):
+                batch_raw, split_raw = divmod(work.tile_idx[2], self.params.num_splits_divmod)
+            else:
+                batch_raw = work.tile_idx[2]
+            linear = ((batch_raw * self.params.num_head + work.tile_idx[1])
+                      * self.params.num_block + block_idx)
+            block_idx, head_swz, batch_swz = self._l2_swizzled_coords(Int32(linear))
+            if const_expr(self.params.lpt):
+                block_idx = self.params.num_block - 1 - block_idx
+            split_idx = split_raw
+            if const_expr(self.params.is_split_kv
+                          and self.params.num_splits_dynamic_ptr is not None):
+                if work.is_valid_tile:
+                    num_splits = Int32(self.params.num_splits_dynamic_ptr[batch_swz])
+                    split_idx = split_idx | (num_splits << 16)
+            return WorkTileInfo(
+                (Int32(block_idx), Int32(head_swz), Int32(batch_swz), Int32(split_idx)),
+                work.is_valid_tile,
+            )
         if const_expr(self.params.lpt):
             # Longest-processing-time-first: reverse block order
             if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
