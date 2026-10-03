@@ -17,10 +17,27 @@ pip install "flash-attn-4[cu13]"
 ## Usage
 
 ```python
-from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+from flash_attn.cute import (
+    flash_attn_func,
+    flash_attn_kvpacked_func,
+    flash_attn_qkvpacked_func,
+    flash_attn_varlen_func,
+    flash_attn_varlen_kvpacked_func,
+    flash_attn_varlen_qkvpacked_func,
+)
 
-out = flash_attn_func(q, k, v, causal=True)
+out, _ = flash_attn_func(q, k, v, causal=True)
+
+# Packed projection outputs can be passed without manually splitting them.
+out_qkv, _ = flash_attn_qkvpacked_func(qkv, causal=True)
+out_kv, _ = flash_attn_kvpacked_func(q, kv, causal=True)
 ```
+
+Packed inputs use the same CuTe options and return the same ``(out, lse)`` tuple
+as their unpacked counterparts. The packed dimensions are
+``(batch, seqlen, 3, heads, dim)`` for QKV and
+``(batch, seqlen_k, 2, heads_k, dim)`` for KV; the varlen forms omit the batch
+dimension.
 
 ## Development
 
