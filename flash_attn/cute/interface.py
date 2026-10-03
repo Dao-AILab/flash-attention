@@ -1610,6 +1610,7 @@ def _flash_attn_fwd(
         if arch // 10 == 8:
             assert page_table is None, "paged KV not supported on SM 8.0"
             assert not is_split_kv, "SplitKV not supported on SM 8.0"
+            assert not use_block_sparsity, "Block sparsity not supported on SM 8.0"
             fa_fwd = FlashAttentionForwardSm80(
                 dtype,
                 head_dim,
