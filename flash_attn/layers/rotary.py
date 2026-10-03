@@ -366,11 +366,7 @@ class RotaryEmbedding(torch.nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.interleaved = interleaved
         self.scale_base = scale_base
-        scale = (
-            (torch.arange(0, dim, 2, device=device, dtype=torch.float32) + 0.4 * dim) / (1.4 * dim)
-            if scale_base is not None
-            else None
-        )
+        scale = self._compute_scale(device) if scale_base is not None else None
         self.register_buffer("scale", scale, persistent=False)
 
         self._seq_len_cached = 0
@@ -383,6 +379,11 @@ class RotaryEmbedding(torch.nn.Module):
         return 1.0 / (
             self.base
             ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
+        )
+
+    def _compute_scale(self, device=None):
+        return (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) + 0.4 * self.dim) / (
+            1.4 * self.dim
         )
 
     def _update_cos_sin_cache(self, seqlen, device=None, dtype=None):
@@ -415,11 +416,19 @@ class RotaryEmbedding(torch.nn.Module):
                 self._cos_cached = torch.cos(freqs).to(dtype)
                 self._sin_cached = torch.sin(freqs).to(dtype)
             else:
+                # We want fp32 here too (see comments above for inv_freq): self.scale could
+                # have been downcast by a module-wide .half()/.bfloat16() call, and computing
+                # the position-dependent power/scale terms in low precision loses a lot of
+                # precision (position indices can be large, and scale is raised to that power).
+                if self.scale.dtype != torch.float32:
+                    scale_fp32 = self._compute_scale(device=self.scale.device)
+                else:
+                    scale_fp32 = self.scale
                 power = (
-                    torch.arange(seqlen, dtype=self.scale.dtype, device=self.scale.device)
+                    torch.arange(seqlen, dtype=torch.float32, device=scale_fp32.device)
                     - seqlen // 2
                 ) / self.scale_base
-                scale = self.scale.to(device=power.device) ** rearrange(power, "s -> s 1")
+                scale = scale_fp32.to(device=power.device) ** rearrange(power, "s -> s 1")
                 # We want the multiplication by scale to happen in fp32
                 self._cos_cached = (torch.cos(freqs) * scale).to(dtype)
                 self._sin_cached = (torch.sin(freqs) * scale).to(dtype)
