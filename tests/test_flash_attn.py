@@ -2140,6 +2140,91 @@ def test_flash_attn_kvcache(
     assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
 
 
+def _noncontiguous_copy(x):
+    storage = torch.empty(
+        (x.shape[0] * 2, *x.shape[1:]), dtype=x.dtype, device=x.device
+    )
+    result = storage[::2]
+    result.copy_(x)
+    assert not result.is_contiguous()
+    return result
+
+
+def test_flash_attn_kvcache_noncontiguous_metadata():
+    """The Python API normalizes tensors that the C++ API requires contiguous."""
+    device = "cuda"
+    dtype = torch.float16
+    batch_size, batch_size_cache = 2, 4
+    seqlen_q, seqlen_k = 1, 8
+    nheads, nheads_k, d = 2, 1, 32
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, 1, nheads_k, d, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    k_cache = torch.randn(
+        batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype
+    )
+    v_cache = torch.randn_like(k_cache)
+
+    cache_seqlens = torch.tensor([2, 3], dtype=torch.int32, device=device)
+    cache_batch_idx = torch.tensor([2, 0], dtype=torch.int32, device=device)
+    cache_leftpad = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    alibi_slopes = torch.tensor(
+        [[0.1, 0.2], [0.3, 0.4]], dtype=torch.float32, device=device
+    )
+    angle = torch.randn(seqlen_k, 8, device=device, dtype=dtype)
+    rotary_cos, rotary_sin = torch.cos(angle), torch.sin(angle)
+
+    def run(use_noncontiguous):
+        def normalize(x):
+            return _noncontiguous_copy(x) if use_noncontiguous else x
+
+        k_cache_test, v_cache_test = k_cache.clone(), v_cache.clone()
+        out = flash_attn_with_kvcache(
+            q,
+            k_cache_test,
+            v_cache_test,
+            k,
+            v,
+            rotary_cos=normalize(rotary_cos),
+            rotary_sin=normalize(rotary_sin),
+            cache_seqlens=normalize(cache_seqlens),
+            cache_batch_idx=normalize(cache_batch_idx),
+            cache_leftpad=normalize(cache_leftpad),
+            alibi_slopes=normalize(alibi_slopes),
+            causal=True,
+            num_splits=1,
+        )
+        return out, k_cache_test, v_cache_test
+
+    expected = run(use_noncontiguous=False)
+    actual = run(use_noncontiguous=True)
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"k": torch.empty(1), "v": None}, "k and v"),
+        ({"k": None, "v": torch.empty(1)}, "k and v"),
+        (
+            {"rotary_cos": torch.empty(1), "rotary_sin": None},
+            "rotary_cos and rotary_sin",
+        ),
+        (
+            {"rotary_cos": None, "rotary_sin": torch.empty(1)},
+            "rotary_cos and rotary_sin",
+        ),
+    ],
+)
+def test_flash_attn_kvcache_rejects_unpaired_inputs(kwargs, match):
+    q = torch.empty(1, 1, 1, 16)
+    cache = torch.empty(1, 1, 1, 16)
+    with pytest.raises(ValueError, match=match):
+        flash_attn_with_kvcache(q, cache, cache, **kwargs)
+
+
 def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype):
     num_blocks = math.ceil(seqlen_k / paged_kv_block_size) * batch_size * 3
     k_cache_paged = torch.randn(
