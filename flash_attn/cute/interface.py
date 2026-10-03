@@ -65,8 +65,7 @@ from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100_h64 import dQdQvGemmKernelH64
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
-# SM100 head_dim=256 2CTA kernel imports
-from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
+# SM100 head_dim=256 2CTA backward kernel
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
 
 from flash_attn.cute.utils import AuxData
@@ -123,7 +122,7 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     """Validate head dimension constraints based on compute capability."""
     is_deepseek_shape = head_dim == 192 and head_dim_v == 128
     is_deepseek_mla_absorbed_shape = (head_dim == 64 or head_dim == head_dim_v) and head_dim_v == 512
-    is_dedicate_kernel_shape = head_dim == 256 and head_dim_v == 256
+    is_hdim256_shape = head_dim == 256 and head_dim_v == 256
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
     is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
@@ -133,7 +132,7 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
             f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
-        assert (is_standard_range or is_deepseek_shape or is_deepseek_mla_absorbed_shape or is_dedicate_kernel_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+        assert (is_standard_range or is_deepseek_shape or is_deepseek_mla_absorbed_shape or is_hdim256_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
             f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek, or (256, 256) for hd256."
         )
@@ -386,7 +385,8 @@ def _get_fwd_config(
 
     seqlen_q_packgqa = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
     if arch // 10 in [10, 11]:
-        q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        # Two Q tiles exceed TMEM capacity at hdim_v 256.
+        q_stage = 2 if seqlen_q_packgqa > tile_m and head_dim_v != 256 else 1
     else:
         q_stage = 1
 
@@ -409,12 +409,8 @@ def _get_fwd_config(
         )
     )
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
-    total_mblocks = batch_size * num_head_kv * num_m_blocks
-    if arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256:
-        # The dedicated hd256 kernel never packs GQA and runs one 2CTA cluster per
-        # 2 * tile_m Q rows of each Q head: count its CTAs.
-        num_clusters_m = cute.ceil_div(max_seqlen_q, 2 * tile_m)
-        total_mblocks = 2 * batch_size * num_head_kv * qhead_per_kvhead * num_clusters_m
+    # Without PackGQA every Q head gets its own m blocks.
+    total_mblocks = batch_size * num_head_kv * (1 if pack_gqa else qhead_per_kvhead) * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = None
     if arch // 10 == 12:
@@ -942,16 +938,12 @@ def _flash_attn_fwd(
 
     # Preserve the caller's hint.
     host_max_seqlen_q = max_seqlen_q if not torch.is_tensor(max_seqlen_q) else None
-    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     # Scheduler bounds stay on host; actual lengths stay on device.
     if arch // 10 in [10, 11]:
-        if use_dedicated_hd256_kernel or cu_seqlens_q is not None or seqused_q is not None:
+        if cu_seqlens_q is not None or seqused_q is not None:
             max_seqlen_q = host_max_seqlen_q
         if (
-            use_dedicated_hd256_kernel
-            or cu_seqlens_k is not None
-            or seqused_k is not None
-            or page_table is not None
+            cu_seqlens_k is not None or seqused_k is not None or page_table is not None
         ) and torch.is_tensor(max_seqlen_k):
             max_seqlen_k = None
     if max_seqlen_q is None:
@@ -1000,28 +992,19 @@ def _flash_attn_fwd(
             ).SPARSE_HEAD_TILE,
         )
         pack_gqa = True
+    is_hdim256 = head_dim == 256 and head_dim_v == 256
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
-
-    if use_dedicated_hd256_kernel and page_table is not None:
-        # The kernel derives KV capacity from the page-table width. Normalize
-        # both before config selection, cache-key construction and tensor conversion.
-        required_pages = (max_seqlen_k + page_size - 1) // page_size
-        assert page_table.shape[1] >= required_pages, (
-            f"SM100 hd256 2CTA paged KV requires page_table to cover max_seqlen_k="
-            f"{max_seqlen_k}, i.e. at least ceil({max_seqlen_k} / {page_size}) = "
-            f"{required_pages} pages, got page_table.shape[1]={page_table.shape[1]}"
-        )
-        if max_seqlen_k % page_size != 0:
-            # seqused_k must mask the extra tokens introduced by page rounding.
-            assert seqused_k is not None, (
-                f"SM100 hd256 2CTA paged KV rounds max_seqlen_k up to the page "
-                f"boundary ({max_seqlen_k} -> {required_pages * page_size}); pass "
-                f"seqused_k with the per-batch KV lengths so the tail inside the "
-                f"last page is masked, or pass a page-aligned max_seqlen_k"
-            )
-        page_table = page_table[:, :required_pages]
-        max_seqlen_k = required_pages * page_size
+        if (
+            arch // 10 in [10, 11]
+            and is_hdim256
+            and 128 % qhead_per_kvhead != 0
+            and cu_seqlens_q is None
+            and seqused_q is None
+            and seqlen_q > 128
+        ):
+            # Prefer 2CTA over cp.async-Q PackGQA for multi-tile hd256 queries.
+            pack_gqa = False
 
     fwd_cfg = _get_fwd_config(
         arch=arch,
@@ -1089,20 +1072,24 @@ def _flash_attn_fwd(
     use_2cta_instrs = (
         arch // 10 in [10, 11]
         and not requested_disable_2cta
-        and not causal
-        and not local
         and not is_split_kv
         and cu_seqlens_q is None
         and seqused_q is None
         and not use_block_sparsity
         and page_size in [None, 128]
-        and int(math.ceil(head_dim / 16) * 16) in [128, 192]
-        and int(math.ceil(head_dim_v / 16) * 16) == 128
-        and seqlen_q_packgqa > 2 * tile_m
+        and not max_m_blocks_leq_one
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
+        and (
+            # hd256 also supports causal/local 2CTA.
+            is_hdim256
+            or (
+                not causal
+                and not local
+                and int(math.ceil(head_dim / 16) * 16) in [128, 192]
+                and int(math.ceil(head_dim_v / 16) * 16) == 128
+            )
+        )
     )
-
-    use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -1261,16 +1248,11 @@ def _flash_attn_fwd(
     if qv is not None:
         # the MLA kernels write all num_splits partials (no per-batch dynamic split counts)
         assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
-    if use_dedicated_hd256_kernel:
-        # The hd=256 2CTA fwd kernel does not support the dynamic-persistent scheduler.
-        scheduler_metadata = None
-        reuse_scheduler_metadata = False
     if (
         is_split_kv
         and is_varlen_q
         and scheduler_metadata is None
         and not disable_scheduler_metadata
-        and not use_dedicated_hd256_kernel
         and qv is None
     ):
         scheduler_metadata = _get_scheduler_metadata(
@@ -1336,7 +1318,6 @@ def _flash_attn_fwd(
         is_varlen_q
         and use_single_tile_varlen_scheduler
         and batch_size > BIN_BATCH_SEARCH_THRESH
-        and not use_dedicated_hd256_kernel
         and qv is None
     )
     if (
@@ -1520,7 +1501,6 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
-        use_dedicated_hd256_kernel and cu_seqlens_q is not None and host_max_seqlen_q is None,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1726,31 +1706,9 @@ def _flash_attn_fwd(
                         rescale_threshold=mla_fwd_rescale_threshold,
                     )
             else:
-                if use_dedicated_hd256_kernel:
-                    # hd=256 2CTA forward: check for currently unsupported features
-                    assert softcap is None, "SM100 forward with head_dim=256 does not support softcap"
-                    assert not use_block_sparsity, \
-                        "SM100 forward with head_dim=256 does not support block sparsity"
-                    assert learnable_sink is None, \
-                        "SM100 forward with head_dim=256 does not support learnable_sink"
-                    # The dedicated kernel derives K/V load offsets from
-                    # cu_seqlens_q; varlen-packed K without varlen Q would be
-                    # silently mis-addressed, so reject it loudly.
-                    assert cu_seqlens_k is None or cu_seqlens_q is not None, \
-                        "SM100 forward with head_dim=256 requires cu_seqlens_q when cu_seqlens_k is used"
-                    # The paged-KV extent/page-table contract is normalized
-                    # up front (see the page_table block above), so it holds by
-                    # construction here.
-                    # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
-                    pack_gqa = False
-
-                flash_fwd_obj_cls = (
-                    BlackwellFusedMultiHeadAttentionForward
-                    if use_dedicated_hd256_kernel
-                    else FlashAttentionForwardSm100
-                )
-
-                fa_fwd_kwargs = dict(
+                fa_fwd = FlashAttentionForwardSm100(
+                    head_dim,
+                    head_dim_v,
                     qhead_per_kvhead=qhead_per_kvhead,
                     is_causal=causal,
                     is_local=local,
@@ -1770,11 +1728,9 @@ def _flash_attn_fwd(
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
                     seqlen_k_per_split=seqlen_k_per_split,
+                    has_tile_count_semaphore=tile_count_semaphore is not None,
+                    use_s_ping_pong=use_s_ping_pong,
                 )
-                if not use_dedicated_hd256_kernel:
-                    fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
-                    fa_fwd_kwargs["use_s_ping_pong"] = use_s_ping_pong
-                fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
@@ -1852,13 +1808,7 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
-            if use_dedicated_hd256_kernel:
-                compile_args.append(
-                    Int32(host_max_seqlen_q)
-                    if cu_seqlens_q is not None and host_max_seqlen_q is not None
-                    else None
-                )
-            if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+            if arch // 10 in [10, 11]:
                 compile_args.extend([
                     num_splits_dynamic_tensor,
                     tile_count_semaphore_tensor,
@@ -1950,13 +1900,7 @@ def _flash_attn_fwd(
                 else None,
                 AuxData(aux_tensors, aux_scalars),
             ])
-            if use_dedicated_hd256_kernel:
-                call_args.append(
-                    host_max_seqlen_q
-                    if cu_seqlens_q is not None
-                    else None
-                )
-            if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+            if arch // 10 in [10, 11]:
                 call_args.extend([
                     num_splits_dynamic,
                     tile_count_semaphore,
