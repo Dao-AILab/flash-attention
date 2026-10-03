@@ -436,8 +436,37 @@ def test_generic_varlen_no_max_shares_flat_scheduler_key(monkeypatch):
     check_against_reference((out_none,), q, k, v, None, q_lens, k_lens, False, dtype)
 
 
+def test_generic_paged_seqused_cuda_maxima_use_host_bounds():
+    """Paged SplitKV scheduler bounds must not require host reads of CUDA maxima."""
+    torch.manual_seed(SEED)
+    dtype, head_dim = torch.bfloat16, 128
+    q = torch.randn(2, 128, 4, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(6, 128, 1, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    pages = torch.tensor([[3, 0], [5, 1]], device="cuda", dtype=torch.int32)
+    seqused_q = torch.full((2,), 128, device="cuda", dtype=torch.int32)
+
+    def forward():
+        return flash_attn_varlen_func(
+            q, k, v, page_table=pages, seqused_q=seqused_q, num_splits=3,
+            max_seqlen_q=seqused_q.max(),
+            max_seqlen_k=torch.tensor(256, device="cuda", dtype=torch.int32),
+        )[0]
+
+    forward()
+    with RejectHostScalarExtraction():
+        out = forward()
+    packed_k = k[pages].reshape(512, 1, head_dim)
+    packed_v = v[pages].reshape_as(packed_k)
+    check_against_reference(
+        (out.flatten(0, 1),), q.flatten(0, 1), packed_k, packed_v, None, (128, 128), (256, 256),
+        False, dtype,
+    )
+
+
+@pytest.mark.parametrize("num_splits", [1, 3])
 @MAX_MODES
-def test_hd256_paged_maximum_uses_table_extent(max_mode):
+def test_hd256_paged_maximum_uses_table_extent(max_mode, num_splits):
     torch.manual_seed(SEED)
     dtype = torch.bfloat16
     q = torch.randn(2, 128, 4, HEAD_DIM, device="cuda", dtype=dtype)
@@ -448,8 +477,15 @@ def test_hd256_paged_maximum_uses_table_extent(max_mode):
     if max_mode == "cuda":
         maximum = torch.tensor(256, device="cuda", dtype=torch.int32)
 
+    # Exercise used-length hints with explicit splits.
+    seqused_q = torch.full((2,), 128, device="cuda", dtype=torch.int32) if num_splits > 1 else None
+
     def forward():
-        return flash_attn_varlen_func(q, k, v, page_table=pages, max_seqlen_k=maximum)[0]
+        max_q = seqused_q.max() if seqused_q is not None and max_mode == "cuda" else None
+        return flash_attn_varlen_func(
+            q, k, v, page_table=pages, max_seqlen_q=max_q, max_seqlen_k=maximum,
+            seqused_q=seqused_q, num_splits=num_splits,
+        )[0]
 
     forward()
     with RejectHostScalarExtraction():

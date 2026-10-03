@@ -943,13 +943,17 @@ def _flash_attn_fwd(
     # Preserve the caller's hint.
     host_max_seqlen_q = max_seqlen_q if not torch.is_tensor(max_seqlen_q) else None
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
-    if use_dedicated_hd256_kernel or (arch // 10 in [10, 11] and cu_seqlens_q is not None):
-        max_seqlen_q = host_max_seqlen_q
-    if (
-        use_dedicated_hd256_kernel
-        or (arch // 10 in [10, 11] and cu_seqlens_k is not None)
-    ) and torch.is_tensor(max_seqlen_k):
-        max_seqlen_k = None
+    # Scheduler bounds stay on host; actual lengths stay on device.
+    if arch // 10 in [10, 11]:
+        if use_dedicated_hd256_kernel or cu_seqlens_q is not None or seqused_q is not None:
+            max_seqlen_q = host_max_seqlen_q
+        if (
+            use_dedicated_hd256_kernel
+            or cu_seqlens_k is not None
+            or seqused_k is not None
+            or page_table is not None
+        ) and torch.is_tensor(max_seqlen_k):
+            max_seqlen_k = None
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
