@@ -44,14 +44,29 @@ def state_dict_from_pretrained(model_name, device=None, dtype=None):
         )
         is_sharded = True
         load_safe = True
-    else:  # Try loading from HF hub instead of from local files
-        resolved_archive_file = cached_file(model_name, WEIGHTS_NAME,
-                                            _raise_exceptions_for_missing_entries=False)
+    else:  # Try the HF Hub in the same format order as local checkpoints.
+        resolved_archive_file = cached_file(
+            model_name, WEIGHTS_NAME, _raise_exceptions_for_missing_entries=False
+        )
         if resolved_archive_file is None:
-            resolved_archive_file = cached_file(model_name, WEIGHTS_INDEX_NAME,
-                                                _raise_exceptions_for_missing_entries=False)
+            resolved_archive_file = cached_file(
+                model_name, WEIGHTS_INDEX_NAME, _raise_exceptions_for_missing_entries=False
+            )
             if resolved_archive_file is not None:
                 is_sharded = True
+        if resolved_archive_file is None:
+            resolved_archive_file = cached_file(
+                model_name, SAFE_WEIGHTS_NAME, _raise_exceptions_for_missing_entries=False
+            )
+            if resolved_archive_file is not None:
+                load_safe = True
+        if resolved_archive_file is None:
+            resolved_archive_file = cached_file(
+                model_name, SAFE_WEIGHTS_INDEX_NAME, _raise_exceptions_for_missing_entries=False
+            )
+            if resolved_archive_file is not None:
+                is_sharded = True
+                load_safe = True
 
     if resolved_archive_file is None:
         raise EnvironmentError(f"Model name {model_name} was not found.")
