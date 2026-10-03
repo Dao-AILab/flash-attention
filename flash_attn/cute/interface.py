@@ -84,6 +84,9 @@ BIN_BATCH_SEARCH_THRESH = 256  # above this batch size SingleTileVarlenScheduler
 # Where the cu hint applies, use an O(1) flat-block -> batch lookup instead of the binary search.
 USE_BLOCKS_TO_BATCH: bool = True
 
+# Enable the S ping-pong only when each split's mainloop is at least this many n_blocks.
+S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT = {64: 16, 128: 64}
+
 
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
@@ -322,7 +325,8 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
 
     # NOTE: We should revisit this heuristic after persistence is supported for split KV.
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
-    return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
+    # More tiles than SMs means no split, not zero splits.
+    return max(1, min(num_SMs // total_mblocks, max_splits, num_n_blocks))
 
 
 def _get_fwd_config(
@@ -930,6 +934,7 @@ def _flash_attn_fwd(
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
+    requested_disable_s_ping_pong = utils._get_disable_s_ping_pong_default()
 
     # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
     if arch // 10 in [8, 12]:
@@ -1408,7 +1413,42 @@ def _flash_attn_fwd(
         else page_size % 64 == 0 if mla_1cta_kb64
         else page_size == tile_n
     )
-    
+
+    s_ping_pong_seqlen_k_loaded = (
+        max_seqlen_k
+        if not local
+        else max(
+            0,
+            min(
+                max_seqlen_k,
+                (max_seqlen_k if window_size_right is None else window_size_right)
+                + (max_seqlen_k if window_size_left is None else window_size_left)
+                + 1
+                + tile_m,
+            ),
+        )
+    )
+    num_n_blocks_per_split = cute.ceil_div(cute.ceil_div(s_ping_pong_seqlen_k_loaded, tile_n), num_splits)
+    use_s_ping_pong = (
+        not requested_disable_s_ping_pong
+        and arch in (100, 110)
+        and q_stage == 1
+        and head_dim in (64, 128)
+        and head_dim_v == head_dim
+        and tile_m == 128
+        and tile_n == 128
+        and not use_2cta_instrs
+        and page_size in (None, tile_n)
+        and score_mod is None
+        and mask_mod is None
+        and not use_block_sparsity
+        and learnable_sink is None
+        and (
+            num_splits == 1
+            or num_n_blocks_per_split >= S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT[head_dim]
+        )
+    )
+
     compile_key = (
         mla_1cta,
         mla_1cta_kb64,
@@ -1457,6 +1497,7 @@ def _flash_attn_fwd(
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
+        use_s_ping_pong,
         num_splits_dynamic is not None,
         mla_fwd_rescale_threshold,
         o_lo is not None,
@@ -1729,6 +1770,7 @@ def _flash_attn_fwd(
                 )
                 if not use_dedicated_hd256_kernel:
                     fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
+                    fa_fwd_kwargs["use_s_ping_pong"] = use_s_ping_pong
                 fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
