@@ -319,6 +319,8 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int head_size_rounded, const float p_dropout,
     const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
 
+    TORCH_CHECK(p_dropout == 0.0f || num_splits <= 1, "num_splits > 1 is not supported with dropout");
+
     // This needs to match with run_mha_fwd_splitkv_dispatch
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
@@ -727,14 +729,11 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     params.page_block_size = page_block_size;
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
-    if (seqlenq_ngroups_swapped) {
+    if (paged_KV || seqlenq_ngroups_swapped) {
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,
                                p_dropout, num_splits, get_num_sm(get_current_device()), opts);
-    } else if (paged_KV) {
-        TORCH_CHECK(num_splits <= 1, "num_splits > 1 is not supported for varlen paged KV");
-        params.num_splits = num_splits;
     }
 
     if (leftpad_k_.has_value()) {
