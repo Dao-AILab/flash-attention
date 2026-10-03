@@ -505,7 +505,10 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
+        if not return_softmax:
+            return out
+        ctx.mark_non_differentiable(softmax_lse, S_dmask)
+        return out, softmax_lse, S_dmask
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -595,7 +598,10 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
+        if not return_softmax:
+            return out
+        ctx.mark_non_differentiable(softmax_lse, S_dmask)
+        return out, softmax_lse, S_dmask
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -684,7 +690,10 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
+        if not return_softmax:
+            return out
+        ctx.mark_non_differentiable(softmax_lse, S_dmask)
+        return out, softmax_lse, S_dmask
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -784,7 +793,10 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
+        if not return_softmax:
+            return out
+        ctx.mark_non_differentiable(softmax_lse, S_dmask)
+        return out, softmax_lse, S_dmask
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -875,7 +887,10 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
+        if not return_softmax:
+            return out
+        ctx.mark_non_differentiable(softmax_lse, S_dmask)
+        return out, softmax_lse, S_dmask
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -976,7 +991,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.deterministic = deterministic
 
         out = out_padded[..., :head_size_og]
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
+        if not return_softmax:
+            return out
+        ctx.mark_non_differentiable(softmax_lse, S_dmask)
+        return out, softmax_lse, S_dmask
 
     @staticmethod
     def backward(ctx, dout, *args):
