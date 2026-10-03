@@ -132,3 +132,30 @@ def test_rotary_interleaved(rotary_emb_fraction, seqlen_offset):
     assert torch.allclose(k_pt.grad, qkv.grad[:, :, 1, :, :rotary_dim], rtol=rtol, atol=atol)
     assert torch.equal(qkv.grad[:, :, 0:2, :, rotary_dim:], g_og[:, :, 0:2, :, rotary_dim:])
     assert torch.equal(qkv.grad[:, :, 2], g_og[:, :, 2])
+
+
+# XPos (scale_base) rotary embedding: the position-dependent `scale` buffer must stay in fp32
+# internally even if the owning module is cast to half/bf16 (e.g. via `.half()`), the same way
+# `inv_freq` is protected. Regression test for a bug where casting the module downcast `scale`
+# and the "power" exponent was computed in that low precision, corrupting cos/sin for XPos.
+@pytest.mark.parametrize("module_dtype", [torch.float16, torch.bfloat16])
+def test_rotary_xpos_scale_precision_survives_half_cast(module_dtype):
+    device = "cpu"
+    dim = 64
+    seqlen = 4096
+    rotary_fp32 = RotaryEmbedding(dim, scale_base=512, device=device)
+    rotary_fp32._update_cos_sin_cache(seqlen, device=device, dtype=module_dtype)
+
+    rotary_cast = RotaryEmbedding(dim, scale_base=512, device=device).to(module_dtype)
+    assert rotary_cast.scale.dtype == module_dtype  # confirms the module-wide cast reached `scale`
+    rotary_cast._update_cos_sin_cache(seqlen, device=device, dtype=module_dtype)
+
+    # Before the fix, computing `power`/`scale` in `module_dtype` (instead of fp32) produced a
+    # materially different cos/sin cache purely from the precision of the owning module's dtype,
+    # even though the mathematically correct result does not depend on it.
+    torch.testing.assert_close(
+        rotary_cast._cos_cached.float(), rotary_fp32._cos_cached.float(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        rotary_cast._sin_cached.float(), rotary_fp32._sin_cached.float(), rtol=0, atol=0
+    )
