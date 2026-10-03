@@ -109,6 +109,7 @@ def decode(
     tensor_parallel=1,
     cg=False,
     enable_timing=False,
+    pad_token_id=None,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -119,13 +120,33 @@ def decode(
     Arguments:
         input_ids: (batch, seq_len)
         max_length: int
+        eos_token_id (optional): int or sequence of ints that mark a completed sequence.
         teacher_outputs (optional): (batch, seq_len). If provided, instead of sampling from the
             logits, the next token is taken from the teacher_outputs. Useful for testing.
+        pad_token_id (optional): Token emitted for sequences that have already completed. Defaults
+            to the first eos_token_id.
     Returns: GreedySearchDecoderOnlyOutput or SampleDecoderOnlyOutput, with the following fields:
-        sequences: (batch, max_length)
+        sequences: (batch, decoded length), where decoded length is at most max_length
         scores: tuples of (batch, vocab_size)
     """
     batch_size, seqlen_og = input_ids.shape
+    eos_token_ids = None
+    pad_token = None
+    unfinished_sequences = None
+    if eos_token_id is not None:
+        eos_token_ids = torch.as_tensor(
+            eos_token_id, dtype=input_ids.dtype, device=input_ids.device
+        ).reshape(-1)
+        if eos_token_ids.numel() == 0:
+            raise ValueError("eos_token_id must contain at least one token ID")
+        pad_token = (
+            eos_token_ids[0]
+            if pad_token_id is None
+            else torch.as_tensor(
+                pad_token_id, dtype=input_ids.dtype, device=input_ids.device
+            ).reshape(())
+        )
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.bool, device=input_ids.device)
     teacher_output_len = teacher_outputs.shape[1] if teacher_outputs is not None else 0
     if cg:
         if not hasattr(model, "_decoding_cache"):
@@ -172,14 +193,18 @@ def decode(
             token = sample(logits, top_k=top_k, top_p=top_p, temperature=temperature)
         else:
             token = teacher_outputs[:, inference_params.seqlen_offset]
+        if unfinished_sequences is not None:
+            token = torch.where(unfinished_sequences, token, pad_token)
         # return rearrange(token, "b -> b 1")
         return token.unsqueeze(1)
 
     def should_stop(current_token, inference_params):
         if inference_params.seqlen_offset == 0:
             return False
-        if eos_token_id is not None and (current_token == eos_token_id).all():
-            return True
+        if unfinished_sequences is not None:
+            unfinished_sequences.logical_and_((current_token != eos_token_ids).all(dim=-1))
+            if not unfinished_sequences.any():
+                return True
         if inference_params.seqlen_offset >= max_length - 1:
             return True
         return False
