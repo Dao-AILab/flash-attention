@@ -131,6 +131,12 @@ class FlashAttentionSparseMLABackwardSm100:
         self.epilogue_warp_indices = (4, 5, 6, 7)
         self.load_warp_id = 8
         self.mma_warp_id = 9
+        # Warps that wait on the TmemPtr barrier for the TMEM allocation.
+        self.tmem_alloc_warp_ids = (
+            self.mma_warp_id,
+            *self.softmax_warp_indices,
+            *self.epilogue_warp_indices,
+        )
         self.clc_scheduler_warp_id = 10
         self.relay_warp_id = 11
         self.cpasync_load_warp_indices = (12, 13, 14, 15)
@@ -1068,7 +1074,7 @@ class FlashAttentionSparseMLABackwardSm100:
         # ==== Prepare TMEM allocator ====
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwdSm100_MLA2CTA.TmemPtr),
-            num_threads=self.num_mma_threads + self.num_softmax_threads + self.num_epilogue_threads,
+            num_threads=cute.arch.WARP_SIZE * len(self.tmem_alloc_warp_ids),
         )
         tmem = cutlass.utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
@@ -1441,12 +1447,14 @@ class FlashAttentionSparseMLABackwardSm100:
                 thr_mma_dKr=thr_mma_dKr,
             )
 
+        # bar.sync is .aligned: all TmemPtr participants must wait at this one site.
+        tmem.allocate(self.tmem_alloc_cols)
+        if warp_idx in self.tmem_alloc_warp_ids:
+            tmem.wait_for_alloc()
+
         if warp_idx == self.mma_warp_id:
             if const_expr(self.num_regs_mma < self.num_regs_per_thread):
                 cute.arch.setmaxregister_decrease(self.num_regs_mma)
-            # ==== Allocate TMEM ====
-            tmem.allocate(self.tmem_alloc_cols)
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.dtype_acc)
             tdPtdP = cute.make_tensor(tmem_ptr + self.tmem_offset_dP, tdPtdP_fake.layout)
             tdVtdV = cute.make_tensor(tmem_ptr + self.tmem_offset_dV0, tdVtdV_fake.layout)
@@ -1500,7 +1508,6 @@ class FlashAttentionSparseMLABackwardSm100:
 
         if warp_idx in self.softmax_warp_indices:
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.dtype_acc)
             tdPtdP = cute.make_tensor(tmem_ptr + self.tmem_offset_dP, tdPtdP_fake.layout)
             tdStS = None
@@ -1543,7 +1550,6 @@ class FlashAttentionSparseMLABackwardSm100:
             elif const_expr(self.num_regs_epilogue > self.num_regs_per_thread):
                 cute.arch.setmaxregister_increase(self.num_regs_epilogue)
 
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.dtype_acc)
             tdVtdV = cute.make_tensor(tmem_ptr + self.tmem_offset_dV0, tdVtdV_fake.layout)
             tdKrtdKr = None

@@ -176,6 +176,8 @@ class FlashAttentionBackwardSm100:
         self.compute_warp_ids = (4, 5, 6, 7, 8, 9, 10, 11)
         self.mma_warp_id = 12
         self.load_warp_id = 13
+        # Warps that wait on the TmemPtr barrier for the TMEM allocation.
+        self.tmem_alloc_warp_ids = (self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)
         self.relay_warp_id = 14
         self.empty_warp_id = 15
 
@@ -1204,8 +1206,7 @@ class FlashAttentionBackwardSm100:
 
         tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwdSm100.TmemPtr),
-            num_threads=cute.arch.WARP_SIZE
-            * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
+            num_threads=cute.arch.WARP_SIZE * len(self.tmem_alloc_warp_ids),
         )
         tmem = cutlass.utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
@@ -1559,14 +1560,15 @@ class FlashAttentionBackwardSm100:
                 should_load_dO=True,
             )
 
+        # bar.sync is .aligned: all TmemPtr participants must wait at this one site.
+        tmem.allocate(self.tmem_alloc_cols)
+        if warp_idx in self.tmem_alloc_warp_ids:
+            tmem.wait_for_alloc()
+
         #  MMA
         # (12)
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_mma)
-
-            # Alloc tmem buffer
-            tmem.allocate(self.tmem_alloc_cols)
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
 
             self.mma(
@@ -1619,7 +1621,6 @@ class FlashAttentionBackwardSm100:
         # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_compute)  # 8 warps
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
             self.compute_loop(
                 thr_mma_S,
@@ -1671,7 +1672,6 @@ class FlashAttentionBackwardSm100:
         # (0, 1, 2, 3) - dQ
         if warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
             self.dQacc_reduce(
                 mdQaccum,
