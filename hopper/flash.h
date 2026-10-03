@@ -165,6 +165,14 @@ struct Flash_fwd_params : public Qkv_params {
 
     int arch;
     int num_sm;
+
+    // Ring-attention backward phase selector (additive; 0 for all existing paths
+    // since set_params_fprop does `params = {}`). Only read by run_flash_bwd:
+    // 0 = normal full backward (unchanged), 1 = preprocess only (compute D +
+    // softmax_lse_log2 + clear dQaccum), 2 = main seqk kernel only (accumulate dQ
+    // into a persistent fp32 dq_accum, write this K/V block's dK/dV), 3 = convert
+    // dQaccum -> dQ only.
+    int ring_bwd_phase;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
