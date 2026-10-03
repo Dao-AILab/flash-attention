@@ -10,9 +10,9 @@ PR or email us. We'd very much like to hear from you!
 
 - Pytorch: [integrated](https://github.com/pytorch/pytorch/pull/81434) into core Pytorch in nn.Transformer.
 
-- Huggingface's [transformers](https://github.com/huggingface/transformers) library.
-  [On-going](https://github.com/huggingface/transformers/pull/18439), blogpost
-  coming soon.
+- Huggingface's [transformers](https://github.com/huggingface/transformers) library:
+  [integrated](https://huggingface.co/docs/transformers/perf_infer_gpu_one#attention-backends)
+  (use `attn_implementation="flash_attention_2"`).
 
 - Microsoft's [DeepSpeed](https://github.com/microsoft/DeepSpeed):
   FlashAttention is [integrated](https://github.com/microsoft/DeepSpeed/blob/ec13da6ba7cabc44bb4745a64a208b8580792954/deepspeed/ops/transformer/inference/triton_ops.py) into DeepSpeed's inference engine.
