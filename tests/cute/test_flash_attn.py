@@ -414,6 +414,55 @@ def test_flash_attn_paged_non_tma_partial_loader_tile():
     torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
 
 
+@pytest.mark.skipif(not IS_SM90, reason="SM90 cp.async paged-KV loader test")
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "d, tile_mn, mma_pv_is_rs",
+    [
+        (80, (192, 144), False),
+        (96, (192, 144), False),
+        (160, (128, 112), True),
+        (224, (128, 80), True),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_non_tma_partial_pass_sm90(d, tile_mn, mma_pv_is_rs, causal, page_size):
+    # The SM90 non-causal tiles for these head dims have tile_n 144, 112 and 80, not a multiple of
+    # the KV rows the 128 loader threads copy per pass (64 for d=80, 32 otherwise).
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    batch_size, seqlen_q, nheads, nheads_k = 4, 16, 8, 2
+    tile_n = tile_mn[1]
+    seqlens_k = [tile_n, tile_n + 1, 3 * tile_n - 7, 97]
+    max_seqlen_k = max(seqlens_k)
+    k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, _ = _generate_block_kvcache(
+        max_seqlen_k, page_size, batch_size, nheads_k, d, d, device, dtype, dtype
+    )
+    cache_seqlens = torch.tensor(seqlens_k, dtype=torch.int32, device=device)
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    out = _flash_attn_fwd(
+        q,
+        k_cache_paged,
+        v_cache_paged,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        causal=causal,
+        tile_mn=tile_mn,
+        mma_pv_is_rs=mma_pv_is_rs,
+    )[0]
+    if is_fake_mode():
+        return
+    key_padding_mask = torch.arange(max_seqlen_k, device=device) < cache_seqlens[:, None]
+    k_rep = repeat(k_cache, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    v_rep = repeat(v_cache, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    out_ref, _ = attention_ref(q, k_rep, v_rep, None, key_padding_mask, causal=causal)
+    out_pt, _ = attention_ref(
+        q, k_rep, v_rep, None, key_padding_mask, causal=causal, upcast=False, reorder_ops=True
+    )
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
