@@ -3,7 +3,8 @@ default 128-row tile and against FP64 eager.
 
 The 64-row tile puts the accumulators in the M=64 TMEM layout and stages P / dS in SMEM (see
 NOTE [M=64 accumulator layout] in flash_bwd_sm100.py); it is the layout the hd256 backward
-needs. Dense MHA only for now: GQA and varlen go through epilogue paths that are not wired yet.
+needs. GQA goes through the fp32 dK/dV accumulate (written row-major, see the postprocess),
+varlen through the non-TMA epilogue.
 """
 
 import os
@@ -11,9 +12,9 @@ import os
 import pytest
 import torch
 
-from eager_reference import check_against_reference
+from eager_reference import check_against_reference, make_cu_seqlens
 
-from flash_attn.cute.interface import flash_attn_func
+from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -105,3 +106,98 @@ def test_bwd_tile_n_64_matches_default(
         causal,
         dtype,
     )
+
+
+HEADS = {"mha": (4, 4), "gqa8_2": (8, 2)}
+FEATURE_KWARGS = {
+    "none": {},
+    "local": {"window_size": (64, 32)},
+    "softcap": {"softcap": 15.0},
+    "deterministic": {"deterministic": True},
+}
+# (q_lens, k_lens) per layout; dense uses equal lengths and the dense API.
+FEATURE_SHAPES = [
+    pytest.param((256, 256), (192, 192), id="2x256x192"),
+    pytest.param((1000,), (1000,), id="1x1000"),
+]
+
+
+def run_fwd_bwd_layout(layout, q, k, v, dout, q_lens, k_lens, causal, tile_n, **kwargs):
+    os.environ["FLASH_ATTENTION_BWD_TILE_N"] = str(tile_n)
+    if layout == "dense":
+        b = len(q_lens)
+        heads_q, heads_kv = q.shape[1], k.shape[1]
+        out, _ = flash_attn_func(
+            q.view(b, q_lens[0], heads_q, HEAD_DIM),
+            k.view(b, k_lens[0], heads_kv, HEAD_DIM),
+            v.view(b, k_lens[0], heads_kv, HEAD_DIM),
+            causal=causal,
+            **kwargs,
+        )
+        out = out.flatten(0, 1)
+    else:
+        out, _ = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=make_cu_seqlens(q_lens),
+            cu_seqlens_k=make_cu_seqlens(k_lens),
+            max_seqlen_q=max(q_lens),
+            max_seqlen_k=max(k_lens),
+            causal=causal,
+            **kwargs,
+        )
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+    torch.cuda.synchronize()
+    return out.detach(), dq, dk, dv
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+@pytest.mark.parametrize("feature", list(FEATURE_KWARGS))
+@pytest.mark.parametrize("layout", ["dense", "varlen"])
+@pytest.mark.parametrize("mha_type", list(HEADS))
+@pytest.mark.parametrize("q_lens,k_lens", FEATURE_SHAPES)
+def test_bwd_tile_n_64_features(
+    q_lens, k_lens, mha_type, layout, feature, causal, bwd_tile_n_env
+):
+    """GQA accumulate, varlen epilogue, deterministic, local and softcap on the 64-row tile."""
+    if layout == "varlen":
+        # Ragged version of the same budget: keeps the tile edges and a short slot.
+        q_lens, k_lens = (
+            (q_lens[0] - 3, 65) if len(q_lens) == 2 else (q_lens[0] - 7,),
+            ((k_lens[0] + 5, 129) if len(k_lens) == 2 else (k_lens[0] + 1,)),
+        )
+    if causal and any(nq > nk for nq, nk in zip(q_lens, k_lens)):
+        pytest.skip("bottom-right causal leaves query rows without keys")
+    torch.manual_seed(SEED)
+    heads_q, heads_kv = HEADS[mha_type]
+    dtype = torch.bfloat16
+    q = torch.randn(
+        sum(q_lens), heads_q, HEAD_DIM, device="cuda", dtype=dtype, requires_grad=True
+    )
+    k = torch.randn(
+        sum(k_lens), heads_kv, HEAD_DIM, device="cuda", dtype=dtype, requires_grad=True
+    )
+    v = torch.randn_like(k, requires_grad=True)
+    dout = torch.randn_like(q)
+    kwargs = FEATURE_KWARGS[feature]
+    args = (layout, q, k, v, dout, q_lens, k_lens, causal)
+    ref = run_fwd_bwd_layout(*args, 128, **kwargs)
+    got = run_fwd_bwd_layout(*args, 64, **kwargs)
+    assert torch.equal(got[0], ref[0]), "forward does not depend on the backward tile"
+    if mha_type == "mha":
+        # Same MMAs, same stores: dK / dV must match the 128-row tile exactly.
+        assert torch.equal(got[2], ref[2]), "dK differs from the 128-row tile"
+        assert torch.equal(got[3], ref[3]), "dV differs from the 128-row tile"
+    else:
+        # GQA accumulates the Q heads into fp32 in a different order: allow bf16 rounding.
+        for name, a, b_ in zip(("dK", "dV"), ref[2:], got[2:]):
+            tol = 2 * torch.finfo(dtype).eps * a.float().abs().max()
+            assert (a.float() - b_.float()).abs().max() <= tol, name
+    if feature == "deterministic":
+        again = run_fwd_bwd_layout(*args, 64, **kwargs)
+        assert all(torch.equal(x, y) for x, y in zip(got, again)), (
+            "deterministic run differs"
+        )
+    if feature in ("none", "deterministic"):
+        check_against_reference(got, q, k, v, dout, q_lens, k_lens, causal, dtype)
