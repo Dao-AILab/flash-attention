@@ -31,6 +31,9 @@ from flash_attn.cute.interface import (
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
+# FLASH_ATTENTION_HD256_GENERIC_BWD=1 runs the hdim 256 backward on the general kernel, which
+# supports the features the dedicated kernels skip below.
+HD256_GENERIC_BWD = os.getenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "0") == "1"
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 INCREASED_TRIALS = False
 
@@ -84,7 +87,7 @@ def test_flash_attn_output(
         pytest.xfail("hdim > 192 backward: SM90 not supported yet")
     # The SM100 head_dim=256 backward does not support these features yet (the forward does).
     # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
+    if d == 256 and IS_SM100 and not HD256_GENERIC_BWD:
         if has_learnable_sink:
             pytest.skip("SM100 head_dim=256 backward does not support learnable_sink yet")
         if local:
@@ -433,7 +436,7 @@ def test_flash_attn_varlen_output(
         pytest.xfail("hdim > 192 backward: SM90 not supported yet")
     # The SM100 head_dim=256 backward does not support these features yet (the forward does).
     # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
+    if d == 256 and IS_SM100 and not HD256_GENERIC_BWD:
         if has_learnable_sink:
             pytest.skip("SM100 head_dim=256 backward does not support learnable_sink yet")
         if local:
