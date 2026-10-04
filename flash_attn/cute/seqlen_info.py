@@ -28,8 +28,11 @@ class SeqlenInfo:
         cu_seqlens: Optional[cute.Tensor] = None,
         seqused: Optional[cute.Tensor] = None,
         tile: cutlass.Constexpr[int] = 128,
+        scale: cutlass.Constexpr[int] = 1,
     ):
-        offset = 0 if const_expr(cu_seqlens is None) else cu_seqlens[batch_idx]
+        """`scale` rows per sequence position (the backward's pack_gqa folds the query heads of
+        a KV head into the rows): offsets, padded offsets and lengths come out in rows."""
+        offset = 0 if const_expr(cu_seqlens is None) else cu_seqlens[batch_idx] * scale
         offset_padded = (
             0
             if const_expr(cu_seqlens is None)
@@ -37,11 +40,11 @@ class SeqlenInfo:
             else cute.assume((offset + batch_idx * tile) // tile * tile, divby=tile)
         )
         if const_expr(seqused is not None):
-            seqlen = seqused[batch_idx]
+            seqlen = seqused[batch_idx] * scale
         elif const_expr(cu_seqlens is not None):
-            seqlen = cu_seqlens[batch_idx + 1] - cu_seqlens[batch_idx]
+            seqlen = cu_seqlens[batch_idx + 1] * scale - offset
         else:
-            seqlen = seqlen_static
+            seqlen = seqlen_static * scale
         return SeqlenInfo(offset, offset_padded, seqlen, has_cu_seqlens=cu_seqlens is not None)
 
     def offset_batch(
@@ -93,8 +96,11 @@ class SeqlenInfoQK:
         mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
+        q_scale: cutlass.Constexpr[int] = 1,
     ):
-        offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
+        """`q_scale` rows per Q position (the backward's pack_gqa folds the query heads of a KV
+        head into the Q rows): Q offsets, padded offsets and lengths come out in rows."""
+        offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx] * q_scale
         offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
         padded_offset_q = (
             0
@@ -107,12 +113,12 @@ class SeqlenInfoQK:
             else cute.assume((offset_k + batch_idx * tile_n) // tile_n * tile_n, divby=tile_n)
         )
         if const_expr(mSeqUsedQ is not None):
-            seqlen_q = mSeqUsedQ[batch_idx]
+            seqlen_q = mSeqUsedQ[batch_idx] * q_scale
         else:
             seqlen_q = (
-                seqlen_q_static
+                seqlen_q_static * q_scale
                 if const_expr(mCuSeqlensQ is None)
-                else mCuSeqlensQ[batch_idx + 1] - offset_q
+                else mCuSeqlensQ[batch_idx + 1] * q_scale - offset_q
             )
         if const_expr(mSeqUsedK is not None):
             seqlen_k = mSeqUsedK[batch_idx]
