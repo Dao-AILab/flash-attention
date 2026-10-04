@@ -393,10 +393,12 @@ class FlashAttentionForwardSm100:
             else:
                 self.num_regs_softmax = 184
                 self.num_regs_correction = 64
-            # Divide the remaining register budget among the other WGs.
-            self.num_regs_other = (
+            # Divide the remaining register budget among the other WGs. Their setmaxnreg.dec
+            # cannot exceed the launch register count.
+            self.num_regs_other = min(
                 (512 - self.num_regs_softmax * self.q_stage - self.num_regs_correction)
-                // (3 - self.q_stage) // 8 * 8
+                // (3 - self.q_stage) // 8 * 8,
+                65536 // self.threads_per_cta,
             )
 
         self.buffer_align_bytes = 1024
