@@ -2380,6 +2380,19 @@ def _flash_attn_bwd(
             and not requested_disable_2cta
             and block_sparse_bwd_supports_2cta(block_sparse_tensors, n_block_size)
         )
+        # 64-row KV tile per CTA (M=64 accumulator layout), see NOTE [M=64 accumulator layout] in
+        # flash_bwd_sm100.py. Test knob for now; only the pipelined 2CTA schedule (hdim <= 128)
+        # is wired.
+        bwd_tile_n_override = utils._get_bwd_tile_n_override()
+        if (
+            bwd_tile_n_override == 64
+            and use_2cta_instrs
+            and head_dim <= 128
+            and block_sparse_tensors is None
+            and q.shape[-2] == k.shape[-2]  # GQA dK/dV accumulate: not wired yet
+            and cu_seqlens_k is None  # varlen K uses the non-TMA epilogue: not wired yet
+        ):
+            n_block_size = 64
         if block_sparse_tensors is not None and head_dim == 192 and not use_2cta_instrs:
             reason = (
                 "2CTA was disabled by request"
