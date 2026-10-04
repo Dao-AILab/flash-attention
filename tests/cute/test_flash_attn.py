@@ -1941,6 +1941,76 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
         ).abs().max().item() + atol, name
 
 
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="hd256 2CTA is SM100/SM110 only")
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("qhead_per_kvhead", [1, 6])
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_varlen_hd256_caller_metadata(causal, qhead_per_kvhead):
+    """hd256 varlen with caller-built scheduler metadata must match the metadata-free call.
+
+    get_scheduler_metadata() builds 1CTA tiles with the default pack_gqa, so the forward
+    must not switch to 2CTA (or drop PackGQA) when it reuses that metadata. Batch > 256 so
+    noncausal reuses the cu_total_m_blocks hint; causal reuses the tile semaphore.
+    """
+    device = "cuda"
+    torch.manual_seed(0)
+    batch_size, seqlen, nheads_kv, d = 300, 129, 2, 256
+    nheads = nheads_kv * qhead_per_kvhead
+    total = batch_size * seqlen
+    q = torch.randn(total, nheads, d, device=device, dtype=torch.bfloat16)
+    k = torch.randn(total, nheads_kv, d, device=device, dtype=torch.bfloat16)
+    v = torch.randn(total, nheads_kv, d, device=device, dtype=torch.bfloat16)
+    cu_seqlens = torch.arange(0, total + 1, seqlen, device=device, dtype=torch.int32)
+    if is_fake_mode():
+        return
+    scheduler_metadata = get_scheduler_metadata(
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        nheads=nheads,
+        nheads_kv=nheads_kv,
+        headdim=d,
+        num_splits=1,
+        causal=causal,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+    )
+    outs = [
+        flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=seqlen,
+            max_seqlen_k=seqlen,
+            causal=causal,
+            num_splits=1,
+            scheduler_metadata=md,
+        )[0]
+        for md in (None, scheduler_metadata)
+    ]
+    out_ref, _ = attention_ref(
+        q.view(batch_size, seqlen, nheads, d),
+        k.view(batch_size, seqlen, nheads_kv, d),
+        v.view(batch_size, seqlen, nheads_kv, d),
+        causal=causal,
+    )
+    out_pt, _ = attention_ref(
+        q.view(batch_size, seqlen, nheads, d),
+        k.view(batch_size, seqlen, nheads_kv, d),
+        v.view(batch_size, seqlen, nheads_kv, d),
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    for out in outs:
+        assert (out.view_as(out_ref) - out_ref).abs().max().item() <= 2 * (
+            out_pt - out_ref
+        ).abs().max().item() + fwd_atol
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])

@@ -993,6 +993,9 @@ def _flash_attn_fwd(
         )
         pack_gqa = True
     is_hdim256 = head_dim == 256 and head_dim_v == 256
+    num_sms = get_num_sms_for_selection(device.index, arch)
+    # Caller-built varlen scheduler metadata assumes 1CTA tiles and the default pack_gqa.
+    hd256_2cta_varlen_ok = cu_seqlens_q is None or scheduler_metadata is None
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
         if (
@@ -1000,16 +1003,10 @@ def _flash_attn_fwd(
             and is_hdim256
             and 128 % qhead_per_kvhead != 0
             and seqused_q is None
-            and (
-                max_seqlen_q > 128
-                or (
-                    num_splits == 1
-                    and 2 * batch_size * num_head <= get_num_sms_for_selection(device.index, arch)
-                )
-            )
+            and hd256_2cta_varlen_ok
+            and (max_seqlen_q > 128 or (num_splits == 1 and 2 * batch_size * num_head <= num_sms))
         ):
-            # Prefer 2CTA over cp.async-Q PackGQA for multi-tile hd256 queries and for
-            # unsplit decode that fits one 2CTA wave (see hd256_decode_2cta).
+            # Prefer 2CTA over cp.async-Q PackGQA for hd256.
             pack_gqa = False
 
     fwd_cfg = _get_fwd_config(
@@ -1063,11 +1060,11 @@ def _flash_attn_fwd(
     max_m_blocks_leq_one = seqlen_q_packgqa <= q_stage * tile_m
 
     is_split_kv = num_splits > 1
-    # hd256 single-M-block (decode) 2CTA halves each CTA's K/V loads; worth it while the
-    # doubled grid still fits in one wave.
-    hd256_decode_2cta = is_hdim256 and 2 * batch_size * (
-        num_head_kv if pack_gqa else num_head
-    ) <= get_num_sms_for_selection(device.index, arch)
+    # Single-M-block hd256 2CTA halves each CTA's K/V loads; worth it while the doubled
+    # grid fits in one wave.
+    hd256_decode_2cta = (
+        is_hdim256 and 2 * batch_size * (num_head_kv if pack_gqa else num_head) <= num_sms
+    )
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         # Combine needs LSE partials seqlen-contiguous, (..., h, s); the MLA kernels take
@@ -1084,15 +1081,13 @@ def _flash_attn_fwd(
         arch // 10 in [10, 11]
         and not requested_disable_2cta
         and not is_split_kv
-        # hd256 also supports varlen Q (cu_seqlens_q) with 2CTA.
-        and (is_hdim256 or cu_seqlens_q is None)
+        and (cu_seqlens_q is None or (is_hdim256 and hd256_2cta_varlen_ok))
         and seqused_q is None
         and not use_block_sparsity
         and page_size in [None, 128]
         and (not max_m_blocks_leq_one or hd256_decode_2cta)
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
         and (
-            # hd256 also supports causal/local 2CTA.
             is_hdim256
             or (
                 not causal
@@ -1126,7 +1121,13 @@ def _flash_attn_fwd(
     # pays work-stealing overhead.
     is_varlen_mha = is_varlen and qhead_per_kvhead == 1
     is_dense_noncausal = not is_varlen and not causal and not local
-    use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
+    use_clc_scheduler = (
+        requested_use_clc_scheduler
+        and not is_varlen_mha
+        and not is_dense_noncausal
+        # CLC does not map hd256 2CTA tiles correctly (wrong output, traps, hangs).
+        and not (is_hdim256 and use_2cta_instrs)
+    )
 
     if use_block_sparsity:
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
