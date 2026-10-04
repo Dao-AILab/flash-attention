@@ -811,6 +811,7 @@ class AttentionMask:
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
 
         if const_expr(not mask_causal and not mask_local and mask_mod is not None):
+            assert self.qhead_per_kvhead_packgqa == 1, "mask_mod with pack_gqa not supported yet"
             # Block sparse case with mask_mod (backward)
             #
             # Coordinate convention: ROW → Q (m_block), COL → KV (n_block).
@@ -891,9 +892,11 @@ class AttentionMask:
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         acc_S[i] = -cutlass.Float32.inf
         else:  # Causal or local
+            # pack_gqa: row r is position r // g, so position limits scale by g (monotone in r)
+            g = self.qhead_per_kvhead_packgqa
             thr_row_offset = tScS_t2r[0][ROW]
-            seqlenq_row_limit = self.seqlen_q - m_block * self.tile_m - thr_row_offset
-            causal_offset = seqlenq_row_limit - seqlenk_col_limit
+            seqlenq_row_limit = self.seqlen_q * g - m_block * self.tile_m - thr_row_offset
+            causal_offset = seqlenq_row_limit - seqlenk_col_limit * g
             if const_expr(mask_causal):
                 # tidx = cute.arch.thread_idx()[0] % 256
                 # if tidx < 32:
@@ -921,11 +924,12 @@ class AttentionMask:
                     )
             else:
                 if const_expr(self.window_size_right is not None):
-                    row_limit_top = causal_offset - self.window_size_right
+                    row_limit_top = causal_offset - self.window_size_right * g
                 else:
                     row_limit_top = 0
                 if const_expr(self.window_size_left is not None):
-                    row_limit_bot = causal_offset + self.window_size_left
+                    # last allowed packed row of the window's last position
+                    row_limit_bot = causal_offset + self.window_size_left * g + (g - 1)
                 if const_expr(mask_seqlen):
                     if seqlenk_col_limit <= 0:
                         row_limit_top = self.tile_m

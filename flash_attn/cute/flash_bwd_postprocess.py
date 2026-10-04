@@ -146,6 +146,8 @@ class FlashAttentionBackwardPostprocess:
         cluster_size: int = 1,  # for varlen offsets
         hdim_multiple_of: int = 32,
         accum_row_major: bool = False,
+        pack_gqa: bool = False,
+        qhead_per_kvhead: int = 1,
     ):
         """
         :param head_dim: head dimension
@@ -156,6 +158,11 @@ class FlashAttentionBackwardPostprocess:
         """
         self.dtype = dtype
         self.tile_m = tile_m
+        # NOTE [bwd pack_gqa]: dQaccum holds, per KV head, the rows of its qhead_per_kvhead
+        # query heads interleaved (row r = head r % qh at position r // qh); dQ is written
+        # through a matching view of the (b, s, h, d) output, so no unpack pass is needed.
+        self.pack_gqa = pack_gqa
+        self.qhead_per_kvhead = qhead_per_kvhead
         assert arch // 10 in [8, 9, 10, 11, 12], (
             "Only Ampere (8.x), Hopper (9.x), and Blackwell (10.x, 11.x, 12.x) are supported"
         )
@@ -388,6 +395,9 @@ class FlashAttentionBackwardPostprocess:
         mSeqUsedQ: Optional[cute.Tensor],
         sink_tensors: LearnableSinkBwdTensors | None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        # pack_gqa + varlen: cu_seqlens / seqused in packed rows for dQaccum (NOTE [bwd pack_gqa])
+        mCuSeqlensQRows: Optional[cute.Tensor] = None,
+        mSeqUsedQRows: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -412,6 +422,27 @@ class FlashAttentionBackwardPostprocess:
                 raise TypeError("dSink must have the learnable sink dtype")
 
         mdQaccum, mdQ = [assume_tensor_aligned(t) for t in (mdQaccum, mdQ)]
+        if const_expr(self.pack_gqa):
+            assert sink_tensors is None, "pack_gqa: learnable_sink not wired yet"
+            qh = self.qhead_per_kvhead
+            if const_expr(mCuSeqlensQ is None):
+                # (b, s, h, d) -> (b, (qh, s), h_kv, d): packed row order per KV head
+                b_, s_, h_, d_ = mdQ.shape
+                sb, ss, sh, sd = mdQ.stride
+                mdQ = cute.make_tensor(
+                    mdQ.iterator,
+                    cute.make_layout(
+                        (b_, (qh, s_), h_ // qh, d_), stride=(sb, (sh, ss), sh * qh, sd)
+                    ),
+                )
+            else:
+                # (total, h, d) -> ((qh, total), h_kv, d)
+                t_, h_, d_ = mdQ.shape
+                st, sh, sd = mdQ.stride
+                mdQ = cute.make_tensor(
+                    mdQ.iterator,
+                    cute.make_layout(((qh, t_), h_ // qh, d_), stride=((sh, st), sh * qh, sd)),
+                )
 
         self.tiled_mma = self._get_tiled_mma()
         self._setup_attributes()
@@ -425,12 +456,12 @@ class FlashAttentionBackwardPostprocess:
             TileScheduler = SingleTileVarlenScheduler
             num_head = mdQ.shape[1]
             num_batch = mCuSeqlensQ.shape[0] - 1
-            num_block = cute.ceil_div(mdQ.shape[0], self.tile_m)
+            num_block = cute.ceil_div(cute.size(mdQ.shape[0]), self.tile_m)
         else:
             TileScheduler = SingleTileScheduler
             num_head = mdQ.shape[2]
             num_batch = mdQ.shape[0]
-            num_block = cute.ceil_div(mdQ.shape[1], self.tile_m)
+            num_block = cute.ceil_div(cute.size(mdQ.shape[1]), self.tile_m)
 
         tile_sched_args = TileSchedulerArguments(
             num_block=num_block,
@@ -440,10 +471,11 @@ class FlashAttentionBackwardPostprocess:
             seqlen_k=0,
             headdim=mdQ.shape[2],
             headdim_v=0,
-            total_q=mdQ.shape[0],
+            total_q=cute.size(mdQ.shape[0]),
             tile_shape_mn=(self.tile_m, 1),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
         )
 
@@ -469,6 +501,8 @@ class FlashAttentionBackwardPostprocess:
             self.rm_tiled_copy_dQ,
             tile_sched_params,
             TileScheduler,
+            mCuSeqlensQRows,
+            mSeqUsedQRows,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -496,6 +530,8 @@ class FlashAttentionBackwardPostprocess:
         rm_tiled_copy_dQ: Optional[cute.TiledCopy],
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
+        mCuSeqlensQRows: Optional[cute.Tensor],
+        mSeqUsedQRows: Optional[cute.Tensor],
     ):
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
@@ -574,9 +610,17 @@ class FlashAttentionBackwardPostprocess:
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
 
+            # static seqlen_q (positions; unused when cu_seqlens is given): dense (b, (qh, s), ..)
+            # vs varlen ((qh, t), ..) packed layouts
+            if const_expr(not self.pack_gqa):
+                seqlen_q_static = mdQ.shape[1]
+            elif const_expr(mCuSeqlensQ is None):
+                seqlen_q_static = mdQ.shape[1][1]
+            else:
+                seqlen_q_static = mdQ.shape[0][1]
             seqlen = SeqlenInfoQK.create(
                 batch_idx,
-                mdQ.shape[1],
+                seqlen_q_static,
                 0,
                 mCuSeqlensQ=mCuSeqlensQ,
                 mCuSeqlensK=None,
@@ -584,13 +628,30 @@ class FlashAttentionBackwardPostprocess:
                 mSeqUsedK=None,
                 tile_m=self.tile_m * self.cluster_size,
             )
+            if const_expr(self.pack_gqa):
+                # dQaccum is per KV head in packed rows: its offsets come in rows
+                seqlen_rows = SeqlenInfoQK.create(
+                    batch_idx,
+                    cute.size(mdQ.shape[1]) if const_expr(mCuSeqlensQ is None) else 0,
+                    0,
+                    mCuSeqlensQ=mCuSeqlensQRows,
+                    mCuSeqlensK=None,
+                    mSeqUsedQ=mSeqUsedQRows,
+                    mSeqUsedK=None,
+                    tile_m=self.tile_m * self.cluster_size,
+                )
+            else:
+                seqlen_rows = seqlen
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdQ_cur = mdQ[batch_idx, None, head_idx, None]
                 mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
                 head_dim = mdQ.shape[3]
             else:
-                padded_offset_q = seqlen.padded_offset_q
-                mdQ_cur = cute.domain_offset((seqlen.offset_q, 0), mdQ[None, head_idx, None])
+                padded_offset_q = seqlen_rows.padded_offset_q
+                q_off = (
+                    seqlen.offset_q if const_expr(not self.pack_gqa) else (None, seqlen.offset_q)
+                )
+                mdQ_cur = cute.domain_offset((q_off, 0), mdQ[None, head_idx, None])
                 mdQaccum_cur = cute.domain_offset(
                     (padded_offset_q * self.tile_hdim,), mdQaccum[head_idx, None]
                 )
@@ -611,7 +672,8 @@ class FlashAttentionBackwardPostprocess:
             gdQaccum = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (m_block,))
             gdQ = cute.local_tile(mdQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
 
-            seqlen_q = seqlen.seqlen_q
+            # pack_gqa: the tile rows are the packed (qh * seqlen) rows of this KV head
+            seqlen_q = seqlen.seqlen_q * self.qhead_per_kvhead
             seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
 
             if const_expr(self.arch // 10 in [10, 11] and self.use_2cta_instrs):
