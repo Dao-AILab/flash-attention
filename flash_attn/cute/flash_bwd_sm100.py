@@ -112,6 +112,21 @@ class FlashAttentionBackwardSm100:
 
         assert self.tile_hdim != 192 or self.use_2cta_instrs, "Must use 2CTA for hdim 192"
 
+        # NOTE [2CTA schedules]
+        # Two 2CTA schedules exist and a 2CTA configuration must pick exactly one:
+        # - pipelined (hdim <= 128): own sQt / sdOt / sdS_xchg buffers, the MMA warp software-
+        #   pipelines S(t+1) with dK/dP/dQ/dV, and dQ overlaps the tail of S in TMEM, so the
+        #   dS pipeline also signals that S has been read.
+        # - serial (hdim 192): Qt and dOt alias Q and dO (one stage), sdS_xchg aliases
+        #   sdQaccum (guarded by dQaccum_empty_mbar), the MMAs run serially, and dP overlaps
+        #   the tail of S, so S is released right after it is read.
+        self.two_cta_pipelined = self.use_2cta_instrs and self.tile_hdim <= 128
+        self.two_cta_serial = self.use_2cta_instrs and self.tile_hdim == 192
+        assert not self.use_2cta_instrs or (self.two_cta_pipelined != self.two_cta_serial), (
+            "2CTA backward needs exactly one of the pipelined / serial schedules"
+        )
+        self.cluster_tile_n = self.cta_group_size * tile_n
+
         # CTA tiler
         self.cta_tiler = (tile_n, tile_m, self.tile_hdim)
         # S = K @ Q.T
@@ -205,43 +220,58 @@ class FlashAttentionBackwardSm100:
         )
         # TMEM setup
         self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
-        # self.tmem_dK_offset = 0
-        # self.tmem_dV_offset = self.tmem_dK_offset + self.tile_hdim
-        # self.tmem_dQ_offset = self.tmem_dV_offset + self.tile_hdimv
-        # self.tmem_dP_offset = self.tmem_dQ_offset  # overlap with dQ
-        # self.tmem_S_offset = self.tmem_dQ_offset + max(self.tile_m, self.tile_hdim)
-        # self.tmem_P_offset = self.tmem_S_offset  # overlap with S
-        # self.tmem_total = self.tmem_S_offset + self.tile_n
-        # assert self.tmem_total <= self.tmem_alloc_cols
+        # TMEM columns per accumulator, for a CTA that owns 128 MMA rows (one row per lane).
+        # S^T and dP^T are (tile_n, tile_m) per CTA, so their width is the MMA N = tile_m.
+        self.tmem_cols_S = self.tile_m
+        self.tmem_cols_dP = self.tile_m
+        self.tmem_cols_dV = self.tile_hdimv
+        self.tmem_cols_dK = self.tile_hdim
+        # dQ = dS @ K is (tile_m, hdim); in 2CTA mode each CTA holds half of it.
+        self.tmem_cols_dQ = self.tile_hdim // self.cta_group_size
+        # P / dS are packed 16-bit over the S / dP columns.
+        self.tmem_cols_P = self.tmem_cols_S // 2
 
-        if self.use_2cta_instrs and self.tile_hdim == 192 and self.tile_hdimv == 128:
+        if self.two_cta_serial:
             assert self.tile_m == 128
             assert self.tile_n == 128
             self.tmem_dV_offset = 0
-            self.tmem_dK_offset = self.tmem_dV_offset + self.tile_hdimv
-            self.tmem_S_offset = self.tmem_dK_offset + self.tile_hdim
+            self.tmem_dK_offset = self.tmem_dV_offset + self.tmem_cols_dV
+            self.tmem_S_offset = self.tmem_dK_offset + self.tmem_cols_dK
             self.tmem_P_offset = self.tmem_S_offset  # overlap with S
-            self.tmem_dP_offset = 512 - self.tile_m
+            # dP overlaps the tail of S (S is released once read), dQ the tail of dP.
+            self.tmem_dP_offset = self.tmem_alloc_cols - self.tmem_cols_dP
             self.tmem_dS_offset = self.tmem_dP_offset  # overlaps with dP
-            self.tmem_dQ_offset = 512 - self.tile_hdim // 2
+            self.tmem_dQ_offset = self.tmem_alloc_cols - self.tmem_cols_dQ
         else:
             self.tmem_S_offset = 0
-            self.tmem_dV_offset = self.tmem_S_offset + self.tile_n
-            self.tmem_dP_offset = self.tmem_dV_offset + self.tile_hdimv
+            self.tmem_dV_offset = self.tmem_S_offset + self.tmem_cols_S
+            self.tmem_dP_offset = self.tmem_dV_offset + self.tmem_cols_dV
+            # 2CTA: dQ overlaps the tail of S (the dS pipeline signals S has been read before
+            # dQ is issued); 1CTA: dQ overlaps dP.
             self.tmem_dQ_offset = (
-                (self.tmem_S_offset + (self.tile_hdim // 2))
+                self.tmem_S_offset + self.tmem_cols_S - self.tmem_cols_dQ
                 if self.use_2cta_instrs
                 else self.tmem_dP_offset
             )
-            self.tmem_dK_offset = self.tmem_dP_offset + self.tile_m
+            self.tmem_dK_offset = self.tmem_dP_offset + self.tmem_cols_dP
             if self.split_P_dS:
-                # P/dS are packed 16-bit over tile_m columns -> tile_m // 2 fp32 columns
-                self.tmem_P_offset = self.tmem_dK_offset + self.tile_hdim
-                self.tmem_dS_offset = self.tmem_P_offset + self.tile_m // 2
-                assert self.tmem_dS_offset + self.tile_m // 2 <= self.tmem_alloc_cols
+                self.tmem_P_offset = self.tmem_dK_offset + self.tmem_cols_dK
+                self.tmem_dS_offset = self.tmem_P_offset + self.tmem_cols_P
             else:
                 self.tmem_P_offset = self.tmem_S_offset  # overlap with S
                 self.tmem_dS_offset = self.tmem_dP_offset  # overlap with dP
+        tmem_end = max(
+            self.tmem_S_offset + self.tmem_cols_S,
+            self.tmem_dP_offset + self.tmem_cols_dP,
+            self.tmem_dV_offset + self.tmem_cols_dV,
+            self.tmem_dK_offset + self.tmem_cols_dK,
+            self.tmem_dQ_offset + self.tmem_cols_dQ,
+            self.tmem_P_offset + self.tmem_cols_P,
+            self.tmem_dS_offset + self.tmem_cols_P,
+        )
+        assert tmem_end <= self.tmem_alloc_cols, (
+            f"TMEM map needs {tmem_end} > {self.tmem_alloc_cols} columns"
+        )
 
         if (not is_causal and not is_local) or deterministic:
             self.num_regs_reduce = 136 if self.use_2cta_instrs else 152
@@ -255,7 +285,7 @@ class FlashAttentionBackwardSm100:
             self.num_regs_mma = 104 if self.use_2cta_instrs else self.num_regs_load
         self.num_regs_empty = 24
 
-        if const_expr(self.tile_hdim == 192):
+        if const_expr(self.two_cta_serial):
             if not is_causal and not is_local:
                 self.num_regs_reduce = 128 + 8
                 self.num_regs_compute = 128 + 8
@@ -284,7 +314,7 @@ class FlashAttentionBackwardSm100:
         self.sdKVaccum_stage = 2
         # number of tma reduce adds per dQacc mma
         # todo: try 32/1 or 48/2 for 2cta d=192 dv=128
-        if self.use_2cta_instrs and self.tile_hdim == 192:
+        if self.two_cta_serial:
             self.dQ_reduce_ncol_t2r = 32
             self.dQ_reduce_ncol = 24 if not self.is_causal else 32
             self.sdQaccum_stage = 2 if not self.is_causal else 1
@@ -813,11 +843,17 @@ class FlashAttentionBackwardSm100:
             assert sdK_bytes <= sK_bytes, "sdK doesn't fit in sK storage allocation (2-CTA)"
 
         if const_expr(self.use_2cta_instrs):
-            sQt_size = cute.cosize(self.sQt_layout) if const_expr(self.tile_hdim <= 128) else 0
-            sdOt_size = cute.cosize(self.sdOt_layout) if const_expr(self.tile_hdim <= 128) else 0
-            sdS_xchg_size = (
-                cute.cosize(self.sdS_xchg_layout) if const_expr(self.tile_hdim <= 128) else 0
-            )
+            # The serial schedule aliases Qt / dOt into Q / dO and sdS_xchg into sdQaccum.
+            own_xchg = const_expr(self.two_cta_pipelined)
+            sQt_size = cute.cosize(self.sQt_layout) if own_xchg else 0
+            sdOt_size = cute.cosize(self.sdOt_layout) if own_xchg else 0
+            sdS_xchg_size = cute.cosize(self.sdS_xchg_layout) if own_xchg else 0
+            if const_expr(self.two_cta_serial):
+                assert cute.size_in_bytes(
+                    self.ds_dtype, self.sdS_xchg_layout
+                ) <= cute.size_in_bytes(self.dqaccum_dtype, self.sdQaccum_layout), (
+                    "sdS_xchg does not fit in the sdQaccum storage it aliases"
+                )
 
             @cute.struct
             class SharedStorage:
@@ -1185,7 +1221,7 @@ class FlashAttentionBackwardSm100:
 
         # Barrier initialization
         if const_expr(self.use_2cta_instrs):
-            if const_expr(self.tile_hdim == 192):
+            if const_expr(self.two_cta_serial):
                 if warp_idx == 2:
                     cute.arch.mbarrier_init(
                         dQaccum_empty_mbar_ptr,
@@ -1324,7 +1360,7 @@ class FlashAttentionBackwardSm100:
         )
 
         if const_expr(self.use_2cta_instrs):
-            if const_expr(self.tile_hdim == 192):
+            if const_expr(self.two_cta_serial):
                 pipeline_Qt = pipeline_Q
             else:
                 pipeline_Qt = pipeline.PipelineTmaUmma.create(
@@ -1359,7 +1395,7 @@ class FlashAttentionBackwardSm100:
         )
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
-        if const_expr(self.use_2cta_instrs and self.tile_hdim <= 128):
+        if const_expr(self.two_cta_pipelined):
             sQt = storage.sQt.get_tensor(
                 sQt_layout.outer, swizzle=sQt_layout.inner, dtype=self.q_dtype
             )
@@ -1376,7 +1412,7 @@ class FlashAttentionBackwardSm100:
         sdSt = storage.sdS.get_tensor(sdSt_layout.outer, swizzle=sdSt_layout.inner)
         sdS = cute.make_tensor(cute.recast_ptr(sdSt.iterator, sdS_layout.inner), sdS_layout.outer)
         if const_expr(self.use_2cta_instrs):
-            if const_expr(self.tile_hdim <= 128):
+            if const_expr(self.two_cta_pipelined):
                 sdS_xchg = storage.sdS_xchg.get_tensor(sdS_xchg_layout)
             else:
                 sdS_xchg = storage.sdQaccum.get_tensor(sdS_xchg_layout, dtype=self.ds_dtype)
@@ -1386,7 +1422,7 @@ class FlashAttentionBackwardSm100:
         sdO = storage.sdO.get_tensor(
             sdO_layout.outer, swizzle=sdO_layout.inner, dtype=self.do_dtype
         )
-        if const_expr(self.use_2cta_instrs and self.tile_hdim <= 128):
+        if const_expr(self.two_cta_pipelined):
             sdOt = storage.sdOt.get_tensor(
                 sdOt_layout.outer, swizzle=sdOt_layout.inner, dtype=self.do_dtype
             )
@@ -1997,7 +2033,7 @@ class FlashAttentionBackwardSm100:
 
                 if process_tile:
                     first_m_block = m_block_min
-                    if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
+                    if const_expr(self.two_cta_serial):
                         #### Prologue ####
                         assert should_load_Q and should_load_dO
                         assert load_dOt is not None and load_Qt is not None
@@ -2235,7 +2271,7 @@ class FlashAttentionBackwardSm100:
 
             else:
                 assert blocksparse_tensors is not None
-                if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
+                if const_expr(self.two_cta_serial):
                     assert should_load_Q and should_load_dO
                     assert load_dOt is not None and load_Qt is not None
                     assert load_Kt is not None and pipeline_Qt is not None
@@ -2508,7 +2544,7 @@ class FlashAttentionBackwardSm100:
                     or m_block_min < m_block_max
                 )
 
-            if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
+            if const_expr(self.two_cta_serial):
                 if is_leader_cta and process_tile:
                     accumulate_dK = False
                     accumulate_dV = False
@@ -3261,15 +3297,13 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S)
                     consumer_state_S.advance()
-                elif const_expr(self.tile_hdim == 192):
-                    # Signal S tmem load completion using pipeline_S_P when hdim 192
-                    # dP is overlapped with S
+                elif const_expr(self.two_cta_serial):
+                    # Signal S tmem load completion using pipeline_S_P: dP overlaps S
                     cute.arch.fence_view_async_tmem_load()
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
-                elif const_expr(self.use_2cta_instrs and self.tile_hdim <= 128):
-                    # Signal S tmem load completion using pipeline_dS when 2cta hdim 128
-                    # dQ is overlapped with S
+                elif const_expr(self.two_cta_pipelined):
+                    # Signal S tmem load completion using pipeline_dS: dQ overlaps S
                     if iter_idx > 0:
                         cute.arch.fence_view_async_tmem_load()
                         with cute.arch.elect_one():
@@ -3362,7 +3396,7 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         pipeline_P.producer_commit(producer_state_P)
                     producer_state_P.advance()
-                elif const_expr(not self.tile_hdim == 192):
+                elif const_expr(not self.two_cta_serial):
                     # Signal tmem store P completion with pipeline_S_P
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
@@ -3473,8 +3507,8 @@ class FlashAttentionBackwardSm100:
 
                 # After the loop: copy exchange registers to sdS_xchg buffer
                 if const_expr(self.use_2cta_instrs):
-                    # when hdim 192, sdQaccum overlapped with sdS_xchg
-                    if const_expr(self.tile_hdim == 192):
+                    # serial schedule: sdS_xchg aliases sdQaccum
+                    if const_expr(self.two_cta_serial):
                         cute.arch.mbarrier_wait(
                             dQaccum_empty_mbar_ptr, phase=producer_state_dS.phase
                         )
@@ -3490,8 +3524,8 @@ class FlashAttentionBackwardSm100:
                 # consumer_release, but we already have the barrier or sync_warp before this
                 pipeline_dPsum.consumer_release(consumer_state_dPsum)
                 consumer_state_dPsum.advance()
-                # when 2cta hdim 128, pipeline_dS also signals S tmem load completion so is deferred
-                if const_expr(not (self.use_2cta_instrs and self.tile_hdim == 128)):
+                # pipelined 2CTA schedule: pipeline_dS also signals S tmem load completion so is deferred
+                if const_expr(not self.two_cta_pipelined):
                     with cute.arch.elect_one():
                         pipeline_dS.producer_commit(producer_state_dS)
                     producer_state_dS.advance()
@@ -3519,7 +3553,7 @@ class FlashAttentionBackwardSm100:
                         )
 
             # Final signal for dS smem store completion
-            if const_expr(self.use_2cta_instrs and self.tile_hdim == 128):
+            if const_expr(self.two_cta_pipelined):
                 if process_tile:
                     with cute.arch.elect_one():
                         pipeline_dS.producer_commit(producer_state_dS)
@@ -3779,7 +3813,7 @@ class FlashAttentionBackwardSm100:
                 assert mdQ_semaphore is not None
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
-            delay_semaphore_release = not self.tile_hdim == 192 and not self.use_block_sparsity
+            delay_semaphore_release = not self.two_cta_serial and not self.use_block_sparsity
 
             dq_sem_release_inc = Int32(1)
             if const_expr(
@@ -3931,7 +3965,7 @@ class FlashAttentionBackwardSm100:
                                 1,
                             )
 
-                if const_expr(self.tile_hdim == 192):
+                if const_expr(self.two_cta_serial):
                     if const_expr(self.sdQaccum_stage > 1):
                         if is_tma_warp:
                             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
@@ -3942,7 +3976,7 @@ class FlashAttentionBackwardSm100:
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
                 if const_expr(self.deterministic and not delay_semaphore_release):
-                    if const_expr(self.sdQaccum_stage > 1 and not self.tile_hdim == 192):
+                    if const_expr(self.sdQaccum_stage > 1 and not self.two_cta_serial):
                         if is_tma_warp and not m_block_oob_upper:
                             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                         self.reduce_sync_barrier.arrive_and_wait()
