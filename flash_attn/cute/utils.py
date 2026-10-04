@@ -112,13 +112,6 @@ def _get_bwd_pack_gqa_override() -> Optional[bool]:
     return value == "1"
 
 
-def _get_hd256_generic_bwd() -> bool:
-    """FLASH_ATTENTION_HD256_GENERIC_BWD=1 runs the SM100 hdim 256 backward on
-    FlashAttentionBackwardSm100 (64-row KV tile, serial 2CTA schedule) instead of the dedicated
-    kernels."""
-    return os.getenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "0") == "1"
-
-
 def _get_bwd_tile_n_override() -> Optional[int]:
     """Test knob: FLASH_ATTENTION_BWD_TILE_N=64 selects the 64-row KV tile per CTA on the SM100
     2CTA backward (the layout the hd256 backward needs). Unset or 128 keeps the default."""
