@@ -67,9 +67,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert score_mod is None and score_mod_bwd is None and mask_mod is None, (
             "SM100 backward with head_dim=256 does not support score_mod/mask_mod"
         )
-        assert not deterministic, (
-            "SM100 backward with head_dim=256 does not support deterministic mode"
-        )
         assert not has_aux_tensors, "SM100 backward with head_dim=256 does not support aux_tensors"
         assert cluster_size in (1, 2), (
             "SM100 backward with head_dim=256 only supports cluster_size in {1, 2}"
