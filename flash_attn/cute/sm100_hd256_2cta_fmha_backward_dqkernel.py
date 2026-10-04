@@ -174,8 +174,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         stream: cuda.CUstream,
     ):
         varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
-        # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D),
-        # similar to the dedicated hd256 forward path.
+        # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D).
         s_q = q_tensor.shape[1]
         s_k = k_tensor.shape[1]
         d = q_tensor.shape[4]

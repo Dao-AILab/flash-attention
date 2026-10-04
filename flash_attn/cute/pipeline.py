@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
+from cutlass._mlir.dialects import nvvm
 from cutlass.cutlass_dsl import if_generate, dsl_user_op
 from cutlass.pipeline import PipelineState
 from cutlass.pipeline import PipelineUserType
@@ -162,6 +163,16 @@ class _PipelineIndexPhaseMixin:
 @dataclass(frozen=True)
 class NamedBarrier(NamedBarrierOg):
     create = _override_create(NamedBarrierOg, None)  # patched below
+
+    @dsl_user_op
+    def arrive_and_wait_unaligned(self, *, loc=None, ip=None) -> None:
+        nvvm.barrier_cta_sync(
+            Int32(self.barrier_id).ir_value(loc=loc, ip=ip),
+            thread_count=Int32(self.num_threads).ir_value(loc=loc, ip=ip),
+            aligned=False,
+            loc=loc,
+            ip=ip,
+        )
 
     @dsl_user_op
     def arrive_w_index(self, index: Int32, *, loc=None, ip=None) -> None:
