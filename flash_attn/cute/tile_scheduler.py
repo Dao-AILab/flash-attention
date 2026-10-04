@@ -593,7 +593,11 @@ class SingleTileLPTScheduler:
             return SingleTileLPTScheduler(
                 params, cute.arch.block_idx()[0], Int32(0), ctx, loc=loc, ip=ip
             )
-        tile_idx, split_idx, _ = cute.arch.block_idx()
+        if const_expr(params.cluster_shape_m > 1 and params.use_cluster_idx):
+            # Both CTAs share one m block.
+            tile_idx, split_idx, _ = cute.arch.cluster_idx()
+        else:
+            tile_idx, split_idx, _ = cute.arch.block_idx()
         return SingleTileLPTScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
     @staticmethod
@@ -605,7 +609,11 @@ class SingleTileLPTScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         if const_expr(params.scheduling_mode == SchedulingMode.CLC):
             return SingleTileLPTScheduler._clc_grid_shape(params)
-        return (params.total_blocks, params.num_splits, Int32(1))
+        grid_x = params.total_blocks
+        if const_expr(params.cluster_shape_m > 1 and params.use_cluster_idx):
+            # Convert clusters to CTAs.
+            grid_x = grid_x * params.cluster_shape_m
+        return (grid_x, params.num_splits, Int32(1))
 
     @cute.jit
     def clc_work_to_coords(self, work) -> WorkTileInfo:
@@ -1867,19 +1875,16 @@ def compute_sm100_fmha_varlen_grid(
     shape: cute.Shape,
     cu_seqlens: cute.Tensor,
     tile_shape_mn: Tuple[int, int],
-    num_splits: Int32 = Int32(1),
-    is_split_kv: bool = False,
 ) -> Tuple[SingleTileVarlenScheduler.Params, Tuple[Int32, Int32, Int32]]:
     """Build a flat grid with each CTA pair confined to one sequence.
 
     ``shape`` is (token_capacity, head_dim, ((head_ratio, num_heads), batch)).
-    With ``is_split_kv``, grid dim y enumerates the KV splits.
     """
     args = TileSchedulerArguments(
         num_block=Int32(0),
         num_head=cute.size(shape[2][0]),
         num_batch=cute.size(shape[2][1]),
-        num_splits=num_splits,
+        num_splits=Int32(1),
         seqlen_k=Int32(0),
         headdim=cute.size(shape[1]),
         headdim_v=cute.size(shape[1]),
@@ -1887,7 +1892,6 @@ def compute_sm100_fmha_varlen_grid(
         tile_shape_mn=tile_shape_mn,
         cluster_shape_mn=(2, 1),
         mCuSeqlensQ=cu_seqlens,
-        is_split_kv=is_split_kv,
     )
     params = SingleTileVarlenScheduler.to_underlying_arguments(args)
     return params, SingleTileVarlenScheduler.get_grid_shape(params)

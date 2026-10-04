@@ -509,17 +509,17 @@ def test_flash_attn_output(
         pytest.skip()
     if has_qv and local:
         pytest.xfail("has_qv: local not supported yet")
-    # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
+    # The SM100 head_dim=256 backward does not support these features yet (the forward does).
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
         if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
+            pytest.skip("SM100 head_dim=256 backward does not support learnable_sink yet")
         if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
+            pytest.skip("SM100 head_dim=256 backward does not support local attention yet")
         if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
+            pytest.skip("SM100 head_dim=256 backward does not support softcap yet")
         if deterministic:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
+            pytest.skip("SM100 head_dim=256 backward does not support deterministic mode yet")
     device = "cuda"
     # set seed
     seed = 0
@@ -663,7 +663,7 @@ def test_flash_attn_output(
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         # num_splits_vals = [1, 3]
         pack_gqa_vals = [True] if has_qv else [False, True, None] if not TEST_BWD_ONLY else [False]
-        # SplitKV is not supported for hdim >= 192, except the SM100 hd256 kernel
+        # SplitKV is not supported for hdim >= 192, except hd256 on SM100
         # pack_gqa_vals = [False]
         split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
         num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY and not has_qv else [1]
@@ -673,14 +673,6 @@ def test_flash_attn_output(
                 continue
             if IS_SM100 and (d >= 192 and dv >= 192) and not (d == 256 and dv == 256):
                 continue
-            # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel does not support pack_gqa yet.
-            # pack_gqa=None means auto-enable for GQA/MQA (qhead_per_kvhead > 1)
-            # Remove this when support is added.
-            if d == 256 and IS_SM100:
-                if pack_gqa is True:
-                    continue
-                if pack_gqa is None and mha_type != "mha":
-                    continue
             out, lse = flash_attn_func(
                 q,
                 k,
@@ -1337,22 +1329,19 @@ def test_flash_attn_varlen_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
+    # The SM100 head_dim=256 backward does not support these features yet (the forward does).
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
         if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
+            pytest.skip("SM100 head_dim=256 backward does not support learnable_sink yet")
         if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
+            pytest.skip("SM100 head_dim=256 backward does not support local attention yet")
         if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
+            pytest.skip("SM100 head_dim=256 backward does not support softcap yet")
         if deterministic:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
+            pytest.skip("SM100 head_dim=256 backward does not support deterministic mode yet")
         if not unpad_q and unpad_kv:
-            pytest.skip(
-                "SM100 head_dim=256 2CTA kernel does not support varlen-packed K "
-                "without varlen Q (cu_seqlens_k requires cu_seqlens_q)"
-            )
+            pytest.skip("SM100 head_dim=256 backward: varlen-packed K without varlen Q is untested")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -1370,7 +1359,7 @@ def test_flash_attn_varlen_output(
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
     if d == 256:
-        dv_vals = [256]  # SM100 hd=256 2CTA kernel only supports dv=256
+        dv_vals = [256]  # (256, 256) is the only hd256 shape on SM100
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k else [0]
@@ -1562,7 +1551,7 @@ def test_flash_attn_varlen_output(
         pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
         # pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
-        # SplitKV is not supported for hdim >= 192, except the SM100 hd256 kernel
+        # SplitKV is not supported for hdim >= 192, except hd256 on SM100
         split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
         num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         precompute_metadata_vals = [False, True]
@@ -1574,14 +1563,6 @@ def test_flash_attn_varlen_output(
                 continue
             if precompute_metadata and is_fake_mode():
                 continue
-            # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel does not support pack_gqa yet.
-            # pack_gqa=None means auto-enable for GQA/MQA (qhead_per_kvhead > 1)
-            # Remove this when support is added.
-            if d == 256 and IS_SM100:
-                if pack_gqa is True:
-                    continue
-                if pack_gqa is None and mha_type != "mha":
-                    continue
             if precompute_metadata:
                 scheduler_metadata = get_scheduler_metadata(
                     max_seqlen_q=seqlen_q,
@@ -2948,7 +2929,7 @@ def test_flash_attn_paged_deepseek(seqlen_q, page_size):
 @pytest.mark.parametrize("seqlen_q", [128, 512, 2048])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_hd256_sm100_tma(seqlen_q, num_splits):
-    """TMA paged KV in the SM100 hd256 2CTA forward kernel.
+    """TMA paged KV in the SM100 hd256 forward.
 
     Verifies paged KV (page_table + TMA) matches the non-paged varlen reference
     and is deterministic across runs. page_size must equal tile_n=128.
@@ -2993,7 +2974,7 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q, num_splits):
         batch_size, num_pages_per_seq
     )
 
-    # Paged via hd256 2CTA TMA paged path — run twice for determinism.
+    # Paged via the TMA paged path — run twice for determinism.
     out_paged_0, _ = flash_attn_varlen_func(
         q, k_paged, v_paged,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
@@ -3021,12 +3002,7 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q, num_splits):
 @pytest.mark.parametrize("nheads_kv", [2, 4, 8])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
-    """TMA paged KV for SM100 hd256 2CTA with GQA (nheads_q > nheads_kv).
-
-    Exercises the head_kv_coord derivation for qhead_per_kvhead > 1 — the MHA
-    test passes by coincidence since modulo and integer division agree when
-    qhead_per_kvhead == 1.
-    """
+    """Paged GQA must select the same KV head as the dense reference."""
     if not IS_SM100:
         pytest.skip("SM100-specific paged hd256 test")
     device = "cuda"
@@ -3081,19 +3057,15 @@ def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
     )
 
 
+@pytest.mark.parametrize("head_dim", [128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_paged_hd256_sm100_tma_shuffled():
-    """TMA paged KV for SM100 hd256 2CTA with a non-identity (shuffled) page_table.
-
-    An identity page_table passes even if the kernel ignores it. This test
-    shuffles physical pages so a kernel that bypasses page_table would silently
-    read wrong data, proving the remapping path is exercised.
-    """
+def test_flash_attn_paged_sm100_tma_capacity(head_dim):
+    """Paged KV remaps shuffled pages and attends full capacity without seqused_k."""
     if not IS_SM100:
-        pytest.skip("SM100-specific paged hd256 test")
+        pytest.skip("SM100-specific paged KV test")
     device = "cuda"
     dtype = torch.bfloat16
-    d = 256
+    d = head_dim
     batch_size = 2
     nheads = 16
     nheads_kv = 16
@@ -3135,7 +3107,7 @@ def test_flash_attn_paged_hd256_sm100_tma_shuffled():
     out_paged, _ = flash_attn_varlen_func(
         q, k_paged, v_paged,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
-        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q // 2,
         page_table=page_table,
     )
 
@@ -3265,59 +3237,6 @@ def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q,
     assert torch.equal(out_full_seqused, out_no_seqused), (
         "seqused_k equal to the allocated length must match the non-seqused path"
     )
-
-
-@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_paged_hd256_sm100_tma_contract_guards():
-    """The two paged-KV contract guards of the SM100 hd256 2CTA forward kernel.
-
-    The interface widens ``max_seqlen_k`` to the enclosing page and narrows the
-    ``page_table`` to match, which is only well defined when (a) the table
-    actually covers the requested extent and (b) something bounds each sequence
-    at its true length once the extent is rounded up.
-    """
-    if not IS_SM100:
-        pytest.skip("SM100-specific paged hd256 test")
-    device = "cuda"
-    dtype = torch.bfloat16
-    d = 256
-    nheads = 8
-    nheads_kv = 8
-    page_size = 128
-    seqlen_q = 1
-    batch_size = 2
-    num_pages_per_seq = 2
-    total_pages = batch_size * num_pages_per_seq
-
-    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
-    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
-    k_paged = torch.randn(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
-    v_paged = torch.randn_like(k_paged)
-    page_table = torch.arange(total_pages, dtype=torch.int32, device=device).reshape(
-        batch_size, num_pages_per_seq
-    )
-    seqused_k = torch.full((batch_size,), 200, dtype=torch.int32, device=device)
-
-    # (a) page_table narrower than the requested extent needs.
-    with pytest.raises(AssertionError, match="page_table to cover max_seqlen_k"):
-        flash_attn_varlen_func(
-            q, k_paged, v_paged,
-            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
-            max_seqlen_q=seqlen_q, max_seqlen_k=num_pages_per_seq * page_size + 1,
-            page_table=page_table,
-            seqused_k=seqused_k,
-            causal=True,
-        )
-
-    # (b) extent that needs rounding, with nothing bounding the true lengths.
-    with pytest.raises(AssertionError, match="rounds max_seqlen_k up"):
-        flash_attn_varlen_func(
-            q, k_paged, v_paged,
-            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
-            max_seqlen_q=seqlen_q, max_seqlen_k=page_size + 1,
-            page_table=page_table,
-            causal=True,
-        )
 
 
 @pytest.mark.parametrize("head_dim", [4, 148, 288])
