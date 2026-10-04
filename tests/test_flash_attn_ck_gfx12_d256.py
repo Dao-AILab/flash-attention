@@ -79,9 +79,15 @@ def check_case(
     ref_grad = torch.autograd.grad(expected, (qr, kr, vr), dout.double())
     for got, ref in zip((actual, *got_grad), (expected, *ref_grad)):
         assert torch.isfinite(got).all()
-        error = (got.double() - ref).norm() / ref.norm().clamp_min(1e-12)
-        assert error.item() < 0.01
-        torch.testing.assert_close(got.double(), ref, atol=0.04, rtol=0.04)
+        ref_norm = ref.norm().item()
+        if ref_norm == 0.0:
+            # Single-key attention has analytically zero dQ/dK. Relative error
+            # is undefined; allow only a small absolute accumulation residual.
+            torch.testing.assert_close(got.double(), ref, atol=1e-5, rtol=0.0)
+        else:
+            error = (got.double() - ref).norm().item() / ref_norm
+            assert error < 0.01
+            torch.testing.assert_close(got.double(), ref, atol=0.04, rtol=0.04)
     if causal and sq > sk:
         assert torch.count_nonzero(actual[:, : sq - sk]).item() == 0
         assert torch.count_nonzero(got_grad[0][:, : sq - sk]).item() == 0
