@@ -4161,6 +4161,9 @@ def flash_attn_func(
             "the backward will run unchunked (full-size dS transient).",
             stacklevel=2,
         )
+    # Custom autograd forwards cannot observe the caller's grad mode.
+    if learnable_sink is not None and not torch.is_grad_enabled():
+        learnable_sink = learnable_sink.detach()
     return FlashAttnFunc.apply(
         q,
         k,
@@ -4291,6 +4294,9 @@ def flash_attn_varlen_func(
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
+    # Custom autograd forwards cannot observe the caller's grad mode.
+    if learnable_sink is not None and not torch.is_grad_enabled():
+        learnable_sink = learnable_sink.detach()
     return FlashAttnVarlenFunc.apply(
         q,
         k,
