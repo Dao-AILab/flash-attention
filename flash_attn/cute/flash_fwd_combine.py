@@ -209,10 +209,13 @@ class FlashAttentionForwardCombine:
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         virtual_batch_idx: Optional[cute.Tensor] = None,
         semaphore_to_reset: Optional[cute.Tensor] = None,
+        mOlo: Optional[cute.Tensor] = None,  # like mO: rounding residual fp32(O) - dtype(O)
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
         # Type checking
+        if const_expr(mOlo is not None and not (mOlo.element_type == self.dtype)):
+            raise TypeError("O residual must have O's data type")
         if const_expr(not (mO_partial.element_type == self.dtype_partial)):
             raise TypeError("O partial tensor must match dtype_partial")
         if const_expr(not (mO.element_type == self.dtype)):
@@ -252,6 +255,11 @@ class FlashAttentionForwardCombine:
         )
         O_layout_transpose = [1, 3, 2, 0] if const_expr(cu_seqlens is None) else [0, 2, 1]
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
+        if const_expr(mOlo is not None):
+            mOlo = assume_tensor_aligned(mOlo)
+            mOlo = cute.make_tensor(
+                mOlo.iterator, cute.select(mOlo.layout, mode=O_layout_transpose)
+            )
         # (num_splits, b, seqlen, h) -> (seqlen, num_splits, h, b)
         # or (num_splits, total_q, h) -> (total_q, num_splits, h)
         LSE_partial_layout_transpose = [2, 0, 3, 1] if const_expr(cu_seqlens is None) else [1, 0, 2]
@@ -331,6 +339,7 @@ class FlashAttentionForwardCombine:
             num_splits_dynamic_ptr,
             virtual_batch_idx,
             semaphore_to_reset,
+            mOlo,
             SharedStorage,
             self.smem_layout_lse,
             self.smem_layout_o,
@@ -362,6 +371,7 @@ class FlashAttentionForwardCombine:
         num_splits_dynamic_ptr: Optional[cute.Tensor],
         virtual_batch_idx: Optional[cute.Tensor],
         semaphore_to_reset: Optional[cute.Tensor],
+        mOlo: Optional[cute.Tensor],
         SharedStorage: cutlass.Constexpr,
         smem_layout_lse: cute.Layout | cute.ComposedLayout,
         smem_layout_o: cute.Layout,
@@ -703,6 +713,32 @@ class FlashAttentionForwardCombine:
                             k_idx = tOcO[0, 0, k][1] // elems_per_store
                             if const_expr(self.is_even_k) or tOpO[k]:
                                 cute.copy(gmem_thr_copy_O, rO[None, m, k], mO_cur_copy[None, k_idx])
+                if const_expr(mOlo is not None):
+                    # Rounding residual of the O just stored, from the fp32 combined O still in
+                    # registers (exact in fp32, rounded once to dtype), written like O. The
+                    # backward preprocess reads O + O_lo so dpsum does not carry O's rounding.
+                    rOlo = cute.make_rmem_tensor_like(tOrO, self.dtype)
+                    rOlo.store((tOrO.load() - rO.load().to(Float32)).to(self.dtype))
+                    if const_expr(cu_seqlens is None):
+                        mOlo_cur = mOlo[None, None, None, batch_idx]
+                    else:
+                        mOlo_cur = cute.domain_offset((offset, 0, 0), mOlo)
+                    mOlo_cur = utils.domain_offset_aligned(
+                        (0, k_block * self.k_block_size, 0), mOlo_cur
+                    )
+                    for m in cutlass.range(num_rows, unroll_full=True):
+                        if tOhidx[m] >= 0:
+                            mOlo_cur_copy = cute.tiled_divide(
+                                mOlo_cur[tOmidx[m], None, tOhidx[m]], (elems_per_store,)
+                            )
+                            for k in cutlass.range(cute.size(tOcO, mode=[2]), unroll_full=True):
+                                k_idx = tOcO[0, 0, k][1] // elems_per_store
+                                if const_expr(self.is_even_k) or tOpO[k]:
+                                    cute.copy(
+                                        gmem_thr_copy_O,
+                                        rOlo[None, m, k],
+                                        mOlo_cur_copy[None, k_idx],
+                                    )
 
     @cute.jit
     def load_O_partial(

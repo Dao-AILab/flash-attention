@@ -504,8 +504,25 @@ def check_tensor_vs_ref(name, actual, ref, pt, rtol=2, atol=None):
     )
 
 
-def check_dsink_vs_ref(actual, ref, pt, rtol=2, atol=0.0):
+def dsink_terms_rms(attn_ref, out_ref, dout):
+    """Per-head sqrt(sum_rows (p_sink * dpsum)^2) from the reference's intermediates, where
+    dsink = -sum_rows p_sink * dpsum, p_sink = exp(sink - lse) = 1 - sum_keys P and
+    dpsum = rowsum(dO * O). attn_ref: (b, h, s_q, s_k) probabilities without the sink column,
+    out_ref: (b, s_q, h, d), dout: (b, s_q, h, d)."""
+    p_sink = (1.0 - attn_ref.float().sum(-1)).clamp_min(0.0)  # (b, h, s_q)
+    dpsum = (dout.float() * out_ref.float()).sum(-1).transpose(1, 2)  # (b, h, s_q)
+    return (p_sink * dpsum).pow(2).sum((0, 2)).sqrt()
+
+
+def check_dsink_vs_ref(actual, ref, pt, rtol=2, atol=0.0, terms_rms=None):
+    """dsink = -sum_rows p_sink * dpsum is a cancelling sum: sum_rows |p_sink * dpsum| can exceed
+    |dsink| by 1000x. The kernels form dpsum from bf16/fp16 operands (O, and P in the PV
+    product), so each row's term carries up to an eps_dtype relative error, independent across
+    rows; `terms_rms` (see dsink_terms_rms) adds that floor, eps_bf16 * sqrt(sum_rows term^2),
+    on top of the usual rtol * |pt - ref| + 2 ulp."""
     ulp = torch.nextafter(ref.abs(), torch.full_like(ref, float("inf"))) - ref.abs()
     diff = (actual - ref).abs()
     tolerance = rtol * (pt - ref).abs().max().item() + 2 * ulp + atol
+    if terms_rms is not None:
+        tolerance = tolerance + 2.0**-8 * terms_rms.to(tolerance.device)
     assert torch.all(diff <= tolerance), f"dSink: {diff=} exceeds {tolerance=}"
