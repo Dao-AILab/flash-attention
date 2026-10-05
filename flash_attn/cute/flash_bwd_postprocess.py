@@ -605,7 +605,9 @@ class FlashAttentionBackwardPostprocess:
                 # Per warp, each load covers 32 consecutive rows = 512 contiguous bytes.
                 gdQaccum_mn = cute.make_tensor(gdQaccum.iterator, self._dQaccum_tile_layout_2cta())
                 g2r_tiled_copy = cute.make_tiled_copy_tv(
-                    cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
+                    cute.make_copy_atom(
+                        cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
+                    ),
                     cute.make_layout((num_reduce_threads, 1)),
                     cute.make_layout((1, 128 // Float32.width)),
                 )
