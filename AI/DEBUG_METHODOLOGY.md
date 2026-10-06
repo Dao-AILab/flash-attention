@@ -93,7 +93,7 @@ pass/fail across repeated runs; divergence against a reference implementation
 at a specific tensor index.
 
 **Tier 2 — usable, needs corroboration.** PTX (`CUTE_DSL_KEEP_PTX=1`), dumped
-SASS (`CUTE_CUBIN_PATH`), shared-memory layout offsets, `cute.printf` traces.
+SASS (`CUTE_DSL_KEEP_CUBIN=1`), shared-memory layout offsets, `cute.printf` traces.
 Real, but one binary's codegen is not the kernel's semantics.
 
 **Tier 3 — contaminated by definition.** Anything captured *at* a trap:
