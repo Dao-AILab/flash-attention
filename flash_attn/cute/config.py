@@ -8,13 +8,17 @@ CUDA, or allocate device memory. MLA (qv) uses a separate policy in interface.py
 """
 
 import math
-from dataclasses import astuple, dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import NamedTuple
 
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def round_up(a: int, b: int) -> int:
+    return ceil_div(a, b) * b
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,8 @@ class FwdConfig:
     Dynamic persistence is derived from scheduler metadata, not is_static_persistent.
     num_splits and tile_n affect reduction order. With causal/local SplitKV, the
     per-split KV range also depends on the M tile extent, q_stage * tile_m.
+    ex2_emu_freq and ex2_emu_start_frg are the SM100/SM110 softmax exp2 emulation
+    (freq 0 keeps hardware exp2 throughout); other architectures carry 0 and 0.
     """
 
     device_capacity: int
@@ -58,6 +64,7 @@ class FwdConfig:
     mma_pv_is_rs: bool
     intra_wg_overlap: bool
     q_stage: int
+    pack_gqa: bool
     use_clc_scheduler: bool
     is_static_persistent: bool
     use_tma_o: bool
@@ -65,6 +72,8 @@ class FwdConfig:
     num_splits: int
     use_2cta_instrs: bool
     registers: Registers
+    ex2_emu_freq: int
+    ex2_emu_start_frg: int
 
 
 class FwdHeuristicInputs(NamedTuple):
@@ -97,9 +106,10 @@ class FwdHeuristicInputs(NamedTuple):
     has_seqused_k: bool = False
     has_caller_scheduler_metadata: bool = False
     has_tile_count_semaphore: bool = False
-    pack_gqa: bool = False
+    pack_gqa: bool | None = None  # None = no preference; selection resolves before policy reads.
     page_size: int | None = None
     use_block_sparsity: bool = False
+    sparse_mask_per_head: bool = False
     sparse_q_block_size: int | None = None
     sparse_kv_block_size: int | None = None
     has_score_mod: bool = False
@@ -128,6 +138,11 @@ class FwdHeuristicInputs(NamedTuple):
         return self.is_varlen_q or self.has_cu_seqlens_k or self.has_seqused_k
 
     @property
+    def has_varlen_q_semaphore(self) -> bool:
+        """A varlen-Q tile-count semaphore selects the dynamic persistent scheduler."""
+        return self.is_varlen_q and self.has_tile_count_semaphore
+
+    @property
     def qhead_per_kvhead(self) -> int:
         return self.num_heads // self.num_heads_kv
 
@@ -137,11 +152,11 @@ class FwdHeuristicInputs(NamedTuple):
 
     @property
     def head_dim_padded(self) -> int:
-        return ceil_div(self.head_dim, 16) * 16
+        return round_up(self.head_dim, 16)
 
     @property
     def head_dim_v_padded(self) -> int:
-        return ceil_div(self.head_dim_v, 16) * 16
+        return round_up(self.head_dim_v, 16)
 
     @property
     def is_hdim256(self) -> bool:
@@ -256,7 +271,7 @@ def fit_sm90_tile_to_block_sparsity(
 #   ex2_emu_start_frg: int — fragment index to start emulation from
 #   num_regs_softmax: int — register count for softmax warps (multiple of 8)
 #   num_regs_correction: int — register count for correction warps (multiple of 8)
-# The forward kernel reads the ex2 fields; select_sm100_registers reads the register fields and
+# select_ex2_emu reads the ex2 fields; select_sm100_registers reads the register fields and
 # gives the remaining budget to the other warp groups.
 SM100_TUNING = {
     (True, False, 128, False): {
@@ -389,6 +404,38 @@ def select_sm100_registers(
     return Sm100Registers(softmax, correction, other)
 
 
+def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tuple[int, int]:
+    """Return (ex2_emu_freq, ex2_emu_start_frg) for the SM100/SM110 forward softmax.
+
+    Untuned keys emulate up to head dim 128, and at 192 only for 2CTA non-causal non-local;
+    the SM103 family keeps hardware exp2. Disabled emulation, and every other architecture,
+    is (0, 0).
+    """
+    if inputs.device_capacity not in (10, 11):
+        return 0, 0
+    head_dim_padded = inputs.head_dim_padded
+    is_sm103 = sm100_is_sm103_family(inputs.device_arch)
+    key = (use_2cta_instrs, inputs.causal, head_dim_padded, is_sm103)
+    tune = SM100_TUNING.get(key, {})
+    fp8_tune = SM100_FP8_TUNING.get(key, {}) if "float8" in inputs.dtype else {}
+    if "ex2_emu_freq" in fp8_tune:
+        tune = {**tune, **fp8_tune}
+    start_frg = tune.get("ex2_emu_start_frg", 1)
+    if "ex2_emu_freq" in tune:
+        enabled = tune["ex2_emu_freq"] > 0
+    else:
+        hd192_2cta_noncausal = (
+            head_dim_padded == 192 and use_2cta_instrs and not inputs.causal and not inputs.local
+        )
+        enabled = (head_dim_padded <= 128 or hd192_2cta_noncausal) and not is_sm103
+    if not enabled:
+        return 0, 0
+    freq = tune.get("ex2_emu_freq", 16)
+    if inputs.pack_gqa and head_dim_padded > 64 and not inputs.causal and not inputs.local:
+        freq = 32 if inputs.is_varlen_q else tune.get("ex2_emu_freq", 10)
+    return freq, start_frg
+
+
 # SM90 splits with TMA Q and KV loads, keyed by MMA warp groups (tile_m // 64).
 SM90_TMA_REGISTERS = {
     1: Sm90Registers(mma=256, producer=56),
@@ -427,21 +474,25 @@ def select_registers(
             return None
 
 
+def check_register_record(registers: object, expected: type, kernel: str) -> None:
+    """Reject a register record of the wrong type, or counts setmaxnreg cannot apply."""
+    if type(registers) is not expected:
+        raise ValueError(
+            f"{kernel} needs registers of type {expected.__name__}, got {type(registers).__name__}"
+        )
+    if registers is not None and any(v % 8 != 0 or not 24 <= v <= 256 for v in vars(registers).values()):
+        raise ValueError(f"Register counts must be multiples of 8 in [24, 256], got {registers}")
+
+
 def validate_registers(config: "FwdConfig") -> None:
     """Reject register splits the kernels cannot apply with setmaxnreg."""
     registers = config.registers
     expected = {9: Sm90Registers, 10: Sm100Registers, 11: Sm100Registers}.get(
         config.device_capacity, type(None)
     )
-    if type(registers) is not expected:
-        raise ValueError(
-            f"SM{config.device_capacity} needs registers of type {expected.__name__}, "
-            f"got {type(registers).__name__}"
-        )
+    check_register_record(registers, expected, f"SM{config.device_capacity}")
     if registers is None:
         return
-    if any(v % 8 != 0 or not 24 <= v <= 256 for v in astuple(registers)):
-        raise ValueError(f"Register counts must be multiples of 8 in [24, 256], got {registers}")
     if isinstance(registers, Sm90Registers):
         num_mma_warp_groups = config.tile_m // 64
         launch = 65536 // (128 * (num_mma_warp_groups + 1))
@@ -617,12 +668,7 @@ def can_use_static_persistent(
     use_clc_scheduler: bool,
 ) -> bool:
     """Whether static persistence supports this tile mapping."""
-    # A varlen-Q tile-count semaphore selects the dynamic persistent scheduler.
-    if (
-        num_splits > 1
-        or use_clc_scheduler
-        or (inputs.is_varlen_q and inputs.has_tile_count_semaphore)
-    ):
+    if num_splits > 1 or use_clc_scheduler or inputs.has_varlen_q_semaphore:
         return False
     dense_noncausal = not inputs.causal and not inputs.local and not inputs.is_varlen_q
     single_m_block = (
@@ -640,8 +686,7 @@ def can_use_clc(inputs: FwdHeuristicInputs, *, tile_n: int, use_2cta_instrs: boo
     """Whether the SM100 kernel honors CLC for this layout."""
     return (
         inputs.page_size in (None, tile_n)
-        # A varlen-Q tile-count semaphore selects the dynamic persistent scheduler.
-        and not (inputs.is_varlen_q and inputs.has_tile_count_semaphore)
+        and not inputs.has_varlen_q_semaphore
         # CLC does not map hd256 2CTA tiles correctly.
         and not (inputs.is_hdim256 and use_2cta_instrs)
     )
@@ -650,6 +695,10 @@ def can_use_clc(inputs: FwdHeuristicInputs, *, tile_n: int, use_2cta_instrs: boo
 @lru_cache(maxsize=1024)
 def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     """Select one fully resolved config from host-visible metadata."""
+    pack_gqa = default_pack_gqa(inputs) if inputs.pack_gqa is None else inputs.pack_gqa
+    if inputs.sparse_mask_per_head:
+        pack_gqa = False
+    inputs = inputs._replace(pack_gqa=pack_gqa)
     device_capacity = inputs.device_capacity
     if device_capacity == 12 and inputs.requested_num_splits not in (None, 1):
         raise ValueError("SM120 forward only supports num_splits=1")
@@ -723,6 +772,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
             >= _S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT.get(inputs.head_dim, math.inf)
         )
     )
+    ex2_emu_freq, ex2_emu_start_frg = select_ex2_emu(inputs, use_2cta_instrs=use_2cta_instrs)
 
     config = FwdConfig(
         device_capacity=device_capacity,
@@ -731,6 +781,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
         q_stage=q_stage,
+        pack_gqa=pack_gqa,
         use_clc_scheduler=use_clc_scheduler,
         is_static_persistent=is_static_persistent,
         use_tma_o=use_tma_o,
@@ -744,10 +795,53 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
             q_stage=q_stage,
             use_2cta_instrs=use_2cta_instrs,
         ),
+        ex2_emu_freq=ex2_emu_freq,
+        ex2_emu_start_frg=ex2_emu_start_frg,
     )
     validate_fwd_config(config, inputs)
     return config
 
+
+def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) -> FwdConfig:
+    """Apply changes to base and re-derive the fields the selector computes from them.
+
+    registers and the exp2 emulation are recomputed for the changed tile, stage, 2CTA, and
+    PackGQA choices unless changes sets them. The result is validated.
+    """
+    config = replace(base, **changes)
+    resolved = inputs._replace(pack_gqa=config.pack_gqa)
+    ex2_emu_freq, ex2_emu_start_frg = select_ex2_emu(
+        resolved, use_2cta_instrs=config.use_2cta_instrs
+    )
+    derived = dict(ex2_emu_freq=ex2_emu_freq, ex2_emu_start_frg=ex2_emu_start_frg)
+    # The register tables cover only supported tiles and stages; validation rejects the rest.
+    if "registers" not in changes:
+        derived["registers"] = select_registers(
+            resolved,
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            q_stage=config.q_stage,
+            use_2cta_instrs=config.use_2cta_instrs,
+        )
+    config = replace(config, **{k: v for k, v in derived.items() if k not in changes})
+    validate_fwd_config(config, inputs)
+    return config
+
+
+# Architecture-specific fields at their neutral values, for architectures that do not expose
+# them: the SM90 MMA flags, and the SM100/SM110 stage, split, scheduler, and exp2 options.
+_FWD_SM90_ONLY_NEUTRAL_FIELDS = dict(mma_pv_is_rs=False, intra_wg_overlap=False)
+_FWD_SM100_ONLY_NEUTRAL_FIELDS = dict(
+    q_stage=1,
+    num_splits=1,
+    use_2cta_instrs=False,
+    use_clc_scheduler=False,
+    is_static_persistent=False,
+    use_tma_o=False,
+    use_s_ping_pong=False,
+    ex2_emu_freq=0,
+    ex2_emu_start_frg=0,
+)
 
 _SM100_SMEM_BYTES = 227 * 1024
 # Barrier/scheduler overhead calibrated to hd192/128, tile_n=192: 247808 bytes at launch.
@@ -777,6 +871,13 @@ def sm100_hd192_uneven_kv_smem_bytes(config: FwdConfig, inputs: FwdHeuristicInpu
 @lru_cache(maxsize=1024)
 def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
     """Reject known unsupported or silently normalized config combinations."""
+    if config.pack_gqa and inputs.sparse_mask_per_head:
+        raise ValueError("PackGQA requires head-broadcast sparse masks")
+    if inputs.pack_gqa is not None and inputs.pack_gqa != config.pack_gqa:
+        raise ValueError(
+            f"pack_gqa={inputs.pack_gqa} disagrees with config.pack_gqa={config.pack_gqa}"
+        )
+    inputs = inputs._replace(pack_gqa=config.pack_gqa)
     if inputs.device_capacity not in (8, 9, 10, 11, 12):
         raise ValueError(f"Unsupported forward architecture family SM{inputs.device_capacity}")
     if config.device_capacity != inputs.device_capacity:
@@ -801,36 +902,39 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
     if inputs.seqlen_k_per_split is not None and inputs.seqlen_k_per_split % config.tile_n != 0:
         raise ValueError(f"seqlen_k_per_split must be divisible by tile_n={config.tile_n}")
 
-    is_sm90 = inputs.device_capacity == 9
-    is_sm100_family = inputs.device_capacity in (10, 11)
-    if not is_sm100_family:
-        match inputs.device_capacity:
+    capacity = inputs.device_capacity
+    if capacity != 9 and any(
+        getattr(config, name) != value for name, value in _FWD_SM90_ONLY_NEUTRAL_FIELDS.items()
+    ):
+        raise ValueError(f"SM{capacity} forward does not expose SM90 MMA flags")
+    if capacity not in (10, 11):
+        match capacity:
             case 8 if inputs.page_size is not None:
                 raise ValueError("SM80 forward does not support paged KV")
+            case 9 if config.tile_m not in (64, 128, 192):
+                raise ValueError(f"SM90 tile_m must be 64, 128, or 192, got {config.tile_m}")
             case 12 if inputs.page_size is not None or inputs.use_block_sparsity:
                 raise ValueError("SM120 forward does not support paged KV or block sparsity")
-        if is_sm90:
-            if config.tile_m not in (64, 128, 192):
-                raise ValueError(f"SM90 tile_m must be 64, 128, or 192, got {config.tile_m}")
-        elif config.mma_pv_is_rs or config.intra_wg_overlap:
-            raise ValueError(f"SM{inputs.device_capacity} does not expose SM90 MMA flags")
-        if config.q_stage != 1:
-            raise ValueError(f"SM{inputs.device_capacity} requires q_stage=1")
-        if config.num_splits != 1:
-            raise ValueError(f"SM{inputs.device_capacity} does not support SplitKV")
-        if (
-            config.use_2cta_instrs
-            or config.use_clc_scheduler
-            or config.is_static_persistent
-            or config.use_tma_o
-            or config.use_s_ping_pong
-        ):
-            raise ValueError(f"SM{inputs.device_capacity} does not support SM100 scheduler options")
+        neutral = _FWD_SM100_ONLY_NEUTRAL_FIELDS
+        mismatched = [name for name, value in neutral.items() if getattr(config, name) != value]
+        if mismatched:
+            raise ValueError(
+                f"SM{capacity} forward does not support SM100-only options: "
+                + ", ".join(f"{n}={getattr(config, n)} (needs {neutral[n]})" for n in mismatched)
+            )
         validate_registers(config)
         return
 
-    if config.mma_pv_is_rs or config.intra_wg_overlap:
-        raise ValueError("SM100 forward does not expose SM90 MMA flags")
+    if config.ex2_emu_freq < 0 or config.ex2_emu_start_frg < 0:
+        raise ValueError(
+            "ex2_emu_freq and ex2_emu_start_frg must be >= 0, got "
+            f"{(config.ex2_emu_freq, config.ex2_emu_start_frg)}"
+        )
+    # The softmax reads start_frg only when emulating; one encoding for "off" keeps one kernel.
+    if config.ex2_emu_freq == 0 and config.ex2_emu_start_frg != 0:
+        raise ValueError(
+            f"ex2_emu_start_frg must be 0 when ex2_emu_freq is 0, got {config.ex2_emu_start_frg}"
+        )
     # Softmax warp groups own 128 rows each; smaller tiles overrun the row statistics.
     if config.tile_m != 128:
         raise ValueError(f"SM100 forward requires tile_m=128, got {config.tile_m}")

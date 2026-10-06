@@ -6,7 +6,10 @@ import os
 import random
 import re
 import gc
+from contextlib import contextmanager
+from dataclasses import replace
 from functools import wraps
+from unittest import mock
 
 import pytest
 import torch
@@ -19,6 +22,7 @@ except ImportError:
     apply_rotary_emb = None
 
 from flash_attn.cute.cache_utils import JITCache
+from flash_attn.cute.config import FwdConfig, Sm100Registers, select_fwd_config
 from flash_attn.cute.testing import (
     check_dsink_vs_ref,
     check_tensor_vs_ref,
@@ -37,6 +41,7 @@ from flash_attn.cute.interface import (
     _bwd_preprocess,
     _bwd_postprocess_convert,
     _flash_attn_fwd,
+    _flash_attn_fwd_combine,
     _flash_attn_bwd,
 )
 
@@ -92,6 +97,19 @@ def test_flash_attn_auto_splits_more_tiles_than_sms():
     if is_fake_mode():
         return
     assert torch.equal(out, ref)
+
+
+@contextmanager
+def capture_selected_fwd_config():
+    """Record the config that _flash_attn_fwd selects."""
+    selected = {}
+
+    def capture(inputs):
+        selected["config"] = select_fwd_config(inputs)
+        return selected["config"]
+
+    with mock.patch("flash_attn.cute.interface.select_fwd_config", side_effect=capture):
+        yield selected
 
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 CLC with 2CTA")
@@ -168,8 +186,8 @@ def test_flash_attn_work_tiles_cover_q(monkeypatch, causal, use_2cta, q_stage, p
     )
     init = FlashAttentionForwardSm100.__init__
 
-    def forced_init(self, *args, **kwargs):
-        init(self, *args, **{**kwargs, **forced})
+    def forced_init(self, *args, config, **kwargs):
+        init(self, *args, config=replace(config, **forced), **kwargs)
 
     monkeypatch.setattr(FlashAttentionForwardSm100, "__init__", forced_init)
     monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", JITCache())
@@ -212,7 +230,7 @@ def test_flash_attn_sm120_num_splits(num_splits):
     out = flash_attn_func(q, k, v)
     out_auto = flash_attn_func(q, k, v, num_splits=num_splits)
     torch.testing.assert_close(out_auto, out)
-    with pytest.raises(AssertionError, match="SM120 forward only supports num_splits=1"):
+    with pytest.raises(ValueError, match="SM120 forward only supports num_splits=1"):
         flash_attn_func(q, k, v, num_splits=3)
 
 
@@ -543,6 +561,100 @@ def test_flash_attn_paged_non_tma_partial_loader_tile():
         v_ref.float().transpose(0, 1).unsqueeze(0),
     ).transpose(1, 2)
     torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 runtime SplitKV")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_forced_split_config_reuses_specializations():
+    """Exact split counts must not enter the compile key."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 128, 8, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 2048, 8, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    config_2 = FwdConfig(
+        device_capacity=torch.cuda.get_device_capability()[0],
+        tile_m=128,
+        tile_n=128,
+        mma_pv_is_rs=False,
+        intra_wg_overlap=False,
+        q_stage=1,
+        pack_gqa=False,
+        use_clc_scheduler=False,
+        is_static_persistent=False,
+        use_tma_o=True,
+        use_s_ping_pong=False,
+        num_splits=2,
+        use_2cta_instrs=False,
+        registers=Sm100Registers(softmax=200, correction=64, other=48),
+        ex2_emu_freq=0,
+        ex2_emu_start_frg=0,
+    )
+    out_2 = _flash_attn_fwd(q, k, v, config=config_2)[0]
+    main_keys = set(_flash_attn_fwd.compile_cache.cache)
+    combine_keys = set(_flash_attn_fwd_combine.compile_cache.cache)
+    out_4 = _flash_attn_fwd(q, k, v, config=replace(config_2, num_splits=4))[0]
+    assert set(_flash_attn_fwd.compile_cache.cache) == main_keys
+    assert set(_flash_attn_fwd_combine.compile_cache.cache) == combine_keys
+    if is_fake_mode():
+        return
+    reference = attention_ref(q, k, v)[0].float()
+    torch.testing.assert_close(out_2.float(), reference, atol=0.04, rtol=0.04)
+    torch.testing.assert_close(out_4.float(), reference, atol=0.04, rtol=0.04)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 explicit config metadata test")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_explicit_config_scheduler_metadata(monkeypatch):
+    """Explicit configs reject caller scheduler_metadata unless it is disabled."""
+    # The hd256 varlen 2CTA config is the case under test; CUDA 12 and FA_DISABLE_2CTA=1 turn 2CTA off.
+    monkeypatch.setattr("flash_attn.cute.utils._get_disable_2cta_default", lambda is_fwd=False: False)
+    lengths = [300, 300]
+    q = torch.randn(sum(lengths), 8, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    cu_seqlens = torch.tensor([0, lengths[0], sum(lengths)], device="cuda", dtype=torch.int32)
+    varlen = dict(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+    )
+    with capture_selected_fwd_config() as selected:
+        out = _flash_attn_fwd(q, k, v, **varlen)[0]
+    config = selected["config"]
+    # Active caller metadata excludes hd256 varlen 2CTA; disabled metadata must not.
+    assert config.use_2cta_instrs
+    metadata = get_scheduler_metadata(nheads=8, nheads_kv=8, headdim=256, num_splits=1, **varlen)
+    with pytest.raises(ValueError, match="cannot reuse caller-built scheduler_metadata"):
+        _flash_attn_fwd(q, k, v, scheduler_metadata=metadata, config=config, **varlen)
+    out_disabled = _flash_attn_fwd(
+        q, k, v, scheduler_metadata=metadata, disable_scheduler_metadata=True, config=config, **varlen
+    )[0]
+    if is_fake_mode():
+        return
+    assert torch.equal(out_disabled, out)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 varlen scheduler metadata test")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_scheduler_metadata_semaphore_follows_selected_scheduler(monkeypatch):
+    """Varlen MHA metadata needs the tile semaphore even with FA_CLC=1."""
+    from flash_attn.cute import utils as cute_utils
+
+    monkeypatch.setattr(cute_utils, "_fa_clc_enabled", True)
+    cu_seqlens = torch.tensor([0, 300, 500], device="cuda", dtype=torch.int32)
+    metadata = get_scheduler_metadata(
+        nheads=4,
+        nheads_kv=4,
+        headdim=128,
+        num_splits=1,
+        causal=True,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=300,
+        max_seqlen_k=300,
+    )
+    assert metadata.tile_count_semaphore is not None
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])

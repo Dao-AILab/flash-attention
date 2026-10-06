@@ -75,16 +75,11 @@ from flash_attn.cute.tile_scheduler import (
 from flash_attn.cute.fa_logging import fa_log, fa_printf
 from flash_attn.cute.utils import smid
 from flash_attn.cute.utils import AuxData
-
-# === TUNING KNOBS (agent-editable) ===
-# Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
-# Values:
-#   ex2_emu_freq: int — how often to use emulated exp2 (0=all hardware exp2, higher=more emulation).
-#                        SM103 has fast native exp2, so set freq=0 there.
-#   ex2_emu_start_frg: int — fragment index to start emulation from
-#   num_regs_softmax: int — register count for softmax warps (multiple of 8)
-#   num_regs_correction: int — register count for correction warps (multiple of 8)
-#   num_regs_other: remaining register budget, shared by the non-softmax/correction WGs
+from flash_attn.cute.config import (
+    SM100_LAUNCH_REGISTERS,
+    SM100_THREADS_PER_CTA,
+    FwdConfig,
+)
 
 # Note [Low Precision Scaling]
 # P is in (0, 1] and is cast to the input dtype before P @ V, so scaling it by 2^max_offset
@@ -101,31 +96,6 @@ _LOG2_DTYPE_MAX = {
     cutlass.BFloat16: math.log2(3.3895313892515355e38),
 }
 
-_TUNING_CONFIG = {
-    (True, False, 128, False): {"ex2_emu_freq": 10, "ex2_emu_start_frg": 1, "num_regs_softmax": 184, "num_regs_correction": 80},
-    (False, True, 128, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
-    (True, False, 192, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "num_regs_softmax": 184, "num_regs_correction": 80},
-    (False, True, 192, False): {"ex2_emu_freq": 32, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
-    (True, False, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 80},
-    (False, True, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
-    (True, False, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
-    (False, True, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 72},
-    (True, False, 256, False): {"ex2_emu_freq": 14, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
-    (True, True, 256, False): {"ex2_emu_freq": 14, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
-}
-_FP8_TUNING_CONFIG = {
-    (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 160, 'num_regs_correction': 72},
-    # Causal hd128 FP8 previously inherited bf16's freq=16. FP8 fwd is MUFU/ex2-bound, so a more
-    # aggressive emulation freq=8 offloads more exp from MUFU: +3.4%(4k)..+5.5%(16k) on B200,
-    # MHA & GQA, accuracy-neutral (3-run validated, locked clocks). freq=8 would regress non-causal
-    # (0.94x), hence keyed on is_causal=True only.
-    (False, True, 128, False): {'ex2_emu_freq': 8, 'ex2_emu_start_frg': 1},
-}
-_FP8_SMALL_HDIM_REGS = {
-    False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
-    True: {"num_regs_softmax": 152, "num_regs_correction": 96, "num_regs_other": 112},
-}
-# === END TUNING KNOBS ===
 
 # NOTE [SM100 forward coordinate spaces]
 # R = m_block_size, C = cta_group_size, S = q_stage; a work tile spans R*C*S effective rows.
@@ -181,25 +151,19 @@ class FlashAttentionForwardSm100:
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         is_causal: bool = False,
         is_local: bool = False,
-        is_split_kv: bool = False,
-        pack_gqa: bool = False,
         q_subtile_factor: int = 1,
         kv_subtile_factor: int = 1,
-        m_block_size: int = 128,
-        n_block_size: int = 128,
-        q_stage: cutlass.Constexpr[int] = 2,
-        is_static_persistent: bool = True,
         score_mod: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
-        use_2cta_instrs: bool = False,
-        use_clc_scheduler: bool = False,
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
-        use_s_ping_pong: cutlass.Constexpr[bool] = False,
+        *,
+        config: FwdConfig,
     ):
+        """config is a validated SM100/SM110 FwdConfig; the kernel copies its fields."""
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -211,21 +175,21 @@ class FlashAttentionForwardSm100:
         self.same_hdim_kv_padded = self.head_dim_padded == self.head_dim_v_padded
         self.check_hdim_oob = head_dim != self.head_dim_padded
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
-        self.m_block_size = m_block_size
-        self.n_block_size = n_block_size
-        self.q_stage = q_stage
+        self.m_block_size = config.tile_m
+        self.n_block_size = config.tile_n
+        self.q_stage = config.q_stage
         assert self.q_stage in [1, 2]
-        self.use_2cta_instrs = use_2cta_instrs
+        self.use_2cta_instrs = config.use_2cta_instrs
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
         # between compute the last couple columns of P and the P @ V MMA.
-        self.split_P_arrive = n_block_size // 4 * 3
+        self.split_P_arrive = self.n_block_size // 4 * 3
         self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
-        assert seqlen_k_per_split is None or seqlen_k_per_split % n_block_size == 0
+        assert seqlen_k_per_split is None or seqlen_k_per_split % self.n_block_size == 0
         self.num_n_blocks_per_split = (
-            seqlen_k_per_split // n_block_size if seqlen_k_per_split is not None else None
+            seqlen_k_per_split // self.n_block_size if seqlen_k_per_split is not None else None
         )
         self.arch = BaseDSL._get_dsl().get_arch_enum()
         assert self.arch.is_family_of(Arch.sm_100f) or self.arch.is_family_of(Arch.sm_110f), \
@@ -233,30 +197,30 @@ class FlashAttentionForwardSm100:
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M covers one CTA; a scheduler work tile spans cta_group_size CTAs (work_q_block).
-        self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
+        self.cta_tiler = (self.q_stage * self.m_block_size, self.n_block_size, self.head_dim_padded)
         # With 2CTA, the MMA tiler M covers both CTAs, so it's cta_group_size * m_block_size.
         # Each CTA owns m_block_size rows; the 2CTA MMA instruction spans both.
-        self.mma_tiler_qk = (self.cta_group_size * m_block_size, n_block_size, self.head_dim_padded)
-        self.mma_tiler_pv = (self.cta_group_size * m_block_size, self.head_dim_v_padded, n_block_size)
+        self.mma_tiler_qk = (
+            self.cta_group_size * self.m_block_size, self.n_block_size, self.head_dim_padded
+        )
+        self.mma_tiler_pv = (
+            self.cta_group_size * self.m_block_size, self.head_dim_v_padded, self.n_block_size
+        )
         self.qk_acc_dtype = Float32
         self.pv_acc_dtype = Float32
         self.cluster_shape_mn = (2, 1) if self.use_2cta_instrs else (1, 1)
-        self.is_static_persistent = is_static_persistent
+        self.is_static_persistent = config.is_static_persistent
         self.is_causal = is_causal
         self.is_local = is_local
         self.is_varlen_q = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
-        self.is_split_kv = is_split_kv
-        self.pack_gqa = pack_gqa
+        self.is_split_kv = config.num_splits > 1
+        self.pack_gqa = config.pack_gqa
         # Half-width fp32 sO preserves two KV stages; unchanged column bounds require exact hd256.
         self.chunked_split_epi = self.is_split_kv and head_dim_v == 256
         self.epi_head_dim_v = 128 if self.chunked_split_epi else self.head_dim_v_padded
-        self.use_tma_O = (
-            not self.chunked_split_epi
-            and not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
-            and not (self.pack_gqa and self.is_split_kv)
-            and not is_varlen_q
-        )
+        assert not (config.use_tma_o and self.chunked_split_epi), "hd256 SplitKV uses a chunked epilogue"
+        self.use_tma_O = config.use_tma_o
         self.use_correction_warps_for_epi = not self.use_tma_O
         self.q_subtile_factor = q_subtile_factor
         self.kv_subtile_factor = kv_subtile_factor
@@ -271,22 +235,17 @@ class FlashAttentionForwardSm100:
         self.mask_vec_size: cutlass.Constexpr = getattr(mask_mod, "__vec_size__", 1)
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
-        # NOTE: is_family_of also matches any future sm_10x with x > 3 — intentional.
-        # The flag gates ex2 emulation; sm_103 (B300) has fast hardware ex2 and later
-        # Blackwell variants are assumed to inherit this, so forward-inclusion is correct
-        # despite the literal `is_sm103` name.
-        is_sm103 = self.arch.is_family_of(Arch.sm_103f)
-        self.is_sm103 = is_sm103
-        # SM103 ld.red is profitable except for D32 when scores are unmodified.
+        # SM103 ld.red is profitable except for D32 when scores are unmodified. is_family_of
+        # intentionally also matches later sm_10x.
         self.use_ldred_rowmax = (
-            is_sm103
+            self.arch.is_family_of(Arch.sm_103f)
             and self.score_mod is None
             and self.mask_mod is None
             and self.head_dim_padded != 32
         )
-        # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
-        _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
-        self.enable_ex2_emu = _default_enable_ex2_emu
+        # FwdConfig carries the exp2 emulation choice; see config.select_ex2_emu.
+        self.ex2_emu_freq = config.ex2_emu_freq
+        self.ex2_emu_start_frg = config.ex2_emu_start_frg
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
@@ -301,7 +260,7 @@ class FlashAttentionForwardSm100:
 
         # ClC does not compose with these other features, so disable even if requested
         self.use_clc_scheduler = (
-            use_clc_scheduler
+            config.use_clc_scheduler
             and self.use_tma_KV
             and not (has_tile_count_semaphore and is_varlen_q)
         )
@@ -362,9 +321,11 @@ class FlashAttentionForwardSm100:
                 *self.empty_warp_ids,
             )
         )
+        # config.select_sm100_registers and its validation assume this launch shape.
+        assert self.threads_per_cta == SM100_THREADS_PER_CTA
 
         self.use_tma_Q = not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
-        self.use_s_ping_pong = use_s_ping_pong
+        self.use_s_ping_pong = config.use_s_ping_pong
         if self.use_s_ping_pong:
             assert self.q_stage == 1, "S ping-pong requires q_stage == 1 (one Q tile per CTA)"
             assert self.head_dim_padded in (64, 128, 256) and self.n_block_size == 128
@@ -407,32 +368,9 @@ class FlashAttentionForwardSm100:
         # vec buffer for row_max & row_sum
         self.tmem_vec_offset = self.tmem_s_offset
 
-        # Look up tuning config for register counts and ex2_emu params
-        _tune_key = (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103)
-        self._tune = _TUNING_CONFIG.get(_tune_key, {})
-        if "ex2_emu_freq" in self._tune:
-            self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
-        if self.head_dim_padded < 96:
-            self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
-            self.num_regs_correction = 64
-            self.num_regs_other = 48 if not paged_kv_non_tma else 80
-        else:
-            if not paged_kv_non_tma and "num_regs_softmax" in self._tune:
-                self.num_regs_softmax = self._tune["num_regs_softmax"]
-                self.num_regs_correction = self._tune["num_regs_correction"]
-            elif not paged_kv_non_tma:
-                self.num_regs_softmax = 192
-                self.num_regs_correction = 80
-            else:
-                self.num_regs_softmax = 184
-                self.num_regs_correction = 64
-            # Divide the remaining register budget among the other WGs. Their setmaxnreg.dec
-            # cannot exceed the launch register count.
-            self.num_regs_other = min(
-                (512 - self.num_regs_softmax * self.q_stage - self.num_regs_correction)
-                // (3 - self.q_stage) // 8 * 8,
-                65536 // self.threads_per_cta,
-            )
+        self.num_regs_softmax = config.registers.softmax
+        self.num_regs_correction = config.registers.correction
+        self.num_regs_other = config.registers.other
 
         self.buffer_align_bytes = 1024
 
@@ -562,33 +500,7 @@ class FlashAttentionForwardSm100:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
-        if const_expr(self.q_dtype.width == 8):
-            paged_kv_non_tma = not self.use_tma_KV
-            if const_expr(self.head_dim_padded < 96):
-                fp8_regs = _FP8_SMALL_HDIM_REGS[paged_kv_non_tma]
-                self.num_regs_softmax = fp8_regs["num_regs_softmax"]
-                self.num_regs_correction = fp8_regs["num_regs_correction"]
-                self.num_regs_other = fp8_regs["num_regs_other"]
-            else:
-                fp8_tune = _FP8_TUNING_CONFIG.get(
-                    (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103), {}
-                )
-                if const_expr("ex2_emu_freq" in fp8_tune):
-                    self._tune = {**self._tune, **fp8_tune}
-                    self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
-                if const_expr(not paged_kv_non_tma and "num_regs_softmax" in fp8_tune):
-                    self.num_regs_softmax = fp8_tune["num_regs_softmax"]
-                    self.num_regs_correction = fp8_tune["num_regs_correction"]
-                    self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
         self._setup_attributes()
-        self.ex2_emu_freq = 0
-        self.ex2_emu_start_frg = self._tune.get("ex2_emu_start_frg", 1)
-        if const_expr(self.enable_ex2_emu):
-            self.ex2_emu_freq = self._tune.get("ex2_emu_freq", 16)
-            if const_expr(
-                self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
-            ):
-                self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         q_major_mode = cute.nvgpu.OperandMajorMode.K
@@ -1503,7 +1415,7 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             # setmaxnreg.dec cannot exceed the launch register count.
-            if const_expr(self.num_regs_correction > 65536 // self.threads_per_cta):
+            if const_expr(self.num_regs_correction > SM100_LAUNCH_REGISTERS):
                 cute.arch.setmaxregister_increase(self.num_regs_correction)
             else:
                 cute.arch.setmaxregister_decrease(self.num_regs_correction)
