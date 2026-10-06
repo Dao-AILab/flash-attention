@@ -338,6 +338,7 @@ class FlashAttentionBackwardSm100:
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
         # number of tma reduce adds for dKacc and dVacc epilogue (must divide hdim_per_wg)
         self.dK_reduce_ncol = math.gcd(32, self.tile_hdim // 2)
+        self.dV_reduce_ncol = math.gcd(32, self.tile_hdimv // 2)
         # CTA group for MMA operations
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -519,8 +520,7 @@ class FlashAttentionBackwardSm100:
             )
         else:
             self.sdK_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
-            # self.dK_reduce_ncol same for dV
-            self.sdV_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
+            self.sdV_layout = cute.make_layout((self.tile_n * self.dV_reduce_ncol, 2))
 
     @cute.jit
     def __call__(
@@ -781,6 +781,7 @@ class FlashAttentionBackwardSm100:
         self.tma_copy_bytes["dPsum"] = self.tile_m * Float32.width // 8
         self.tma_copy_bytes["dQ"] = self.tile_m * self.dQ_reduce_ncol * Float32.width // 8
         self.tma_copy_bytes["dKacc"] = self.tile_n * self.dK_reduce_ncol * Float32.width // 8
+        self.tma_copy_bytes["dVacc"] = self.tile_n * self.dV_reduce_ncol * Float32.width // 8
         self.tma_copy_bytes["dS"] = cute.size_in_bytes(self.ds_dtype, self.sdS_layout)
         self.tma_copy_bytes["sdS_xchg"] = self.tma_copy_bytes["dS"] // 2  # Half of dS for exchange
 
@@ -841,10 +842,12 @@ class FlashAttentionBackwardSm100:
         assert sdV_bytes <= sdO_alloc_bytes, "sdV doesn't fit in sdO storage allocation"
         assert sdK_bytes <= sQ_alloc_bytes, "sdK doesn't fit in sQ storage allocation"
         # 2-CTA: sdV reuses sV, sdK reuses sK
-        sV_bytes = cute.size_in_bytes(self.v_dtype, self.sV_layout)
         sK_bytes = cute.size_in_bytes(self.k_dtype, self.sK_layout)
         if const_expr(self.use_2cta_instrs):
-            assert sdV_bytes <= sV_bytes, "sdV doesn't fit in sV storage allocation (2-CTA)"
+            sV_bytes = cute.size_in_bytes(self.v_dtype, self.sV_layout)
+            # Narrow V tiles can be smaller than the FP32 GQA epilogue that reuses
+            # their storage, even with the correct independent dV reduction width.
+            sV_alloc_bytes = max(sV_bytes, sdV_bytes)
             assert sdK_bytes <= sK_bytes, "sdK doesn't fit in sK storage allocation (2-CTA)"
 
         if const_expr(self.use_2cta_instrs):
@@ -897,7 +900,7 @@ class FlashAttentionBackwardSm100:
                     self.buffer_align_bytes,
                 ]
                 sV: cute.struct.Align[
-                    cute.struct.MemRange[self.v_dtype, cute.cosize(self.sV_layout)],
+                    cute.struct.MemRange[self.v_dtype, sV_alloc_bytes // (self.v_dtype.width // 8)],
                     self.buffer_align_bytes,
                 ]
                 sdO: cute.struct.Align[
@@ -4219,6 +4222,9 @@ class FlashAttentionBackwardSm100:
     ) -> cutlass.pipeline.PipelineState:
         assert K_or_V in ("K", "V")
         tile_hdim = self.tile_hdim if const_expr(K_or_V == "K") else self.tile_hdimv
+        # Each compute warpgroup owns half the columns. The TMEM load width must
+        # divide that half independently for asymmetric Q/K and V dimensions.
+        reduce_ncol = self.dK_reduce_ncol if const_expr(K_or_V == "K") else self.dV_reduce_ncol
         dtype = self.dk_dtype if const_expr(K_or_V == "K") else self.dv_dtype
         epi_tile = self.sdK_epi_tile if const_expr(K_or_V == "K") else self.sdV_epi_tile
         flat_epi_tile = (
@@ -4294,7 +4300,7 @@ class FlashAttentionBackwardSm100:
             )
 
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dK_reduce_ncol)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(reduce_ncol)), Float32
         )
 
         read_flag = const_expr(not deterministic_KV)
@@ -4357,7 +4363,7 @@ class FlashAttentionBackwardSm100:
                         copy_utils.cpasync_reduce_bulk_add_f32(
                             sdKV.iterator,
                             gdKV_epi[None, epi_stage].iterator,
-                            self.tma_copy_bytes["dKacc"],
+                            self.tma_copy_bytes["dKacc" if const_expr(K_or_V == "K") else "dVacc"],
                         )
                 if const_expr(epi_stage < num_epi_stages - 1):
                     cute.arch.cp_async_bulk_commit_group()
