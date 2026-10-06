@@ -58,6 +58,7 @@ class FwdConfig:
     mma_pv_is_rs: bool
     intra_wg_overlap: bool
     q_stage: int
+    pack_gqa: bool
     use_clc_scheduler: bool
     is_static_persistent: bool
     use_tma_o: bool
@@ -97,9 +98,10 @@ class FwdHeuristicInputs(NamedTuple):
     has_seqused_k: bool = False
     has_caller_scheduler_metadata: bool = False
     has_tile_count_semaphore: bool = False
-    pack_gqa: bool = False
+    pack_gqa: bool | None = None  # None = no preference; selection resolves before policy reads.
     page_size: int | None = None
     use_block_sparsity: bool = False
+    sparse_mask_per_head: bool = False
     sparse_q_block_size: int | None = None
     sparse_kv_block_size: int | None = None
     has_score_mod: bool = False
@@ -606,6 +608,10 @@ def can_use_clc(
 @lru_cache(maxsize=1024)
 def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     """Select one fully resolved config from host-visible metadata."""
+    pack_gqa = default_pack_gqa(inputs) if inputs.pack_gqa is None else inputs.pack_gqa
+    if inputs.sparse_mask_per_head:
+        pack_gqa = False
+    inputs = inputs._replace(pack_gqa=pack_gqa)
     device_capacity = inputs.device_capacity
     if device_capacity == 12 and inputs.requested_num_splits not in (None, 1):
         raise ValueError("SM120 forward only supports num_splits=1")
@@ -701,6 +707,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
         q_stage=q_stage,
+        pack_gqa=pack_gqa,
         use_clc_scheduler=use_clc_scheduler,
         is_static_persistent=is_static_persistent,
         use_tma_o=use_tma_o,
@@ -749,6 +756,13 @@ def sm100_hd192_uneven_kv_smem_bytes(
 @lru_cache(maxsize=1024)
 def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
     """Reject known unsupported or silently normalized config combinations."""
+    if config.pack_gqa and inputs.sparse_mask_per_head:
+        raise ValueError("PackGQA requires head-broadcast sparse masks")
+    if inputs.pack_gqa is not None and inputs.pack_gqa != config.pack_gqa:
+        raise ValueError(
+            f"pack_gqa={inputs.pack_gqa} disagrees with config.pack_gqa={config.pack_gqa}"
+        )
+    inputs = inputs._replace(pack_gqa=config.pack_gqa)
     if inputs.device_capacity not in (8, 9, 10, 11, 12):
         raise ValueError(
             f"Unsupported forward architecture family SM{inputs.device_capacity}"
