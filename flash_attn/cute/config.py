@@ -421,7 +421,7 @@ def can_use_clc(
 def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     """Select one fully resolved config from host-visible metadata."""
     device_capacity = inputs.device_capacity
-    if device_capacity == 12 and inputs.requested_num_splits != 1:
+    if device_capacity == 12 and inputs.requested_num_splits not in (None, 1):
         raise AssertionError("SM120 forward only supports num_splits=1")
 
     tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap = select_initial_fwd_tile(inputs)
@@ -443,7 +443,9 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         inputs.batch_size * inputs.num_heads_kv * heads_per_m_block * num_m_blocks
     )
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
-    if inputs.requested_num_splits is not None:
+    if device_capacity == 12:
+        num_splits = 1
+    elif inputs.requested_num_splits is not None:
         num_splits = max(1, inputs.requested_num_splits)
     else:
         num_splits = num_splits_heuristic(
