@@ -191,6 +191,163 @@ def test_flash_attn_value_dim_larger_than_query_dim():
     torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
 
 
+def check_sm100_asymmetric_backward(
+    monkeypatch,
+    d,
+    dv,
+    mha_type,
+    varlen,
+    causal,
+    dtype,
+    *,
+    disable_2cta=False,
+    deterministic=False,
+):
+    """SM100 backward: asymmetric Dqk/Dv, dV epilogue TMEM loads and FP32 GQA staging."""
+    from flash_attn.cute import utils
+
+    monkeypatch.setattr(utils, "_fa_disable_2cta_enabled", disable_2cta)
+    torch.manual_seed(0)
+    heads = 4
+    kv_heads = {"mha": 4, "gqa": 2, "mqa": 1}[mha_type]
+    q_lengths, k_lengths = [113, 129], [211, 257]
+    q = torch.randn(2, 129, heads, d, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(2, 257, kv_heads, d, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(2, 257, kv_heads, dv, device="cuda", dtype=dtype, requires_grad=True)
+    if varlen:
+        q_input = torch.cat([q[i, :length] for i, length in enumerate(q_lengths)])
+        k_input = torch.cat([k[i, :length] for i, length in enumerate(k_lengths)])
+        v_input = torch.cat([v[i, :length] for i, length in enumerate(k_lengths)])
+        out, _ = flash_attn_varlen_func(
+            q_input,
+            k_input,
+            v_input,
+            cu_seqlens_q=torch.tensor([0, 113, 242], device="cuda", dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 211, 468], device="cuda", dtype=torch.int32),
+            max_seqlen_q=129,
+            max_seqlen_k=257,
+            causal=causal,
+            deterministic=deterministic,
+            num_splits=1,
+        )
+    else:
+        out, _ = flash_attn_func(
+            q,
+            k,
+            v,
+            causal=causal,
+            deterministic=deterministic,
+            num_splits=1,
+        )
+    dout = torch.randn_like(out)
+    grads = torch.autograd.grad(out, (q, k, v), dout, retain_graph=deterministic)
+    repeated_grads = torch.autograd.grad(out, (q, k, v), dout) if deterministic else None
+    if is_fake_mode():
+        return
+
+    q_mask = k_mask = None
+    if varlen:
+        q_mask = (
+            torch.arange(129, device="cuda")[None, :]
+            < torch.tensor(q_lengths, device="cuda")[:, None]
+        )
+        k_mask = (
+            torch.arange(257, device="cuda")[None, :]
+            < torch.tensor(k_lengths, device="cuda")[:, None]
+        )
+    refs = [x.detach().double().requires_grad_() for x in (q, k, v)]
+    reference, _ = attention_ref(
+        *refs,
+        q_mask,
+        k_mask,
+        causal=causal,
+        upcast=False,
+    )
+    eager, _ = attention_ref(
+        q,
+        k,
+        v,
+        q_mask,
+        k_mask,
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+    if varlen:
+        reference = torch.cat([reference[i, :length] for i, length in enumerate(q_lengths)])
+        eager = torch.cat([eager[i, :length] for i, length in enumerate(q_lengths)])
+    reference_grads = torch.autograd.grad(reference, refs, dout.double())
+    eager_grads = torch.autograd.grad(eager, (q, k, v), dout)
+    for name, actual, ref, pt in zip(
+        ("out", "dq", "dk", "dv"),
+        (out, *grads),
+        (reference, *reference_grads),
+        (eager, *eager_grads),
+    ):
+        assert actual.isfinite().all(), name
+        rounding = 2 * torch.finfo(dtype).eps * ref.abs()
+        check_tensor_vs_ref(name, actual.double(), ref, pt.double(), atol=rounding.max().item())
+        assert (actual.double() - ref).abs().mean() <= (
+            2 * (pt.double() - ref).abs().mean() + rounding.mean()
+        ), name
+    if repeated_grads is not None:
+        for name, actual, repeated in zip(("dq", "dk", "dv"), grads, repeated_grads):
+            assert torch.equal(actual, repeated), name
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 dV epilogue regression")
+@pytest.mark.parametrize("dv", [32, 96])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_asymmetric_backward(monkeypatch, dv, mha_type, varlen, causal, dtype):
+    check_sm100_asymmetric_backward(monkeypatch, 128, dv, mha_type, varlen, causal, dtype)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 dV epilogue regression")
+@pytest.mark.parametrize(
+    "d,dv,mha_type,varlen,disable_2cta,deterministic",
+    [
+        (128, 24, "mha", False, False, False),
+        (128, 24, "gqa", True, False, False),
+        (128, 80, "mha", True, False, False),
+        (128, 80, "mqa", False, False, False),
+        (128, 32, "mha", True, True, False),
+        (128, 96, "gqa", False, True, False),
+        (128, 32, "gqa", False, False, True),
+        (128, 96, "gqa", True, False, True),
+        (64, 64, "mha", False, False, False),
+        (128, 64, "gqa", True, False, False),
+        (128, 128, "mqa", False, False, False),
+        (192, 128, "mha", True, False, False),
+        (96, 128, "gqa", False, True, False),
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_asymmetric_backward_edges(
+    monkeypatch,
+    d,
+    dv,
+    mha_type,
+    varlen,
+    disable_2cta,
+    deterministic,
+    causal,
+):
+    check_sm100_asymmetric_backward(
+        monkeypatch,
+        d,
+        dv,
+        mha_type,
+        varlen,
+        causal,
+        torch.bfloat16,
+        disable_2cta=disable_2cta,
+        deterministic=deterministic,
+    )
 def check_sm90_hdim_padding(
     d: int,
     seqlen_q: int = 257,
