@@ -37,6 +37,7 @@ from flash_attn.cute.testing import (
 from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
+    _get_device_arch,
     get_scheduler_metadata,
     _bwd_preprocess,
     _bwd_postprocess_convert,
@@ -581,6 +582,43 @@ def test_flash_attn_forced_split_config_reuses_specializations():
     reference = attention_ref(q, k, v)[0].float()
     torch.testing.assert_close(out_2.float(), reference, atol=0.04, rtol=0.04)
     torch.testing.assert_close(out_4.float(), reference, atol=0.04, rtol=0.04)
+
+
+@pytest.mark.parametrize(
+    "arch,varlen,batch,seqlen_q,seqlen_k,nheads,nheads_kv,causal,expected",
+    [
+        # GB300 tuning (#2738): packed high-head varlen and dense causal short-K use CLC.
+        pytest.param(103, True, 3, 1366, 1366, 24, 6, True,
+                     {"pack_gqa": True, "use_clc_scheduler": True}, id="sm103-varlen-high-head-clc"),
+        pytest.param(103, False, 32, 17, 640, 24, 6, True,
+                     {"pack_gqa": True, "use_clc_scheduler": True}, id="sm103-dense-short-k-clc"),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_tuned_default_config_matches_reference(
+    arch, varlen, batch, seqlen_q, seqlen_k, nheads, nheads_kv, causal, expected
+):
+    if _get_device_arch() != arch:
+        pytest.skip(f"tuned rule targets sm_{arch}")
+    torch.manual_seed(0)
+    q = torch.randn(batch, seqlen_q, nheads, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seqlen_k, nheads_kv, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q_in, k_in, v_in, kwargs = q, k, v, {}
+    if varlen:
+        assert seqlen_q == seqlen_k
+        cu_seqlens = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * seqlen_q
+        q_in, k_in, v_in = (t.flatten(0, 1) for t in (q, k, v))
+        kwargs = dict(
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k
+        )
+    with capture_selected_fwd_config() as selected:
+        out = _flash_attn_fwd(q_in, k_in, v_in, causal=causal, **kwargs)[0]
+    assert {name: getattr(selected["config"], name) for name in expected} == expected
+    if is_fake_mode():
+        return
+    reference = attention_ref(q, k, v, causal=causal)[0].float()
+    torch.testing.assert_close(out.view(reference.shape).float(), reference, atol=0.04, rtol=0.04)
 
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 explicit config metadata test")
