@@ -1456,6 +1456,7 @@ def _flash_attn_fwd(
         head_dim,
         head_dim_v,
         nheads_per_kv,  # the real count; qhead_per_kvhead must follow from the key
+        num_head_kv if qv is not None else None,  # MLA kernels specialize on nheads_kv
         causal,
         score_mod_hash,
         mask_mod_hash,
