@@ -328,6 +328,7 @@ def test_flash_attn_output(
                     causal=causal,
                     window_size_left=window_size[0],
                     window_size_right=window_size[1],
+                    softcap=softcap,
                     deterministic=True,
                 )
 
@@ -781,6 +782,7 @@ def test_flash_attn_varlen_output(
                     causal=causal,
                     window_size_left=window_size[0],
                     window_size_right=window_size[1],
+                    softcap=softcap,
                     deterministic=True,
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k=cu_seqlens_k,
