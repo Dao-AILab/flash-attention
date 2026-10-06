@@ -592,6 +592,9 @@ def test_flash_attn_forced_split_config_reuses_specializations():
                      {"pack_gqa": True, "use_clc_scheduler": True}, id="sm103-varlen-high-head-clc"),
         pytest.param(103, False, 32, 17, 640, 24, 6, True,
                      {"pack_gqa": True, "use_clc_scheduler": True}, id="sm103-dense-short-k-clc"),
+        # B200 tuning (#2741): BF16 hd64 long prefill stores O without TMA.
+        pytest.param(100, False, 4, 257, 2048, 16, 4, False,
+                     {"pack_gqa": True, "use_tma_o": False}, id="sm100-direct-o"),
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
