@@ -135,7 +135,7 @@ MAX_JOBS=4 pip install flash-attn --no-build-isolation
 
 ### NVIDIA CUDA Support
 **Requirements:**
-- CUDA 12.0 and above.
+- CUDA 11.7 and above.
 
 We recommend the
 [Pytorch](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)
