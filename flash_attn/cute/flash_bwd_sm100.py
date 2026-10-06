@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
+import enum
 import math
 from typing import Callable, Optional
 from functools import partial
@@ -64,6 +65,14 @@ from flash_attn.cute.block_sparse_utils import (
 # aliased layout is what every other shape runs.
 
 
+class CtaSchedule(enum.Enum):
+    """Backward only: how a CTA (pair) issues the five GEMMs; see NOTE [2CTA schedules]."""
+
+    ONE_CTA = enum.auto()
+    TWO_CTA_PIPELINED = enum.auto()
+    TWO_CTA_SERIAL = enum.auto()
+
+
 class FlashAttentionBackwardSm100:
     arch = 100
 
@@ -113,18 +122,22 @@ class FlashAttentionBackwardSm100:
         assert self.tile_hdim != 192 or self.use_2cta_instrs, "Must use 2CTA for hdim 192"
 
         # NOTE [2CTA schedules]
-        # Two 2CTA schedules exist and a 2CTA configuration must pick exactly one:
+        # Two 2CTA schedules exist and a 2CTA configuration runs exactly one of them:
         # - pipelined (hdim <= 128): own sQt / sdOt / sdS_xchg buffers, the MMA warp software-
         #   pipelines S(t+1) with dK/dP/dQ/dV, and dQ overlaps the tail of S in TMEM, so the
         #   dS pipeline also signals that S has been read.
         # - serial (hdim 192): Qt and dOt alias Q and dO (one stage), sdS_xchg aliases
         #   sdQaccum (guarded by dQaccum_empty_mbar), the MMAs run serially, and dP overlaps
         #   the tail of S, so S is released right after it is read.
-        self.two_cta_pipelined = self.use_2cta_instrs and self.tile_hdim <= 128
-        self.two_cta_serial = self.use_2cta_instrs and self.tile_hdim == 192
-        assert not self.use_2cta_instrs or (self.two_cta_pipelined != self.two_cta_serial), (
-            "2CTA backward needs exactly one of the pipelined / serial schedules"
-        )
+        if not self.use_2cta_instrs:
+            self.cta_schedule = CtaSchedule.ONE_CTA
+        elif self.tile_hdim == 192:
+            self.cta_schedule = CtaSchedule.TWO_CTA_SERIAL
+        else:  # hdim <= 128; in practice 128 (the interface enables 2CTA for hdim >= 128 only)
+            self.cta_schedule = CtaSchedule.TWO_CTA_PIPELINED
+        # Predicates for the kernel branches that only care about one schedule.
+        self.two_cta_pipelined = self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED
+        self.two_cta_serial = self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL
         self.cluster_tile_n = self.cta_group_size * tile_n
 
         # CTA tiler
@@ -230,6 +243,7 @@ class FlashAttentionBackwardSm100:
         self.tmem_cols_dQ = self.tile_hdim // self.cta_group_size
         # P / dS are packed 16-bit over the S / dP columns.
         self.tmem_cols_P = self.tmem_cols_S // 2
+        self.tmem_cols_dS = self.tmem_cols_dP // 2
 
         if self.two_cta_serial:
             assert self.tile_m == 128
@@ -267,7 +281,7 @@ class FlashAttentionBackwardSm100:
             self.tmem_dK_offset + self.tmem_cols_dK,
             self.tmem_dQ_offset + self.tmem_cols_dQ,
             self.tmem_P_offset + self.tmem_cols_P,
-            self.tmem_dS_offset + self.tmem_cols_P,
+            self.tmem_dS_offset + self.tmem_cols_dS,
         )
         assert tmem_end <= self.tmem_alloc_cols, (
             f"TMEM map needs {tmem_end} > {self.tmem_alloc_cols} columns"
@@ -286,16 +300,10 @@ class FlashAttentionBackwardSm100:
         self.num_regs_empty = 24
 
         if const_expr(self.two_cta_serial):
-            if not is_causal and not is_local:
-                self.num_regs_reduce = 128 + 8
-                self.num_regs_compute = 128 + 8
-                self.num_regs_load = 128 - 24
-                self.num_regs_mma = self.num_regs_load
-            else:
-                self.num_regs_reduce = 128 + 8
-                self.num_regs_compute = 128 + 8
-                self.num_regs_load = 128 - 24
-                self.num_regs_mma = self.num_regs_load
+            self.num_regs_reduce = 128 + 8
+            self.num_regs_compute = 128 + 8
+            self.num_regs_load = 128 - 24
+            self.num_regs_mma = self.num_regs_load
 
         assert (
             self.num_regs_reduce

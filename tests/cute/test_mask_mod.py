@@ -763,7 +763,7 @@ def test_single_doc_bwd_minimal():
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_COMPREHENSIVE)
 @pytest.mark.parametrize("nheads", [16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
-@pytest.mark.parametrize("headdim", [128, 256])
+@pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_block_sparsity", [True, False])
 @pytest.mark.parametrize(
@@ -782,8 +782,6 @@ def test_static_masks(
     """
     if COMPUTE_CAPABILITY == 10 and (tile_m, tile_n) != (128, 128):
         pytest.skip("TODO: Non-128x128 tiles currently not supported on SM 10.0. due to TMEM")
-    if headdim == 256:
-        pytest.skip("head_dim=256 backward does not support mask_mod yet")
 
     _run_mask_test(
         seqlen_q=seqlen_q,
@@ -806,7 +804,7 @@ def test_static_masks(
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_SMOKE)
 @pytest.mark.parametrize("nheads", [16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
-@pytest.mark.parametrize("headdim", [128, 256])
+@pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_block_sparsity", [True, False])
 @pytest.mark.parametrize(
@@ -836,8 +834,6 @@ def test_parameterized_masks(
     """
     if COMPUTE_CAPABILITY == 10 and (tile_m, tile_n) != (128, 128):
         pytest.skip("TODO: Non-128x128 tiles currently not supported on SM 10.0. due to TMEM")
-    if headdim == 256:
-        pytest.skip("head_dim=256 backward does not support mask_mod yet")
 
     _run_mask_test(
         seqlen_q=seqlen_q,

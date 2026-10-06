@@ -91,8 +91,6 @@ def test_flash_attn_output(
             pytest.skip("SM100 head_dim=256 backward does not support local attention yet")
         if softcap > 0.0:
             pytest.skip("SM100 head_dim=256 backward does not support softcap yet")
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 backward does not support deterministic mode yet")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -442,8 +440,6 @@ def test_flash_attn_varlen_output(
             pytest.skip("SM100 head_dim=256 backward does not support local attention yet")
         if softcap > 0.0:
             pytest.skip("SM100 head_dim=256 backward does not support softcap yet")
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 backward does not support deterministic mode yet")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
