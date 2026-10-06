@@ -135,9 +135,6 @@ class FlashAttentionBackwardSm100:
             self.cta_schedule = CtaSchedule.TWO_CTA_SERIAL
         else:  # hdim <= 128; in practice 128 (the interface enables 2CTA for hdim >= 128 only)
             self.cta_schedule = CtaSchedule.TWO_CTA_PIPELINED
-        # Predicates for the kernel branches that only care about one schedule.
-        self.two_cta_pipelined = self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED
-        self.two_cta_serial = self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL
         self.cluster_tile_n = self.cta_group_size * tile_n
 
         # CTA tiler
@@ -245,7 +242,7 @@ class FlashAttentionBackwardSm100:
         self.tmem_cols_P = self.tmem_cols_S // 2
         self.tmem_cols_dS = self.tmem_cols_dP // 2
 
-        if self.two_cta_serial:
+        if self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL:
             assert self.tile_m == 128
             assert self.tile_n == 128
             self.tmem_dV_offset = 0
@@ -299,7 +296,7 @@ class FlashAttentionBackwardSm100:
             self.num_regs_mma = 104 if self.use_2cta_instrs else self.num_regs_load
         self.num_regs_empty = 24
 
-        if const_expr(self.two_cta_serial):
+        if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
             self.num_regs_reduce = 128 + 8
             self.num_regs_compute = 128 + 8
             self.num_regs_load = 128 - 24
@@ -322,7 +319,7 @@ class FlashAttentionBackwardSm100:
         self.sdKVaccum_stage = 2
         # number of tma reduce adds per dQacc mma
         # todo: try 32/1 or 48/2 for 2cta d=192 dv=128
-        if self.two_cta_serial:
+        if self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL:
             self.dQ_reduce_ncol_t2r = 32
             self.dQ_reduce_ncol = 24 if not self.is_causal else 32
             self.sdQaccum_stage = 2 if not self.is_causal else 1
@@ -852,11 +849,11 @@ class FlashAttentionBackwardSm100:
 
         if const_expr(self.use_2cta_instrs):
             # The serial schedule aliases Qt / dOt into Q / dO and sdS_xchg into sdQaccum.
-            own_xchg = const_expr(self.two_cta_pipelined)
+            own_xchg = const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED)
             sQt_size = cute.cosize(self.sQt_layout) if own_xchg else 0
             sdOt_size = cute.cosize(self.sdOt_layout) if own_xchg else 0
             sdS_xchg_size = cute.cosize(self.sdS_xchg_layout) if own_xchg else 0
-            if const_expr(self.two_cta_serial):
+            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                 assert cute.size_in_bytes(
                     self.ds_dtype, self.sdS_xchg_layout
                 ) <= cute.size_in_bytes(self.dqaccum_dtype, self.sdQaccum_layout), (
@@ -1229,7 +1226,7 @@ class FlashAttentionBackwardSm100:
 
         # Barrier initialization
         if const_expr(self.use_2cta_instrs):
-            if const_expr(self.two_cta_serial):
+            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                 if warp_idx == 2:
                     cute.arch.mbarrier_init(
                         dQaccum_empty_mbar_ptr,
@@ -1368,7 +1365,7 @@ class FlashAttentionBackwardSm100:
         )
 
         if const_expr(self.use_2cta_instrs):
-            if const_expr(self.two_cta_serial):
+            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                 pipeline_Qt = pipeline_Q
             else:
                 pipeline_Qt = pipeline.PipelineTmaUmma.create(
@@ -1403,7 +1400,7 @@ class FlashAttentionBackwardSm100:
         )
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
-        if const_expr(self.two_cta_pipelined):
+        if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
             sQt = storage.sQt.get_tensor(
                 sQt_layout.outer, swizzle=sQt_layout.inner, dtype=self.q_dtype
             )
@@ -1420,7 +1417,7 @@ class FlashAttentionBackwardSm100:
         sdSt = storage.sdS.get_tensor(sdSt_layout.outer, swizzle=sdSt_layout.inner)
         sdS = cute.make_tensor(cute.recast_ptr(sdSt.iterator, sdS_layout.inner), sdS_layout.outer)
         if const_expr(self.use_2cta_instrs):
-            if const_expr(self.two_cta_pipelined):
+            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
                 sdS_xchg = storage.sdS_xchg.get_tensor(sdS_xchg_layout)
             else:
                 sdS_xchg = storage.sdQaccum.get_tensor(sdS_xchg_layout, dtype=self.ds_dtype)
@@ -1430,7 +1427,7 @@ class FlashAttentionBackwardSm100:
         sdO = storage.sdO.get_tensor(
             sdO_layout.outer, swizzle=sdO_layout.inner, dtype=self.do_dtype
         )
-        if const_expr(self.two_cta_pipelined):
+        if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
             sdOt = storage.sdOt.get_tensor(
                 sdOt_layout.outer, swizzle=sdOt_layout.inner, dtype=self.do_dtype
             )
@@ -2041,7 +2038,7 @@ class FlashAttentionBackwardSm100:
 
                 if process_tile:
                     first_m_block = m_block_min
-                    if const_expr(self.two_cta_serial):
+                    if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                         #### Prologue ####
                         assert should_load_Q and should_load_dO
                         assert load_dOt is not None and load_Qt is not None
@@ -2279,7 +2276,7 @@ class FlashAttentionBackwardSm100:
 
             else:
                 assert blocksparse_tensors is not None
-                if const_expr(self.two_cta_serial):
+                if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                     assert should_load_Q and should_load_dO
                     assert load_dOt is not None and load_Qt is not None
                     assert load_Kt is not None and pipeline_Qt is not None
@@ -2552,7 +2549,7 @@ class FlashAttentionBackwardSm100:
                     or m_block_min < m_block_max
                 )
 
-            if const_expr(self.two_cta_serial):
+            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                 if is_leader_cta and process_tile:
                     accumulate_dK = False
                     accumulate_dV = False
@@ -3305,12 +3302,12 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S)
                     consumer_state_S.advance()
-                elif const_expr(self.two_cta_serial):
+                elif const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                     # Signal S tmem load completion using pipeline_S_P: dP overlaps S
                     cute.arch.fence_view_async_tmem_load()
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
-                elif const_expr(self.two_cta_pipelined):
+                elif const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
                     # Signal S tmem load completion using pipeline_dS: dQ overlaps S
                     if iter_idx > 0:
                         cute.arch.fence_view_async_tmem_load()
@@ -3404,7 +3401,7 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         pipeline_P.producer_commit(producer_state_P)
                     producer_state_P.advance()
-                elif const_expr(not self.two_cta_serial):
+                elif const_expr(self.cta_schedule != CtaSchedule.TWO_CTA_SERIAL):
                     # Signal tmem store P completion with pipeline_S_P
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
@@ -3516,7 +3513,7 @@ class FlashAttentionBackwardSm100:
                 # After the loop: copy exchange registers to sdS_xchg buffer
                 if const_expr(self.use_2cta_instrs):
                     # serial schedule: sdS_xchg aliases sdQaccum
-                    if const_expr(self.two_cta_serial):
+                    if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                         cute.arch.mbarrier_wait(
                             dQaccum_empty_mbar_ptr, phase=producer_state_dS.phase
                         )
@@ -3533,7 +3530,7 @@ class FlashAttentionBackwardSm100:
                 pipeline_dPsum.consumer_release(consumer_state_dPsum)
                 consumer_state_dPsum.advance()
                 # pipelined 2CTA schedule: pipeline_dS also signals S tmem load completion so is deferred
-                if const_expr(not self.two_cta_pipelined):
+                if const_expr(self.cta_schedule != CtaSchedule.TWO_CTA_PIPELINED):
                     with cute.arch.elect_one():
                         pipeline_dS.producer_commit(producer_state_dS)
                     producer_state_dS.advance()
@@ -3561,7 +3558,7 @@ class FlashAttentionBackwardSm100:
                         )
 
             # Final signal for dS smem store completion
-            if const_expr(self.two_cta_pipelined):
+            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
                 if process_tile:
                     with cute.arch.elect_one():
                         pipeline_dS.producer_commit(producer_state_dS)
@@ -3821,7 +3818,9 @@ class FlashAttentionBackwardSm100:
                 assert mdQ_semaphore is not None
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
-            delay_semaphore_release = not self.two_cta_serial and not self.use_block_sparsity
+            delay_semaphore_release = (
+                self.cta_schedule != CtaSchedule.TWO_CTA_SERIAL and not self.use_block_sparsity
+            )
 
             dq_sem_release_inc = Int32(1)
             if const_expr(
@@ -3973,7 +3972,7 @@ class FlashAttentionBackwardSm100:
                                 1,
                             )
 
-                if const_expr(self.two_cta_serial):
+                if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                     if const_expr(self.sdQaccum_stage > 1):
                         if is_tma_warp:
                             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
@@ -3984,7 +3983,9 @@ class FlashAttentionBackwardSm100:
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
                 if const_expr(self.deterministic and not delay_semaphore_release):
-                    if const_expr(self.sdQaccum_stage > 1 and not self.two_cta_serial):
+                    if const_expr(
+                        self.sdQaccum_stage > 1 and self.cta_schedule != CtaSchedule.TWO_CTA_SERIAL
+                    ):
                         if is_tma_warp and not m_block_oob_upper:
                             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                         self.reduce_sync_barrier.arrive_and_wait()
