@@ -417,6 +417,97 @@ def can_use_clc(
     )
 
 
+class TunedSm100Overrides(NamedTuple):
+    """Measured scheduling wins applied on top of the default policy."""
+
+    clc: bool = False
+    nonpersistent: bool = False
+
+
+def select_tuned_sm100_overrides(
+    inputs: FwdHeuristicInputs,
+    *,
+    tile_m: int,
+    tile_n: int,
+    num_n_blocks: int,
+    is_split_kv: bool,
+) -> TunedSm100Overrides:
+    """Return measured BF16 output-only scheduling wins for one problem.
+
+    Each rule was promoted from explicit-config A/B campaigns on the named GPU and
+    covers only plain output-only BF16 attention on 128x128 nonsplit tiles.
+    """
+    plain = (
+        inputs.dtype == "torch.bfloat16"
+        and inputs.page_size is None
+        and not inputs.use_block_sparsity
+        and not inputs.has_score_mod
+        and not inputs.has_mask_mod
+        and not inputs.has_learnable_sink
+        and not inputs.has_lse
+        and tile_m == 128
+        and tile_n == 128
+        and not is_split_kv
+        and inputs.head_dim == inputs.head_dim_v
+        and not inputs.local
+    )
+    if not plain:
+        return TunedSm100Overrides()
+    head_dim, num_heads, batch = inputs.head_dim, inputs.num_heads, inputs.batch_size
+    packs_all_q_heads = inputs.qhead_per_kvhead == 1 or inputs.pack_gqa
+    dense_noncausal = not inputs.is_varlen and not inputs.causal
+    match inputs.device_arch:
+        case 103:
+            # GB300: nonpersistent scheduling wins once D64 spans at least 32 K tiles.
+            nonpersistent = (
+                dense_noncausal
+                and head_dim == 64
+                and packs_all_q_heads
+                and num_n_blocks >= 32
+            )
+            # CLC pays off for balanced medium-head MHA and broadly for packed high-head
+            # varlen once Q has enough work, and for dense causal short-K batches.
+            packed_varlen = (
+                inputs.has_cu_seqlens_q
+                and inputs.has_cu_seqlens_k
+                and not inputs.has_seqused_q
+                and not inputs.has_seqused_k
+                # Caller-built metadata with a tile semaphore selects dynamic scheduling.
+                and not inputs.has_caller_scheduler_metadata
+            )
+            balanced_mha = (
+                inputs.qhead_per_kvhead == 1
+                and not inputs.causal
+                and num_heads in (8, 16)
+                and 4 <= batch <= 24
+                and inputs.total_q >= 10240
+                # Mean sequence length at least 40% of the maximum, for Q and K.
+                and inputs.total_q * 5 >= 2 * batch * inputs.max_seqlen_q
+                and inputs.total_k * 5 >= 2 * batch * inputs.max_seqlen_k
+            )
+            high_head = (
+                num_heads >= 24
+                and packs_all_q_heads
+                and 3 <= batch <= 64
+                and inputs.total_q >= 4096
+            )
+            dense_short_k = (
+                not inputs.is_varlen
+                and inputs.causal
+                and num_heads >= 24
+                and (num_heads % 8 == 0 or inputs.num_heads_kv == 1)
+                and (inputs.num_heads_kv != 1 or inputs.max_seqlen_q > 1)
+                and packs_all_q_heads
+                and batch >= 32
+                and 640 <= inputs.max_seqlen_k <= 2048
+            )
+            clc = head_dim in (64, 96, 128) and (
+                (packed_varlen and (balanced_mha or high_head)) or dense_short_k
+            )
+            return TunedSm100Overrides(clc=clc, nonpersistent=nonpersistent)
+    return TunedSm100Overrides()
+
+
 @lru_cache(maxsize=1024)
 def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     """Select one fully resolved config from host-visible metadata."""
@@ -477,20 +568,36 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     # traffic under imbalance, while the latter mostly pays work-stealing overhead.
     is_varlen_mha = inputs.is_varlen and inputs.qhead_per_kvhead == 1
     is_dense_noncausal = not inputs.is_varlen and not inputs.causal and not inputs.local
+    tuned = select_tuned_sm100_overrides(
+        inputs,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        num_n_blocks=num_n_blocks,
+        is_split_kv=is_split_kv,
+    )
     use_clc_scheduler = (
         is_sm100_family
         and can_use_clc(inputs, tile_n=tile_n, use_2cta_instrs=use_2cta_instrs)
-        and inputs.requested_use_clc_scheduler
-        and not is_varlen_mha
-        and not is_dense_noncausal
+        and (
+            tuned.clc
+            or (
+                inputs.requested_use_clc_scheduler
+                and not is_varlen_mha
+                and not is_dense_noncausal
+            )
+        )
     )
-    is_static_persistent = is_sm100_family and can_use_static_persistent(
-        inputs,
-        tile_m=tile_m,
-        q_stage=q_stage,
-        num_splits=num_splits,
-        use_2cta_instrs=use_2cta_instrs,
-        use_clc_scheduler=use_clc_scheduler,
+    is_static_persistent = (
+        is_sm100_family
+        and not tuned.nonpersistent
+        and can_use_static_persistent(
+            inputs,
+            tile_m=tile_m,
+            q_stage=q_stage,
+            num_splits=num_splits,
+            use_2cta_instrs=use_2cta_instrs,
+            use_clc_scheduler=use_clc_scheduler,
+        )
     )
     use_tma_o = is_sm100_family and can_use_tma_o(
         inputs, tile_m=tile_m, num_splits=num_splits
