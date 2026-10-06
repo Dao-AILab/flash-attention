@@ -422,6 +422,8 @@ class TunedSm100Overrides(NamedTuple):
 
     clc: bool = False
     nonpersistent: bool = False
+    one_cta: bool = False
+    direct_o: bool = False
 
 
 def select_tuned_sm100_overrides(
@@ -429,6 +431,8 @@ def select_tuned_sm100_overrides(
     *,
     tile_m: int,
     tile_n: int,
+    num_m_blocks: int,
+    total_mblocks: int,
     num_n_blocks: int,
     is_split_kv: bool,
 ) -> TunedSm100Overrides:
@@ -457,6 +461,19 @@ def select_tuned_sm100_overrides(
     packs_all_q_heads = inputs.qhead_per_kvhead == 1 or inputs.pack_gqa
     dense_noncausal = not inputs.is_varlen and not inputs.causal
     match inputs.device_arch:
+        case 100 if dense_noncausal and head_dim in (64, 128):
+            # B200: direct (non-TMA) O for D64 and 1CTA for D128 on long dense prefill.
+            long_prefill = (
+                inputs.qhead_per_kvhead in (1, 4, 8, 16)
+                and inputs.pack_gqa == (inputs.qhead_per_kvhead != 1)
+                and num_m_blocks > 1
+                and inputs.max_seqlen_k >= 2048
+                and total_mblocks >= 64
+            )
+            return TunedSm100Overrides(
+                one_cta=long_prefill and head_dim == 128,
+                direct_o=long_prefill and head_dim == 64,
+            )
         case 103:
             # GB300: nonpersistent scheduling wins once D64 spans at least 32 K tiles.
             nonpersistent = (
@@ -572,9 +589,12 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         inputs,
         tile_m=tile_m,
         tile_n=tile_n,
+        num_m_blocks=num_m_blocks,
+        total_mblocks=total_mblocks,
         num_n_blocks=num_n_blocks,
         is_split_kv=is_split_kv,
     )
+    use_2cta_instrs = use_2cta_instrs and not tuned.one_cta
     use_clc_scheduler = (
         is_sm100_family
         and can_use_clc(inputs, tile_n=tile_n, use_2cta_instrs=use_2cta_instrs)
@@ -599,8 +619,10 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
             use_clc_scheduler=use_clc_scheduler,
         )
     )
-    use_tma_o = is_sm100_family and can_use_tma_o(
-        inputs, tile_m=tile_m, num_splits=num_splits
+    use_tma_o = (
+        is_sm100_family
+        and not tuned.direct_o
+        and can_use_tma_o(inputs, tile_m=tile_m, num_splits=num_splits)
     )
     n_blocks_per_split = (num_n_blocks + num_splits - 1) // num_splits
     use_s_ping_pong = (

@@ -214,6 +214,17 @@ def test_decode_uses_s_ping_pong_only_without_score_modifiers():
         validate_fwd_config(config, masked)
 
 
+_B200_LONG_PREFILL = make_inputs(
+    num_heads=32,
+    num_heads_kv=32,
+    batch_size=1,
+    total_q=257,
+    total_k=2048,
+    max_seqlen_q=257,
+    max_seqlen_k=2048,
+)
+
+
 def select_untuned(inputs: FwdHeuristicInputs) -> FwdConfig:
     """Return the config with the tuned overrides patched out."""
     with mock.patch.object(
@@ -230,6 +241,11 @@ def tuned_fields(inputs: FwdHeuristicInputs) -> set[str]:
 
 _TUNED_RULES = {
     # rule -> (inputs where it fires, config fields it must change)
+    "b200_d64_direct_o": (_B200_LONG_PREFILL, {"use_tma_o"}),
+    "b200_d128_1cta": (
+        _B200_LONG_PREFILL._replace(head_dim=128, head_dim_v=128),
+        {"use_2cta_instrs"},
+    ),
     "sm103_d64_nonpersistent": (
         make_inputs(device_arch=103, max_seqlen_k=8192),
         {"is_static_persistent"},
@@ -306,6 +322,17 @@ def test_tuned_rules_fire_only_for_plain_bf16(rule, changes):
 @pytest.mark.parametrize(
     ("rule", "changes", "fires"),
     [
+        ("b200_d64_direct_o", {"max_seqlen_q": 256}, False),
+        ("b200_d64_direct_o", {"max_seqlen_k": 2047}, False),
+        ("b200_d64_direct_o", {"num_heads": 31, "num_heads_kv": 31}, False),
+        ("b200_d64_direct_o", {"causal": True}, False),
+        ("b200_d64_direct_o", {"num_heads": 64, "num_heads_kv": 16, "pack_gqa": True}, True),
+        ("b200_d64_direct_o", {"num_heads": 64, "num_heads_kv": 32, "pack_gqa": True}, False),
+        ("b200_d64_direct_o", {"num_heads_kv": 8, "pack_gqa": False}, False),
+        ("b200_d64_direct_o", {"device_arch": 103}, False),
+        ("b200_d128_1cta", {"max_seqlen_k": 2047}, False),
+        ("b200_d128_1cta", {"num_heads": 31, "num_heads_kv": 31}, False),
+        ("b200_d128_1cta", {"num_heads": 64, "num_heads_kv": 4, "pack_gqa": True}, True),
         ("sm103_d64_nonpersistent", {"max_seqlen_k": 4096}, True),
         ("sm103_d64_nonpersistent", {"max_seqlen_k": 3072}, False),
         ("sm103_d64_nonpersistent", {"head_dim": 96, "head_dim_v": 96}, False),
