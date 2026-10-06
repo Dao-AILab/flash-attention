@@ -3911,6 +3911,20 @@ def _compile_fwd_combine(
     )
 
 
+def combine_kernel_geometry(head_dim: int, num_splits: int) -> Tuple[int, int, int]:
+    """Return the combine kernel's (tile_m, k_block_size, log_max_splits) codegen key."""
+    # If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
+    # so that kBlockM is smaller and we have more parallelism.
+    k_block_size = 64 if head_dim <= 64 else 128
+    # We want kBlockM to be as small as possible to maximize parallelism.
+    # E.g., if hdim is 64, we want kBlockM to be 16 so that we can use 256 threads, each reading 4 elements (floats).
+    tile_m = 16 if k_block_size == 64 else 8
+    # If kBlockM == 8 then the minimum number of splits is 32.
+    # TODO: we can deal w this by using 128 threads instead
+    log_max_splits = max(math.ceil(math.log2(num_splits)), 5 if tile_m == 8 else 4)
+    return tile_m, k_block_size, log_max_splits
+
+
 def _flash_attn_fwd_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
@@ -3966,17 +3980,7 @@ def _flash_attn_fwd_combine(
     num_head = out_partial.shape[-2]
     num_splits = out_partial.shape[0]
     assert num_splits <= 256
-    # If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
-    # so that kBlockM is smaller and we have more parallelism.
-    k_block_size = 64 if head_dim <= 64 else 128
-    # We want kBlockM to be as small as possible to maximize parallelism.
-    # E.g., if hdim is 64, we want kBlockM to be 16 so that we can use 256 threads, each reading 4 elements (floats).
-    tile_m = 8 if k_block_size % 128 == 0 else (16 if k_block_size % 64 == 0 else 32)
-    log_max_splits = max(math.ceil(math.log2(num_splits)), 4)
-    if tile_m == 8:
-        # If kBlockM == 8 then the minimum number of splits is 32.
-        # TODO: we can deal w this by using 128 threads instead
-        log_max_splits = max(log_max_splits, 5)
+    tile_m, k_block_size, log_max_splits = combine_kernel_geometry(head_dim, num_splits)
 
     # Create combine kernel configuration
     dtype = torch2cute_dtype_map[out.dtype]
