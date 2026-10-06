@@ -96,6 +96,43 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
     assert torch.allclose(x.grad, x_pt.grad, rtol=rtol, atol=2 * atol)
 
 
+def test_rotary_emb_eager_bypasses_wrap_triton(monkeypatch):
+    device = "cuda"
+    dtype = torch.bfloat16 if is_sm8x else torch.float16
+    x = torch.randn(2, 8, 4, 64, device=device, dtype=dtype)
+    cos, sin = generate_cos_sin(8, 64, device, dtype)
+    expected = apply_rotary_emb_torch(
+        x.float(), cos[:8].float(), sin[:8].float()
+    ).to(dtype)
+
+    def unexpected_wrap_triton(*args, **kwargs):
+        raise AssertionError("eager rotary should launch the Triton kernel directly")
+
+    monkeypatch.setattr(torch.library, "wrap_triton", unexpected_wrap_triton)
+    actual = apply_rotary_emb(x, cos, sin)
+
+    atol = ((expected + 0.3 - 0.3) - expected).abs().max().item()
+    assert torch.allclose(actual, expected, rtol=1e-3, atol=2 * atol)
+
+
+def test_rotary_emb_make_fx_capture():
+    from torch.fx.experimental.proxy_tensor import make_fx
+    from flash_attn.ops.triton.rotary import apply_rotary
+
+    device = "cuda"
+    dtype = torch.bfloat16 if is_sm8x else torch.float16
+    x = torch.randn(2, 8, 4, 64, device=device, dtype=dtype)
+    cos, sin = generate_cos_sin(8, 64, device, dtype)
+    traced = make_fx(lambda x, cos, sin: apply_rotary(x, cos, sin))(
+        x, cos, sin
+    )
+
+    x2 = torch.randn_like(x)
+    expected = apply_rotary(x2, cos, sin)
+    actual = traced(x2, cos, sin)
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize(
     "dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16])
 )
