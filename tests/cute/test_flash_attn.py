@@ -21,6 +21,7 @@ except ImportError:
 from flash_attn.cute.cache_utils import JITCache
 from flash_attn.cute.testing import (
     check_dsink_vs_ref,
+    dsink_roundoff_atol,
     check_tensor_vs_ref,
     attention_ref,
     generate_qkv,
@@ -606,7 +607,7 @@ def test_flash_attn_output(
             for x in (q_ref, k_ref, v_ref)
         ]
         qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None
-        out_ref, attn_ref = attention_ref(
+        ref_result = attention_ref(
             q_ref,
             k_ref,
             v_ref,
@@ -621,7 +622,10 @@ def test_flash_attn_output(
             attention_chunk=attention_chunk,
             learnable_sink=learnable_sink_ref,
             softcap=softcap,
+            return_sink_prob=has_learnable_sink,
         )
+        out_ref, attn_ref = ref_result[:2]
+        sink_prob_ref = ref_result[2] if has_learnable_sink else None
         out_pt, attn_pt = attention_ref(
             q_ref,
             k_ref,
@@ -811,7 +815,8 @@ def test_flash_attn_output(
                     dsink_ref,
                     dsink_pt,
                     rtol=rtol,
-                    atol=0 if softcap == 0 else 3e-4,
+                    atol=(0 if softcap == 0 else 3e-4)
+                    + dsink_roundoff_atol(out_ref, g, sink_prob_ref),
                 )
 
 
@@ -3771,3 +3776,54 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
     )
 
 
+@pytest.mark.skipif(not IS_SM100, reason="O rounding residual is emitted by the SM100 forward")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_splits", [1, 3])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("seqlen_q,seqlen_k,d", [(113, 203, 64), (512, 512, 128), (300, 300, 256)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sink_o_lo_residual(seqlen_q, seqlen_k, d, causal, num_splits, dtype):
+    """With a learnable sink that requires grad, the SM100 forward (attention kernel, or the
+    combine kernel with split KV) also returns o_lo = fp32(O) - dtype(O), which the backward
+    preprocess adds back when forming dpsum (issue #2969).
+
+    q = 0 makes every unnormalised probability exactly 1 (no rounding of P in the PV product,
+    whatever the running max does), so the kernel's fp32 O is the fp64 O up to fp32 accumulation
+    and out + o_lo must land within ~1e-6 relative of it, while out alone is off by the dtype's
+    half ulp."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size, nheads, nheads_kv = 2, 6, 2
+    q = torch.zeros(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    sink = -torch.rand(nheads, device=device, dtype=dtype)  # <= 0: the row max stays at the keys' 0
+    out0, _, _, _, o_lo0 = _flash_attn_fwd(q, k, v, causal=causal, learnable_sink=sink, num_splits=num_splits)
+    sink.requires_grad_()
+    out, _, _, _, o_lo = _flash_attn_fwd(q, k, v, causal=causal, learnable_sink=sink, num_splits=num_splits)
+    if is_fake_mode():
+        return
+    assert o_lo0 is None, "no residual unless the sink requires grad"
+    assert torch.equal(out, out0)
+    assert o_lo is not None and o_lo.shape == out.shape and o_lo.dtype == out.dtype
+    eps = torch.finfo(dtype).eps
+    assert (o_lo.float().abs() <= out.float().abs() * eps / 2 + 2.0 ** -24).all()
+    # fp64 reference: uniform attention over the visible keys plus the sink column
+    g = nheads // nheads_kv
+    vd = v.double().repeat_interleave(g, 2)  # (b, s_k, h, d)
+    visible = torch.ones(seqlen_q, seqlen_k, device=device, dtype=torch.float64)
+    if causal:
+        row = torch.arange(seqlen_q, device=device)[:, None] + (seqlen_k - seqlen_q)
+        col = torch.arange(seqlen_k, device=device)[None, :]
+        visible = visible.masked_fill(col > row, 0.0)
+    n_vis = visible.sum(-1)  # (s_q,)
+    denom = n_vis[None, :, None] + torch.exp(sink.detach().double())[None, None, :]  # (1, s_q, h)
+    out_ref = torch.einsum("qk,bkhd->bqhd", visible, vd) / denom[..., None]
+    err_plain = (out.double() - out_ref).abs().max()
+    err_resid = (out.double() + o_lo.double() - out_ref).abs().max()
+    scale = out_ref.abs().max()
+    # fp32 accumulation over up to seqlen_k keys and the fp32 1/l: ~1e-6 relative; out alone is
+    # off by the dtype's rounding (2^-9 / 2^-12 relative).
+    assert err_resid <= 2e-5 * scale and err_resid * 32 < err_plain, (
+        f"max|out - O|={err_plain.item():.3e}, max|out + o_lo - O|={err_resid.item():.3e}, max|O|={scale.item():.3e}"
+    )

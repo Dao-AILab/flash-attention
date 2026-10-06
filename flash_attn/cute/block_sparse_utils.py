@@ -862,6 +862,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
     mO_cur: Optional[cute.Tensor] = None,
     gO: Optional[cute.Tensor] = None,
     gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
+    correction_residual: Optional[Callable] = None,
+    mOlo_cur: Optional[cute.Tensor] = None,
 ):
     """Handle SM100 forward block-sparse tiles with no active KV blocks.
 
@@ -940,6 +942,19 @@ def handle_block_sparse_empty_tile_correction_sm100(
         )
         if const_expr(gmem_tiled_copy_O is None):
             pipeline_o_epi.producer_commit_w_index(stage)
+        if const_expr(mOlo_cur is not None):
+            # Empty tile: the O rounding residual is zero too (nothing is read from TMEM).
+            correction_residual(
+                thr_mma_pv,
+                tOtO[None, None, None, stage],
+                tidx,
+                stage,
+                m_block,
+                seqlen_info.seqlen_q,
+                Float32(0.0),
+                mOlo_cur,
+                zero_fill=True,
+            )
 
     sm_stats_consumer_phase ^= 1
     corr_epi_producer_phase ^= 1

@@ -1252,7 +1252,22 @@ def _flash_attn_fwd(
         gather_kv_length = None
         sparse_kv = None
         disable_sparse_kv_bitmask = None
-        p = row_max = o_lo = None
+        p = row_max = None
+        # Dense SM100 forward: emit the bf16 rounding residual of O when the sink gradient is
+        # needed, so the backward preprocess forms dpsum from a near-fp32 O. dsink sums
+        # exp(sink - lse) * dpsum over all rows with heavy cancellation, which amplifies the
+        # bf16-O rounding error in dpsum far beyond dq's (issue #2969).
+        o_lo = (
+            torch.empty_like(out)
+            if arch // 10 in [10, 11]
+            and learnable_sink is not None
+            and learnable_sink.requires_grad
+            and out.dtype in (torch.float16, torch.bfloat16)
+            else None
+        )
+    # With split KV the combine kernel forms the final O (and its residual); the attention
+    # kernel writes fp32 partials and gets no residual tensor.
+    o_lo_fwd = None if is_split_kv else o_lo
 
 
     reuse_scheduler_metadata = scheduler_metadata is not None
@@ -1499,7 +1514,7 @@ def _flash_attn_fwd(
         use_s_ping_pong,
         num_splits_dynamic is not None,
         mla_fwd_rescale_threshold,
-        o_lo is not None,
+        o_lo_fwd is not None,
         virtual_batch_idx is not None,
         num_nheads_in_l2 is not None,
         tile_count_semaphore is not None,
@@ -1603,7 +1618,7 @@ def _flash_attn_fwd(
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices)
         p_tensor = to_cute_tensor(p)
         row_max_tensor = to_cute_tensor(row_max)
-        o_lo_tensor = to_cute_tensor(o_lo, assumed_align=o_align)
+        o_lo_tensor = to_cute_tensor(o_lo_fwd, assumed_align=o_align)
 
         if arch // 10 == 8:
             assert page_table is None, "paged KV not supported on SM 8.0"
@@ -1833,6 +1848,7 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks_tensor,
                     blocks_to_batch_idx_tensor,
                     max_seqlen_q,
+                    o_lo_tensor,
                 ])
             elif arch // 10 in [8, 9, 12]:
                 compile_args.extend([
@@ -1879,7 +1895,7 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 learnable_sink,
-                o_lo,
+                o_lo_fwd,
             )
         else:
             call_args = [
@@ -1925,6 +1941,7 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks,
                     blocks_to_batch_idx,
                     max_seqlen_q,
+                    o_lo_fwd,
                 ])
             elif arch // 10 in [8, 9, 12]:
                 call_args.extend([
@@ -1952,6 +1969,7 @@ def _flash_attn_fwd(
             seqused_q,
             num_splits_dynamic_ptr=num_splits_dynamic if has_scheduler_metadata else None,
             virtual_batch_idx=virtual_batch_idx if has_scheduler_metadata else None,
+            o_lo=o_lo,
             _arch=arch,
         )
         if lse is not None and qv is not None:
@@ -2275,11 +2293,15 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    o_lo: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, ...]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    if o_lo is not None:
+        # bf16 rounding residual of out from the forward; the preprocess forms dpsum from out + o_lo.
+        assert o_lo.shape == out.shape and o_lo.dtype == out.dtype, "o_lo must match out"
     if block_sparse_tensors is not None:
         assert (
             cu_seqlens_q is None
@@ -2683,6 +2705,7 @@ def _flash_attn_bwd(
         cu_total_m_blocks=cu_total_m_blocks_q,
         fake_mode=fake_mode,
         hdim_multiple_of=hdim_multiple_of,
+        o_lo=o_lo,
     )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).
@@ -3858,6 +3881,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 block_sparse_tensors=ctx.block_sparse_tensors_bwd,
                 dlse=dlse,
                 learnable_sink=learnable_sink,
+                o_lo=o_lo,
             )
             if learnable_sink is None:
                 dq, dk, dv = bwd_result
@@ -4048,6 +4072,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 mask_mod=ctx.mask_mod,
                 dlse=dlse,
                 learnable_sink=learnable_sink,
+                o_lo=o_lo,
             )
             if learnable_sink is None:
                 dq, dk, dv = bwd_result
@@ -4136,6 +4161,9 @@ def flash_attn_func(
             "the backward will run unchunked (full-size dS transient).",
             stacklevel=2,
         )
+    # Custom autograd forwards cannot observe the caller's grad mode.
+    if learnable_sink is not None and not torch.is_grad_enabled():
+        learnable_sink = learnable_sink.detach()
     return FlashAttnFunc.apply(
         q,
         k,
@@ -4266,6 +4294,9 @@ def flash_attn_varlen_func(
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
+    # Custom autograd forwards cannot observe the caller's grad mode.
+    if learnable_sink is not None and not torch.is_grad_enabled():
+        learnable_sink = learnable_sink.detach()
     return FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -4306,7 +4337,7 @@ def flash_attn_varlen_func(
 def _compile_fwd_combine(
     _arch, dtype, dtype_partial, head_dim, num_head, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, has_lse, has_virtual_batch_idx,
-    has_num_splits_dynamic, has_semaphore_to_reset,
+    has_num_splits_dynamic, has_semaphore_to_reset, has_o_lo=False,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -4352,11 +4383,12 @@ def _compile_fwd_combine(
     mNumSplitsDynamic = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_num_splits_dynamic else None
     mVirtualBatchIdx = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_virtual_batch_idx else None
     mSemaphore = fake_tensor(Int32, (1,), divisibility=1) if has_semaphore_to_reset else None
+    mOlo = fake_tensor(dtype, mO.shape, divisibility=div) if has_o_lo else None
 
     return cute.compile(
         fa_combine,
         mO_partial, mLSE_partial, mO, mLSE,
-        mCuSeqlens, mSeqused, mNumSplitsDynamic, mVirtualBatchIdx, mSemaphore,
+        mCuSeqlens, mSeqused, mNumSplitsDynamic, mVirtualBatchIdx, mSemaphore, mOlo,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -4372,6 +4404,7 @@ def _flash_attn_fwd_combine(
     num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
     virtual_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
+    o_lo: Optional[torch.Tensor] = None,
     *,
     _arch: Optional[int] = None,
 ) -> None:
@@ -4447,6 +4480,7 @@ def _flash_attn_fwd_combine(
         virtual_batch_idx is not None,
         num_splits_dynamic_ptr is not None,
         semaphore_to_reset is not None,
+        o_lo is not None,
     )
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
@@ -4456,7 +4490,7 @@ def _flash_attn_fwd_combine(
         _flash_attn_fwd_combine.compile_cache[compile_key](
             out_partial, lse_partial, out, lse,
             cu_seqlens, seqused, num_splits_dynamic_ptr, virtual_batch_idx,
-            semaphore_to_reset,
+            semaphore_to_reset, o_lo,
         )
 
 
