@@ -178,6 +178,7 @@ class PackGQA:
     head_dim_padded: cutlass.Constexpr[int]
     check_hdim_oob: cutlass.Constexpr[bool]
     qhead_per_kvhead: cutlass.Constexpr[bool]
+    fp8: cutlass.Constexpr[bool] = False
 
     @cute.jit
     def compute_ptr(

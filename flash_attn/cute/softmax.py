@@ -157,6 +157,7 @@ class Softmax(ParamsBase):
     row_sum: cute.Tensor
     arch: cutlass.Constexpr[int] = 80
     softmax_scale: Float32 | None = None
+    max_offset: cutlass.Constexpr[int] = 0
 
     @staticmethod
     def create(
@@ -164,10 +165,11 @@ class Softmax(ParamsBase):
         num_rows: cutlass.Constexpr[int],
         arch: cutlass.Constexpr[int] = 80,
         softmax_scale: Float32 | None = None,
+        max_offset: cutlass.Constexpr[int] = 0,
     ):
         row_max = cute.make_rmem_tensor(num_rows, Float32)
         row_sum = cute.make_rmem_tensor(num_rows, Float32)
-        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
+        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale, max_offset)
 
     def reset(self) -> None:
         self.row_max.fill(-Float32.inf)
@@ -226,6 +228,8 @@ class Softmax(ParamsBase):
 
             if cutlass.const_expr(is_first):
                 row_max_cur_scaled = row_max_cur * scale_log2
+                if cutlass.const_expr(self.max_offset != 0):
+                    row_max_cur_scaled -= self.max_offset
                 acc_S_row_exp = cute.math.exp2(
                     acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
                 )
@@ -233,6 +237,8 @@ class Softmax(ParamsBase):
                 row_scale[r] = 1.0
             else:
                 row_max_cur_scaled = row_max_cur * scale_log2
+                if cutlass.const_expr(self.max_offset != 0):
+                    row_max_cur_scaled -= self.max_offset
                 acc_S_row_exp = cute.math.exp2(
                     acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
                 )
@@ -259,6 +265,7 @@ class Softmax(ParamsBase):
         row_sum = self.row_sum
         row_max = self.row_max
         scale_log2 = self.scale_log2
+        assert sink_val is None or self.max_offset == 0, "Offset softmax does not support a sink"
 
         # quad reduction for row_sum as we didn't do it during each iteration of online softmax
         row_sum.store(utils.warp_reduce(row_sum.load(), operator.add, width=4))
@@ -281,7 +288,11 @@ class Softmax(ParamsBase):
             row_sum_cur = row_sum[r]
             LN2 = math.log(2.0)
             row_sum[r] = (
-                (row_max_scaled + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
+                (row_max_scaled + (
+                    cute.math.log2(row_sum_cur, fastmath=True) - self.max_offset
+                    if cutlass.const_expr(self.max_offset != 0)
+                    else cute.math.log2(row_sum_cur, fastmath=True)
+                )) * LN2
                 if not acc_O_mn_row_is_zero_or_nan
                 else -Float32.inf
             )
