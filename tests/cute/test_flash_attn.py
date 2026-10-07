@@ -8,6 +8,7 @@ import re
 import gc
 from dataclasses import replace
 from functools import wraps
+from unittest import mock
 
 import pytest
 import torch
@@ -20,7 +21,7 @@ except ImportError:
     apply_rotary_emb = None
 
 from flash_attn.cute.cache_utils import JITCache
-from flash_attn.cute.config import FwdConfig
+from flash_attn.cute.config import FwdConfig, select_fwd_config
 from flash_attn.cute.testing import (
     check_dsink_vs_ref,
     check_tensor_vs_ref,
@@ -469,6 +470,103 @@ def test_flash_attn_forced_split_config_reuses_specializations():
     torch.testing.assert_close(out_4.float(), reference, atol=0.04, rtol=0.04)
     assert set(_flash_attn_fwd.compile_cache.cache) == main_keys
     assert set(_flash_attn_fwd_combine.compile_cache.cache) == combine_keys
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 3) or USE_FAKE_TENSOR,
+    reason="GB300 (SM103) promoted CLC selector tests",
+)
+def test_flash_attn_high_head_varlen_clc_default_matches_reference():
+    """Exercise the promoted packed-varlen CLC rule through config=None."""
+    torch.manual_seed(0)
+    lengths = [1365, 1365, 1366]
+    q = torch.randn(sum(lengths), 24, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(lengths), 6, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    cu_seqlens = torch.tensor(
+        [0, lengths[0], sum(lengths[:2]), sum(lengths)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    selected = {}
+
+    def capture_config(inputs):
+        selected["inputs"] = inputs
+        selected["config"] = select_fwd_config(inputs)
+        return selected["config"]
+
+    with mock.patch(
+        "flash_attn.cute.interface.select_fwd_config", side_effect=capture_config
+    ):
+        out = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max(lengths),
+            max_seqlen_k=max(lengths),
+            causal=True,
+        )[0]
+
+    assert selected["inputs"].pack_gqa
+    assert selected["config"].use_clc_scheduler
+    references = []
+    start = 0
+    for length in lengths:
+        references.append(
+            torch.nn.functional.scaled_dot_product_attention(
+                q[start : start + length].float().transpose(0, 1).unsqueeze(0),
+                k[start : start + length].float().transpose(0, 1).unsqueeze(0),
+                v[start : start + length].float().transpose(0, 1).unsqueeze(0),
+                is_causal=True,
+                scale=1 / math.sqrt(64),
+                enable_gqa=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
+        start += length
+    torch.testing.assert_close(
+        out.float(), torch.cat(references), atol=0.04, rtol=0.04
+    )
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 3) or USE_FAKE_TENSOR,
+    reason="GB300 (SM103) promoted CLC selector tests",
+)
+def test_flash_attn_dense_short_k_clc_default_matches_reference():
+    """Exercise the promoted dense short-K CLC rule through config=None."""
+    torch.manual_seed(0)
+    q = torch.randn(32, 17, 24, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(32, 640, 6, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    selected = {}
+
+    def capture_config(inputs):
+        selected["inputs"] = inputs
+        selected["config"] = select_fwd_config(inputs)
+        return selected["config"]
+
+    with mock.patch(
+        "flash_attn.cute.interface.select_fwd_config", side_effect=capture_config
+    ):
+        out = _flash_attn_fwd(q, k, v, causal=True)[0]
+
+    assert selected["inputs"].pack_gqa
+    assert selected["config"].use_clc_scheduler
+    k_expanded = k.float().repeat_interleave(4, dim=2)
+    v_expanded = v.float().repeat_interleave(4, dim=2)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k_expanded) / math.sqrt(64)
+    q_positions = torch.arange(q.shape[1], device="cuda")[:, None]
+    k_positions = torch.arange(k.shape[1], device="cuda")[None, :]
+    scores.masked_fill_(
+        k_positions > q_positions + k.shape[1] - q.shape[1], -torch.inf
+    )
+    reference = torch.einsum(
+        "bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), v_expanded
+    )
+    torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
 
 
 @pytest.mark.skipif(
