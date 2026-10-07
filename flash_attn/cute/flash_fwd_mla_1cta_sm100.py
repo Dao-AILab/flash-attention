@@ -39,7 +39,7 @@
 
 import math
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -67,7 +67,8 @@ from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
+from flash_attn.cute.kernel_args import FwdKernelArgs, normalize_kernel_args
+from flash_attn.cute.utils import DescaleTensors
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
@@ -89,6 +90,26 @@ class FlashAttentionMLAForward1CtaSm100:
     ptxas_options = "-O2"
     # sparse MLA: a token's heads padded to one 64-row tile (pack_gqa.sparse_mla_qhead_tile)
     SPARSE_HEAD_TILE = 64
+    # fmt: off
+    class Args(NamedTuple):
+        mQv: cute.Tensor                            # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
+        mV: cute.Tensor                             # (b, s_k, h_k, dv) or (total_k, h_k, dv) if cu_seqlens_k
+        mO: cute.Tensor                             # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
+        softmax_scale: Float32
+        mQ: Optional[cute.Tensor] = None            # (b, s_q, h, d)   or (total_q, h, d)  if cu_seqlens_q
+        mK: Optional[cute.Tensor] = None            # (b, s_k, h_k, d) or (total_k, h_k, d)  if cu_seqlens_k
+        mLSE: Optional[cute.Tensor] = None          # (b, s_q, h)      or (total_q, h)     if cu_seqlens_q
+        mCuSeqlensQ: Optional[cute.Tensor] = None   # (b + 1)
+        mCuSeqlensK: Optional[cute.Tensor] = None   # (b + 1)
+        mSeqUsedQ: Optional[cute.Tensor] = None     # (b)
+        mSeqUsedK: Optional[cute.Tensor] = None     # (b)
+        mIndexTopk: Optional[cute.Tensor] = None
+        mPageTable: Optional[cute.Tensor] = None
+        # fp8 per-(batch, kv head) dequantization scales; see _effective_descales.
+        descale_tensors: Optional[DescaleTensors] = None
+        learnable_sink: Optional[cute.Tensor] = None  # (h,)
+        mOlo: Optional[cute.Tensor] = None          # bf16 rounding residual of O (sparse training)
+    # fmt: on
 
     @staticmethod
     def use_clc(*, is_topk_gather, seqlen_q_hint, clc_default) -> bool:
@@ -574,50 +595,30 @@ class FlashAttentionMLAForward1CtaSm100:
 
         return SharedStorage
 
-    # fmt: off
     @cute.jit
     def __call__(
         self,
-        mQ: Optional[cute.Tensor],    # (b, s_q, h, d)   or (total_q, h, d)  if cu_seqlens_q
-        mQv: cute.Tensor,             # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
-        mK: Optional[cute.Tensor],    # (b, s_k, h_k, d) or (total_k, h_k, d)  if cu_seqlens_k
-        mV: cute.Tensor,              # (b, s_k, h_k, dv) or (total_k, h_k, dv) if cu_seqlens_k
-        mO: cute.Tensor,              # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
-        mLSE: Optional[cute.Tensor],  # (b, s_q, h)      or (total_q, h)     if cu_seqlens_q
-        softmax_scale: Float32,
-        # The following are accepted for interface compatibility with the 2CTA MLA
-        # kernel; the ones the 1CTA kernel does not support are asserted None.
-        mP: Optional[cute.Tensor] = None,
-        mRowMax: Optional[cute.Tensor] = None,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,  # (b + 1)
-        mCuSeqlensK: Optional[cute.Tensor] = None,  # (b + 1)
-        mSeqUsedQ: Optional[cute.Tensor] = None,    # (b)
-        mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
-        mIndexTopk: Optional[cute.Tensor] = None,
-        mPageTable: Optional[cute.Tensor] = None,
-        # fp8 per-(batch, kv head) dequantization scales; see _effective_descales.
-        descale_tensors: Optional[DescaleTensors] = None,
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
-        learnable_sink: Optional[cute.Tensor] = None,  # (h,)
-        # Sparse-training O residual (2CTA only); accepted for signature parity.
-        mOlo: Optional[cute.Tensor] = None,
+        args: FwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # fmt: on
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
+        mQ, mQv, mK, mV, mO, mLSE = args.mQ, args.mQv, args.mK, args.mV, args.mO, args.mLSE
+        softmax_scale = args.softmax_scale
+        mCuSeqlensQ, mCuSeqlensK = args.mCuSeqlensQ, args.mCuSeqlensK
+        mSeqUsedQ, mSeqUsedK = args.mSeqUsedQ, args.mSeqUsedK
+        mIndexTopk = args.mIndexTopk
+        mPageTable = args.mPageTable
+        descale_tensors = args.descale_tensors
+        learnable_sink = args.learnable_sink
+        mOlo = args.mOlo
+
         self.has_learnable_sink = learnable_sink is not None
         # sparse training: bf16 rounding residual of O, for the backward's dpsum
         assert mOlo is None or not self.is_split_kv, "mOlo is not supported with split-KV"
         assert (mIndexTopk is not None) == self.is_topk_gather, (
             "mIndexTopk presence must match the is_topk_gather ctor flag"
         )
-        for name, t in [
-            ("mP", mP), ("mRowMax", mRowMax),
-            ("window_size_left", window_size_left),
-            ("window_size_right", window_size_right),
-        ]:
-            assert t is None, f"{name} is not supported by the 1CTA MLA kernel (v1)"
         if const_expr(mPageTable is not None):
             # Paged KV: mK/mV are (num_pages, page_size, h_k, d) -- the KV transpose
             # below maps that to (page_size, d, h_k, num_pages) with exactly the same
