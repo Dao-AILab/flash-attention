@@ -234,6 +234,19 @@ def test_flash_attn_sm120_num_splits(num_splits):
         flash_attn_func(q, k, v, num_splits=3)
 
 
+@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
+@pytest.mark.parametrize("num_splits", [0, -1])
+def test_flash_attn_sm120_fp8_num_splits(num_splits):
+    q, k, v = [
+        torch.randn(1, 16, h, 64, device="cuda").to(torch.float8_e4m3fn) for h in (4, 1, 1)
+    ]
+    out = flash_attn_func(q, k, v)
+    out_auto = flash_attn_func(q, k, v, num_splits=num_splits)
+    torch.testing.assert_close(out_auto, out)
+    with pytest.raises(NotImplementedError, match="num_splits<=1"):
+        flash_attn_func(q, k, v, num_splits=3)
+
+
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
     reason="SM100/SM110 runtime layout-cache test",
@@ -658,7 +671,7 @@ def test_scheduler_metadata_semaphore_follows_selected_scheduler(monkeypatch):
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if IS_SM120 else []))
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
@@ -730,6 +743,8 @@ def test_flash_attn_output(
     mha_type,
     dtype,
 ):
+    if IS_SM120 and dtype == torch.float8_e4m3fn and (softcap > 0.0 or has_qv or has_learnable_sink):
+        pytest.skip("SM120 FP8 does not support softcap, MLA or learnable sinks")
     local = local_enum > 0
     if local and causal:
         pytest.skip()
@@ -1482,7 +1497,7 @@ def test_flash_attn_hd256_output_singleton_strides(dtype, shape):
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if IS_SM120 else []))
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_learnable_sink", [False, True])
@@ -1578,6 +1593,8 @@ def test_flash_attn_varlen_output(
     unpad_q,
     unpad_kv,
 ):
+    if IS_SM120 and dtype == torch.float8_e4m3fn and (softcap > 0.0 or has_qv or has_learnable_sink):
+        pytest.skip("SM120 FP8 does not support softcap, MLA or learnable sinks")
     local = local_enum > 0
     if local and causal:
         pytest.skip()
@@ -1748,8 +1765,11 @@ def test_flash_attn_varlen_output(
         else:
             print("seqused_k = ", seqused_k)
         q_unpad, k_unpad, v_unpad = [
-            x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
+            x.detach().to(dtype).requires_grad_(dtype != torch.float8_e4m3fn)
+            for x in (q_unpad, k_unpad, v_unpad)
         ]
+        if dtype == torch.float8_e4m3fn:
+            q, k, v = [x.detach().to(dtype) for x in (q, k, v)]
 
         out_ref, attn_ref = attention_ref(
             q_ref,
@@ -1804,7 +1824,7 @@ def test_flash_attn_varlen_output(
         # SplitKV is not supported for hdim >= 192, except hd256 on SM100
         split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
         num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
-        precompute_metadata_vals = [False, True]
+        precompute_metadata_vals = [False] if IS_SM120 and dtype == torch.float8_e4m3fn else [False, True]
         for pack_gqa, num_splits, precompute_metadata in itertools.product(
             pack_gqa_vals, num_splits_vals, precompute_metadata_vals
         ):
@@ -1844,8 +1864,8 @@ def test_flash_attn_varlen_output(
                     seqused_k=seqused_k if not unpad_kv else None,
                     causal=causal,
                     # qv=qv_unpad,
-                    # q_descale=q_descale,
-                    # k_descale=k_descale, v_descale=v_descale,
+                    q_descale=q_descale,
+                    k_descale=k_descale, v_descale=v_descale,
                     window_size=window_size,
                     # attention_chunk=attention_chunk,
                     learnable_sink=learnable_sink,
