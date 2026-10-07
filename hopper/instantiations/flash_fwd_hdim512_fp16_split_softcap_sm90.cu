@@ -2,9 +2,8 @@
 // Splitting the different template instantiations to different files to speed up compilation.
 // This file is auto-generated. See "generate_kernels.py"
 
-#include "flash_fwd_hdim64_bf16_sm90.cu"
-#include "flash_fwd_hdim96_bf16_sm90.cu"
-#include "flash_fwd_hdim128_bf16_sm90.cu"
-#include "flash_fwd_hdim192_bf16_sm90.cu"
-#include "flash_fwd_hdim256_bf16_sm90.cu"
-#include "flash_fwd_hdim512_bf16_sm90.cu"
+#include "flash_fwd_launch_template.h"
+
+#ifndef FLASHATTENTION_DISABLE_HDIM512
+template void run_mha_fwd_<90, cutlass::half_t, 512, 512, true, false, true, true>(Flash_fwd_params &params, cudaStream_t stream);
+#endif
