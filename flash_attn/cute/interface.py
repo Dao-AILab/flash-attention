@@ -63,7 +63,7 @@ from flash_attn.cute.cute_dsl_utils import (
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
-from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120, PackVSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess, PackGQA
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -612,6 +612,34 @@ def _validate_block_scales(
     sfq, sfk, sfv = (t if t is None else maybe_contiguous(t.reshape(-1)) for t in scales[:3])
     return scales._replace(q=sfq, k=sfk, v=sfv, v_bf16=maybe_contiguous(v_bf16))
 
+def _pack_v_sm120(v, cu_seqlens_k, seqused_k, batch_size, max_seqlen_k, fake_mode):
+    """Allocate and fill a byte-exact sequence-major V buffer for FP8 warp MMA."""
+    padded_s = (max_seqlen_k + 63) // 64 * 64
+    heads, dim = v.shape[-2:]
+    packed = torch.empty_strided(
+        (batch_size, padded_s, heads, dim),
+        (heads * dim * padded_s, 1, dim * padded_s, padded_s),
+        dtype=v.dtype, device=v.device,
+    )
+    key = (cu_seqlens_k is not None, seqused_k is not None)
+    if key not in _pack_v_sm120.compile_cache:
+        _pack_v_sm120.compile_cache[key] = cute.compile(
+            PackVSm120(),
+            to_cute_tensor(v.view(torch.uint8)),
+            to_cute_tensor(packed.view(torch.uint8), leading_dim=1),
+            to_cute_tensor(cu_seqlens_k, assumed_align=4, leading_dim=0),
+            to_cute_tensor(seqused_k, assumed_align=4, leading_dim=0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    if not fake_mode:
+        _pack_v_sm120.compile_cache[key](v.view(torch.uint8), packed.view(torch.uint8),
+                                        cu_seqlens_k, seqused_k)
+    return packed
+
+
+_pack_v_sm120.compile_cache = get_jit_cache("sm120_fp8_pack_v")
+
 
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
@@ -679,7 +707,8 @@ def _flash_attn_fwd(
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
-        t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
+        t is not None and t.requires_grad
+        for t in (q, k, v, qv, learnable_sink)
     )
     fake_mode = is_fake_mode()
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
@@ -736,6 +765,7 @@ def _flash_attn_fwd(
             raise TypeError(
                 f"scales must be TensorwiseScales, BlockScales or None, got {type(scales).__name__}"
             )
+    requires_grad |= any(t is not None and t.requires_grad for t in descales)
     has_descale = any(t is not None for t in descales)
     qk_blockscaled = block_scales is not None
     pv_blockscaled = qk_blockscaled and block_scales.v is not None
@@ -829,6 +859,20 @@ def _flash_attn_fwd(
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
+    if is_fp8 and arch // 10 == 12:
+        if v.dtype != torch.float8_e4m3fn:
+            raise NotImplementedError("SM120 FP8 forward supports E4M3 inputs only")
+        if (qv is not None or gather_kv_indices is not None or page_table is not None
+                or learnable_sink is not None or score_mod is not None or mask_mod is not None
+                or block_sparse_tensors is not None or aux_tensors is not None
+                or aux_scalars is not None or softcap is not None or num_splits > 1
+                or scheduler_metadata is not None or seqlen_k_per_split is not None):
+            raise NotImplementedError(
+                "SM120 FP8 supports dense/varlen causal or local attention with num_splits<=1; "
+                "MLA, paged/gather KV, sinks, modifiers, sparsity and scheduler metadata are unsupported"
+            )
+        if min(head_dim, head_dim_v) <= 0 or max(head_dim, head_dim_v) > 256 or head_dim % 16 or head_dim_v % 16:
+            raise ValueError("SM120 FP8 head dimensions must be positive multiples of 16, at most 256")
     out_torch_dtype = torch.bfloat16 if is_fp8 or qk_blockscaled else q_dtype
     device = v.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
@@ -880,7 +924,7 @@ def _flash_attn_fwd(
 
     dtype = torch2cute_dtype_map[q_dtype]
     if is_fp8:
-        assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
+        assert arch // 10 in [10, 12], "FP8 is only supported on SM100 and SM120 for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
@@ -962,6 +1006,14 @@ def _flash_attn_fwd(
     use_dynamic_varlen = (
         mla_kernel is None and config.use_dynamic_varlen and scheduler_metadata is None
     )
+    if is_fp8 and arch // 10 == 12:
+        if host_max_seqlen_k <= 0:
+            raise ValueError("SM120 FP8 max_seqlen_k must be positive for nonempty inputs")
+        if not FlashAttentionForwardSm120.can_implement(
+                dtype, head_dim, head_dim_v, config.tile_m, config.tile_n, 1, 128, causal):
+            raise ValueError("SM120 FP8 tile exceeds the supported MMA/layout or 99 KiB shared-memory limits")
+        v = _pack_v_sm120(v, cu_seqlens_k, seqused_k, batch_size, max_seqlen_k, fake_mode)
+
 
     is_split_kv = num_splits > 1
     if is_split_kv:
@@ -1344,7 +1396,8 @@ def _flash_attn_fwd(
             if tensormap_workspace is not None
             else None
         )
-        q_tensor, k_tensor, v_tensor = [to_cute_tensor(t) for t in (q, k, v)]
+        q_tensor, k_tensor = [to_cute_tensor(t) for t in (q, k)]
+        v_tensor = to_cute_tensor(v, leading_dim=1 if is_fp8 and arch // 10 == 12 else -1)
         o_align = 32 if head_dim_v == 512 else 16
         o_tensor = to_cute_tensor(out if not is_split_kv else out_partial, assumed_align=o_align)
         if is_split_kv:
@@ -1644,6 +1697,8 @@ def _flash_attn_fwd(
                 ])
                 if arch // 10 == 9:
                     compile_args.append(tensormap_workspace_tensor)
+            if arch // 10 in [8, 12]:
+                compile_args.append(descale_tensors_tensor)
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
@@ -1740,6 +1795,8 @@ def _flash_attn_fwd(
                 ])
                 if arch // 10 == 9:
                     call_args.append(tensormap_workspace)
+            if arch // 10 in [8, 12]:
+                call_args.append(descale_tensors)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         # Combine writes a seqlen-contiguous LSE. The MLA LSE is (..., s, h) contiguous, so
