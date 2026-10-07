@@ -42,7 +42,7 @@ from flash_attn.cute.cute_dsl_utils import (
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
-from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120, PackVSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -673,6 +673,34 @@ def _mla_fwd_plan(
     return mla_1cta, cls, cfg_mla
 
 
+def _pack_v_sm120(v, cu_seqlens_k, seqused_k, batch_size, max_seqlen_k, fake_mode):
+    """Allocate and fill a byte-exact sequence-major V buffer for FP8 warp MMA."""
+    padded_s = (max_seqlen_k + 63) // 64 * 64
+    heads, dim = v.shape[-2:]
+    packed = torch.empty_strided(
+        (batch_size, padded_s, heads, dim),
+        (heads * dim * padded_s, 1, dim * padded_s, padded_s),
+        dtype=v.dtype, device=v.device,
+    )
+    key = (cu_seqlens_k is not None, seqused_k is not None)
+    if key not in _pack_v_sm120.compile_cache:
+        _pack_v_sm120.compile_cache[key] = cute.compile(
+            PackVSm120(),
+            to_cute_tensor(v.view(torch.uint8)),
+            to_cute_tensor(packed.view(torch.uint8), leading_dim=1),
+            to_cute_tensor(cu_seqlens_k, assumed_align=4, leading_dim=0),
+            to_cute_tensor(seqused_k, assumed_align=4, leading_dim=0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    if not fake_mode:
+        _pack_v_sm120.compile_cache[key](v.view(torch.uint8), packed.view(torch.uint8),
+                                        cu_seqlens_k, seqused_k)
+    return packed
+
+
+_pack_v_sm120.compile_cache = get_jit_cache("sm120_fp8_pack_v")
+
 
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
@@ -735,7 +763,8 @@ def _flash_attn_fwd(
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
-        t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
+        t is not None and t.requires_grad
+        for t in (q, k, v, qv, learnable_sink, q_descale, k_descale, v_descale)
     )
     fake_mode = is_fake_mode()
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
@@ -858,6 +887,23 @@ def _flash_attn_fwd(
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
+    if is_fp8 and arch // 10 == 12:
+        if v.dtype != torch.float8_e4m3fn:
+            raise NotImplementedError("SM120 FP8 forward supports E4M3 inputs only")
+        if (qv is not None or gather_kv_indices is not None or page_table is not None
+                or learnable_sink is not None or score_mod is not None or mask_mod is not None
+                or block_sparse_tensors is not None or aux_tensors is not None
+                or aux_scalars is not None or softcap is not None or num_splits != 1
+                or scheduler_metadata is not None or seqlen_k_per_split is not None):
+            raise NotImplementedError(
+                "SM120 FP8 supports dense/varlen causal or local attention with num_splits=1; "
+                "MLA, paged/gather KV, sinks, modifiers, sparsity and scheduler metadata are unsupported"
+            )
+        if min(head_dim, head_dim_v) <= 0 or max(head_dim, head_dim_v) > 256 or head_dim % 16 or head_dim_v % 16:
+            raise ValueError("SM120 FP8 head dimensions must be positive multiples of 16, at most 256")
+        for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
+            if t is not None:
+                _validate_tensor(t, name, (batch_size, num_head_kv), torch.float32, v.device)
     out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
     device = v.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
@@ -921,7 +967,7 @@ def _flash_attn_fwd(
 
     dtype = torch2cute_dtype_map[q_dtype]
     if is_fp8:
-        assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
+        assert arch // 10 in [10, 12], "FP8 is only supported on SM100 and SM120 for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
@@ -1051,6 +1097,13 @@ def _flash_attn_fwd(
         )
     mla_1cta_kb64 = mla_fwd_cls is FlashAttentionMLAForward1CtaKb64Sm100
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    if is_fp8 and arch // 10 == 12:
+        if max_seqlen_k <= 0:
+            raise ValueError("SM120 FP8 max_seqlen_k must be positive for nonempty inputs")
+        if not FlashAttentionForwardSm120.can_implement(
+                dtype, head_dim, head_dim_v, tile_m, tile_n, 1, num_threads, causal):
+            raise ValueError("SM120 FP8 tile exceeds the supported MMA/layout or 99 KiB shared-memory limits")
+        v = _pack_v_sm120(v, cu_seqlens_k, seqused_k, batch_size, max_seqlen_k, fake_mode)
     q_stage = fwd_cfg.q_stage
     num_splits = fwd_cfg.num_splits
     mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
@@ -1538,7 +1591,8 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
-        q_tensor, k_tensor, v_tensor = [to_cute_tensor(t) for t in (q, k, v)]
+        q_tensor, k_tensor = [to_cute_tensor(t) for t in (q, k)]
+        v_tensor = to_cute_tensor(v, leading_dim=1 if is_fp8 and arch // 10 == 12 else -1)
         o_align = 32 if head_dim_v == 512 else 16
         o_tensor = to_cute_tensor(out if not is_split_kv else out_partial, assumed_align=o_align)
         if is_split_kv:
@@ -1840,6 +1894,8 @@ def _flash_attn_fwd(
                     cu_total_m_blocks_tensor,
                     cu_total_splits_m_blocks_tensor,
                 ])
+            if arch // 10 in [8, 12]:
+                compile_args.append(descale_tensors_tensor)
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
@@ -1932,6 +1988,8 @@ def _flash_attn_fwd(
                     cu_total_m_blocks,
                     cu_total_splits_m_blocks,
                 ])
+            if arch // 10 in [8, 12]:
+                call_args.append(descale_tensors)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         # Combine writes a seqlen-contiguous LSE. The MLA LSE is (..., s, h) contiguous, so
@@ -3757,6 +3815,9 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3787,6 +3848,9 @@ class FlashAttnFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -3834,9 +3898,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 17)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 14)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 17)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3865,7 +3929,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 14)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 17)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3905,6 +3969,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3946,6 +4013,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         ctx.save_for_backward(
             q,
@@ -4019,9 +4089,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 16)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 19)
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 19)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4055,7 +4125,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 16)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 19)
 
 
 def _validate_gather_bwd_kwargs(
@@ -4119,7 +4189,14 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
+    """Attention with optional per-batch/KV-head FP32 descales for FP8 inputs.
+
+    FP8 returns BF16 output and does not support backward, including descale gradients.
+    """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -4161,6 +4238,9 @@ def flash_attn_func(
         return_lse,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        q_descale,
+        k_descale,
+        v_descale,
     )
 
 
@@ -4198,6 +4278,9 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
     """
     Tensor arguments:
@@ -4210,6 +4293,8 @@ def flash_attn_varlen_func(
         gather_kv_indices: (total_q, gather_kv_length) or
                            (batch, seqlen_q, gather_kv_length)
         page_table: (batch, max_num_pages_per_seq)
+        q_descale, k_descale, v_descale: optional FP32 (batch, nheads_k) tensors
+            for FP8 inputs. FP8 returns BF16 output and is forward-only.
     
     Return:
        out: (total_q, nheads, hdim) or (batch, seqlen_q, nheads, hdim)
@@ -4301,6 +4386,9 @@ def flash_attn_varlen_func(
         disable_scheduler_metadata,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        q_descale,
+        k_descale,
+        v_descale,
     )
 
 
