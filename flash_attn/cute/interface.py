@@ -390,6 +390,15 @@ def _get_fwd_config(
     else:
         q_stage = 1
 
+    # On Thor, spread a short packed-GQA prefill across one wave of single-Q CTAs.
+    if (
+        arch == 110 and head_dim == head_dim_v == 128
+        and causal and not local and pack_gqa and block_sparse_tensors is None
+        and tile_mn is None and q_stage == 2 and seqlen_q_packgqa <= 2 * tile_m
+        and 2 * batch_size * num_head_kv <= get_num_sms_for_selection(device.index, arch)
+    ):
+        q_stage = 1
+
     m_block_size_effective = q_stage * tile_m
     # Only None is unbounded; preserve 0 (e.g. the right bound of a causal window).
     window_right_loaded = max_seqlen_k if window_size_right is None else window_size_right
@@ -963,22 +972,24 @@ def _flash_attn_fwd(
 
     # MLA (qv): 1CTA or 2CTA kernel. Decided here: the sparse head padding below and the
     # MLA plan (_mla_fwd_plan) depend on it.
-    mla_route = partial(
-        _mla_1cta_route,
-        gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p,
-        seqlen_q_hint=seqlen_q_hint,
-        needs_1cta=(
-            v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-            or any(t is not None for t in (q_descale, k_descale, v_descale))
-            or num_splits > 1
-        ),
-        # 2CTA tiles: one per token (sparse) or per batch element (dense decode), 2 CTAs each
-        ctas_2cta=2 * num_head_kv * (total_q if gather_kv_indices is not None else batch_size),
-        num_sms=get_num_sms_for_selection(v.device.index, arch),
-    )
-    # num_splits < 1 (the split heuristic): 1CTA provisionally, re-decided after planning
+    mla_1cta = False
     num_splits_auto = num_splits < 1
-    mla_1cta = qv is not None and mla_route(split_kv=num_splits_auto)
+    if qv is not None:
+        mla_route = partial(
+            _mla_1cta_route,
+            gather_kv_indices is not None, qhead_per_kvhead, requires_grad, gather_bwd_recompute_p,
+            seqlen_q_hint=seqlen_q_hint,
+            needs_1cta=(
+                v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                or any(t is not None for t in (q_descale, k_descale, v_descale))
+                or num_splits > 1
+            ),
+            # 2CTA tiles: one per token (sparse) or per batch element (dense decode), 2 CTAs each
+            ctas_2cta=2 * num_head_kv * (total_q if gather_kv_indices is not None else batch_size),
+            num_sms=get_num_sms_for_selection(v.device.index, arch),
+        )
+        # num_splits < 1 (the split heuristic): 1CTA provisionally, re-decided after planning
+        mla_1cta = mla_route(split_kv=num_splits_auto)
     
     # Sparse MLA pads a token's heads to the kernel's tile (pack_gqa.qheads_first_tma_view); the
     # kernel takes the real count, the interface needs the tile width for its grid math.
@@ -3788,6 +3799,8 @@ class FlashAttnFunc(torch.autograd.Function):
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
         )
+        if ctx is None:
+            return out, lse
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
         ctx.shared_kv = shared_kv
@@ -4137,7 +4150,8 @@ def flash_attn_func(
             "the backward will run unchunked (full-size dS transient).",
             stacklevel=2,
         )
-    return FlashAttnFunc.apply(
+    forward = FlashAttnFunc.apply if torch.is_grad_enabled() else partial(FlashAttnFunc.forward, None)
+    return forward(
         q,
         k,
         v,
