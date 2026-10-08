@@ -2840,6 +2840,348 @@ def _fp8_decode_reference(q, k, v):
     return torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v)
 
 
+def check_sm100_unused_v_cache(
+    monkeypatch,
+    d,
+    varlen,
+    causal,
+    dtype,
+    num_splits,
+    *,
+    seqlen_q=1,
+    disable_2cta=False,
+    nheads_kv=8,
+    dv=None,
+    v_layout="contiguous",
+):
+    """Unused nonpaged V cache rows must not contribute NaNs to attention."""
+    from flash_attn.cute import utils
+
+    if DISABLE_SPLIT and num_splits > 1:
+        pytest.skip("SplitKV disabled by the test environment")
+    monkeypatch.setattr(utils, "_fa_disable_2cta_enabled", disable_2cta)
+    torch.manual_seed(42)
+    k_lengths = [32, 64, 96, 48, 128, 0, 193]
+    if v_layout == "broadcast_batch":
+        k_lengths = [73] * len(k_lengths)
+    batch_size, nheads, capacity = len(k_lengths), 8, 256
+    dv = d if dv is None else dv
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, capacity, nheads_kv, d, device="cuda", dtype=dtype)
+    v_clean = torch.randn(
+        batch_size, capacity, nheads_kv, dv, device="cuda", dtype=dtype
+    )
+    if v_layout == "broadcast_batch":
+        v_clean = v_clean[:1].expand_as(v_clean).clone()
+    elif v_layout == "broadcast_head":
+        v_clean = v_clean[:, :, :1].expand_as(v_clean).clone()
+    elif v_layout == "broadcast_sequence":
+        v_clean = v_clean[:, :1].expand_as(v_clean).clone()
+    v_finite, v_nan, v_unused_tiles = [v_clean.clone() for _ in range(3)]
+    if not is_fake_mode():
+        for b, length in enumerate(k_lengths):
+            v_clean[b, length:] = 0
+            v_finite[b, length:] = 300
+            v_nan[b, length:] = float("nan")
+            v_unused_tiles[b, length:] = 0
+            first_unused_tile = math.ceil(length / 128) * 128
+            v_unused_tiles[b, first_unused_tile:] = float("nan")
+    seqused_k = torch.tensor(k_lengths, device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.arange(
+        0, (batch_size + 1) * capacity, capacity, device="cuda", dtype=torch.int32
+    )
+
+    def run(value):
+        if v_layout == "strided":
+            storage = torch.empty(
+                batch_size, capacity, 2 * nheads_kv, dv, device="cuda", dtype=dtype
+            )
+            storage[:, :, ::2].copy_(value)
+            value = storage[:, :, ::2]
+        elif v_layout == "batch_transpose":
+            value = value.transpose(0, 1).contiguous().transpose(0, 1)
+        elif v_layout == "broadcast_batch":
+            value = value[:1].expand_as(value)
+        elif v_layout == "broadcast_head":
+            value = value[:, :, :1].expand_as(value)
+        elif v_layout == "broadcast_sequence":
+            value = value[:, :1].expand_as(value)
+        out, lse = flash_attn_varlen_func(
+            q.flatten(0, 1) if varlen else q,
+            k.flatten(0, 1) if varlen else k,
+            value.flatten(0, 1) if varlen else value,
+            cu_seqlens_q=cu_seqlens_q if varlen else None,
+            cu_seqlens_k=cu_seqlens_k if varlen else None,
+            seqused_k=seqused_k,
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=capacity,
+            causal=causal,
+            num_splits=num_splits,
+            return_lse=True,
+        )
+        if varlen:
+            out = out.reshape(batch_size, seqlen_q, nheads, dv)
+            lse = lse.reshape(nheads, batch_size, seqlen_q).permute(1, 0, 2)
+        return out, lse
+
+    # Issue every selected kernel variant before the FakeTensor early return.
+    results = [run(value) for value in (v_clean, v_finite, v_nan, v_unused_tiles)]
+    if is_fake_mode():
+        return
+
+    key_mask = (
+        torch.arange(capacity, device="cuda")[None, :]
+        < torch.tensor(k_lengths, device="cuda")[:, None]
+    )
+    reference, _ = attention_ref(
+        q.double(),
+        k.double(),
+        v_clean.double(),
+        key_padding_mask=key_mask,
+        causal=causal,
+        upcast=False,
+    )
+    eager, _ = attention_ref(
+        q,
+        k,
+        v_clean,
+        key_padding_mask=key_mask,
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+    scores = torch.einsum(
+        "bqhd,bkhd->bhqk",
+        q.double() * d**-0.5,
+        k.double().repeat_interleave(nheads // nheads_kv, dim=2),
+    )
+    scores.masked_fill_(~key_mask[:, None, None, :], float("-inf"))
+    if causal:
+        q_positions = torch.arange(seqlen_q, device="cuda")[None, None, :, None]
+        k_positions = torch.arange(capacity, device="cuda")[None, None, None, :]
+        lengths = torch.tensor(k_lengths, device="cuda")[:, None, None, None]
+        scores.masked_fill_(
+            k_positions > q_positions + lengths - seqlen_q, float("-inf")
+        )
+    lse_ref = torch.logsumexp(scores, dim=-1)
+    finite_lse = torch.isfinite(lse_ref)
+    empty_rows = ~finite_lse.permute(0, 2, 1)
+    rounding = 2 * torch.finfo(dtype).eps * reference.abs()
+    for out, lse in results:
+        assert out.isfinite().all()
+        check_tensor_vs_ref(
+            "out", out.double(), reference, eager.double(), atol=rounding.max().item()
+        )
+        assert (out.double() - reference).abs().mean() <= (
+            2 * (eager.double() - reference).abs().mean() + rounding.mean()
+        )
+        assert torch.count_nonzero(out[empty_rows]) == 0
+        assert torch.equal(torch.isneginf(lse), torch.isneginf(lse_ref))
+        assert lse[finite_lse].isfinite().all()
+        assert torch.allclose(
+            lse[finite_lse].double(), lse_ref[finite_lse], atol=1e-5, rtol=1e-5
+        )
+    for out, lse in results[1:]:
+        assert torch.equal(out, results[0][0])
+        assert torch.equal(lse, results[0][1])
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_splits", [1, 3])
+@pytest.mark.parametrize("nheads_kv", [8, 2, 1])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache(
+    monkeypatch, d, varlen, causal, dtype, num_splits, nheads_kv
+):
+    check_sm100_unused_v_cache(
+        monkeypatch, d, varlen, causal, dtype, num_splits, nheads_kv=nheads_kv
+    )
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "varlen,causal,num_splits,disable_2cta",
+    [
+        (False, False, 1, False),  # Sq=257 enables the dense D128 2CTA route.
+        (False, False, 1, True),
+        (False, True, 1, False),
+        (False, True, 3, False),
+        (True, False, 1, False),
+        (True, True, 3, False),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache_edges(
+    monkeypatch, dtype, varlen, causal, num_splits, disable_2cta
+):
+    check_sm100_unused_v_cache(
+        monkeypatch,
+        128,
+        varlen,
+        causal,
+        dtype,
+        num_splits,
+        seqlen_q=257,
+        disable_2cta=disable_2cta,
+    )
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "d,dv", [(128, 8), (128, 24), (128, 80), (192, 128), (256, 256)]
+)
+@pytest.mark.parametrize("varlen", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache_dimensions(monkeypatch, dtype, d, dv, varlen):
+    check_sm100_unused_v_cache(monkeypatch, d, varlen, False, dtype, 1, dv=dv)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "varlen,v_layout",
+    [
+        (False, "strided"),
+        (True, "strided"),
+        (False, "batch_transpose"),
+        (False, "broadcast_batch"),
+        (False, "broadcast_head"),
+        (False, "broadcast_sequence"),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache_layouts(monkeypatch, dtype, varlen, v_layout):
+    check_sm100_unused_v_cache(
+        monkeypatch, 128, varlen, False, dtype, 1, v_layout=v_layout
+    )
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache_packed_boundary(dtype):
+    # No seqused_k: NaNs in sequence 1 are valid there but must not leak into
+    # sequence 0's partially filled last tile through a packed TMA load.
+    q = torch.randn(2, 8, 64, device="cuda", dtype=dtype)
+    k = torch.randn(96, 8, 64, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    poisoned = v.clone()
+    poisoned[32:] = float("nan")
+    cu_q = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, 32, 96], device="cuda", dtype=torch.int32)
+    outputs = [
+        flash_attn_varlen_func(
+            q,
+            k,
+            value,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=1,
+            max_seqlen_k=64,
+            num_splits=1,
+            return_lse=True,
+        )
+        for value in (v, poisoned)
+    ]
+    if is_fake_mode():
+        return
+    clean, dirty = outputs
+    assert clean[0].isfinite().all()
+    assert torch.equal(clean[0][0], dirty[0][0])
+    assert torch.isnan(dirty[0][1]).all()
+    assert torch.equal(clean[1], dirty[1])
+    reference, _ = attention_ref(
+        q[:1].unsqueeze(0).double(),
+        k[:32].unsqueeze(0).double(),
+        v[:32].unsqueeze(0).double(),
+        upcast=False,
+    )
+    low_reference, _ = attention_ref(
+        q[:1].unsqueeze(0),
+        k[:32].unsqueeze(0),
+        v[:32].unsqueeze(0),
+        upcast=False,
+        reorder_ops=True,
+    )
+    check_tensor_vs_ref(
+        "out",
+        dirty[0][:1].unsqueeze(0).double(),
+        reference,
+        low_reference.double(),
+        atol=2 * torch.finfo(dtype).eps * reference.abs().max().item(),
+    )
+    for b, (start, end) in enumerate(((0, 32), (32, 96))):
+        scores = torch.einsum("hd,khd->hk", q[b].double() / 8, k[start:end].double())
+        assert torch.allclose(
+            dirty[1][:, b].double(), scores.logsumexp(-1), atol=1e-5, rtol=1e-5
+        )
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("varlen", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache_fp8(dtype, varlen):
+    q = torch.randn(2, 1, 8, 64, device="cuda").to(dtype)
+    k = torch.randn(2, 128, 8, 64, device="cuda").to(dtype)
+    v = torch.randn(2, 128, 8, 64, device="cuda")
+    v[:, 73:] = 0
+    poisoned = v.clone()
+    poisoned[:, 73:] = float("nan")
+    used = torch.full((2,), 73, device="cuda", dtype=torch.int32)
+    cu_q = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
+    outputs = [
+        flash_attn_varlen_func(
+            q.flatten(0, 1) if varlen else q,
+            k.flatten(0, 1) if varlen else k,
+            value.to(dtype).flatten(0, 1) if varlen else value.to(dtype),
+            cu_seqlens_q=cu_q if varlen else None,
+            cu_seqlens_k=cu_k if varlen else None,
+            seqused_k=used,
+            max_seqlen_q=1,
+            max_seqlen_k=128,
+            num_splits=1,
+            return_lse=True,
+        )
+        for value in (v, poisoned)
+    ]
+    if is_fake_mode():
+        return
+    assert outputs[0][0].isfinite().all()
+    assert torch.equal(outputs[0][0], outputs[1][0])
+    assert torch.equal(outputs[0][1], outputs[1][1])
+    reference, _ = attention_ref(
+        q.double(), k[:, :73].double(), v.to(dtype)[:, :73].double(), upcast=False
+    )
+    low_reference, _ = attention_ref(
+        q.float(),
+        k[:, :73].float(),
+        v.to(dtype)[:, :73].float(),
+        upcast=False,
+        intermediate_dtype=dtype,
+    )
+    check_tensor_vs_ref(
+        "out",
+        outputs[0][0].reshape_as(reference).double(),
+        reference,
+        low_reference.double(),
+        atol=2 * torch.finfo(torch.bfloat16).eps * reference.abs().max().item(),
+    )
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.double() / 8, k[:, :73].double())
+    lse = outputs[0][1].reshape(8, 2, 1).permute(1, 0, 2) if varlen else outputs[0][1]
+    assert torch.allclose(lse.double(), scores.logsumexp(-1), atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.skipif(not IS_SM100, reason="SM100 paged KV (TMA pages)")
 @pytest.mark.parametrize("d, page_size", [(128, 128), (64, 128), (128, 64)])
 @pytest.mark.parametrize("num_splits", [1, 3])
@@ -3769,5 +4111,3 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
     assert torch.equal(out_1024, first), (
         f"seqlen_k_per_split not batch-invariant: max_diff={max_diff}."
     )
-
-

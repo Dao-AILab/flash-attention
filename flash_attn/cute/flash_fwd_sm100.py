@@ -677,6 +677,13 @@ class FlashAttentionForwardSm100:
 
         tma_atom_K = None
         tma_atom_V = None
+        self.ragged_tma_V = (
+            self.use_tma_KV
+            and mPageTable is None
+            and (mCuSeqlensK is not None or mSeqUsedK is not None)
+            and not (isinstance(mV.stride[1], int) and mV.stride[1] == 0)
+        )
+        v_address_strides = None
         if const_expr(self.use_tma_KV):
             # TMA load for K
             tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
@@ -688,9 +695,38 @@ class FlashAttentionForwardSm100:
                 cta_layout_vmnk.shape,
             )
             # TMA load for V
+            # Bound V loads by the logical sequence length. Masking P alone cannot
+            # prevent unused NaN cache entries from entering the PV MMA (0 * NaN).
+            if const_expr(self.ragged_tma_V):
+                # Keep the real feature extent: padded Dv columns must also be
+                # zero-filled. Two address axes encode arbitrary aligned outer
+                # offsets without narrowing a byte offset to a single Int32.
+                v_address_strides = (
+                    mV.stride[2],
+                    mV.stride[3] if const_expr(mCuSeqlensK is None) else Int64(0),
+                    mV.stride[1],
+                )
+                alignment = 128 // self.v_dtype.width
+                # TMA byte strides must be < 2**40. The row and wrap strides
+                # sum to wrap_stride, and v_ragged_rows * wrap_stride == 2**64.
+                # A low-address extent of 2**30 + 1 prevents coalescing the
+                # two address axes into one coordinate wider than Int32.
+                wrap_stride = 2**40 // (self.v_dtype.width // 8)
+                self.v_ragged_rows = 2**64 // wrap_stride
+                mV_tma = cute.make_tensor(
+                    mV.iterator,
+                    cute.make_layout(
+                        (mV.shape[0], self.v_ragged_rows, 2**30 + 1,
+                         2**31 - 1, self.v_ragged_rows + 1),
+                        stride=(1, mV.stride[1], alignment, Int64(alignment * 2**30),
+                                wrap_stride - mV.stride[1]),
+                    ),
+                )
+            else:
+                mV_tma = mV
             tma_atom_V, mV = cute.nvgpu.make_tiled_tma_atom_B(
                 tma_load_op,
-                mV,
+                mV_tma,
                 cute.select(sV_layout, mode=[0, 1, 2]),
                 self.mma_tiler_pv,
                 tiled_mma_pv,
@@ -843,6 +879,7 @@ class FlashAttentionForwardSm100:
             mQ,
             mK,
             mV,
+            v_address_strides,
             mO,
             mLSE,
             mCuSeqlensQ,
@@ -906,6 +943,7 @@ class FlashAttentionForwardSm100:
         mQ: cute.Tensor,  # (s_q, d, h, b) or (total_q, d, h) if there is cu_seqlens_q
         mK: cute.Tensor,  # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there is cu_seqlens_k or (page_size, d, h_k, num_pages) if there is page_table
         mV: cute.Tensor,  # (d, s_k, h_k, b_k) or (d, total_k, h_k) if there is cu_seqlens_k or (d, page_size, h_k, num_pages) if there is page_table
+        v_address_strides: Optional[tuple],
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
@@ -1317,6 +1355,7 @@ class FlashAttentionForwardSm100:
                 mQ,
                 mK,
                 mV,
+                v_address_strides,
                 sQ,
                 sK,
                 sV,
@@ -1490,6 +1529,7 @@ class FlashAttentionForwardSm100:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        v_address_strides: Optional[tuple],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -1536,12 +1576,24 @@ class FlashAttentionForwardSm100:
             )
             if const_expr(mPageTable is None):
                 if const_expr(not seqlen.has_cu_seqlens_k):
-                    mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
+                    mK_cur = mK[None, None, head_idx_kv, batch_idx]
                 else:
                     mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
+                if const_expr(self.ragged_tma_V):
+                    outer_offset = (
+                        Int64(head_idx_kv) * v_address_strides[0]
+                        + Int64(batch_idx) * v_address_strides[1]
+                    )
+                    mV_cur = None  # V's row bound and address are formed per tile.
+                elif const_expr(not seqlen.has_cu_seqlens_k):
+                    mV_cur = mV[None, None, head_idx_kv, batch_idx]
+                else:
                     mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, head_idx_kv])
                 gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
-                gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+                gV = (
+                    cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+                    if const_expr(mV_cur is not None) else None
+                )
             else:
                 # Need to keep batch coord None since we'll index into it with page idx
                 mK_cur, mV_cur = [t[None, None, head_idx_kv, None] for t in (mK, mV)]
@@ -1552,7 +1604,7 @@ class FlashAttentionForwardSm100:
                     mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None, None)
                 )
             tSgK = thr_mma_qk.partition_B(gK)
-            tOgV = thr_mma_pv.partition_B(gV)
+            tOgV = thr_mma_pv.partition_B(gV) if const_expr(gV is not None) else None
             if const_expr(self.use_tma_Q):
                 tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
                 gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
@@ -1586,13 +1638,16 @@ class FlashAttentionForwardSm100:
                     cute.group_modes(sK, 0, 3),
                     cute.group_modes(tSgK, 0, 3),
                 )
-                tVsV, tVgV = cpasync.tma_partition(
-                    tma_atom_V,
-                    0,  # no multicast
-                    cute.make_layout(1),
-                    cute.group_modes(sV, 0, 3),
-                    cute.group_modes(tOgV, 0, 3),
-                )
+                if const_expr(not self.ragged_tma_V):
+                    tVsV, tVgV = cpasync.tma_partition(
+                        tma_atom_V,
+                        0,  # no multicast
+                        cute.make_layout(1),
+                        cute.group_modes(sV, 0, 3),
+                        cute.group_modes(tOgV, 0, 3),
+                    )
+                else:
+                    tVsV, tVgV = None, None
                 paged_kv_manager = None
             else:
                 page_size = mK.shape[0]
@@ -1625,16 +1680,23 @@ class FlashAttentionForwardSm100:
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
             )
-            load_V = partial(
-                self.load_KV,
-                tma_atom_V,
-                tVgV,
-                tVsV,
-                paged_kv_manager,
-                sV,
-                pipeline_kv=pipeline_kv,
-                K_or_V="V",
-            )
+            if const_expr(self.ragged_tma_V):
+                load_V = partial(
+                    self.load_V_ragged, tma_atom_V, mV, sV, thr_mma_pv,
+                    outer_offset, v_address_strides[2], seqlen.offset_k, seqlen.seqlen_k,
+                    pipeline_kv=pipeline_kv,
+                )
+            else:
+                load_V = partial(
+                    self.load_KV,
+                    tma_atom_V,
+                    tVgV,
+                    tVsV,
+                    paged_kv_manager,
+                    sV,
+                    pipeline_kv=pipeline_kv,
+                    K_or_V="V",
+                )
 
             if const_expr(not self.use_block_sparsity):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
@@ -3471,6 +3533,44 @@ class FlashAttentionForwardSm100:
         pack_gqa.load_Q(mQ, sQ_pi, gmem_tiled_copy_Q, tidx, m_block * self.q_stage + block, seqlen_q)
         cute.arch.cp_async_commit_group()
         pipeline_q.sync_object_full.arrive_cp_async_mbarrier(stage)
+
+    @cute.jit
+    def load_V_ragged(
+        self,
+        tma_atom: cute.CopyAtom,
+        mV: cute.Tensor,
+        sV: cute.Tensor,
+        thr_mma: cute.ThrMma,
+        outer_offset: Int64,
+        row_stride: Int64,
+        offset: Int32,
+        length: Int32,
+        block: Int32,
+        pipeline_kv: pipeline.PipelineAsync,
+        producer_state: pipeline.PipelineState,
+        page_idx: Optional[Int32] = None,
+    ):
+        assert page_idx is None
+        start = cutlass.max(block, 0) * self.n_block_size
+        valid = cutlass.min(cutlass.max(length - start, 0), self.n_block_size)
+        if block < 0:
+            valid = 0
+        # The row and wrap axes contribute (row - valid) * row_stride
+        # modulo 2^64. The two address axes supply the remaining offset.
+        address = outer_offset + (Int64(offset) + start + valid) * row_stride
+        address = address // (128 // self.v_dtype.width)
+        view = mV[None, None, Int32(address % 2**30), Int32(address // 2**30),
+                  self.v_ragged_rows]
+        view = cute.domain_offset((0, self.v_ragged_rows - valid), view)
+        gV = cute.local_tile(view, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+        tOgV = thr_mma.partition_B(gV)
+        tVsV, tVgV = cpasync.tma_partition(
+            tma_atom, 0, cute.make_layout(1),
+            cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3),
+        )
+        self.load_KV(
+            tma_atom, tVgV, tVsV, None, sV, 0, pipeline_kv, producer_state, "V"
+        )
 
     @cute.jit
     def load_KV(
