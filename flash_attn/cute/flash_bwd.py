@@ -11,6 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
+from cutlass.cute import FastDivmodDivisor
 from cutlass import Int32
 import cutlass.utils as utils_basic
 
@@ -19,7 +20,7 @@ from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import call_score_mod, call_score_mod_bwd
+from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from quack.cute_dsl_utils import ParamsBase
@@ -52,6 +53,7 @@ class FlashAttentionBackwardSm80:
         V_in_regs: bool = False,
         score_mod: cutlass.Constexpr | None = None,
         score_mod_bwd: cutlass.Constexpr | None = None,
+        has_aux_tensors: cutlass.Constexpr = False,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -100,6 +102,16 @@ class FlashAttentionBackwardSm80:
         self.share_QV_smem = V_in_regs
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
+        self.has_aux_tensors = has_aux_tensors
+        self.score_vec_size: cutlass.Constexpr = getattr(
+            score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
+        )
+        if self.score_vec_size > 2:
+            raise ValueError(
+                f"score_mod vec_size {self.score_vec_size} not supported on Sm80/120 "
+                "due to accumulator thread ownership pattern."
+            )
+        self.qk_acc_dtype = cutlass.Float32
 
     @staticmethod
     def can_implement(
@@ -444,6 +456,14 @@ class FlashAttentionBackwardSm80:
         softmax_scale_log2, _ = utils.compute_softmax_scale_log2(
             softmax_scale, self.score_mod
         )
+        fastdiv_mods = None
+        if cutlass.const_expr(aux_data.tensors is not None):
+            seqlen_q = mQ.shape[1] if cutlass.const_expr(mCuSeqlensQ is None) else mQ.shape[0]
+            seqlen_k = mK.shape[1] if cutlass.const_expr(mCuSeqlensK is None) else mK.shape[0]
+            fastdiv_mods = (
+                FastDivmodDivisor(seqlen_q),
+                FastDivmodDivisor(seqlen_k),
+            )
         self.kernel(
             mQ,
             mK,
@@ -482,6 +502,7 @@ class FlashAttentionBackwardSm80:
             tile_sched_params,
             TileScheduler,
             aux_data,
+            fastdiv_mods,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -529,6 +550,7 @@ class FlashAttentionBackwardSm80:
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         aux_data: AuxData = AuxData(),
+        fastdiv_mods=None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -550,6 +572,25 @@ class FlashAttentionBackwardSm80:
                 tile_m=self.m_block_size,
                 tile_n=self.n_block_size,
             )
+
+            recompute_fastdiv_mods_q = cutlass.const_expr(
+                aux_data.tensors is not None
+                and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
+            )
+            recompute_fastdiv_mods_k = cutlass.const_expr(
+                aux_data.tensors is not None
+                and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
+            )
+            if cutlass.const_expr(fastdiv_mods is not None):
+                seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                fastdiv_mods = (
+                    seqlen_q_divmod
+                    if not recompute_fastdiv_mods_q
+                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    seqlen_k_divmod
+                    if not recompute_fastdiv_mods_k
+                    else FastDivmodDivisor(seqlen.seqlen_k),
+                )
 
             block_info = BlockInfo(
                 self.m_block_size,
@@ -797,7 +838,12 @@ class FlashAttentionBackwardSm80:
                 m_block_max=m_block_max,
                 softmax_scale=softmax_scale,
                 softmax_scale_log2=softmax_scale_log2,
+                batch_idx=batch_idx,
+                head_idx=head_idx,
+                n_block=n_block,
+                seqlen=seqlen,
                 aux_data=aux_data,
+                fastdiv_mods=fastdiv_mods,
             )
 
             if m_block_min < m_block_max:
@@ -879,6 +925,100 @@ class FlashAttentionBackwardSm80:
             )
 
     @cute.jit
+    def apply_score_mod(
+        self,
+        acc_S: cute.Tensor,
+        thr_mma_sdp: cute.ThrMma,
+        batch_idx,
+        head_idx,
+        m_block,
+        n_block,
+        softmax_scale,
+        seqlen_info: SeqlenInfoQK,
+        aux_data: AuxData = AuxData(),
+        fastdiv_mods=None,
+    ):
+        cS = cute.make_identity_tensor(
+            (self.n_block_size, self.m_block_size)
+            if self.SdP_swapAB
+            else (self.m_block_size, self.n_block_size)
+        )
+        cS = cute.domain_offset(
+            (n_block * self.n_block_size, m_block * self.m_block_size)
+            if self.SdP_swapAB
+            else (m_block * self.m_block_size, n_block * self.n_block_size),
+            cS,
+        )
+        tScS = thr_mma_sdp.partition_C(cS)
+
+        apply_score_mod_inner(
+            acc_S,
+            tScS,
+            self.score_mod,
+            batch_idx,
+            head_idx,
+            softmax_scale,
+            self.score_vec_size,
+            self.qk_acc_dtype,
+            aux_data,
+            fastdiv_mods,
+            seqlen_info,
+            constant_q_idx=None,
+            qhead_per_kvhead=(
+                self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1
+            ),
+            transpose_indices=self.SdP_swapAB,
+        )
+
+    @cute.jit
+    def apply_score_mod_bwd(
+        self,
+        grad_tensor: cute.Tensor,
+        score_tensor: cute.Tensor,
+        thr_mma_sdp: cute.ThrMma,
+        batch_idx,
+        head_idx,
+        m_block,
+        n_block,
+        softmax_scale,
+        seqlen_info: SeqlenInfoQK,
+        aux_data: AuxData = AuxData(),
+        fastdiv_mods=None,
+    ):
+        cS = cute.make_identity_tensor(
+            (self.n_block_size, self.m_block_size)
+            if self.SdP_swapAB
+            else (self.m_block_size, self.n_block_size)
+        )
+        cS = cute.domain_offset(
+            (n_block * self.n_block_size, m_block * self.m_block_size)
+            if self.SdP_swapAB
+            else (m_block * self.m_block_size, n_block * self.n_block_size),
+            cS,
+        )
+        tScS = thr_mma_sdp.partition_C(cS)
+
+        apply_score_mod_bwd_inner(
+            grad_tensor,
+            score_tensor,
+            tScS,
+            self.score_mod_bwd,
+            batch_idx,
+            head_idx,
+            softmax_scale,
+            self.score_vec_size,
+            self.qk_acc_dtype,
+            aux_data,
+            fastdiv_mods,
+            seqlen_info,
+            constant_q_idx=None,
+            qhead_per_kvhead=(
+                self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1
+            ),
+            transpose_indices=self.SdP_swapAB,
+        )
+
+    @cute.jit
     def compute_one_m_block(
         self,
         m_block: cutlass.Int32,
@@ -894,7 +1034,12 @@ class FlashAttentionBackwardSm80:
         m_block_max: cutlass.Int32,
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
+        batch_idx: cutlass.Int32,
+        head_idx: cutlass.Int32,
+        n_block: cutlass.Int32,
+        seqlen: SeqlenInfoQK,
         aux_data: AuxData = AuxData(),
+        fastdiv_mods=None,
         mask_fn: Optional[Callable] = None,
     ):
         def load_Q_next():
@@ -932,19 +1077,18 @@ class FlashAttentionBackwardSm80:
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
         acc_S_pre_mn = layout_utils.reshape_acc_to_mn(acc_S_pre)
         if cutlass.const_expr(self.score_mod is not None):
-            for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
-                acc_S_mn[r, None].store(
-                    call_score_mod(
-                        self.score_mod,
-                        acc_S_mn[r, None].load() * softmax_scale,
-                        0,
-                        0,
-                        0,
-                        0,
-                        None,
-                        aux_data,
-                    )
-                )
+            self.apply_score_mod(
+                acc_S,
+                mma_params.thr_mma_sdp,
+                batch_idx,
+                head_idx,
+                m_block,
+                n_block,
+                softmax_scale,
+                seqlen,
+                aux_data,
+                fastdiv_mods,
+            )
         if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, m_block=m_block)
         bidx = 0
@@ -977,19 +1121,21 @@ class FlashAttentionBackwardSm80:
         assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
             grad_val = acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
-            if cutlass.const_expr(self.score_mod_bwd is not None):
-                grad_val = call_score_mod_bwd(
-                    self.score_mod_bwd,
-                    grad_val,
-                    acc_S_pre_mn[r, None].load() * softmax_scale,
-                    0,
-                    0,
-                    0,
-                    0,
-                    None,
-                    aux_data,
-                )
             acc_dP_mn[r, None].store(grad_val)
+        if cutlass.const_expr(self.score_mod_bwd is not None):
+            self.apply_score_mod_bwd(
+                acc_dP,
+                acc_S_pre,
+                mma_params.thr_mma_sdp,
+                batch_idx,
+                head_idx,
+                m_block,
+                n_block,
+                softmax_scale,
+                seqlen,
+                aux_data,
+                fastdiv_mods,
+            )
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))
