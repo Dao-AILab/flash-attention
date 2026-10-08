@@ -399,7 +399,6 @@ public:
         // swizzle. Instead we want to divide by the remainder.
         int const num_hb_remainder = (args.num_head * args.num_batch) % swizzle;
         // printf("num_blocks = %d, num_head = %d, num_batch = %d, size_one_head = %d, ratio = %d, swizzle = %d, num_hb_remainder = %d\n", args.num_blocks, args.num_head, args.num_batch, size_one_head, size_l2 / size_one_head, swizzle, num_hb_remainder);
-        assert(args.tile_count_semaphore != nullptr);
         return {args.num_blocks * args.num_head * args.num_batch,
                 cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head),
                 cutlass::FastDivmod(swizzle), cutlass::FastDivmod(swizzle * args.num_blocks),
