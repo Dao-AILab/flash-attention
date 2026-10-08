@@ -87,6 +87,15 @@ USE_BLOCKS_TO_BATCH: bool = True
 S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT = {64: 16, 128: 64}
 
 
+def _normalize_max_seqlen(max_seqlen: Optional[int]) -> Optional[int]:
+    """Return a host scalar for compiled forward-kernel scalar arguments."""
+    if isinstance(max_seqlen, torch.Tensor):
+        if max_seqlen.numel() != 1:
+            raise ValueError("max_seqlen must be a scalar")
+        return int(max_seqlen.item())
+    return max_seqlen
+
+
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
     import re
@@ -1008,6 +1017,11 @@ def _flash_attn_fwd(
         ):
             # Prefer 2CTA over cp.async-Q PackGQA for hd256.
             pack_gqa = False
+
+    # SM100/SM110 pass max_seqlen_q as a typed kernel argument.  On other
+    # architectures, preserve a tensor value to avoid an unnecessary host sync.
+    if arch // 10 in [10, 11]:
+        max_seqlen_q = _normalize_max_seqlen(max_seqlen_q)
 
     fwd_cfg = _get_fwd_config(
         arch=arch,
