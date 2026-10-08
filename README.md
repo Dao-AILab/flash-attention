@@ -231,6 +231,27 @@ docker build -t flash-attn-triton .
 docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri flash-attn-triton
 ```
 
+#### AITER Native Backend
+
+The AITER native backend delegates dense `flash_attn_func` calls to AITER's dispatcher, which can select FMHA v3 ASM kernels or another supported AITER implementation. Other FlashAttention APIs continue to use the existing AITER Triton integration. Softcap is not currently supported by the AITER native backend.
+
+To install the bundled full AITER package while keeping the Triton version provided by the ROCm PyTorch environment:
+```sh
+cd flash-attention
+FLASH_ATTENTION_AITER_ENABLE="TRUE" AITER_USE_SYSTEM_TRITON=1 pip install --no-build-isolation .
+```
+
+To use an existing full AITER installation:
+```sh
+cd flash-attention
+FLASH_ATTENTION_AITER_ENABLE="TRUE" FLASH_ATTENTION_USE_SYSTEM_AITER="TRUE" pip install --no-build-isolation .
+```
+
+Set the backend flag when running an application:
+```sh
+export FLASH_ATTENTION_AITER_ENABLE="TRUE"
+```
+
 ## How to use FlashAttention
 
 The main functions implement scaled dot product attention (softmax(Q @ K^T *
