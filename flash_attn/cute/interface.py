@@ -458,6 +458,29 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
     return causal, local, window_size_left, window_size_right
 
 
+def _validate_kv_start(kv_start, name, batch_size, seqlen, device, arch, **unsupported):
+    """kv_start / q_end: per-row int32 bounds of a causal or local window (SM100/SM110, batched)."""
+    assert arch // 10 in [10, 11], f"{name} is only supported on SM100/SM110"
+    for feature, used in unsupported.items():
+        assert not used, f"{name} does not support {feature}"
+    _validate_tensor(kv_start, name, (batch_size, seqlen), torch.int32, device)
+    assert kv_start.is_contiguous(), f"{name} must be contiguous"
+
+
+def _kv_start_window(causal, local, window_size_left, window_size_right):
+    """kv_start runs as a local window whose left edge moves per query; the right edge stays causal."""
+    assert causal or (local and window_size_right == 0), "kv_start needs causal=True"
+    return False, True, window_size_left, 0
+
+
+def _q_end_from_kv_start(kv_start: torch.Tensor, seqlen_k: int) -> torch.Tensor:
+    """One past the last query that may attend each key; exact because kv_start is non-decreasing."""
+    keys = torch.arange(seqlen_k, dtype=kv_start.dtype, device=kv_start.device)
+    return torch.searchsorted(
+        kv_start, keys.expand(kv_start.shape[0], seqlen_k).contiguous(), right=True, out_int32=True
+    )
+
+
 def _compute_tile_cumsum(
     *,
     num_m_blocks: Optional[torch.Tensor] = None,
@@ -716,6 +739,7 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    kv_start: Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -732,6 +756,9 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
+        kv_start: Optional (batch, seqlen_q) int32 tensor, non-decreasing along the sequence:
+            the first key each query may attend, on top of the causal (or local) window.
+            Describes causal document masking with O(seqlen) metadata (see flash_attn_func).
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
@@ -927,6 +954,23 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
+    if kv_start is not None:
+        _validate_kv_start(
+            kv_start, "kv_start", batch_size, seqlen_q, device, arch,
+            varlen=cu_seqlens_q is not None or cu_seqlens_k is not None
+            or seqused_q is not None or seqused_k is not None,
+            paged_kv=page_table is not None,
+            qv=qv is not None,
+            gather_kv_indices=gather_kv_indices is not None,
+            mask_mod=mask_mod is not None,
+            block_sparsity=use_block_sparsity,
+            head_dim_256=head_dim == 256,
+            num_splits=num_splits > 1,
+        )
+        causal, local, window_size_left, window_size_right = _kv_start_window(
+            causal, local, window_size_left, window_size_right
+        )
+        num_splits = 1
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
@@ -1473,6 +1517,7 @@ def _flash_attn_fwd(
         page_table is not None,
         window_size_left is not None,
         window_size_right is not None,
+        kv_start is not None,
         (
             torch2cute_dtype_map[learnable_sink.dtype]
             if learnable_sink is not None
@@ -1835,6 +1880,11 @@ def _flash_attn_fwd(
                     blocks_to_batch_idx_tensor,
                     max_seqlen_q,
                 ])
+                compile_args.append(
+                    to_cute_tensor(kv_start, assumed_align=4, leading_dim=1)
+                    if kv_start is not None
+                    else None
+                )
             elif arch // 10 in [8, 9, 12]:
                 compile_args.extend([
                     cu_total_m_blocks_tensor,
@@ -1927,6 +1977,7 @@ def _flash_attn_fwd(
                     blocks_to_batch_idx,
                     max_seqlen_q,
                 ])
+                call_args.append(kv_start)
             elif arch // 10 in [8, 9, 12]:
                 call_args.extend([
                     cu_total_m_blocks,
@@ -2276,6 +2327,7 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    q_end: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, ...]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
@@ -2318,6 +2370,18 @@ def _flash_attn_bwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
+    if q_end is not None:
+        _validate_kv_start(
+            q_end, "q_end", k.shape[0], k.shape[1], k.device, arch,
+            varlen=cu_seqlens_q is not None or cu_seqlens_k is not None
+            or seqused_q is not None or seqused_k is not None,
+            mask_mod=mask_mod is not None,
+            block_sparsity=block_sparse_tensors is not None,
+            head_dim_256=head_dim == 256,
+        )
+        causal, local, window_size_left, window_size_right = _kv_start_window(
+            causal, local, window_size_left, window_size_right
+        )
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
@@ -2828,6 +2892,7 @@ def _flash_attn_bwd(
             cu_total_m_blocks_k is not None,
             use_dedicated_hd256_kernel and cu_seqlens_q is not None and max_seqlen_q is None,
             use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
+            q_end is not None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2992,6 +3057,10 @@ def _flash_attn_bwd(
         ]
         if not use_dedicated_hd256_kernel:
             compile_args.append(cu_total_m_blocks_k_tensor)
+            if arch // 10 in [10, 11]:
+                compile_args.append(
+                    to_cute_tensor(q_end, assumed_align=4, leading_dim=1) if q_end is not None else None
+                )
         else:
             compile_args.extend(
                 (
@@ -3047,6 +3116,8 @@ def _flash_attn_bwd(
         ]
         if not use_dedicated_hd256_kernel:
             call_args.append(cu_total_m_blocks_k)
+            if arch // 10 in [10, 11]:
+                call_args.append(q_end)
         else:
             call_args.extend(
                 (
@@ -3757,6 +3828,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        kv_start: Optional[torch.Tensor] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3787,8 +3859,9 @@ class FlashAttnFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            kv_start=kv_start,
         )
-        ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
+        ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, kv_start, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
         ctx.shared_kv = shared_kv
         ctx.softmax_scale = softmax_scale
@@ -3808,7 +3881,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
-        q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *aux = ctx.saved_tensors
+        q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, kv_start, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
@@ -3834,9 +3907,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 15)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 14)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 15)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3859,13 +3932,14 @@ class FlashAttnFunc(torch.autograd.Function):
                 block_sparse_tensors=ctx.block_sparse_tensors_bwd,
                 dlse=dlse,
                 learnable_sink=learnable_sink,
+                q_end=_q_end_from_kv_start(kv_start, k.shape[1]) if kv_start is not None else None,
             )
             if learnable_sink is None:
                 dq, dk, dv = bwd_result
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 14)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 15)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -4119,7 +4193,14 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    kv_start: Optional[torch.Tensor] = None,
 ):
+    """kv_start: optional (batch, seqlen_q) int32, non-decreasing along the sequence. With causal=True,
+    query i may only attend keys j with kv_start[b, i] <= j, in addition to the causal and window_size
+    limits. For packed documents pass each token's document start (i + 1 for padding, which then
+    attends nothing). This is causal document masking with O(seqlen) metadata, without a mask_mod or
+    block sparsity. SM100/SM110, batched (non-varlen) inputs, not head_dim 256.
+    """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -4161,6 +4242,7 @@ def flash_attn_func(
         return_lse,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        kv_start,
     )
 
 

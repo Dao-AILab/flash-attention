@@ -548,9 +548,17 @@ class FlashAttentionBackwardSm100:
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        # (b, s_k) int32 one past the last query that may attend each key, non-decreasing;
+        # the backward counterpart of the forward's mKvStart (needs is_local).
+        mQEnd: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
+        if const_expr(mQEnd is not None):
+            assert self.is_local, "mQEnd needs is_local (window_size_right sets the diagonal)"
+            assert blocksparse_tensors is None, "mQEnd replaces block sparsity"
+            assert mCuSeqlensQ is None and mCuSeqlensK is None, "mQEnd supports batched inputs only"
+        self.has_q_end = mQEnd is not None
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
@@ -1093,6 +1101,7 @@ class FlashAttentionBackwardSm100:
             aux_data,
             fastdiv_mods,
             blocksparse_tensors,
+            mQEnd,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1176,6 +1185,7 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mQEnd: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1523,6 +1533,7 @@ class FlashAttentionBackwardSm100:
             mSeqUsedK=mSeqUsedK,
             tile_m=self.tile_m,
             tile_n=self.tile_n * self.cluster_shape_mnk[0],
+            mQEnd=mQEnd,
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
@@ -4014,7 +4025,7 @@ class FlashAttentionBackwardSm100:
                 self.deterministic
                 and not self.spt
                 and not self.use_block_sparsity
-                and block_info.window_size_left is not None
+                and (block_info.window_size_left is not None or self.has_q_end)
             ):
                 m_block_global_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
                 for m_block in cutlass.range(m_block_max, m_block_global_max, unroll=1):
