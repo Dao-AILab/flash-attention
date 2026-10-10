@@ -69,6 +69,9 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 MLA_1CTA = os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
 # SplitKV is not supported on SM90 or SM120
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
+# FLASH_ATTENTION_HD256_GENERIC_BWD=1 runs the hdim 256 backward on the general kernel, which
+# supports the features the dedicated kernels skip below.
+HD256_GENERIC_BWD = os.getenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "0") == "1"
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 IS_SM110 = torch.cuda.get_device_capability()[0] == 11
 IS_SM120 = torch.cuda.get_device_capability()[0] == 12
@@ -511,7 +514,7 @@ def test_flash_attn_output(
         pytest.xfail("has_qv: local not supported yet")
     # The SM100 head_dim=256 backward does not support these features yet (the forward does).
     # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
+    if d == 256 and IS_SM100 and not HD256_GENERIC_BWD:
         if has_learnable_sink:
             pytest.skip("SM100 head_dim=256 backward does not support learnable_sink yet")
         if local:
@@ -710,7 +713,7 @@ def test_flash_attn_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
+                or (IS_SM100 and d == 256 and dv == 256 and (softcap == 0.0 or HD256_GENERIC_BWD))
             )
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
@@ -1355,7 +1358,7 @@ def test_flash_attn_varlen_output(
         pytest.skip()
     # The SM100 head_dim=256 backward does not support these features yet (the forward does).
     # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
+    if d == 256 and IS_SM100 and not HD256_GENERIC_BWD:
         if has_learnable_sink:
             pytest.skip("SM100 head_dim=256 backward does not support learnable_sink yet")
         if local:
@@ -1664,7 +1667,7 @@ def test_flash_attn_varlen_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
+                or (IS_SM100 and d == 256 and dv == 256 and (softcap == 0.0 or HD256_GENERIC_BWD))
             )
             and not has_learnable_sink
             # and False
