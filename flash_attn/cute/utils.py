@@ -102,6 +102,27 @@ def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
         return _fa_disable_2cta_enabled
 
 
+def _get_bwd_pack_gqa_override() -> Optional[bool]:
+    """FLASH_ATTENTION_BWD_PACK_GQA=0/1 forces the SM100 backward GQA head packing off / on
+    (NOTE [bwd pack_gqa] in flash_bwd_sm100.py); unset or "auto" leaves it to the heuristic."""
+    value = os.getenv("FLASH_ATTENTION_BWD_PACK_GQA")
+    if value is None or value == "" or value == "auto":
+        return None
+    assert value in ("0", "1"), f"FLASH_ATTENTION_BWD_PACK_GQA must be 0, 1 or auto, got {value}"
+    return value == "1"
+
+
+def _get_bwd_tile_n_override() -> Optional[int]:
+    """Test knob: FLASH_ATTENTION_BWD_TILE_N=64 selects the 64-row KV tile per CTA on the SM100
+    2CTA backward (the layout the hd256 backward needs). Unset or 128 keeps the default."""
+    value = os.getenv("FLASH_ATTENTION_BWD_TILE_N")
+    if value is None or value == "":
+        return None
+    tile_n = int(value)
+    assert tile_n in (64, 128), f"FLASH_ATTENTION_BWD_TILE_N must be 64 or 128, got {value}"
+    return tile_n
+
+
 def _compute_base_hash(func: Callable) -> str:
     """Compute a hash from callable code and captured compile-time values."""
     try:

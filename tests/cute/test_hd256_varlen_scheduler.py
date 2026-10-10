@@ -6,7 +6,6 @@ Set FLASH_ATTENTION_HD256_STRESS=1 for additional randomized cases.
 """
 
 import os
-from functools import partial
 from unittest.mock import Mock
 
 import pytest
@@ -98,6 +97,8 @@ def run_varlen(q, k, v, dout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seql
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         causal=causal,
+        # The bit-equality checks below need a fixed dQ / dK / dV reduction order.
+        deterministic=True,
     )
     dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
     return out.detach(), dq, dk, dv
@@ -244,10 +245,10 @@ def test_hd256_varlen_maxima_compile_keys(causal, monkeypatch):
 
     by_mode["int"] = run("int")
     torch.cuda.synchronize()
-    # The forward reads lengths on device and does not specialize on the maxima; the hd256
-    # backward still selects a separate specialization for explicit int maxima.
-    assert (len(fwd_cache.cache), len(bwd_cache.cache)) == (1, 2), (
-        "explicit int maxima should select a distinct backward specialization only"
+    # Neither kernel specializes on the maxima: the forward reads lengths on device and the
+    # backward derives its grid from cu_seqlens, so explicit int maxima reuse both keys.
+    assert (len(fwd_cache.cache), len(bwd_cache.cache)) == (1, 1), (
+        "explicit int maxima should not select a distinct specialization"
     )
     assert all(
         not torch.is_tensor(value)
@@ -431,22 +432,6 @@ def test_hd256_paged_maximum_uses_table_extent(max_mode, num_splits):
         False,
         dtype,
     )
-
-
-def test_hd256_clc_requires_host_maximum(monkeypatch):
-    monkeypatch.setattr(_flash_attn_bwd, "compile_cache", JITCache())
-    monkeypatch.setattr(
-        interface,
-        "BlackwellFusedMultiHeadAttentionBackward",
-        partial(interface.BlackwellFusedMultiHeadAttentionBackward, use_clc_scheduler=True),
-    )
-    q, k, v, dout = make_inputs((128, 256), (128, 256), torch.bfloat16)
-    cu = make_cu_seqlens((128, 256))
-    with pytest.raises(
-        Exception, match="SM100 hd256 varlen dQ requires max_seqlen_q for grid sizing"
-    ):
-        run_varlen(q, k, v, dout, cu, cu, None, None, False)
-    torch.cuda.synchronize()
 
 
 # ---------------------------------------------------------------------------

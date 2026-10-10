@@ -82,15 +82,6 @@ def test_flash_attn_output(
         pytest.xfail("headdim 192 not supported on sm90")
     if d == 256 and IS_SM90:
         pytest.xfail("hdim > 192 backward: SM90 not supported yet")
-    # The SM100 head_dim=256 backward does not support these features yet (the forward does).
-    # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 backward does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 backward does not support local attention yet")
-        if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 backward does not support softcap yet")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -431,15 +422,6 @@ def test_flash_attn_varlen_output(
         pytest.xfail("headdim 192 not supported on sm90")
     if d == 256 and IS_SM90:
         pytest.xfail("hdim > 192 backward: SM90 not supported yet")
-    # The SM100 head_dim=256 backward does not support these features yet (the forward does).
-    # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 backward does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 backward does not support local attention yet")
-        if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 backward does not support softcap yet")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
