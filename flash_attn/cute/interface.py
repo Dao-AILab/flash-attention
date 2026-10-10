@@ -2149,6 +2149,7 @@ def _compile_bwd_postprocess(
     has_cu_total_m_blocks,
     learnable_sink_dtype,
     hdim_multiple_of,
+    accum_row_major=False,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -2174,6 +2175,7 @@ def _compile_bwd_postprocess(
         use_2cta_instrs=use_2cta_instrs,
         cluster_size=cluster_size,
         hdim_multiple_of=hdim_multiple_of,
+        accum_row_major=accum_row_major,
     )
     return cute.compile(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
@@ -2193,6 +2195,7 @@ def _bwd_postprocess_convert(
     cu_total_m_blocks=None,
     sink_tensors=None,
     hdim_multiple_of=32,
+    accum_row_major=False,
     *,
     fake_mode,
 ):
@@ -2219,6 +2222,7 @@ def _bwd_postprocess_convert(
             else None
         ),
         hdim_multiple_of,
+        accum_row_major,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
@@ -2339,6 +2343,7 @@ def _flash_attn_bwd(
         dQ_single_wg = False
         cluster_size = 1
         use_2cta_instrs = False
+        bwd_dkv_accum_row_major = False
         num_threads = 128
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
@@ -2367,6 +2372,7 @@ def _flash_attn_bwd(
         dQ_single_wg = cfg.dQ_single_wg
         cluster_size = 1
         use_2cta_instrs = False
+        bwd_dkv_accum_row_major = False
     else:
         m_block_size = 128
         n_block_size = 128
@@ -2381,6 +2387,20 @@ def _flash_attn_bwd(
             and not requested_disable_2cta
             and block_sparse_bwd_supports_2cta(block_sparse_tensors, n_block_size)
         )
+        # 64-row KV tile per CTA (M=64 accumulator layout), see NOTE [M=64 accumulator layout] in
+        # flash_bwd_sm100.py. Test knob for now; only the pipelined 2CTA schedule (hdim <= 128)
+        # is wired.
+        bwd_tile_n_override = utils._get_bwd_tile_n_override()
+        if (
+            bwd_tile_n_override == 64
+            and use_2cta_instrs
+            and head_dim <= 128
+            and block_sparse_tensors is None
+        ):
+            n_block_size = 64
+        # The 64-row tile writes the GQA dK/dV accumulate tile row-major (NOTE [M=64
+        # accumulator layout]); the postprocess has to read it the same way.
+        bwd_dkv_accum_row_major = use_2cta_instrs and n_block_size == 64
         if block_sparse_tensors is not None and head_dim == 192 and not use_2cta_instrs:
             reason = (
                 "2CTA was disabled by request"
@@ -3097,6 +3117,7 @@ def _flash_attn_bwd(
                 cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
                 fake_mode=fake_mode,
                 hdim_multiple_of=hdim_multiple_of,
+                accum_row_major=bwd_dkv_accum_row_major,
             )
             # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
             _bwd_postprocess_convert(
@@ -3108,6 +3129,7 @@ def _flash_attn_bwd(
                 cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
                 fake_mode=fake_mode,
                 hdim_multiple_of=hdim_multiple_of,
+                accum_row_major=bwd_dkv_accum_row_major,
             )
 
     return (dq, dk, dv) if learnable_sink is None else (dq, dk, dv, dsink)
