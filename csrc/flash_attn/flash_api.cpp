@@ -6,6 +6,7 @@
 #include <torch/python.h>
 #include <torch/nn/functional.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAStream.h>
 #ifndef FLASHATTENTION_DISABLE_DROPOUT
 #include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::PhiloxCudaState / at::CUDAGeneratorImpl (default-generator dropout path)
@@ -1430,14 +1431,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_DEVICE(seqlens_k);
         CHECK_CONTIGUOUS(seqlens_k);
         CHECK_SHAPE(seqlens_k, batch_size);
-        // Defense-in-depth for the paged KV cache. The split-KV kernel indexes block_table with
-        // block_table[n_block * kBlockN / page_block_size], bounded only by actual_seqlen_k, which
-        // in this path is seqlens_k[b] + seqlen_knew (leftpad_k is disallowed with paged KV below).
-        // block_table only has max_num_blocks_per_seq entries per sequence, so if any sequence length
-        // exceeds max_num_blocks_per_seq * page_block_size the kernel reads block_table out of bounds.
-        // The kernel itself does no such check, so validate the caller contract here.
-        // Note: .max().item() forces a device->host sync, so we only pay it for the paged KV case.
-        if (paged_KV) {
+        // .max().item() synchronizes with the host, so skip this check during graph capture.
+        // Callers must keep sequence lengths within capacity on every graph replay.
+        if (paged_KV && c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None) {
             const int seqlen_knew = k_.has_value() ? k.size(1) : 0;
             const int max_seqlen_k = seqlens_k.max().item<int>() + seqlen_knew;
             TORCH_CHECK(max_seqlen_k <= max_num_blocks_per_seq * page_block_size,
