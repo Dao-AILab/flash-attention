@@ -1152,6 +1152,51 @@ def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_
     assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="kv_start requires SM100/SM110")
+@pytest.mark.parametrize("seqlen", [113, 1024])
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS)
+def test_cute_score_mod_with_kv_start(seqlen, dim, score_mod_triple):
+    """score_mod on kv_start document masking matches flex_attention with a document mask_mod."""
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_ref = score_mod_triple
+    batch_size, num_heads, dtype = 2, 4, torch.bfloat16
+    q, k, v = [
+        torch.randn(batch_size, seqlen, num_heads, dim, device="cuda", dtype=dtype)
+        for _ in range(3)
+    ]
+    doc_ids = (torch.rand(batch_size, seqlen, device="cuda") < 4.0 / seqlen).cumsum(dim=1)
+    pos = torch.arange(seqlen, device="cuda")
+    is_first = torch.ones_like(doc_ids, dtype=torch.bool)
+    is_first[:, 1:] = doc_ids[:, 1:] != doc_ids[:, :-1]
+    kv_start = torch.where(is_first, pos, 0).cummax(dim=1).values.to(torch.int32).contiguous()
+
+    q_, k_, v_ = [t.clone().requires_grad_() for t in (q, k, v)]
+    out = flash_attn_func(
+        q_, k_, v_, causal=True, kv_start=kv_start, score_mod=cute_fwd, score_mod_bwd=cute_bwd
+    )[0]
+    grad_out = torch.randn_like(out)
+    grads = torch.autograd.grad(out, (q_, k_, v_), grad_out)
+
+    def document_causal(b, h, q_idx, kv_idx):
+        return (doc_ids[b, q_idx] == doc_ids[b, kv_idx]) & (kv_idx <= q_idx)
+
+    block_mask = create_block_mask(document_causal, batch_size, None, seqlen, seqlen, device="cuda")
+
+    def run_flex(flex_dtype):
+        qf, kf, vf = [t.transpose(1, 2).to(flex_dtype).contiguous().requires_grad_() for t in (q, k, v)]
+        o = torch.compile(flex_attention)(qf, kf, vf, score_mod=eager_ref, block_mask=block_mask)
+        g = torch.autograd.grad(o, (qf, kf, vf), grad_out.transpose(1, 2).to(flex_dtype))
+        return [t.transpose(1, 2) for t in (o, *g)]
+
+    ref, pt = run_flex(torch.float32), run_flex(dtype)
+    for name, x, x_ref, x_pt in zip(("out", "dQ", "dK", "dV"), (out, *grads), ref, pt):
+        atol = 2 * (x_ref + 0.3 - 0.3 - x_ref).abs().max().item()
+        err = (x.float() - x_ref).abs().max().item()
+        pt_err = (x_pt.float() - x_ref).abs().max().item()
+        assert err <= 2 * pt_err + atol, f"{name}: {err=:.2e} {pt_err=:.2e} {atol=:.2e}"
+
+
 def make_aux_tensors_for_bwd(cute_score_mod, eager_factory, seqlen_q, num_heads, batch_size, dtype):
     if cute_score_mod == score_mod_10:
         buffer = torch.randn(batch_size, device="cuda", dtype=dtype) * 0.1

@@ -72,6 +72,7 @@ _UNSUPPORTED = [
     ({"has_cu_seqlens_k": True}, "cu_seqlens_k"),
     ({"has_seqused_q": True}, "seqused_q"),
     ({"has_learnable_sink": True}, "learnable_sink"),
+    ({"has_kv_start": True}, "kv_start"),
     ({"use_block_sparsity": True}, "block_sparse_tensors"),
     ({"has_aux_scalars": True}, "aux_scalars"),
     ({"has_caller_scheduler_metadata": True}, "scheduler_metadata"),

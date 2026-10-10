@@ -136,6 +136,7 @@ class FwdHeuristicInputs(NamedTuple):
     has_mask_mod: bool = False
     has_learnable_sink: bool = False
     has_lse: bool = False
+    has_kv_start: bool = False
     requested_tile_m: int | None = None
     requested_tile_n: int | None = None
     requested_mma_pv_is_rs: bool | None = None
@@ -1186,6 +1187,7 @@ class SwapABPolicy:
             "cu_seqlens_k": inputs.has_cu_seqlens_k,
             "seqused_q": inputs.has_seqused_q,
             "learnable_sink": inputs.has_learnable_sink,
+            "kv_start": inputs.has_kv_start,
             "block_sparse_tensors": inputs.use_block_sparsity,
             "aux_scalars": inputs.has_aux_scalars,
             "scheduler_metadata": inputs.has_caller_scheduler_metadata,
