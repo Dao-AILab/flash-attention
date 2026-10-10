@@ -753,6 +753,14 @@ class AttentionMask:
                     if const_expr(self.window_size_left is not None)
                     else 0
                 )
+                if const_expr(self.seqlen_info.kv_start is not None):
+                    # Each thread owns one row: its left edge comes from kv_start.
+                    row_kv_start = self.seqlen_info.kv_start[
+                        cutlass.min(row_idx, self.seqlen_q - 1)
+                    ]
+                    col_limit_left = cutlass.max(
+                        col_limit_left, row_kv_start - n_block * self.tile_n
+                    )
                 if const_expr(not r2p):
                     # if cute.arch.thread_idx()[0] == 0 or cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", m_block, n_block, row_idx, causal_row_offset, col_limit_right, col_limit_left)
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
@@ -924,8 +932,20 @@ class AttentionMask:
                     row_limit_top = causal_offset - self.window_size_right
                 else:
                     row_limit_top = 0
+                has_bot = const_expr(
+                    self.window_size_left is not None or self.seqlen_info.q_end is not None
+                )
                 if const_expr(self.window_size_left is not None):
                     row_limit_bot = causal_offset + self.window_size_left
+                if const_expr(self.seqlen_info.q_end is not None):
+                    # Each thread owns one key column: its last query comes from q_end.
+                    col_idx = n_block * self.tile_n + thr_col_offset
+                    col_q_end = self.seqlen_info.q_end[cutlass.min(col_idx, self.seqlen_k - 1)]
+                    q_limit_bot = col_q_end - 1 - m_block * self.tile_m - thr_row_offset
+                    if const_expr(self.window_size_left is not None):
+                        row_limit_bot = cutlass.min(row_limit_bot, q_limit_bot)
+                    else:
+                        row_limit_bot = q_limit_bot
                 if const_expr(mask_seqlen):
                     if seqlenk_col_limit <= 0:
                         row_limit_top = self.tile_m
@@ -934,7 +954,7 @@ class AttentionMask:
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         row_idx = t0ScS_t2r[i][ROW]
                         local_mask = row_idx < row_limit_top
-                        if const_expr(self.window_size_left is not None):
+                        if const_expr(has_bot):
                             local_mask |= row_idx > row_limit_bot
                         acc_S[i] = -cutlass.Float32.inf if local_mask else acc_S[i]
                 else:
@@ -946,7 +966,7 @@ class AttentionMask:
                         row_limit = row_to_r2p_idx(row_limit_top, num_rep, num_wg)
                         mask = r2p_bitmask_above(row_limit, s)
 
-                        if const_expr(self.window_size_left is not None):
+                        if const_expr(has_bot):
                             row_limit_bottom = row_to_r2p_idx(row_limit_bot + 1, num_rep, num_wg)
                             mask = mask & r2p_bitmask_below(row_limit_bottom, s)
 

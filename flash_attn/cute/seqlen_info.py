@@ -79,6 +79,9 @@ class SeqlenInfoQK:
     has_seqused_q: cutlass.Constexpr[bool]
     has_seqused_k: cutlass.Constexpr[bool]
     has_cu_block_idx_offsets: cutlass.Constexpr[bool] = False
+    # Per-row bounds of an interval mask, sliced to this batch (see create()).
+    kv_start: Optional[cute.Tensor] = None
+    q_end: Optional[cute.Tensor] = None
 
     @staticmethod
     def create(
@@ -93,7 +96,11 @@ class SeqlenInfoQK:
         mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
+        mKvStart: Optional[cute.Tensor] = None,
+        mQEnd: Optional[cute.Tensor] = None,
     ):
+        """mKvStart (b, s_q): first key each query may attend. mQEnd (b, s_k): one past the last
+        query that may attend each key. Both int32 and non-decreasing along the sequence."""
         offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
         offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
         padded_offset_q = (
@@ -144,6 +151,8 @@ class SeqlenInfoQK:
             has_seqused_q=mSeqUsedQ is not None,
             has_seqused_k=mSeqUsedK is not None,
             has_cu_block_idx_offsets=mCuBlockIdxOffsets is not None,
+            kv_start=mKvStart[batch_idx, None] if const_expr(mKvStart is not None) else None,
+            q_end=mQEnd[batch_idx, None] if const_expr(mQEnd is not None) else None,
         )
 
     def offset_batch_Q(

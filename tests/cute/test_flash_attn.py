@@ -959,6 +959,141 @@ def test_flash_attn_varlen_learnable_sink_backward_with_lse(sink_dtype):
     check_dsink_vs_ref(dsink, dsink_ref, dsink_pt, rtol=3)
 
 
+def _random_doc_ids(batch_size, seqlen, mean_doc_len, max_pad, device):
+    """(batch, seqlen) document ids for packed sequences; 0 marks right padding."""
+    starts = torch.rand(batch_size, seqlen, device=device) < 1.0 / mean_doc_len
+    doc_ids = starts.cumsum(dim=1, dtype=torch.int32) + 1
+    if max_pad > 0:
+        seqlen_real = seqlen - torch.randint(0, max_pad + 1, (batch_size, 1), device=device)
+        doc_ids = doc_ids.masked_fill(torch.arange(seqlen, device=device) >= seqlen_real, 0)
+    return doc_ids
+
+
+def _kv_start_for_documents(doc_ids, window_size_left=None):
+    """First key each token may attend: its document start, clipped to a sliding window.
+    Padding (id 0) gets i + 1, so it attends nothing."""
+    pos = torch.arange(doc_ids.shape[1], device=doc_ids.device).expand_as(doc_ids)
+    is_first = torch.ones_like(doc_ids, dtype=torch.bool)
+    is_first[:, 1:] = doc_ids[:, 1:] != doc_ids[:, :-1]
+    kv_start = torch.where(is_first, pos, 0).cummax(dim=1).values
+    if window_size_left is not None:
+        kv_start = torch.maximum(kv_start, pos - window_size_left)
+    return torch.where(doc_ids == 0, pos + 1, kv_start).to(torch.int32)
+
+
+def _check_kv_start(
+    d, dv, nheads, nheads_kv, seqlen_q, seqlen_k, kv_start_kind, deterministic=False,
+    softcap=0.0, has_learnable_sink=False,
+):
+    device, dtype = "cuda", torch.bfloat16
+    torch.random.manual_seed(0)
+    batch_size = 2
+    q, k, v = [
+        torch.randn(batch_size, s, h, hd, device=device, dtype=dtype, requires_grad=True)
+        for s, h, hd in ((seqlen_q, nheads, d), (seqlen_k, nheads_kv, d), (seqlen_k, nheads_kv, dv))
+    ]
+    sink = (
+        torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True)
+        if has_learnable_sink
+        else None
+    )
+    inputs = (q, k, v) if sink is None else (q, k, v, sink)
+    # Causal is bottom-right aligned: query i sits at key position i + seqlen_k - seqlen_q.
+    q_pos = torch.arange(seqlen_k - seqlen_q, seqlen_k, device=device)
+    window_size_left = 63 if kv_start_kind in ("docs_window", "docs_window_size") else None
+    if kv_start_kind == "random":
+        # Any non-decreasing left edge at or before the diagonal.
+        frac = torch.rand(batch_size, seqlen_q, device=device).sort(dim=1).values
+        kv_start = (frac * (q_pos + 1)).to(torch.int32)
+    else:
+        max_pad = seqlen_k // 8 if kv_start_kind == "docs_padded" else 0
+        doc_ids = _random_doc_ids(batch_size, seqlen_k, max(2, seqlen_k // 6), max_pad, device)
+        kv_start = _kv_start_for_documents(
+            doc_ids, window_size_left if kv_start_kind == "docs_window" else None
+        )[:, seqlen_k - seqlen_q :]
+    kv_start = kv_start.contiguous()
+    window_size = (window_size_left, 0) if kv_start_kind == "docs_window_size" else (None, None)
+    out, _ = flash_attn_func(
+        q, k, v, causal=True, window_size=window_size, softcap=softcap, learnable_sink=sink,
+        deterministic=deterministic, kv_start=kv_start,
+    )
+    dout = torch.randn_like(out)
+    grads = torch.autograd.grad(out, inputs, dout, retain_graph=deterministic)
+    if is_fake_mode():
+        return
+
+    key_pos = torch.arange(seqlen_k, device=device)
+    first_key = kv_start.long()
+    if window_size_left is not None:
+        first_key = torch.maximum(first_key, q_pos - window_size_left)
+    allowed = (key_pos >= first_key[..., None]) & (key_pos <= q_pos[:, None])
+    live_q = allowed.any(dim=-1)
+    live_k = allowed.any(dim=1)
+    # Rows with no keys (padding) output zeros. The reference attends their diagonal to stay
+    # finite and drops them from the gradients, so only real tokens are compared.
+    allowed |= ~live_q[..., None] & (key_pos == q_pos[:, None])
+    attn_bias = torch.zeros(allowed.shape, device=device).masked_fill(~allowed, float("-inf"))[:, None]
+    ref_kwargs = {"softcap": softcap, "learnable_sink": sink}
+    out_ref, _ = attention_ref(q, k, v, None, None, attn_bias=attn_bias, **ref_kwargs)
+    out_pt, _ = attention_ref(
+        q, k, v, None, None, attn_bias=attn_bias.to(dtype), upcast=False, reorder_ops=True,
+        **ref_kwargs,
+    )
+    dout_live = dout * live_q[..., None, None]
+    grads_ref = torch.autograd.grad(out_ref, inputs, dout_live)
+    grads_pt = torch.autograd.grad(out_pt, inputs, dout_live)
+    for name, x, x_ref, x_pt, live in zip(
+        ("out", "dQ", "dK", "dV"),
+        (out, *grads[:3]),
+        (out_ref, *grads_ref[:3]),
+        (out_pt, *grads_pt[:3]),
+        (live_q, live_q, live_k, live_k),
+    ):
+        check_tensor_vs_ref(name, x[live], x_ref[live], x_pt[live])
+        assert (x[~live] == 0).all(), f"{name} is not zero where nothing is attended"
+    if sink is not None:
+        check_dsink_vs_ref(grads[3], grads_ref[3], grads_pt[3], rtol=3)
+    if deterministic:
+        for _ in range(2):
+            grads_again = torch.autograd.grad(out, inputs, dout, retain_graph=True)
+            for name, x, x_again in zip(("dQ", "dK", "dV", "dSink"), grads, grads_again):
+                assert torch.equal(x, x_again), f"{name} is not deterministic"
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="kv_start requires SM100/SM110")
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize(
+    "kv_start_kind", ["docs", "docs_padded", "docs_window", "docs_window_size", "random"]
+)
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k", [(113, 113), (1000, 1000), (2048, 2048), (1000, 1536)]
+)
+@pytest.mark.parametrize("nheads,nheads_kv", [(8, 8), (16, 2)])
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (192, 128)])
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kv_start(
+    d, dv, nheads, nheads_kv, seqlen_q, seqlen_k, kv_start_kind, deterministic
+):
+    _check_kv_start(d, dv, nheads, nheads_kv, seqlen_q, seqlen_k, kv_start_kind, deterministic)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="kv_start requires SM100/SM110")
+@pytest.mark.parametrize("feature", ["softcap", "learnable_sink"])
+@pytest.mark.parametrize("kv_start_kind", ["docs_padded", "docs_window_size"])
+@pytest.mark.parametrize("seqlen", [113, 1000])
+@pytest.mark.parametrize("nheads,nheads_kv", [(8, 8), (16, 2)])
+@pytest.mark.parametrize("d", [64, 128])
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kv_start_softcap_sink(d, nheads, nheads_kv, seqlen, kv_start_kind, feature):
+    _check_kv_start(
+        d, d, nheads, nheads_kv, seqlen, seqlen, kv_start_kind,
+        softcap=15.0 if feature == "softcap" else 0.0,
+        has_learnable_sink=feature == "learnable_sink",
+    )
+
+
 # Regression test for #2591: SMEM overflow at small head_dims on SM100. The main
 # test_flash_attn_output skips d < 64, but _validate_head_dims accepts head_dim >= 8
 # for sm_100/110, so this path needs coverage. Trigger requires
