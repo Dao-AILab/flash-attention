@@ -9,6 +9,51 @@
 #include <optional>
 #include <string>
 
+// Defined in mha_fwd_kvcache.cpp.
+fmha_fwd_splitkv_traits get_ck_fmha_fwd_splitkv_traits(const mask_info &mask,
+                                                       std::string dtype,
+                                                       int head_size,
+                                                       bool has_lse,
+                                                       bool enable_alibi);
+
+fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
+                                                   const mask_info &mask,
+                                                   const int b,
+                                                   const int seqlen_q,
+                                                   const int seqlen_k,
+                                                   const int h,
+                                                   const int h_k,
+                                                   const int d,
+                                                   const int page_block_size,
+                                                   const int num_splits,
+                                                   float softmax_scale,
+                                                   const at::Tensor q,
+                                                   const at::Tensor k,
+                                                   const at::Tensor v,
+                                                   std::optional<const at::Tensor> seqlens_k_,
+                                                   std::optional<const at::Tensor> &cache_batch_idx_,
+                                                   std::optional<at::Tensor> &block_table_,
+                                                   std::optional<at::Tensor> &alibi_slopes_,
+                                                   at::Tensor out,
+                                                   at::Tensor lse,
+                                                   at::Tensor lse_acc,
+                                                   at::Tensor out_acc);
+
+// The split heuristic sizes the grid by nhead_k, but fmha_fwd launches one workgroup per
+// (batch, nhead, 128-row q tile), so it can already fill the GPU where the heuristic splits.
+// Measured on MI350X (bf16): splitting loses once that grid covers the CUs, except for
+// hdim > 128 (fmha_fwd is slow there) and a little past it for very short queries. With a
+// full q tile, the split kernel also needs enough KV blocks per split to pay for the combine.
+static bool fwd_splitkv_is_faster(int batch, int nhead, int seqlen_q, int seqlen_k, int hdim, int num_splits)
+{
+    const int num_cus = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const int fwd_grid = batch * nhead * ((seqlen_q + 127) / 128);
+    const int kv_blocks_per_split = ((seqlen_k + 127) / 128 + num_splits - 1) / num_splits;
+    const bool grid_underfilled =
+        hdim > 128 || fwd_grid < num_cus || (fwd_grid < 2 * num_cus && seqlen_q <= 16);
+    return grid_underfilled && (seqlen_q < 128 || kv_blocks_per_split >= 8);
+}
+
 fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
                                        std::string dtype,
                                        int head_size,
@@ -303,59 +348,106 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
 #endif
         ck_tile::stream_config stream_config{stream};
 
-        auto traits =
-            get_ck_fmha_fwd_traits(
-                mask,
-                q_dtype_str,
-                head_size,
-                has_dropout,
-                has_lse,
-                alibi_slopes_.has_value());
+        // Split the KV sequence when the grid alone cannot fill the GPU (decode and short-q
+        // shapes); the heuristic returns 1 otherwise. One split stays on fmha_fwd, which is
+        // faster than fmha_fwd_splitkv there. fmha_fwd_splitkv has no dropout.
+        const int num_splits = has_dropout ? 1 :
+            flash::override_num_splits_if_necessary(
+                batch_size, num_heads, num_heads_k, seqlen_q, seqlen_k, head_size, p_dropout, 0);
 
-        auto args =
-            get_ck_fmha_fwd_args(
-                has_lse,
-                return_dropout_randval,
-                mask,
-                batch_size,
-                seqlen_q,
-                seqlen_k,
-                num_heads,
-                num_heads_k,
-                head_size,
-                q,
-                k,
-                v,
-                alibi_slopes_,
-                out,
-                softmax_lse,
-                p,
-                softmax_scale,
-                p_dropout,
-                drop_seed_offset);
+        if (num_splits > 1 && fwd_splitkv_is_faster(batch_size, num_heads, seqlen_q, seqlen_k, head_size, num_splits)) {
+            auto softmax_lse_accum = torch::empty({num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+            auto out_accum = torch::empty({num_splits, batch_size, num_heads, seqlen_q, head_size}, opts.dtype(at::kFloat));
+            std::optional<const at::Tensor> cache_batch_idx;
+            std::optional<at::Tensor> block_table;
 
-        float t =
-            flash::maybe_dispatch_head_grouped_fwd(
-                stream_config,
-                traits,
-                args,
-                num_heads,
-                num_heads_k,
-                batch_size,
-                seqlen_k,
-                head_size,
-                head_size,
-                k.element_size(),
-                v.element_size(),
-                q.scalar_type(),
-                [&](const auto& grouped_traits, auto& grouped_args, const auto& grouped_sc) {
-                    return fmha_fwd(grouped_traits, grouped_args, grouped_sc);
-                });
+            auto splitkv_traits =
+                get_ck_fmha_fwd_splitkv_traits(
+                    mask, q_dtype_str, head_size, has_lse, alibi_slopes_.has_value());
 
-        if (t < 0.0f) {
-            t = fmha_fwd(traits, args, stream_config);
+            auto splitkv_args =
+                get_ck_fmha_fwd_splitkv_args(
+                    has_lse,
+                    mask,
+                    batch_size,
+                    seqlen_q,
+                    seqlen_k,
+                    num_heads,
+                    num_heads_k,
+                    head_size,
+                    0, // page_block_size
+                    num_splits,
+                    softmax_scale,
+                    q,
+                    k,
+                    v,
+                    std::nullopt, // seqlens_k: every batch attends to all seqlen_k keys
+                    cache_batch_idx,
+                    block_table,
+                    alibi_slopes_,
+                    out,
+                    softmax_lse,
+                    softmax_lse_accum,
+                    out_accum);
+
+            float t = fmha_fwd_splitkv(splitkv_traits, splitkv_args, stream_config);
+            TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
         }
-        TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
+        else {
+            auto traits =
+                get_ck_fmha_fwd_traits(
+                    mask,
+                    q_dtype_str,
+                    head_size,
+                    has_dropout,
+                    has_lse,
+                    alibi_slopes_.has_value());
+
+            auto args =
+                get_ck_fmha_fwd_args(
+                    has_lse,
+                    return_dropout_randval,
+                    mask,
+                    batch_size,
+                    seqlen_q,
+                    seqlen_k,
+                    num_heads,
+                    num_heads_k,
+                    head_size,
+                    q,
+                    k,
+                    v,
+                    alibi_slopes_,
+                    out,
+                    softmax_lse,
+                    p,
+                    softmax_scale,
+                    p_dropout,
+                    drop_seed_offset);
+
+            float t =
+                flash::maybe_dispatch_head_grouped_fwd(
+                    stream_config,
+                    traits,
+                    args,
+                    num_heads,
+                    num_heads_k,
+                    batch_size,
+                    seqlen_k,
+                    head_size,
+                    head_size,
+                    k.element_size(),
+                    v.element_size(),
+                    q.scalar_type(),
+                    [&](const auto& grouped_traits, auto& grouped_args, const auto& grouped_sc) {
+                        return fmha_fwd(grouped_traits, grouped_args, grouped_sc);
+                    });
+
+            if (t < 0.0f) {
+                t = fmha_fwd(traits, args, stream_config);
+            }
+            TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
+        }
     }
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
