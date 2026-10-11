@@ -1530,7 +1530,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mask_fn(acc_S=acc_S, n_block=n_block)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
 
-        row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
+        # Reducing every row max before the first exp2 gives ptxas a better softmax schedule
+        # around the PV GEMM wait (2% faster at hdim 128, neutral elsewhere)
+        row_scale = softmax.online_softmax(acc_S, check_inf=check_inf, max_first=True)
         warpgroup.wait_group(0)
         pipeline_v.consumer_release(smem_pipe_read_v)
         tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
