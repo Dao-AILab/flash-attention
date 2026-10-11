@@ -1451,12 +1451,12 @@ def _flash_attn_fwd(
     # SM90: persistent CTAs claim tiles from an atomic counter so that the next tile's Q and
     # K load during the current tile's epilogue. With at most one wave of tiles there is
     # nothing to overlap, and zeroing the counter would only add a launch. Non-causal tiles
-    # with long KV already amortize the per-tile cost, and there the persistent kernel's
-    # mainloop measured up to 2% slower (hdim 128, seqlen_k >= 16k).
+    # with KV longer than 16k already amortize the per-tile cost, and there the persistent
+    # kernel measured no faster (hdim 128, seqlen_k 32k).
     sm90_persistent = (
         arch // 10 == 9
         and os.environ.get("FA_DISABLE_SM90_PERSISTENT", "0") != "1"
-        and (causal or local or max_seqlen_k <= 8192)
+        and (causal or local or max_seqlen_k <= 16384)
         and cu_seqlens_q is None
         and seqused_q is None
         and not use_block_sparsity
