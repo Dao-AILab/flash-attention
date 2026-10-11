@@ -1448,7 +1448,29 @@ def _flash_attn_fwd(
         )
     )
 
+    # SM90: persistent CTAs claim tiles from an atomic counter so that the next tile's Q and
+    # K load during the current tile's epilogue. With at most one wave of tiles there is
+    # nothing to overlap, and zeroing the counter would only add a launch. Non-causal tiles
+    # with long KV already amortize the per-tile cost, and there the persistent kernel's
+    # mainloop measured up to 2% slower (hdim 128, seqlen_k >= 16k).
+    sm90_persistent = (
+        arch // 10 == 9
+        and os.environ.get("FA_DISABLE_SM90_PERSISTENT", "0") != "1"
+        and (causal or local or max_seqlen_k <= 8192)
+        and cu_seqlens_q is None
+        and seqused_q is None
+        and not use_block_sparsity
+        and tile_m <= 2 * tile_n  # sO must fit in the two sV stages it aliases
+        and batch_size
+        * (num_head_kv if pack_gqa else num_head)
+        * ((seqlen_q * (qhead_per_kvhead if pack_gqa else 1) + tile_m - 1) // tile_m)
+        > num_sms
+    )
+    if sm90_persistent:
+        tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=device)
+
     compile_key = (
+        sm90_persistent,
         mla_1cta,
         mla_1cta_kb64,
         mla_1cta_s_ahead if mla_1cta else None,
@@ -1649,6 +1671,7 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
+                is_persistent=sm90_persistent,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
@@ -1840,6 +1863,8 @@ def _flash_attn_fwd(
                     cu_total_m_blocks_tensor,
                     cu_total_splits_m_blocks_tensor,
                 ])
+                if arch // 10 == 9:
+                    compile_args.append(tile_count_semaphore_tensor if sm90_persistent else None)
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
@@ -1932,6 +1957,8 @@ def _flash_attn_fwd(
                     cu_total_m_blocks,
                     cu_total_splits_m_blocks,
                 ])
+                if arch // 10 == 9:
+                    call_args.append(tile_count_semaphore if sm90_persistent else None)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         # Combine writes a seqlen-contiguous LSE. The MLA LSE is (..., s, h) contiguous, so
