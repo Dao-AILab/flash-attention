@@ -44,8 +44,8 @@ class GeLUFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         input, bias = ctx.saved_tensors
-        tmp = bias_gelu_back(grad_output, input, bias)
-        return tmp, tmp
+        grad_input, grad_bias = bias_gelu_back(grad_output, input, bias)
+        return grad_input, grad_bias
 
 
 bias_gelu_impl = GeLUFunction.apply
