@@ -134,9 +134,17 @@ class BlackwellFusedMultiHeadAttentionBackward:
         block_sparse_tensors: cute.Tensor | None = None,
         max_seqlen_q: Int32 | None = None,
         max_seqlen_k: Int32 | None = None,
+        dKV_partial: cute.Tensor | None = None,
+        dKV_split_semaphore: cute.Tensor | None = None,
+        dkdv_split_chunk_iters: Int32 | None = None,
+        dkdv_split_slots: Int32 | None = None,
         stream: cuda.CUstream = None,
     ):
-        """Host function to launch CuTeDSL kernel."""
+        """Host function to launch CuTeDSL kernel.
+
+        dKV_partial / dKV_split_semaphore / dkdv_split_chunk_iters / dkdv_split_slots enable the dK/dV head x Q-block split (see
+        sm100_hd256_2cta_fmha_backward_dkdvkernel.py); all None keeps the unsplit kernel.
+        """
         assert window_size_left is None and window_size_right is None, (
             "SM100 backward with head_dim=256 uses constructor-provided window sizes"
         )
@@ -224,4 +232,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
             scale_softmax,
             max_seqlen_k,
             stream,
+            dKV_partial=dKV_partial,
+            dKV_split_semaphore=dKV_split_semaphore,
+            split_chunk_iters=dkdv_split_chunk_iters,
+            split_slots=dkdv_split_slots,
         )

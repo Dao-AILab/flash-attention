@@ -2233,6 +2233,119 @@ def _bwd_postprocess_convert(
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
 
 
+# hd256 dK/dV split for GQA/MQA (sm100_hd256_2cta_fmha_backward_dkdvkernel.py): a KV tile's serial
+# h_r x Q-block loop is cut into at most `splits` chunks of about `chunk_iters` iterations each.
+# Defaults tuned on GB300 for MQA (h_r=16) hd256 THD packs that hold one long sequence.
+_HD256_DKDV_SPLITS_DEFAULT = 4
+_HD256_DKDV_CHUNK_ITERS_DEFAULT = 40
+
+
+@lru_cache(maxsize=1)
+def _hd256_dkdv_split_env() -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """FLASH_ATTENTION_HD256_DKDV_{SPLITS,CHUNK_ITERS,SLOTS}, read once per process (None = unset)."""
+    return tuple(
+        int(os.environ[name]) if name in os.environ else None
+        for name in (
+            "FLASH_ATTENTION_HD256_DKDV_SPLITS",
+            "FLASH_ATTENTION_HD256_DKDV_CHUNK_ITERS",
+            "FLASH_ATTENTION_HD256_DKDV_SLOTS",
+        )
+    )
+
+
+@lru_cache(maxsize=None)
+def _hd256_dkdv_default_slots(device_index: Optional[int], arch: int) -> int:
+    """CTA-pair budget per non-causal sequence: FLASH_ATTENTION_HD256_DKDV_SLOTS or one 2-CTA cluster per SM pair."""
+    env_slots = _hd256_dkdv_split_env()[2]
+    if env_slots is not None:
+        return env_slots
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return get_num_sms_for_selection(device_index, arch) // 2
+
+
+def _hd256_dkdv_split_config(
+    qhead_per_kvhead: int,
+    seqlen_q_bound: int,
+    num_splits: Optional[int],
+    chunk_iters: Optional[int],
+) -> Tuple[int, int]:
+    """(num_splits, chunk_iters) for the hd256 dK/dV split; num_splits == 1 keeps the unsplit kernel.
+
+    None reads FLASH_ATTENTION_HD256_DKDV_SPLITS (1 = off) and FLASH_ATTENTION_HD256_DKDV_CHUNK_ITERS, else the
+    defaults.
+    A KV tile runs qhead_per_kvhead * ceil(seqlen_q / 128) iterations at most; no tile is split when that
+    bound fits in one chunk, and MHA (qhead_per_kvhead == 1) is never split.
+    """
+    env_splits, env_chunk_iters, _ = _hd256_dkdv_split_env()
+    if num_splits is None:
+        num_splits = _HD256_DKDV_SPLITS_DEFAULT if env_splits is None else env_splits
+    if chunk_iters is None:
+        chunk_iters = _HD256_DKDV_CHUNK_ITERS_DEFAULT if env_chunk_iters is None else env_chunk_iters
+    assert num_splits >= 1 and chunk_iters >= 1, "dkdv_num_splits and dkdv_split_chunk_iters must be >= 1"
+    if qhead_per_kvhead < 2:
+        return 1, chunk_iters
+    max_tile_iters = qhead_per_kvhead * ((seqlen_q_bound + 127) // 128)
+    return max(1, min(num_splits, (max_tile_iters + chunk_iters - 1) // chunk_iters)), chunk_iters
+
+
+def _hd256_dkdv_num_tiles(
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_k: Optional[int],
+    total_k: int,
+    seqlen_k: int,
+    batch_size: int,
+    num_head_kv: int,
+) -> int:
+    """CTAs of the unsplit hd256 dK/dV grid (tile 64 x cluster 2); mirrors the kernel's grid sizing."""
+    tile_n, cluster = 64, 2
+    if cu_seqlens_k is not None and max_seqlen_k is None:
+        # SingleTileVarlenScheduler.get_grid_shape via compute_sm100_fmha_varlen_grid
+        nseq = cu_seqlens_k.shape[0] - 1
+        blocks = (total_k + nseq * (cluster * tile_n - 1)) // tile_n // cluster * cluster
+        return blocks * num_head_kv
+    k = max_seqlen_k if cu_seqlens_k is not None else seqlen_k
+    blocks = (k + tile_n - 1) // tile_n
+    blocks = (blocks + cluster - 1) // cluster * cluster
+    return blocks * num_head_kv * batch_size
+
+
+_hd256_dkdv_split_buffer_cache: dict = {}
+
+
+def _hd256_dkdv_split_buffers(
+    num_partial: int, num_tiles: int, device: torch.device, fake_mode: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp32 workspace (num_partial) and int32 arrival counters (num_tiles) for the hd256 dK/dV split.
+
+    Cached per (device, stream) and only grown: the kernel leaves every counter it uses at zero and kernels on one
+    stream do not overlap, so nothing is cleared per call. Views are cached per size, so a call allocates nothing.
+    Under CUDA graph capture (and in fake mode) fresh buffers are allocated, which the graph keeps alive.
+    """
+    if fake_mode or torch._C._cuda_isCurrentStreamCapturing():
+        return (
+            torch.empty(num_partial, dtype=torch.float32, device=device),
+            torch.zeros(num_tiles, dtype=torch.int32, device=device),
+        )
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (device_index, torch._C._cuda_getCurrentRawStream(device_index))
+    entry = _hd256_dkdv_split_buffer_cache.get(key)
+    views = None if entry is None else entry[2].get((num_partial, num_tiles))
+    if views is not None:
+        return views
+    partial, semaphore = (None, None) if entry is None else entry[:2]
+    if partial is None or partial.numel() < num_partial:
+        partial = torch.empty(num_partial, dtype=torch.float32, device=device)
+        entry = None
+    if semaphore is None or semaphore.numel() < num_tiles:
+        semaphore = torch.zeros(num_tiles, dtype=torch.int32, device=device)
+        entry = None
+    view_cache = {} if entry is None else entry[2]
+    views = view_cache[(num_partial, num_tiles)] = (partial[:num_partial], semaphore[:num_tiles])
+    _hd256_dkdv_split_buffer_cache[key] = (partial, semaphore, view_cache)
+    return views
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2276,7 +2389,12 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    dkdv_num_splits: Optional[int] = None,
+    dkdv_split_chunk_iters: Optional[int] = None,
+    dkdv_split_slots: Optional[int] = None,
 ) -> Tuple[torch.Tensor, ...]:
+    # dkdv_num_splits / dkdv_split_chunk_iters / dkdv_split_slots: SM100 hd256 GQA/MQA dK/dV split, see
+    # _hd256_dkdv_split_config (None = environment or default, dkdv_num_splits=1 = off, slots 0 = no budget).
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
@@ -2641,6 +2759,25 @@ def _flash_attn_bwd(
                 device=device,
             )
 
+    # hd256 GQA/MQA dK/dV split: fp32 per-chunk workspace + per-tile arrival counters (zero; the kernel
+    # leaves them zero). The reduction order is fixed, so the split path stays deterministic.
+    dkdv_split = False
+    dkdv_partial = dkdv_split_semaphore = None
+    if use_dedicated_hd256_kernel:
+        dkdv_num_splits, dkdv_split_chunk_iters = _hd256_dkdv_split_config(
+            qhead_per_kvhead, seqlen_q, dkdv_num_splits, dkdv_split_chunk_iters
+        )
+        dkdv_split = dkdv_num_splits > 1
+        if dkdv_split:
+            num_dkdv_tiles = _hd256_dkdv_num_tiles(
+                cu_seqlens_k, max_seqlen_k, total_k, seqlen_k, batch_size, num_head_kv
+            )
+            dkdv_partial, dkdv_split_semaphore = _hd256_dkdv_split_buffers(
+                dkdv_num_splits * num_dkdv_tiles * 2 * 64 * head_dim, num_dkdv_tiles, device, fake_mode
+            )
+            if dkdv_split_slots is None:
+                dkdv_split_slots = _hd256_dkdv_default_slots(device.index, arch)
+
     dtype = torch2cute_dtype_map[q.dtype]
 
     # The dedicated hd256 backward is deterministic without semaphores.
@@ -2828,6 +2965,7 @@ def _flash_attn_bwd(
             cu_total_m_blocks_k is not None,
             use_dedicated_hd256_kernel and cu_seqlens_q is not None and max_seqlen_q is None,
             use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
+            dkdv_split,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -3001,6 +3139,12 @@ def _flash_attn_bwd(
                     Int32(max_seqlen_k)
                     if cu_seqlens_k is not None and max_seqlen_k is not None
                     else None,
+                    to_cute_tensor(dkdv_partial, leading_dim=0) if dkdv_split else None,
+                    to_cute_tensor(dkdv_split_semaphore, assumed_align=4, leading_dim=0)
+                    if dkdv_split
+                    else None,
+                    Int32(dkdv_split_chunk_iters) if dkdv_split else None,
+                    Int32(dkdv_split_slots) if dkdv_split else None,
                 )
             )
         compile_args.append(current_stream)
@@ -3056,6 +3200,10 @@ def _flash_attn_bwd(
                     max_seqlen_k
                     if cu_seqlens_k is not None
                     else None,
+                    dkdv_partial,
+                    dkdv_split_semaphore,
+                    dkdv_split_chunk_iters if dkdv_split else None,
+                    dkdv_split_slots if dkdv_split else None,
                 )
             )
         _flash_attn_bwd.compile_cache[compile_key](*call_args)
