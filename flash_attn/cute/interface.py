@@ -148,7 +148,9 @@ class FwdConfig:
     num_splits: int = 1
 
 
-def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_size_q=None):
+def _tile_size_fwd_sm90(
+    head_dim, head_dim_v, is_causal, is_local, sparse_block_size_q=None, paged_kv=False
+):
     """Return FwdConfig for SM90 forward.
 
     Tile sizes and flags based on tile_size_fwd_sm90 in hopper/tile_size.h, adjusted
@@ -167,9 +169,10 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
         # C++: 192×144 noRS+OL for all cases.
         # Python: RS is catastrophic with 192× tiles (~300 vs ~600 TFLOPS).
         # noRS+OL is always required. Causal: 192×128 slightly better short seqlen.
+        # Paged KV needs tile_n 128 like C++: the paged loads give wrong output at 144.
         if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
             return FwdConfig(128, 128, False, True)
-        if is_causal or is_local:
+        if is_causal or is_local or paged_kv:
             return FwdConfig(192, 128, False, True)
         else:
             return FwdConfig(192, 144, False, True)
@@ -350,6 +353,7 @@ def _get_fwd_config(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
+    paged_kv: bool = False,
 ) -> FwdConfig:
     if seqlen_q is None:
         seqlen_q = max_seqlen_q
@@ -368,7 +372,7 @@ def _get_fwd_config(
         elif arch // 10 == 9:
             sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
             cfg = _tile_size_fwd_sm90(
-                head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q
+                head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q, paged_kv=paged_kv
             )
             if block_sparse_tensors is not None and block_sparse_tensors.block_size is not None:
                 cfg = _fit_sm90_fwd_tile_to_block_sparsity(
@@ -1030,6 +1034,7 @@ def _flash_attn_fwd(
         block_sparse_tensors=block_sparse_tensors,
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
+        paged_kv=page_table is not None,
     )
     mla_fwd_cls = None
     if qv is not None:
