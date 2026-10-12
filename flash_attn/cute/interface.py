@@ -674,6 +674,141 @@ def _mla_fwd_plan(
 
 
 
+# Forward launch plans: replay the kernel launch of an earlier identical call without the host path
+# that chose it. See _fwd_plan_key for what "identical" covers and _record_fwd_plan for which
+# launches are replayed.
+_FWD_PLAN_CACHE_ENABLED = os.environ.get("FLASH_ATTENTION_FWD_PLAN_CACHE", "1") == "1"
+_FWD_PLAN_CACHE_MAX = 4096
+_fwd_plans: dict = {}
+_FWD_PLAN_NO_SWITCH = lambda: None  # noqa: E731
+_fwd_plan_s_ping_pong_default = getattr(
+    utils, "_get_disable_s_ping_pong_default", _FWD_PLAN_NO_SWITCH
+)
+
+
+def _fwd_plan_key(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k,
+    softmax_scale, causal, window_size_left, window_size_right, return_lse,
+):
+    """Key of everything _flash_attn_fwd reads on the host for an eligible call, or None."""
+    if (
+        type(q) is not torch.Tensor
+        or type(k) is not torch.Tensor
+        or type(v) is not torch.Tensor
+        or torch.is_tensor(max_seqlen_q)
+        or torch.is_tensor(max_seqlen_k)
+        or fa_logging.get_fa_log_level()
+        or is_fake_mode()
+        # maybe_contiguous copies inputs with unaligned pointers: replay only calls without copies
+        or q.data_ptr() % 16
+        or k.data_ptr() % 16
+        or v.data_ptr() % 16
+    ):
+        return None
+    meta = []
+    for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k):
+        if t is None:
+            meta.append(None)
+        elif type(t) is torch.Tensor:
+            meta.append((t.shape, t.stride(), t.dtype, t.device))
+        else:
+            return None
+    return (
+        q.shape, q.stride(), q.dtype, q.device, q.requires_grad,
+        k.shape, k.stride(), k.dtype, k.device, k.requires_grad,
+        v.shape, v.stride(), v.dtype, v.device, v.requires_grad,
+        *meta,
+        max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size_left, window_size_right,
+        return_lse,
+        utils._get_use_clc_scheduler_default(),
+        utils._get_disable_2cta_default(is_fwd=True),
+        _fwd_plan_s_ping_pong_default(),
+        os.environ.get("FLASH_ATTENTION_NUM_SMS"),
+        USE_BLOCKS_TO_BATCH,
+        BIN_BATCH_SEARCH_THRESH,
+    )
+
+
+def _fwd_plan_has_tensor(x):
+    if isinstance(x, torch.Tensor):
+        return True
+    if isinstance(x, (tuple, list)):
+        return any(_fwd_plan_has_tensor(y) for y in x)
+    return False
+
+
+class _FwdPlan:
+    """Compiled forward function + argument template; slots 0-4 and 6-9 are per call."""
+
+    __slots__ = ("fn", "template", "out_shape", "out_dtype", "lse_shape", "device")
+
+    def __init__(self, fn, template, out, lse):
+        self.fn = fn
+        self.template = template
+        self.out_shape = tuple(out.shape)
+        self.out_dtype = out.dtype
+        self.lse_shape = None if lse is None else tuple(lse.shape)
+        self.device = out.device
+
+    def __call__(self, q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k):
+        # same allocations, in the same order, as _flash_attn_fwd
+        out = torch.empty(self.out_shape, dtype=self.out_dtype, device=self.device)
+        lse = (
+            None
+            if self.lse_shape is None
+            else torch.empty(self.lse_shape, dtype=torch.float32, device=self.device)
+        )
+        args = self.template.copy()
+        args[0] = q.detach()
+        args[1] = k.detach()
+        args[2] = v.detach()
+        args[3] = out.detach()
+        args[4] = lse
+        args[6] = cu_seqlens_q
+        args[7] = cu_seqlens_k
+        args[8] = seqused_q
+        args[9] = seqused_k
+        self.fn(*args)
+        return out, lse, None, None, None
+
+
+def _record_fwd_plan(
+    key, fn, call_args, inputs, contiguous_inputs, call_inputs, out, lse,
+    cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, replayable,
+):
+    """Store the plan of a completed launch if replaying it reproduces the launch exactly."""
+    if not replayable or len(call_args) < 10:
+        return
+    # maybe_contiguous returned the caller's tensors
+    if any(a is not b for a, b in zip(inputs, contiguous_inputs)):
+        return
+    o = call_args[3]
+    if not (
+        call_args[0] is call_inputs[0]
+        and call_args[1] is call_inputs[1]
+        and call_args[2] is call_inputs[2]
+        and isinstance(o, torch.Tensor)
+        and o.data_ptr() == out.data_ptr()
+        and o.shape == out.shape
+        and o.stride() == out.stride()
+        and o.dtype == out.dtype
+        and call_args[4] is lse
+        and call_args[6] is cu_seqlens_q
+        and call_args[7] is cu_seqlens_k
+        and call_args[8] is seqused_q
+        and call_args[9] is seqused_k
+    ):
+        return
+    template = list(call_args)
+    for j in (0, 1, 2, 3, 4, 6, 7, 8, 9):
+        template[j] = None
+    if any(_fwd_plan_has_tensor(a) for a in template):
+        return
+    if len(_fwd_plans) >= _FWD_PLAN_CACHE_MAX:
+        _fwd_plans.clear()
+    _fwd_plans[key] = _FwdPlan(fn, template, out, lse)
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -733,6 +868,48 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
+    fwd_plan_key = None
+    if (
+        _FWD_PLAN_CACHE_ENABLED
+        and qv is None
+        and q is not None
+        and k is not None
+        and min_seqlen_k is None
+        and page_table is None
+        and softcap is None
+        and learnable_sink is None
+        and tile_mn is None
+        and mma_pv_is_rs is None
+        and intra_wg_overlap is None
+        and num_threads == 384
+        and num_splits == 1
+        and pack_gqa is None
+        and _arch is None
+        and score_mod is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and out is None
+        and lse is None
+        and aux_tensors is None
+        and not aux_scalars
+        and q_descale is None
+        and k_descale is None
+        and v_descale is None
+        and gather_kv_indices is None
+        and scheduler_metadata is None
+        and seqlen_k_per_split is None
+        and not disable_scheduler_metadata
+        and not gather_bwd_recompute_p
+    ):
+        fwd_plan_key = _fwd_plan_key(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k,
+            softmax_scale, causal, window_size_left, window_size_right, return_lse,
+        )
+        if fwd_plan_key is not None:
+            fwd_plan = _fwd_plans.get(fwd_plan_key)
+            if fwd_plan is not None:
+                return fwd_plan(q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+            fwd_plan_inputs = (q, k, v)
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
@@ -1932,7 +2109,31 @@ def _flash_attn_fwd(
                     cu_total_m_blocks,
                     cu_total_splits_m_blocks,
                 ])
-            _flash_attn_fwd.compile_cache[compile_key](*call_args)
+            compiled_fwd = _flash_attn_fwd.compile_cache[compile_key]
+            compiled_fwd(*call_args)
+            if fwd_plan_key is not None:
+                _record_fwd_plan(
+                    fwd_plan_key,
+                    compiled_fwd,
+                    call_args,
+                    fwd_plan_inputs,
+                    (q, k, v),
+                    (q_call, k_call, v_call),
+                    out,
+                    lse,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_q,
+                    seqused_k,
+                    replayable=not (
+                        is_split_kv
+                        or is_fp8
+                        or reuse_scheduler_metadata
+                        or p is not None
+                        or row_max is not None
+                        or o_lo is not None
+                    ),
+                )
     if is_split_kv:
         # Combine writes a seqlen-contiguous LSE. The MLA LSE is (..., s, h) contiguous, so
         # it goes through a seqlen-major staging buffer, copied back below (b*s*h floats).
