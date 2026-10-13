@@ -138,3 +138,60 @@ def test_bwd_pack_gqa_matches_unpacked(
         )
     if feature in ("none", "deterministic"):
         check_against_reference(got, q, k, v, dout, q_lens, k_lens, causal, dtype)
+
+
+def test_bwd_pack_gqa_heuristic():
+    """Pack when the grid still hides the qh-times longer packed tiles; keep ragged / long causal
+    MQA unpacked (measured on B200: MQA 16/1 hd256, one 8k causal sequence plus 16 x 256 in a
+    varlen pack: packed 3946 us, unpacked 2297 us)."""
+    from flash_attn.cute.interface import _bwd_pack_gqa_heuristic
+
+    def decide(
+        batch,
+        heads,
+        heads_kv,
+        seqlen_q,
+        seqlen_k,
+        causal,
+        varlen=False,
+        total_q=None,
+        total_k=None,
+    ):
+        return _bwd_pack_gqa_heuristic(
+            num_sms=148,
+            batch_size=batch,
+            num_head=heads,
+            num_head_kv=heads_kv,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            total_q=total_q if total_q is not None else batch * seqlen_q,
+            total_k=total_k if total_k is not None else batch * seqlen_k,
+            m_block_size=128,
+            n_block_size=128,
+            cluster_size=2,
+            causal=causal,
+            local=False,
+            varlen=varlen,
+        )
+
+    # dense 2k / 4k GQA and MQA batches: enough packed tiles, pack
+    assert decide(8, 16, 4, 2048, 2048, False)
+    assert decide(4, 16, 1, 4096, 4096, False)
+    # one long causal MQA sequence: the first packed KV tile runs 16 x 64 iterations, serial
+    assert not decide(1, 16, 1, 8192, 8192, True)
+    # ragged varlen pack, one 8k sequence + 16 x 256 (PR 2993's workload), causal and not
+    lens = (8192,) + (256,) * 16
+    assert not decide(
+        17, 16, 1, 8192, 8192, True, varlen=True, total_q=sum(lens), total_k=sum(lens)
+    )
+    assert not decide(
+        17,
+        16,
+        1,
+        8192,
+        4096,
+        False,
+        varlen=True,
+        total_q=sum(lens),
+        total_k=sum(lens) // 2,
+    )
