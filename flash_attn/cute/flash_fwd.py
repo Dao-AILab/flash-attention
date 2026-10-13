@@ -35,6 +35,7 @@ from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 from flash_attn.cute.utils import AuxData
+from cutlass.cute import FastDivmodDivisorV2
 
 
 class FlashAttentionForwardBase:
@@ -812,6 +813,26 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 mSeqUsedQ=mSeqUsedQ,
                 mSeqUsedK=mSeqUsedK,
             )
+            # Recompute fastdiv_mods if necessary for varlen with aux_tensors (as in Sm90/Sm100).
+            # The host-side divisors cover the whole batch, so without this the score_mod sees
+            # q_idx/kv_idx wrapped by the total length and indexes aux tensors past their end
+            # for every sequence after the first (e.g. aux[offset_q + q_idx] on padding rows).
+            recompute_fastdiv_mods_q = cutlass.const_expr(
+                aux_data.tensors is not None and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
+            )
+            recompute_fastdiv_mods_k = cutlass.const_expr(
+                aux_data.tensors is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
+            )
+            if cutlass.const_expr(fastdiv_mods is not None):
+                seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                fastdiv_mods = (
+                    seqlen_q_divmod
+                    if not recompute_fastdiv_mods_q
+                    else FastDivmodDivisorV2(seqlen.seqlen_q),
+                    seqlen_k_divmod
+                    if not recompute_fastdiv_mods_k
+                    else FastDivmodDivisorV2(seqlen.seqlen_k),
+                )
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
             # seqlen_q=seqlen_k=0 and n_block_max=0.  Clamp to 0 so we don't use a
