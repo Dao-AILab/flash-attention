@@ -3286,9 +3286,9 @@ class FlashAttentionBackwardSm100:
                 cute.recast_ptr(sdS_xchg.iterator, sdS_epi_layout.inner), sdS_xchg_layout_full
             )
             tRS_sdS_xchg = self.split_wg(thr_copy_r2s.partition_D(sdS_xchg_epi), wg_idx, num_wg)
-            # Q-column half this thread's chunk belongs to; the CTA keeps the half it owns for dQ
-            # and exchanges the other one.
-            q_half = (tidx % 128) // 64
+            # Q-column half this thread's chunk belongs to (from its partition coordinates); the
+            # CTA keeps the half it owns for dQ and exchanges the other one.
+            q_half = tScS_t2r[0][1] // (self.tile_m // 2)
 
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         dS_cluster_empty_phase = Int32(1)
@@ -4283,9 +4283,9 @@ class FlashAttentionBackwardSm100:
         tdVpdV = None
         if const_expr(self.check_hdim_v_oob):
             tdVpdV = self.predicate_hdim(tdVcdV_t2r, self.head_dim_v)
-        # NOTE [M=64 accumulator layout]: a thread's row is not its index; take it from the
-        # partition coordinates (per-CTA row = cluster row mod tile_n).
-        row_dV = tidx if const_expr(not self.acc_m64) else tdVcdV_t2r[0][0] % self.tile_n
+        # The thread's row from its partition coordinates (per-CTA row = cluster row mod
+        # tile_n); with the M=64 accumulator layout it is not the thread index.
+        row_dV = tdVcdV_t2r[0][0] % self.tile_n
         if row_dV < seqlen.seqlen_k - self.tile_n * n_block:
             cute.copy(tiled_gmem_store_dV, tdVrdV_r2s, tdVgdV_r2g, pred=tdVpdV)
 
@@ -4343,7 +4343,7 @@ class FlashAttentionBackwardSm100:
         tdKpdK = None
         if const_expr(self.check_hdim_oob):
             tdKpdK = self.predicate_hdim(tdKcdK_t2r, self.head_dim)
-        row_dK = tidx if const_expr(not self.acc_m64) else tdKcdK_t2r[0][0] % self.tile_n
+        row_dK = tdKcdK_t2r[0][0] % self.tile_n
         if row_dK < seqlen.seqlen_k - self.tile_n * n_block:
             cute.copy(tiled_gmem_store_dK, tdKrdK_r2s, tdKgdK_r2g, pred=tdKpdK)
 
