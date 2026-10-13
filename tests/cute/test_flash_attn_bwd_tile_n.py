@@ -15,6 +15,7 @@ import torch
 from eager_reference import check_against_reference, make_cu_seqlens
 
 from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
+from score_mod_definitions import score_mod_bwd_rel_bias, score_mod_rel_bias
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -114,6 +115,12 @@ FEATURE_KWARGS = {
     "local": {"window_size": (64, 32)},
     "softcap": {"softcap": 15.0},
     "deterministic": {"deterministic": True},
+    # position-dependent score_mod: the M=64 layout must hand every warpgroup its own
+    # (q_idx, kv_idx) coordinates (score_mod and score_mod_bwd)
+    "rel_bias": {
+        "score_mod": score_mod_rel_bias,
+        "score_mod_bwd": score_mod_bwd_rel_bias,
+    },
 }
 # (q_lens, k_lens) per layout; dense uses equal lengths and the dense API.
 FEATURE_SHAPES = [

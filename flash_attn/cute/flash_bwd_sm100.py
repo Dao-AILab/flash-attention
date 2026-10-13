@@ -3011,6 +3011,7 @@ class FlashAttentionBackwardSm100:
         seqlen_info,
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
+        wg_split=None,
     ):
         """Apply forward score modification for SM100 backward pass."""
         # In bwd, S is computed as K @ Q.T so dimensions are (tile_n, tile_m).
@@ -3022,6 +3023,9 @@ class FlashAttentionBackwardSm100:
         cS = cute.domain_offset((cluster_n_block * cluster_tile_n, m_block * self.tile_m), cS)
         tScS = thr_mma_S.partition_C(cS)
         tScS_idx = thr_copy_t2r.partition_D(tScS)
+        if const_expr(wg_split is not None):
+            # M=64 layout: the thread's chunk is the warpgroup's half of the partition
+            tScS_idx = self.split_wg(tScS_idx, wg_split[0], wg_split[1])
 
         apply_score_mod_inner(
             tSrS_t2r,
@@ -3452,6 +3456,7 @@ class FlashAttentionBackwardSm100:
                         seqlen,
                         aux_data,
                         fastdiv_mods,
+                        wg_split=(wg_idx, num_wg) if const_expr(self.acc_m64) else None,
                     )
 
                 #### APPLY MASK (after score_mod, matching forward pass order)
@@ -3591,6 +3596,8 @@ class FlashAttentionBackwardSm100:
                         )
                         tScS_bwd = thr_mma_S.partition_C(cS_bwd)
                         tScS_idx_bwd = thr_copy_t2r.partition_D(tScS_bwd)
+                        if const_expr(self.acc_m64):
+                            tScS_idx_bwd = self.split_wg(tScS_idx_bwd, wg_idx, num_wg)
                         tScS_idx_cur = tScS_idx_bwd[None, stage, 0, 0]
                         self.apply_score_mod_bwd(
                             tdPrdP_cur,
