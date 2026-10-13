@@ -2299,6 +2299,70 @@ def _bwd_postprocess_convert(
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
 
 
+def _bwd_pack_gqa_heuristic(
+    num_sms: int,
+    batch_size: int,
+    num_head: int,
+    num_head_kv: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    total_q: int,
+    total_k: int,
+    m_block_size: int,
+    n_block_size: int,
+    cluster_size: int,
+    causal: bool,
+    local: bool,
+    varlen: bool,
+) -> bool:
+    """Whether the SM100 backward should pack the query heads of a KV head into the Q tile.
+
+    Packing divides the tile count by qhead_per_kvhead. Its per-tile saving (K/V loaded once per
+    KV head, dK/dV kept in TMEM, no fp32 dK/dV accumulate + postprocess) shrinks with seqlen_q,
+    while the wave-quantization loss of the smaller grid can grow; measured on B200: ~25% gross
+    gain at 2k, ~7% at 8k, and a 3.5-wave packed grid loses ~13%.
+
+    A packed tile also loops over qhead_per_kvhead times more Q rows, so the longest packed CTA
+    runs qh * ceil(seqlen_q / tile_m) iterations (every KV tile, or the first one with causal).
+    When that exceeds the work a cluster slot gets on average, the grid cannot hide it and the
+    long tiles serialize: MQA 16/1 on one 8k causal sequence runs 2x slower packed. Varlen only
+    knows the longest sequence and the totals, so the average is taken over mean sequence
+    lengths; ragged packs (one long sequence plus short ones) then stay unpacked.
+    """
+    qh = num_head // num_head_kv
+    kv_tile = n_block_size * cluster_size
+    n_blocks_kv = (seqlen_k + kv_tile - 1) // kv_tile
+    slots = max(1, num_sms // cluster_size)
+
+    # critical path of a packed tile vs the average cluster-slot work
+    packed_max_iters = qh * ((seqlen_q + m_block_size - 1) // m_block_size)
+    mean_q = total_q / max(batch_size, 1) if varlen else seqlen_q
+    mean_k = total_k / max(batch_size, 1) if varlen else seqlen_k
+    total_iters = (
+        batch_size
+        * num_head
+        * math.ceil(mean_k / kv_tile)
+        * math.ceil(mean_q / m_block_size)
+        * (0.5 if causal else 1.0)
+    )
+    if packed_max_iters > 1.25 * total_iters / slots:
+        return False
+
+    def wave_loss(num_ctas):
+        waves = num_ctas / num_sms
+        return (math.ceil(waves) - waves) / math.ceil(waves)
+
+    ctas_unpacked = batch_size * num_head * n_blocks_kv * cluster_size
+    ctas_packed = batch_size * num_head_kv * n_blocks_kv * cluster_size
+    gain = 0.25 * 2048 / max(seqlen_q, 1)
+    if causal or local:
+        # causal / local tiles are uneven and the qh-times longer packed tiles balance
+        # worse at the tail: smaller gain, and only pack with a margin
+        gain *= 0.6
+        gain -= 0.02
+    return gain > wave_loss(ctas_packed) - wave_loss(ctas_unpacked)
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2654,28 +2718,26 @@ def _flash_attn_bwd(
         and learnable_sink is None
     )
     if bwd_pack_gqa:
-        # Packing divides the tile count by qhead_per_kvhead. Its per-tile saving (K/V loaded
-        # once per KV head, dK/dV kept in TMEM, no fp32 dK/dV accumulate + postprocess) shrinks
-        # with seqlen_q, while the wave-quantization loss of the smaller grid can grow; measured
-        # on B200: ~25% gross gain at 2k, ~7% at 8k, and a 3.5-wave packed grid loses ~13%.
         override = utils._get_bwd_pack_gqa_override()
-        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-        n_blocks_kv = (seqlen_k + n_block_size * cluster_size - 1) // (n_block_size * cluster_size)
-
-        def wave_loss(num_ctas):
-            waves = num_ctas / num_sms
-            return (math.ceil(waves) - waves) / math.ceil(waves)
-
-        ctas_unpacked = batch_size * num_head * n_blocks_kv * cluster_size
-        ctas_packed = batch_size * num_head_kv * n_blocks_kv * cluster_size
-        gain = 0.25 * 2048 / max(seqlen_q, 1)
-        if causal or local:
-            # causal / local tiles are uneven and the qh-times longer packed tiles balance
-            # worse at the tail: smaller gain, and only pack with a margin
-            gain *= 0.6
-            gain -= 0.02
-        heuristic = gain > wave_loss(ctas_packed) - wave_loss(ctas_unpacked)
-        bwd_pack_gqa = heuristic if override is None else override
+        if override is None:
+            bwd_pack_gqa = _bwd_pack_gqa_heuristic(
+                num_sms=torch.cuda.get_device_properties(q.device).multi_processor_count,
+                batch_size=batch_size,
+                num_head=num_head,
+                num_head_kv=num_head_kv,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                total_q=total_q,
+                total_k=total_k,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                cluster_size=cluster_size,
+                causal=causal,
+                local=local,
+                varlen=cu_seqlens_q is not None or cu_seqlens_k is not None,
+            )
+        else:
+            bwd_pack_gqa = override
     
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
