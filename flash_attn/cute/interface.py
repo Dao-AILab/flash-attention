@@ -2388,12 +2388,15 @@ def _flash_attn_bwd(
         )
         # 64-row KV tile per CTA (M=64 accumulator layout), see NOTE [M=64 accumulator layout] in
         # flash_bwd_sm100.py. Test knob for now; only the pipelined 2CTA schedule (hdim <= 128)
-        # is wired.
+        # is wired, and the dK / dV epilogue needs the (32-padded) head dims to be multiples
+        # of 64.
         bwd_tile_n_override = utils._get_bwd_tile_n_override()
         if (
             bwd_tile_n_override == 64
             and use_2cta_instrs
             and head_dim <= 128
+            and head_dim_v <= 128
+            and all(-(-d // 32) * 32 % 64 == 0 for d in (head_dim, head_dim_v))
             and block_sparse_tensors is None
         ):
             n_block_size = 64

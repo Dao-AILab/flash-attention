@@ -515,18 +515,25 @@ class FlashAttentionBackwardSm100:
         self.sdK_flat_epi_tile = self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages
         self.sdV_flat_epi_tile = self.tile_n * (self.tile_hdimv // 2) // self.num_epi_stages_v
         if const_expr(not self.dKV_postprocess):
+            # One (tile_n, epi) stage per compute warpgroup; with the M=64 layout the whole CTA
+            # stages the (tile_n, hdim) tile, i.e. hdim / epi stages (the same bytes for hdim 128).
             self.sdK_layout = sm100_utils_basic.make_smem_layout_epi(
                 self.dk_dtype,
                 LayoutEnum.ROW_MAJOR,
                 self.sdK_epi_tile,
-                2,  # num compute wgs
+                self.tile_hdim // self.sdK_epi_tile[1] if self.acc_m64 else 2,
             )
             self.sdV_layout = sm100_utils_basic.make_smem_layout_epi(
                 self.dv_dtype,
                 LayoutEnum.ROW_MAJOR,
                 self.sdV_epi_tile,
-                2,  # num compute wgs
+                self.tile_hdimv // self.sdV_epi_tile[1] if self.acc_m64 else 2,
             )
+        elif self.acc_m64:
+            # fp32 row-major staging of half the (tile_n, hdim) tile (NOTE [M=64 accumulator
+            # layout] GQA path): all of the K / V storage.
+            self.sdK_layout = cute.make_layout((self.tile_n // 2) * self.tile_hdim)
+            self.sdV_layout = cute.make_layout((self.tile_n // 2) * self.tile_hdimv)
         else:
             self.sdK_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
             # self.dK_reduce_ncol same for dV
@@ -4209,14 +4216,25 @@ class FlashAttentionBackwardSm100:
         # The gmem store below has no head-dim OOB protection from TMA, so when head_dim is
         # not a multiple of the tile we predicate each 128-bit store vector (8 bf16 columns).
         # The store's predicate granularity is one tmem-load repetition, so shrink the
-        # repetition to 8 columns for that case; 16 keeps fewer tmem loads otherwise.
+        # repetition to 8 columns for that case; otherwise the widest chunk (<= 16) that still
+        # gives every warpgroup a whole number of chunks of the lane's columns (hdim, or hdim / 2
+        # with the M=64 layout).
+        lane_cols_div = 2 if const_expr(self.acc_m64) else 1
+        rep_dV = (
+            8
+            if const_expr(self.check_hdim_v_oob)
+            else math.gcd(16, self.tile_hdimv // lane_cols_div // num_wg)
+        )
+        rep_dK = (
+            8
+            if const_expr(self.check_hdim_oob)
+            else math.gcd(16, self.tile_hdim // lane_cols_div // num_wg)
+        )
         tmem_load_atom_dV = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8 if self.check_hdim_v_oob else 16)),
-            Float32,
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(rep_dV)), Float32
         )
         tmem_load_atom_dK = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8 if self.check_hdim_oob else 16)),
-            Float32,
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(rep_dK)), Float32
         )
         # dV
         pipeline_dKV.consumer_wait(consumer_state_dKV)
@@ -4371,11 +4389,11 @@ class FlashAttentionBackwardSm100:
     ) -> cutlass.pipeline.PipelineState:
         """dK / dV epilogue for NOTE [M=64 accumulator layout].
 
-        Every thread owns one (row, 32-column) chunk of the (tile_n, hdim) accumulator and a
+        Every thread owns (row, column-chunk) pieces of the (tile_n, hdim) accumulator and a
         warpgroup's columns are not contiguous, so the whole CTA stages the tile in SMEM through
-        the layout-aware TMEM -> RMEM -> SMEM copies and one warp issues the hdim / 64 TMA
-        stores. The staging buffer is the per-warpgroup (tile_n, 64) x 2 layout viewed as one
-        (tile_n, hdim) tile: both are the same 128B-swizzled bytes (stage stride == half stride).
+        the layout-aware TMEM -> RMEM -> SMEM copies and one warp issues the TMA stores, one per
+        (tile_n, epi) stage. The staging buffer's column and stage modes regroup into the
+        (tile_n, hdim) tile view, keeping its strides and swizzle.
         """
         tile_hdim = self.tile_hdim if const_expr(K_or_V == "K") else self.tile_hdimv
         dtype = self.dk_dtype if const_expr(K_or_V == "K") else self.dv_dtype
@@ -4419,6 +4437,8 @@ class FlashAttentionBackwardSm100:
                     (seqlen.padded_offset_k * tile_hdim,), mdKV[None, head_idx_kv]
                 )
             gdKV_flat = cute.local_tile(mdKV_cur, (self.tile_n * tile_hdim,), (n_block,))
+            # the two row halves of the tile: ((elems_per_half, 2))
+            gdKV_halves = cute.logical_divide(gdKV_flat, (rows_per_half * tile_hdim,))
             sdKV_rm = cute.make_tensor(
                 cute.recast_ptr(sdKV.iterator, dtype=Float32),
                 cute.make_layout((rows_per_half, tile_hdim), stride=(tile_hdim, 1)),
@@ -4426,9 +4446,18 @@ class FlashAttentionBackwardSm100:
 
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
-        # TMEM -> RMEM: one 32-column chunk per thread (NOTE [M=64 accumulator layout])
+        # TMEM -> RMEM (NOTE [M=64 accumulator layout]): a lane holds hdim / 2 columns of the
+        # gradient and the two warpgroups split them, so a thread loads the widest chunk
+        # (<= 32 columns) that leaves every warpgroup a whole number of chunks: one 32-column
+        # chunk for hdim 128, one 16-column chunk for hdim 64. Narrower chunks come out of the
+        # TMEM partition as a nested chunk mode that does not split evenly, so hdim must be a
+        # multiple of 64 here (the interface keeps other head dims on the 128-row tile).
+        assert (tile_hdim // 2 // num_wg) % 16 == 0, (
+            "the M=64 dK/dV epilogue needs a head dim that is a multiple of 64"
+        )
+        rep = math.gcd(32, tile_hdim // 2 // num_wg)
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(rep)), Float32
         )
         thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV).get_slice(tidx % 128)
         tdKVtdKV_t2r = self.split_wg(thr_copy_t2r.partition_S(tdKVtdKV), wg_idx, num_wg)
@@ -4448,21 +4477,24 @@ class FlashAttentionBackwardSm100:
         tdKVrdKV.store(tdKVrdKV_t2r.load().to(dtype))
 
         if const_expr(not self.dKV_postprocess):
-            # RMEM -> SMEM through the (tile_n, hdim) view of the staging buffer
+            # RMEM -> SMEM through the (tile_n, hdim) view of the staging buffer: stage s holds
+            # columns [s * epi, (s + 1) * epi), so regrouping the column and stage modes of
+            # sdKV gives the tile view with the buffer's own strides and swizzle. Rank 3 like
+            # the TMEM fragment, so the layout-aware r2s tiled copy can partition it.
             copy_atom_r2s = sm100_utils_basic.get_smem_store_op(
                 LayoutEnum.ROW_MAJOR, dtype, Float32, thr_copy_t2r
             )
             thr_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, thr_copy_t2r).get_slice(tidx % 128)
-            full_epi_layout = sm100_utils_basic.make_smem_layout_epi(
-                dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, tile_hdim), 1
-            )
-            full_2d = cute.slice_(full_epi_layout.outer, (None, None, 0))
             sdKV_full = cute.make_tensor(
                 sdKV.iterator,
-                cute.make_layout((full_2d.shape, 1, 1), stride=(full_2d.stride, 0, 0)),
+                cute.make_layout(
+                    ((sdKV.shape[0], (sdKV.shape[1], sdKV.shape[2])), 1, 1),
+                    stride=((sdKV.stride[0], (sdKV.stride[1], sdKV.stride[2])), 0, 0),
+                ),
             )
             tRS_sdKV = self.split_wg(thr_copy_r2s.partition_D(sdKV_full), wg_idx, num_wg)
-            cute.autovec_copy(tdKVrdKV, tRS_sdKV[None, 0, 0, 0])
+            for chunk in cutlass.range_constexpr(cute.size(tRS_sdKV, mode=[1])):
+                cute.autovec_copy(tdKVrdKV[None, chunk, 0, 0], tRS_sdKV[None, chunk, 0, 0])
             cute.arch.fence_view_async_shared()
             self.compute_sync_barrier.arrive_and_wait()
 
@@ -4475,9 +4507,11 @@ class FlashAttentionBackwardSm100:
             # The staging buffer is reused by the next tile / the other gradient
             self.compute_sync_barrier.arrive_and_wait()
         else:
-            # Each thread owns 32 contiguous fp32 of one row: (row, col0) from the partition.
+            # Each thread owns column chunks of one row: (row, col0) per chunk from the
+            # partition coordinates.
             row = tdKVcdKV_t2r[0][0] % self.tile_n
-            col0 = tdKVcdKV_t2r[0][1]
+            num_chunks = cute.size(tdKVcdKV_t2r, mode=[1])
+            chunk_cols = cute.size(tdKVrdKV, mode=[0])
             # One thread of the whole CTA drives the semaphore (tidx is warpgroup-local).
             tidx_cta = cute.arch.thread_idx()[0] % num_compute_threads
             if const_expr(deterministic_KV):
@@ -4488,19 +4522,19 @@ class FlashAttentionBackwardSm100:
                 self.compute_sync_barrier.arrive_and_wait()
             for half in cutlass.range_constexpr(2):
                 if row // rows_per_half == half:
-                    dst = cute.make_tensor(
-                        sdKV_rm.iterator + ((row - half * rows_per_half) * tile_hdim + col0),
-                        cute.make_layout(cute.size(tdKVrdKV)),
-                    )
-                    cute.autovec_copy(tdKVrdKV, dst)
+                    for chunk in cutlass.range_constexpr(num_chunks):
+                        col0 = tdKVcdKV_t2r[(0, chunk, 0, 0)][1]
+                        # this thread's chunk of the staging half: the chunk_cols columns of
+                        # row (row - half * rows_per_half) starting at col0
+                        row_view = cute.domain_offset((row - half * rows_per_half, col0), sdKV_rm)
+                        dst = cute.local_tile(row_view[0, None], (chunk_cols,), (0,))
+                        cute.autovec_copy(tdKVrdKV[None, chunk, 0, 0], dst)
                 cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
                 if wg_idx == 0 and leader_warp:
                     with cute.arch.elect_one():
                         copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdKV_rm.iterator,
-                            gdKV_flat.iterator + half * rows_per_half * tile_hdim,
-                            half_bytes,
+                            sdKV_rm.iterator, gdKV_halves[((None, half),)].iterator, half_bytes
                         )
                     cute.arch.cp_async_bulk_commit_group()
                     # Deterministic: the adds must have landed before the next head is released.

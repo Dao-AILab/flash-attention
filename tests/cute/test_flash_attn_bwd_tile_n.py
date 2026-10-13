@@ -129,15 +129,22 @@ FEATURE_SHAPES = [
 ]
 
 
+def ragged_lens(q_lens, k_lens):
+    """Ragged version of a dense budget: keeps the tile edges and adds a short slot."""
+    return (
+        (q_lens[0] - 3, 65) if len(q_lens) == 2 else (q_lens[0] - 7,),
+        ((k_lens[0] + 5, 129) if len(k_lens) == 2 else (k_lens[0] + 1,)),
+    )
+
+
 def run_fwd_bwd_layout(layout, q, k, v, dout, q_lens, k_lens, causal, tile_n, **kwargs):
     os.environ["FLASH_ATTENTION_BWD_TILE_N"] = str(tile_n)
     if layout == "dense":
         b = len(q_lens)
-        heads_q, heads_kv = q.shape[1], k.shape[1]
         out, _ = flash_attn_func(
-            q.view(b, q_lens[0], heads_q, HEAD_DIM),
-            k.view(b, k_lens[0], heads_kv, HEAD_DIM),
-            v.view(b, k_lens[0], heads_kv, HEAD_DIM),
+            q.view(b, q_lens[0], *q.shape[1:]),
+            k.view(b, k_lens[0], *k.shape[1:]),
+            v.view(b, k_lens[0], *v.shape[1:]),
             causal=causal,
             **kwargs,
         )
@@ -159,6 +166,19 @@ def run_fwd_bwd_layout(layout, q, k, v, dout, q_lens, k_lens, causal, tile_n, **
     return out.detach(), dq, dk, dv
 
 
+def check_tile_n_64_against_128(ref, got, mha_type, dtype):
+    assert torch.equal(got[0], ref[0]), "forward does not depend on the backward tile"
+    if mha_type == "mha":
+        # Same MMAs, same stores: dK / dV must match the 128-row tile exactly.
+        assert torch.equal(got[2], ref[2]), "dK differs from the 128-row tile"
+        assert torch.equal(got[3], ref[3]), "dV differs from the 128-row tile"
+    else:
+        # GQA accumulates the Q heads into fp32 in a different order: allow bf16 rounding.
+        for name, a, b_ in zip(("dK", "dV"), ref[2:], got[2:]):
+            tol = 2 * torch.finfo(dtype).eps * a.float().abs().max()
+            assert (a.float() - b_.float()).abs().max() <= tol, name
+
+
 @pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
 @pytest.mark.parametrize("feature", list(FEATURE_KWARGS))
 @pytest.mark.parametrize("layout", ["dense", "varlen"])
@@ -169,11 +189,7 @@ def test_bwd_tile_n_64_features(
 ):
     """GQA accumulate, varlen epilogue, deterministic, local and softcap on the 64-row tile."""
     if layout == "varlen":
-        # Ragged version of the same budget: keeps the tile edges and a short slot.
-        q_lens, k_lens = (
-            (q_lens[0] - 3, 65) if len(q_lens) == 2 else (q_lens[0] - 7,),
-            ((k_lens[0] + 5, 129) if len(k_lens) == 2 else (k_lens[0] + 1,)),
-        )
+        q_lens, k_lens = ragged_lens(q_lens, k_lens)
     if causal and any(nq > nk for nq, nk in zip(q_lens, k_lens)):
         pytest.skip("bottom-right causal leaves query rows without keys")
     torch.manual_seed(SEED)
@@ -191,16 +207,7 @@ def test_bwd_tile_n_64_features(
     args = (layout, q, k, v, dout, q_lens, k_lens, causal)
     ref = run_fwd_bwd_layout(*args, 128, **kwargs)
     got = run_fwd_bwd_layout(*args, 64, **kwargs)
-    assert torch.equal(got[0], ref[0]), "forward does not depend on the backward tile"
-    if mha_type == "mha":
-        # Same MMAs, same stores: dK / dV must match the 128-row tile exactly.
-        assert torch.equal(got[2], ref[2]), "dK differs from the 128-row tile"
-        assert torch.equal(got[3], ref[3]), "dV differs from the 128-row tile"
-    else:
-        # GQA accumulates the Q heads into fp32 in a different order: allow bf16 rounding.
-        for name, a, b_ in zip(("dK", "dV"), ref[2:], got[2:]):
-            tol = 2 * torch.finfo(dtype).eps * a.float().abs().max()
-            assert (a.float() - b_.float()).abs().max() <= tol, name
+    check_tile_n_64_against_128(ref, got, mha_type, dtype)
     if feature == "deterministic":
         again = run_fwd_bwd_layout(*args, 64, **kwargs)
         assert all(torch.equal(x, y) for x, y in zip(got, again)), (
@@ -208,3 +215,44 @@ def test_bwd_tile_n_64_features(
         )
     if feature in ("none", "deterministic"):
         check_against_reference(got, q, k, v, dout, q_lens, k_lens, causal, dtype)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+@pytest.mark.parametrize("layout", ["dense", "varlen"])
+@pytest.mark.parametrize("mha_type", list(HEADS))
+@pytest.mark.parametrize("head_dim,head_dim_v", [(128, 64)])
+def test_bwd_tile_n_64_head_dim_v(
+    head_dim, head_dim_v, mha_type, layout, causal, bwd_tile_n_env
+):
+    """head_dim_v != head_dim: the dV epilogue derives its TMEM load width, staging and TMA
+    stores from head_dim_v (MHA: TMA / direct store; GQA: fp32 accumulate)."""
+    # keys cover every query row, so causal has no empty rows (NaN in the eager reference)
+    q_lens, k_lens = (192, 192), (256, 256)
+    if layout == "varlen":
+        q_lens, k_lens = ragged_lens(q_lens, k_lens)
+    torch.manual_seed(SEED)
+    heads_q, heads_kv = HEADS[mha_type]
+    dtype = torch.bfloat16
+    q = torch.randn(
+        sum(q_lens), heads_q, head_dim, device="cuda", dtype=dtype, requires_grad=True
+    )
+    k = torch.randn(
+        sum(k_lens), heads_kv, head_dim, device="cuda", dtype=dtype, requires_grad=True
+    )
+    v = torch.randn(
+        sum(k_lens),
+        heads_kv,
+        head_dim_v,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+    dout = torch.randn(sum(q_lens), heads_q, head_dim_v, device="cuda", dtype=dtype)
+    args = (layout, q, k, v, dout, q_lens, k_lens, causal)
+    got = run_fwd_bwd_layout(*args, 64)
+    if mha_type == "mha":
+        ref = run_fwd_bwd_layout(*args, 128)
+        check_tile_n_64_against_128(ref, got, mha_type, dtype)
+    # GQA on the 128-row 2CTA tile does not compile for head_dim_v != head_dim (its fp32 dV
+    # staging is sized by head_dim), so every case is also checked against the eager reference.
+    check_against_reference(got, q, k, v, dout, q_lens, k_lens, causal, dtype)
