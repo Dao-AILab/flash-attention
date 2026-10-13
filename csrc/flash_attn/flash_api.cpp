@@ -365,6 +365,62 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
 #endif
 }
 
+// Allocate only when the caller requests slope gradients. Distinct key blocks and
+// warps write distinct partials, followed by a deterministic reduction.
+std::tuple<at::Tensor, at::Tensor> set_params_dalibi(
+        Flash_bwd_params &params,
+        const std::optional<at::Tensor> &alibi_slopes,
+        const std::optional<at::Tensor> &dalibi_slopes,
+        const at::Tensor &q,
+        const at::Tensor &k) {
+    params.dalibi_slopes_accum_ptr = nullptr;
+    params.dalibi_slopes_accum_head_stride = 0;
+    params.dalibi_slopes_batched_ptr = nullptr;
+    if (!dalibi_slopes.has_value()) { return {}; }
+    TORCH_CHECK(alibi_slopes.has_value(), "ALiBi slope gradients require ALiBi slopes");
+    TORCH_CHECK(dalibi_slopes->dtype() == torch::kFloat32, "ALiBi slope gradients must have dtype fp32");
+    TORCH_CHECK(dalibi_slopes->device() == q.device(), "ALiBi slope gradients must be on the same device as q");
+    TORCH_CHECK(dalibi_slopes->sizes() == alibi_slopes->sizes(), "ALiBi slope gradients must have the same shape as ALiBi slopes");
+    at::Tensor partials, batched;
+    auto opts = q.options().dtype(at::kFloat);
+    // Zero initialization covers padding, empty sequences, and skipped local tiles.
+    if (params.cu_seqlens_k != nullptr) {
+        // Sequence b starts at floor(cu_seqlens_k[b] / 32) + b. The extra slot
+        // per sequence accommodates rounding without padding every sequence to max K.
+        const int64_t num_slots = k.size(0) / Flash_bwd_params::kAlibiGradMinBlockN + params.b;
+        partials = torch::zeros({params.h, num_slots, Flash_bwd_params::kAlibiGradMaxWarps}, opts);
+        params.dalibi_slopes_accum_head_stride = partials.stride(0);
+        if (dalibi_slopes->dim() == 2) {
+            // Keep zero gradients when max_seqlen_q == 0 skips the backward launch.
+            batched = torch::zeros({params.b, params.h}, opts);
+            params.dalibi_slopes_batched_ptr = batched.data_ptr<float>();
+        }
+    } else {
+        const int num_n_blocks = (params.seqlen_k + Flash_bwd_params::kAlibiGradMinBlockN - 1)
+            / Flash_bwd_params::kAlibiGradMinBlockN;
+        partials = torch::zeros({params.b, params.h, num_n_blocks, Flash_bwd_params::kAlibiGradMaxWarps}, opts);
+        params.dalibi_slopes_accum_head_stride = partials.stride(1);
+    }
+    params.dalibi_slopes_accum_ptr = partials.data_ptr<float>();
+    return {partials, batched};
+}
+
+void reduce_dalibi(const at::Tensor &partials, const at::Tensor &batched,
+                   std::optional<at::Tensor> &dalibi_slopes) {
+    if (!dalibi_slopes.has_value()) { return; }
+    if (batched.defined()) {
+        // The native segmented reduction writes a contiguous temporary so the
+        // caller's output buffer may have any non-overlapping strided layout.
+        dalibi_slopes->copy_(batched);
+    } else if (partials.dim() == 3) {
+        at::sum_out(dalibi_slopes.value(), partials, {1, 2});
+    } else if (dalibi_slopes->dim() == 1) {
+        at::sum_out(dalibi_slopes.value(), partials, {0, 2, 3});
+    } else {
+        at::sum_out(dalibi_slopes.value(), partials, {2, 3});
+    }
+}
+
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
@@ -518,11 +574,11 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
-    if (seqlen_k > 0) {
+    if (seqlen_q > 0 && seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
     } else {
-        // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
+        // Empty Q or K requires no kernel launch and produces zero output.
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
@@ -767,11 +823,11 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
-    if (max_seqlen_k > 0) {
+    if (max_seqlen_q > 0 && max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream, paged_KV);
     } else {
-        // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
+        // Empty Q or K requires no kernel launch and produces zero output.
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
@@ -817,7 +873,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         const bool deterministic,
         // Retained only for backwards-compat arg positioning; must be None.
         std::optional<at::Tensor> unused_generator_compat,
-        std::optional<at::Tensor> &rng_state) {
+        std::optional<at::Tensor> &rng_state,
+        std::optional<at::Tensor> dalibi_slopes_ = std::nullopt) {
 
     TORCH_CHECK(!unused_generator_compat.has_value(),
                 "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
@@ -988,11 +1045,13 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+    auto [dalibi_slopes_accum, dalibi_slopes_batched] = set_params_dalibi(params, alibi_slopes_, dalibi_slopes_, q, k);
 
-    if (seqlen_q > 0) {
+    if (seqlen_q > 0 && seqlen_k > 0) {
         launch(params, stream);
     } else {
-        // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
+        // With empty Q or K all gradients are zero, including dQ when K is empty.
+        dq.zero_();
         dk_expanded.zero_();
         dv_expanded.zero_();
         softmax_d.zero_();
@@ -1004,6 +1063,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
     }
 
+    reduce_dalibi(dalibi_slopes_accum, dalibi_slopes_batched, dalibi_slopes_);
     return { dq, dk, dv, softmax_d };
 }
 
@@ -1032,7 +1092,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const bool deterministic,
                // Retained only for backwards-compat arg positioning; must be None.
                std::optional<at::Tensor> unused_generator_compat,
-               std::optional<at::Tensor> &rng_state) {
+               std::optional<at::Tensor> &rng_state,
+               std::optional<at::Tensor> dalibi_slopes_ = std::nullopt) {
 
     TORCH_CHECK(!unused_generator_compat.has_value(),
                 "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
@@ -1221,11 +1282,13 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+    auto [dalibi_slopes_accum, dalibi_slopes_batched] = set_params_dalibi(params, alibi_slopes_, dalibi_slopes_, q, k);
 
-    if (max_seqlen_q > 0) {
+    if (max_seqlen_q > 0 && max_seqlen_k > 0) {
         launch(params, stream);
     } else {
-        // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
+        // With empty Q or K all gradients are zero, including dQ when K is empty.
+        dq.zero_();
         dk_expanded.zero_();
         dv_expanded.zero_();
         softmax_d.zero_();
@@ -1237,6 +1300,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         at::sum_out(dv, at::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
     }
 
+    reduce_dalibi(dalibi_slopes_accum, dalibi_slopes_batched, dalibi_slopes_);
     return { dq, dk, dv, softmax_d };
 }
 
@@ -1536,7 +1600,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &FLASH_NAMESPACE::mha_fwd, "Forward pass");
     m.def("varlen_fwd", &FLASH_NAMESPACE::mha_varlen_fwd, "Forward pass (variable length)");
-    m.def("bwd", &FLASH_NAMESPACE::mha_bwd, "Backward pass");
-    m.def("varlen_bwd", &FLASH_NAMESPACE::mha_varlen_bwd, "Backward pass (variable length)");
+    m.def("bwd", &FLASH_NAMESPACE::mha_bwd, "Backward pass",
+          pybind11::arg("dout"), pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+          pybind11::arg("out"), pybind11::arg("softmax_lse"), pybind11::arg("dq"), pybind11::arg("dk"),
+          pybind11::arg("dv"), pybind11::arg("alibi_slopes"), pybind11::arg("p_dropout"),
+          pybind11::arg("softmax_scale"), pybind11::arg("is_causal"), pybind11::arg("window_size_left"),
+          pybind11::arg("window_size_right"), pybind11::arg("softcap"), pybind11::arg("deterministic"),
+          pybind11::arg("unused_generator_compat"), pybind11::arg("rng_state"),
+          pybind11::arg("dalibi_slopes") = pybind11::none());
+    m.def("varlen_bwd", &FLASH_NAMESPACE::mha_varlen_bwd, "Backward pass (variable length)",
+          pybind11::arg("dout"), pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+          pybind11::arg("out"), pybind11::arg("softmax_lse"), pybind11::arg("dq"), pybind11::arg("dk"),
+          pybind11::arg("dv"), pybind11::arg("cu_seqlens_q"), pybind11::arg("cu_seqlens_k"),
+          pybind11::arg("alibi_slopes"), pybind11::arg("max_seqlen_q"), pybind11::arg("max_seqlen_k"),
+          pybind11::arg("p_dropout"), pybind11::arg("softmax_scale"), pybind11::arg("zero_tensors"),
+          pybind11::arg("is_causal"), pybind11::arg("window_size_left"), pybind11::arg("window_size_right"),
+          pybind11::arg("softcap"), pybind11::arg("deterministic"), pybind11::arg("unused_generator_compat"),
+          pybind11::arg("rng_state"), pybind11::arg("dalibi_slopes") = pybind11::none());
     m.def("fwd_kvcache", &FLASH_NAMESPACE::mha_fwd_kvcache, "Forward pass, with KV-cache");
 }
