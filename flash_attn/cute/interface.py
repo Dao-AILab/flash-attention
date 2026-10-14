@@ -350,6 +350,7 @@ def _get_fwd_config(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
+    is_fp8: bool = False,
 ) -> FwdConfig:
     if seqlen_q is None:
         seqlen_q = max_seqlen_q
@@ -363,6 +364,15 @@ def _get_fwd_config(
             # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
             if head_dim > 64:
                 cfg = FwdConfig(128, 64, True, True)
+            if is_fp8:
+                # FP8 keeps P and O fragments live together. Use smaller tiles for
+                # wide V heads, or when the default grid cannot fill one SM wave.
+                q_rows = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
+                num_m_blocks = (q_rows + 127) // 128
+                num_heads = num_head_kv * (1 if pack_gqa else qhead_per_kvhead)
+                num_ctas = batch_size * num_heads * num_m_blocks
+                if head_dim_v > 128 or num_ctas < get_num_sms_for_selection(device.index, arch):
+                    cfg = FwdConfig(64, 64, True, True)
         elif arch // 10 == 8:
             cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
@@ -1077,6 +1087,7 @@ def _flash_attn_fwd(
         block_sparse_tensors=block_sparse_tensors,
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
+        is_fp8=is_fp8,
     )
     mla_fwd_cls = None
     if qv is not None:
