@@ -60,6 +60,7 @@ def test_splitkv_forwards_explicit_arch(monkeypatch):
     monkeypatch.setattr(_flash_attn_fwd, "compile_cache", HitCache())
     monkeypatch.setattr(_flash_attn_fwd_combine, "compile_cache", HitCache())
     monkeypatch.setattr(interface, "_get_device_arch", unexpected_arch_query)
+    monkeypatch.setenv("FLASH_ATTENTION_NUM_SMS", "148")
     with FakeTensorMode():
         q = torch.empty(1, 1, 8, 64, device="cuda", dtype=torch.bfloat16)
         k = torch.empty(1, 1024, 8, 64, device="cuda", dtype=torch.bfloat16)
