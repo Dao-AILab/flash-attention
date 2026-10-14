@@ -701,6 +701,14 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
                     tile_m, tile_n = 64, 128
                 else:
                     tile_m, tile_n = 128, 64
+            if inputs.dtype == "torch.float8_e4m3fn":
+                # FP8 keeps P and O fragments live together. Shrink wide-V
+                # tiles and grids that cannot fill one SM wave.
+                num_m_blocks = ceil_div(inputs.packed_max_seqlen_q, 128)
+                num_heads = inputs.num_heads_kv if inputs.pack_gqa else inputs.num_heads
+                num_ctas = inputs.batch_size * num_heads * num_m_blocks
+                if inputs.head_dim_v > 128 or num_ctas < inputs.num_sms:
+                    tile_m, tile_n = 64, 64
 
     if inputs.requested_tile_m is not None:
         tile_m = inputs.requested_tile_m
