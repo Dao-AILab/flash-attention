@@ -664,7 +664,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         """
         assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         if const_expr(self.is_fp8):
-            assert mV.stride[1] == 1, "SM120 E4M3 V must be sequence-major packed BSHD"
+            assert mV.stride[-1] == 1, "SM120 E4M3 V must have contiguous head dimension"
             assert self.num_stages == 1 and not self.Q_in_regs
         self._check_type(
             *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
@@ -678,12 +678,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mO)]
-        if const_expr(self.is_fp8):
-            mV = cute.make_tensor(mV.iterator, cute.make_layout(mV.shape, stride=tuple(
-                s if i == 1 or isinstance(s, int) else cute.assume(s, divby=16)
-                for i, s in enumerate(mV.stride))))
-        else:
-            mV = assume_tensor_aligned(mV)
+        mV = assume_tensor_aligned(mV)
         # Layout permutation: 4D non-varlen vs 3D varlen
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
@@ -692,8 +687,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             for t in (mQ, mO)
         ]
         mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=KV_layout_transpose))
-        V_layout_transpose = [1, 3, 2, 0] if const_expr(self.is_fp8) else KV_layout_transpose
-        mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
+        mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=KV_layout_transpose))
         if const_expr(mLSE is not None):
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
@@ -865,10 +859,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 mV_cur = mV[None, None, num_head_kv, batch_size]
             else:
                 mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
-                if const_expr(not self.is_fp8):
-                    mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
-            if const_expr(self.is_fp8):
-                mV_cur = mV[None, None, num_head_kv, batch_size]
+                mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
             if const_expr(not self.pack_gqa):
                 gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
             gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
@@ -924,13 +915,29 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
                 self.dtype,
             )
-            smem_copy_atom_V = cute.make_copy_atom(
-                warp.LdMatrix8x8x16bOp(transpose=not self.is_fp8, num_matrices=4),
-                self.dtype,
-            )
+            if const_expr(self.is_fp8):
+                # Native byte transpose loads row-major V into the FP8 MMA B layout.
+                smem_copy_atom_V = cute.make_copy_atom(
+                    warp.LdMatrix16x16x8bOp(transpose=True, num_matrices=2),
+                    self.dtype,
+                )
+            else:
+                smem_copy_atom_V = cute.make_copy_atom(
+                    warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+                    self.dtype,
+                )
             smem_thr_copy_Q = utils.make_tiled_copy_A(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
             smem_thr_copy_K = utils.make_tiled_copy_B(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
-            smem_thr_copy_V = utils.make_tiled_copy_B(smem_copy_atom_V, tiled_mma_pv).get_slice(tidx)
+            if const_expr(self.is_fp8):
+                # Native b8 load order: four k bytes, two n8 groups, two k16 groups.
+                smem_thr_copy_V = cute.make_tiled_copy(
+                    smem_copy_atom_V,
+                    cute.make_layout(((4, 8, self.num_threads // 32), (4, 2, 2)),
+                                     stride=((64, 1, 0), (16, 8, 256))),
+                    (16, 32),
+                ).get_slice(tidx)
+            else:
+                smem_thr_copy_V = utils.make_tiled_copy_B(smem_copy_atom_V, tiled_mma_pv).get_slice(tidx)
 
             tSsQ = smem_thr_copy_Q.partition_S(sQ)
             tSsK = smem_thr_copy_K.partition_S(sK)
@@ -1256,7 +1263,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             sync()
             load_K_next()
         if const_expr(self.is_fp8):
-            sm80_utils.gemm(
+            self.gemm_pv_fp8(
                 mma_params.thr_mma_pv, mma_params.acc_O,
                 mma_params.tOrP, mma_params.tOrVt,
                 smem_copy_params.tPsP, smem_copy_params.tOsVt[None, None, None, 0],
