@@ -717,6 +717,7 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    combine_max_splits: Optional[int] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -1954,6 +1955,7 @@ def _flash_attn_fwd(
             seqused_q,
             num_splits_dynamic_ptr=num_splits_dynamic if has_scheduler_metadata else None,
             virtual_batch_idx=virtual_batch_idx if has_scheduler_metadata else None,
+            combine_max_splits=combine_max_splits,
             _arch=arch,
         )
         if lse is not None and qv is not None:
@@ -3906,6 +3908,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        combine_max_splits: Optional[int] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3947,6 +3950,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            combine_max_splits=combine_max_splits,
         )
         ctx.save_for_backward(
             q,
@@ -4020,9 +4024,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 16)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 17)
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 17)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4056,7 +4060,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 16)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 17)
 
 
 def _validate_gather_bwd_kwargs(
@@ -4199,6 +4203,7 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    combine_max_splits: Optional[int] = None,
 ):
     """
     Tensor arguments:
@@ -4246,7 +4251,14 @@ def flash_attn_varlen_func(
         and functionality. computed in get_scheduler_metadata.
 
     seqlen_k_per_split: when using dynamic (per-batch) num_splits, can set a fixed seqlen_k to be
-        covered per split for bitwise reproducibility.
+        covered per split for bitwise reproducibility. Split s covers the absolute key range
+        [s * seqlen_k_per_split, (s + 1) * seqlen_k_per_split).
+
+    combine_max_splits: fix the split capacity of the SplitKV combine kernel (<= 256, >= num_splits).
+        The order in which the combine sums the per-split LSE terms depends on its split capacity,
+        which by default grows with num_splits. Pinning it, together with seqlen_k_per_split, makes
+        the output independent of num_splits, e.g. decode (paged KV, a few query tokens) and prefill
+        over the same tokens agree bitwise even if they launch different split counts.
 
     disable_scheduler_metadata: if True, ignores scheduler_metadata if it is passed and skips
         computing metadata fresh.
@@ -4302,6 +4314,7 @@ def flash_attn_varlen_func(
         disable_scheduler_metadata,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        combine_max_splits,
     )
 
 
@@ -4375,6 +4388,7 @@ def _flash_attn_fwd_combine(
     virtual_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
     *,
+    combine_max_splits: Optional[int] = None,
     _arch: Optional[int] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
@@ -4430,6 +4444,12 @@ def _flash_attn_fwd_combine(
         # If kBlockM == 8 then the minimum number of splits is 32.
         # TODO: we can deal w this by using 128 threads instead
         log_max_splits = max(log_max_splits, 5)
+    if combine_max_splits is not None:
+        # Pinned split capacity: the LSE reduction order no longer depends on num_splits.
+        assert num_splits <= combine_max_splits <= 256, (
+            f"combine_max_splits={combine_max_splits} must be in [num_splits={num_splits}, 256]"
+        )
+        log_max_splits = max(math.ceil(math.log2(combine_max_splits)), 5 if tile_m == 8 else 4)
 
     # Create combine kernel configuration
     dtype = torch2cute_dtype_map[out.dtype]
