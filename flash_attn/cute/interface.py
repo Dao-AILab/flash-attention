@@ -31,6 +31,7 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
+    _has_aligned_pointer,
     get_aux_tensor_metadata,
     get_broadcast_dims,
     get_num_sms_for_selection,
@@ -381,6 +382,17 @@ def _get_fwd_config(
         cfg = FwdConfig(tile_mn[0], tile_mn[1], cfg.mma_pv_is_rs, cfg.intra_wg_overlap)
 
     tile_m, tile_n = cfg.m_block_size, cfg.n_block_size
+    if arch // 10 == 12 and not is_fp8 and tile_mn is None:
+        # Capacity fallback, independent of sequence lengths and benchmark shapes.
+        while not FlashAttentionForwardSm120.can_implement(
+            cutlass.BFloat16, head_dim, head_dim_v, tile_m, tile_n, 1, 128, causal
+        ):
+            if tile_m > 64:
+                tile_m //= 2
+            elif tile_n > 16:
+                tile_n //= 2
+            else:
+                raise ValueError("SM120 head dimensions exceed the shared-memory capacity")
     if mma_pv_is_rs is None:
         mma_pv_is_rs = cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
@@ -416,10 +428,7 @@ def _get_fwd_config(
     total_mblocks = batch_size * num_head_kv * (1 if pack_gqa else qhead_per_kvhead) * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = None
-    if arch // 10 == 12:
-        assert num_splits <= 1, "SM120 forward only supports num_splits=1"
-        num_splits = 1
-    elif num_splits < 1:
+    if num_splits < 1:
         num_SMs = get_num_sms_for_selection(device.index, arch)
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
@@ -742,14 +751,24 @@ def _flash_attn_fwd(
         for t in (q, k, v, qv, learnable_sink, q_descale, k_descale, v_descale)
     )
     fake_mode = is_fake_mode()
+    arch = _get_device_arch() if _arch is None else _arch
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
     # MLA needs K and V to share one descale tensor: check identity before maybe_contiguous
     kv_descale_shared = k_descale is not None and k_descale is v_descale
-    q_descale, k_descale, v_descale = [
-        maybe_contiguous(t, align_bytes=4) for t in (q_descale, k_descale, v_descale)
-    ]
+    if arch // 10 == 12:
+        # Caller-owned scalar-expanded scales need no materialization. Preserve
+        # their broadcast strides, including a size-one KV-head dimension.
+        q_descale, k_descale, v_descale = [
+            t if t is not None and all(s == 0 for s in t.stride()) and _has_aligned_pointer(t, 4)
+            else maybe_contiguous(t, align_bytes=4)
+            for t in (q_descale, k_descale, v_descale)
+        ]
+    else:
+        q_descale, k_descale, v_descale = [
+            maybe_contiguous(t, align_bytes=4) for t in (q_descale, k_descale, v_descale)
+        ]
     if kv_descale_shared:
         v_descale = k_descale
     page_table = maybe_contiguous(page_table, align_bytes=4)
@@ -844,7 +863,6 @@ def _flash_attn_fwd(
                 learnable_sink,
             )
         ), "inputs must be on CUDA device"
-    arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
@@ -868,11 +886,10 @@ def _flash_attn_fwd(
         if (qv is not None or gather_kv_indices is not None or page_table is not None
                 or learnable_sink is not None or score_mod is not None or mask_mod is not None
                 or block_sparse_tensors is not None or aux_tensors is not None
-                or aux_scalars is not None or softcap is not None or num_splits > 1
-                or scheduler_metadata is not None or seqlen_k_per_split is not None):
+                or aux_scalars is not None or softcap is not None):
             raise NotImplementedError(
-                "SM120 FP8 supports dense/varlen causal or local attention with num_splits<=1; "
-                "MLA, paged/gather KV, sinks, modifiers, sparsity and scheduler metadata are unsupported"
+                "SM120 FP8 supports dense/varlen causal or local attention with SplitKV; "
+                "MLA, paged/gather KV, sinks, modifiers and sparsity are unsupported"
             )
         if min(head_dim, head_dim_v) <= 0 or max(head_dim, head_dim_v) > 256 or head_dim % 16 or head_dim_v % 16:
             raise ValueError("SM120 FP8 head dimensions must be positive multiples of 16, at most 256")
@@ -1030,6 +1047,7 @@ def _flash_attn_fwd(
             # Prefer 2CTA over cp.async-Q PackGQA for hd256.
             pack_gqa = False
 
+    requested_num_splits = num_splits
     fwd_cfg = _get_fwd_config(
         arch=arch,
         head_dim=head_dim,
@@ -1073,12 +1091,12 @@ def _flash_attn_fwd(
         )
     mla_1cta_kb64 = mla_fwd_cls is FlashAttentionMLAForward1CtaKb64Sm100
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
-    if is_fp8 and arch // 10 == 12:
-        if max_seqlen_k <= 0:
+    if arch // 10 == 12:
+        if is_fp8 and max_seqlen_k <= 0:
             raise ValueError("SM120 FP8 max_seqlen_k must be positive for nonempty inputs")
         if not FlashAttentionForwardSm120.can_implement(
                 dtype, head_dim, head_dim_v, tile_m, tile_n, 1, num_threads, causal):
-            raise ValueError("SM120 FP8 tile exceeds the supported MMA/layout or 99 KiB shared-memory limits")
+            raise ValueError("SM120 tile exceeds the supported MMA/layout or 99 KiB shared-memory limits")
     q_stage = fwd_cfg.q_stage
     num_splits = fwd_cfg.num_splits
     mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
@@ -1088,6 +1106,11 @@ def _flash_attn_fwd(
     max_m_blocks_leq_one = seqlen_q_packgqa <= q_stage * tile_m
 
     is_split_kv = num_splits > 1
+    if arch // 10 == 12 and seqlen_k_per_split is not None:
+        if seqlen_k_per_split <= 0 or seqlen_k_per_split % tile_n:
+            raise ValueError("seqlen_k_per_split must be a positive multiple of tile_n")
+        if num_splits * seqlen_k_per_split < max_seqlen_k:
+            raise ValueError("num_splits cannot cover max_seqlen_k at the requested split grain")
     # Single-M-block hd256 2CTA halves each CTA's K/V loads; worth it while the doubled
     # grid fits in one wave.
     hd256_decode_2cta = (
@@ -1295,6 +1318,7 @@ def _flash_attn_fwd(
         and scheduler_metadata is None
         and not disable_scheduler_metadata
         and qv is None
+        and (arch // 10 != 12 or requested_num_splits < 1)
     ):
         scheduler_metadata = _get_scheduler_metadata(
             num_batch=batch_size,
@@ -1354,7 +1378,7 @@ def _flash_attn_fwd(
     cu_total_m_blocks = None
     cu_total_splits_m_blocks = None
     blocks_to_batch_idx = None
-    use_single_tile_varlen_scheduler = tile_count_semaphore is None
+    use_single_tile_varlen_scheduler = arch // 10 == 12 or tile_count_semaphore is None
     use_cu_hint = (
         is_varlen_q
         and use_single_tile_varlen_scheduler
@@ -1613,7 +1637,10 @@ def _flash_attn_fwd(
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
         q_descale_tensor, k_descale_tensor, v_descale_tensor = (
-            to_cute_tensor(t, assumed_align=4, leading_dim=1)
+            to_cute_tensor(
+                t, assumed_align=4, leading_dim=1,
+                fully_dynamic=t is not None and t.stride(-1) == 0,
+            ) if arch // 10 == 12 else to_cute_tensor(t, assumed_align=4, leading_dim=1)
             for t in (q_descale, k_descale, v_descale)
         )
         descale_tensors_tensor = (
@@ -1809,7 +1836,6 @@ def _flash_attn_fwd(
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
             assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
@@ -1817,6 +1843,8 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
+                seqlen_k_per_split=seqlen_k_per_split,
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
@@ -1903,6 +1931,10 @@ def _flash_attn_fwd(
                     compile_args.append(tensormap_workspace_tensor)
             if arch // 10 in [8, 12]:
                 compile_args.append(descale_tensors_tensor)
+            if arch // 10 == 12:
+                compile_args.extend([num_splits_dynamic_tensor, virtual_batch_idx_tensor])
+            elif arch // 10 == 8:
+                compile_args.extend([None, None])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
@@ -2000,6 +2032,10 @@ def _flash_attn_fwd(
                     call_args.append(tensormap_workspace)
             if arch // 10 in [8, 12]:
                 call_args.append(descale_tensors)
+            if arch // 10 == 12:
+                call_args.extend([num_splits_dynamic, virtual_batch_idx])
+            elif arch // 10 == 8:
+                call_args.extend([None, None])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         # Combine writes a seqlen-contiguous LSE. The MLA LSE is (..., s, h) contiguous, so
@@ -2025,7 +2061,7 @@ def _flash_attn_fwd(
         )
         if lse is not None and qv is not None:
             lse.copy_(lse_combine)
-    if reuse_scheduler_metadata and tile_count_semaphore is not None:
+    if reuse_scheduler_metadata and tile_count_semaphore is not None and arch // 10 != 12:
         # TODO: pass tile_count_semaphore to the combine kernel and zero it there when
         # is_split_kv (using CTA 0, since a later CTA may have exited prematurely), so
         # that this host-side zeroing is only needed when is_split_kv=False.
