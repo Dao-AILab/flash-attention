@@ -363,6 +363,23 @@ def _get_fwd_config(
             # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
             if head_dim > 64:
                 cfg = FwdConfig(128, 64, True, True)
+            # BF16 and FP16 share the same SM120 resource requirements.
+            if not FlashAttentionForwardSm120.can_implement(
+                cutlass.BFloat16, head_dim, head_dim_v,
+                cfg.m_block_size, cfg.n_block_size, 1, 128, causal,
+            ) and FlashAttentionForwardSm120.can_implement(
+                cutlass.BFloat16, head_dim, head_dim_v, 64, 64, 1, 128, causal,
+            ):
+                cfg = FwdConfig(64, 64, True, True)
+            # Keep the existing head-width boundary; account for causal masking.
+            if head_dim <= 64:
+                tile_m, tile_n = (64, 128) if causal else (128, 64)
+            else:
+                tile_m, tile_n = 64, 64
+            if FlashAttentionForwardSm120.can_implement(
+                cutlass.BFloat16, head_dim, head_dim_v, tile_m, tile_n, 1, 128, causal,
+            ):
+                cfg = FwdConfig(tile_m, tile_n, True, True)
         elif arch // 10 == 8:
             cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
