@@ -78,8 +78,6 @@ from flash_attn.cute.utils import AuxData
 # === TUNING KNOBS (agent-editable) ===
 # Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
 # Values:
-#   ex2_emu_freq: int — how often to use emulated exp2 (0=all hardware exp2, higher=more emulation).
-#                        SM103 has fast native exp2, so set freq=0 there.
 #   ex2_emu_start_frg: int — fragment index to start emulation from
 #   num_regs_softmax: int — register count for softmax warps (multiple of 8)
 #   num_regs_correction: int — register count for correction warps (multiple of 8)
@@ -166,7 +164,9 @@ class FlashAttentionForwardSm100:
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
         use_s_ping_pong: cutlass.Constexpr[bool] = False,
+        ex2_emu_freq: Optional[int] = None,
     ):
+        self.ex2_emu_freq_override = ex2_emu_freq
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -377,6 +377,8 @@ class FlashAttentionForwardSm100:
         # Look up tuning config for register counts and ex2_emu params
         _tune_key = (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103)
         self._tune = _TUNING_CONFIG.get(_tune_key, {})
+        if ex2_emu_freq is not None:
+            self._tune = {**self._tune, "ex2_emu_freq": ex2_emu_freq}
         if "ex2_emu_freq" in self._tune:
             self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
         if self.head_dim_padded < 96:
@@ -552,6 +554,7 @@ class FlashAttentionForwardSm100:
             self.ex2_emu_freq = self._tune.get("ex2_emu_freq", 16)
             if const_expr(
                 self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
+                and self.ex2_emu_freq_override is None
             ):
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
 

@@ -717,6 +717,7 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    ex2_emu_freq: Optional[int] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -843,6 +844,13 @@ def _flash_attn_fwd(
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+    if ex2_emu_freq is not None and not (
+        type(ex2_emu_freq) is int and ex2_emu_freq >= 0
+        and arch // 10 in (10, 11) and q is not None and k is not None
+        and qv is None and q.dtype in (torch.float16, torch.bfloat16)
+        and q.device == k.device == v.device
+    ):
+        raise ValueError("ex2_emu_freq requires a nonnegative int and standard SM100/SM110 FP16 or BF16 attention")
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
     if arch // 10 not in [8, 12]:
@@ -1518,6 +1526,7 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
+        ex2_emu_freq,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1747,6 +1756,7 @@ def _flash_attn_fwd(
                     seqlen_k_per_split=seqlen_k_per_split,
                     has_tile_count_semaphore=tile_count_semaphore is not None,
                     use_s_ping_pong=use_s_ping_pong,
+                    ex2_emu_freq=ex2_emu_freq,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -3811,6 +3821,7 @@ class FlashAttnFunc(torch.autograd.Function):
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
         bf16_dq: bool = False,
+        ex2_emu_freq: Optional[int] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3841,6 +3852,7 @@ class FlashAttnFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            ex2_emu_freq=ex2_emu_freq,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -3889,9 +3901,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 15)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 15)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3921,7 +3933,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 15)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3961,6 +3973,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        ex2_emu_freq: Optional[int] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -4002,6 +4015,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            ex2_emu_freq=ex2_emu_freq,
         )
         ctx.save_for_backward(
             q,
@@ -4075,9 +4089,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 16)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 17)
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 17)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4111,7 +4125,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 16)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 17)
 
 
 def _validate_gather_bwd_kwargs(
@@ -4176,7 +4190,10 @@ def flash_attn_func(
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
     bf16_dq: bool = False,
+    ex2_emu_freq: Optional[int] = None,
 ):
+    if ex2_emu_freq is not None and softcap is None:
+        softcap = 0.0
     if bf16_dq:
         _validate_bf16_dq(q, k, v,
             not deterministic and softcap in (None, 0.0)
@@ -4226,6 +4243,7 @@ def flash_attn_func(
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
         bf16_dq,
+        ex2_emu_freq,
     )
 
 
@@ -4263,6 +4281,7 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    ex2_emu_freq: Optional[int] = None,
 ):
     """
     Tensor arguments:
@@ -4329,6 +4348,8 @@ def flash_attn_varlen_func(
         Must be a positive int (anything else raises); requires varlen or batch 1 (warns
         and runs unchunked otherwise). Small launch-overhead cost. None disables.
     """
+    if ex2_emu_freq is not None and softcap is None:
+        softcap = 0.0
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -4366,6 +4387,7 @@ def flash_attn_varlen_func(
         disable_scheduler_metadata,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        ex2_emu_freq,
     )
 
 
