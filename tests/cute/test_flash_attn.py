@@ -91,7 +91,7 @@ def test_flash_attn_auto_splits_more_tiles_than_sms():
     assert torch.equal(out, ref)
 
 
-@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
+@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV behavior")
 @pytest.mark.parametrize("num_splits", [0, -1])
 def test_flash_attn_sm120_num_splits(num_splits):
     q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
@@ -100,11 +100,12 @@ def test_flash_attn_sm120_num_splits(num_splits):
     out = flash_attn_func(q, k, v)
     out_auto = flash_attn_func(q, k, v, num_splits=num_splits)
     torch.testing.assert_close(out_auto, out)
-    with pytest.raises(AssertionError, match="SM120 forward only supports num_splits=1"):
-        flash_attn_func(q, k, v, num_splits=3)
+    out_1 = flash_attn_func(q, k, v, num_splits=1)
+    out_split = flash_attn_func(q, k, v, num_splits=3)
+    torch.testing.assert_close(out_split, out_1)
 
 
-@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
+@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV behavior")
 @pytest.mark.parametrize("num_splits", [0, -1])
 def test_flash_attn_sm120_fp8_num_splits(num_splits):
     q, k, v = [
@@ -113,8 +114,11 @@ def test_flash_attn_sm120_fp8_num_splits(num_splits):
     out = flash_attn_func(q, k, v)
     out_auto = flash_attn_func(q, k, v, num_splits=num_splits)
     torch.testing.assert_close(out_auto, out)
-    with pytest.raises(NotImplementedError, match="num_splits<=1"):
-        flash_attn_func(q, k, v, num_splits=3)
+    out_1 = flash_attn_func(q, k, v, num_splits=1)
+    out_split = flash_attn_func(q, k, v, num_splits=3)
+    torch.testing.assert_close(out_split, out_1)
+    with pytest.raises(NotImplementedError, match="SM120 FP8 supports dense/varlen"):
+        flash_attn_func(q, k, v, num_splits=3, softcap=1.0)
 
 
 @pytest.mark.skipif(
