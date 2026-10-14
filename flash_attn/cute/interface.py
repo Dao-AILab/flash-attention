@@ -733,6 +733,7 @@ def _flash_attn_fwd(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     ex2_emu_freq: Optional[int] = None,
+    approximate_softmax: bool = False,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -755,6 +756,8 @@ def _flash_attn_fwd(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
     )
     fake_mode = is_fake_mode()
+    original_qkv = (q, k, v) if approximate_softmax else ()
+    original_outputs = (out, lse) if approximate_softmax else ()
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
@@ -866,6 +869,24 @@ def _flash_attn_fwd(
         and q.device == k.device == v.device
     ):
         raise ValueError("ex2_emu_freq requires a nonnegative int and standard SM100/SM110 FP16 or BF16 attention")
+    if approximate_softmax and not (
+        arch // 10 in (10, 11) and q is not None and k is not None
+        and q.ndim == 4 and q.dtype == torch.bfloat16
+        and q.device == k.device == v.device
+        and num_head > 0 and num_head_kv > 0
+        and ex2_emu_freq is None and softcap in (None, 0.0) and num_splits == 1
+        and (softmax_scale is None or (
+            isinstance(softmax_scale, (int, float))
+            and math.isfinite(softmax_scale) and softmax_scale > 0
+        ))
+        and all(t is None for t in (
+            qv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table,
+            learnable_sink, score_mod,
+            mask_mod, block_sparse_tensors, gather_kv_indices, scheduler_metadata,
+            aux_tensors, aux_scalars, seqlen_k_per_split, q_descale, k_descale, v_descale,
+        ))
+    ):
+        raise ValueError("approximate_softmax requires SM100 BF16 attention with a finite positive scale and no score modifiers")
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
     if arch // 10 not in [8, 12]:
@@ -916,6 +937,22 @@ def _flash_attn_fwd(
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
         validate_output_layout(lse, "lse", align_bytes=4)
+
+    if approximate_softmax:
+        for dst in original_outputs:
+            if dst is not None:
+                span = 1
+                for stride, size in sorted(zip(dst.stride(), dst.shape)):
+                    if size > 1:
+                        if stride < span:
+                            raise ValueError("approximate_softmax requires non-overlapping output layouts")
+                        span += (size - 1) * stride
+                if any(_storage_overlaps(dst, t) for t in original_qkv):
+                    raise ValueError("approximate_softmax requires output storage separate from inputs")
+        if all(t is not None for t in original_outputs) and _storage_overlaps(*original_outputs):
+            raise ValueError("approximate_softmax requires separate out and lse storage")
+        if min(seqlen_q, seqlen_k) < 16384:
+            approximate_softmax, ex2_emu_freq = False, 32
 
     if seqlen_k == 0 or total_q == 0:
         out.zero_()
@@ -1079,6 +1116,8 @@ def _flash_attn_fwd(
     num_splits = fwd_cfg.num_splits
     mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     intra_wg_overlap = fwd_cfg.intra_wg_overlap
+    if approximate_softmax and (tile_m != 128 or tile_n not in (64, 128)):
+        approximate_softmax = False
 
     seqlen_q_packgqa = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
     max_m_blocks_leq_one = seqlen_q_packgqa <= q_stage * tile_m
@@ -1191,6 +1230,9 @@ def _flash_attn_fwd(
         block_sparse_broadcast_pattern = block_sparse_config.broadcast_pattern
         q_subtile_factor = block_sparse_config.q_subtile_factor
         kv_subtile_factor = block_sparse_config.kv_subtile_factor
+    if approximate_softmax:
+        from flash_attn.cute.norm_certificate import attention_norm_certificate
+        aux_tensors = [attention_norm_certificate(q, k, v, softmax_scale)]
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
@@ -1455,6 +1497,7 @@ def _flash_attn_fwd(
     num_n_blocks_per_split = cute.ceil_div(cute.ceil_div(s_ping_pong_seqlen_k_loaded, tile_n), num_splits)
     use_s_ping_pong = (
         not requested_disable_s_ping_pong
+        and not approximate_softmax
         and arch // 10 in (10, 11)
         and q_stage == 1
         and head_dim in (64, 128, 256)
@@ -1472,6 +1515,7 @@ def _flash_attn_fwd(
         )
     )
 
+    packed_masked_scores = approximate_softmax and (causal or local or seqlen_k % tile_n != 0)
     compile_key = (
         mla_1cta,
         mla_1cta_kb64,
@@ -1542,6 +1586,8 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
         ex2_emu_freq,
+        approximate_softmax,
+        packed_masked_scores,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1772,6 +1818,8 @@ def _flash_attn_fwd(
                     has_tile_count_semaphore=tile_count_semaphore is not None,
                     use_s_ping_pong=use_s_ping_pong,
                     ex2_emu_freq=ex2_emu_freq,
+                    approximate_softmax=approximate_softmax,
+                    packed_masked_scores=packed_masked_scores,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -3838,6 +3886,7 @@ class FlashAttnFunc(torch.autograd.Function):
         gather_bwd_token_chunk: Optional[int] = None,
         bf16_dq: bool = False,
         ex2_emu_freq: Optional[int] = None,
+        approximate_softmax: bool = False,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3869,11 +3918,13 @@ class FlashAttnFunc(torch.autograd.Function):
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             ex2_emu_freq=ex2_emu_freq,
+            approximate_softmax=approximate_softmax,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
         ctx.shared_kv = shared_kv
         ctx.bf16_dq = bf16_dq
+        ctx.approximate_softmax = approximate_softmax
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -3891,6 +3942,8 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
+        if ctx.approximate_softmax:
+            raise ValueError("approximate_softmax is forward-only")
         q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
@@ -3917,9 +3970,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 17)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 17)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3949,7 +4002,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 17)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -4207,6 +4260,7 @@ def flash_attn_func(
     gather_bwd_token_chunk: Optional[int] = None,
     bf16_dq: bool = False,
     ex2_emu_freq: Optional[int] = None,
+    approximate_softmax: bool = False,
 ):
     if ex2_emu_freq is not None and softcap is None:
         softcap = 0.0
@@ -4217,6 +4271,12 @@ def flash_attn_func(
                 qv, gather_kv_indices, learnable_sink, score_mod, score_mod_bwd,
                 mask_mod, aux_tensors, aux_scalars, block_sparse_tensors, block_sparse_tensors_bwd,
             )))
+    if approximate_softmax and (bf16_dq or ex2_emu_freq is not None):
+        raise ValueError("approximate_softmax does not support bf16_dq or ex2_emu_freq")
+    if approximate_softmax and torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
+    ):
+        raise ValueError("approximate_softmax is forward-only")
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -4260,6 +4320,7 @@ def flash_attn_func(
         gather_bwd_token_chunk,
         bf16_dq,
         ex2_emu_freq,
+        approximate_softmax,
     )
 
 
