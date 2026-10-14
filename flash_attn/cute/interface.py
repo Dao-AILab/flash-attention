@@ -52,6 +52,7 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
+    _has_aligned_pointer,
     get_aux_tensor_metadata,
     get_broadcast_dims,
     get_num_sms_for_selection,
@@ -495,6 +496,7 @@ def _validate_tensorwise_scales(
     *,
     batch_size: int,
     num_head_kv: int,
+    preserve_broadcast: bool = False,
 ) -> TensorwiseScales:
     """Check FP8 descales against the inputs; return them in a kernel-compatible layout.
 
@@ -519,7 +521,11 @@ def _validate_tensorwise_scales(
             "MLA without q / k (no rope part) reads the latent cache as v: pass its descale as "
             "scales.v (scales.k, if given, must be the same tensor)"
         )
-    return TensorwiseScales(*(maybe_contiguous(t, align_bytes=4) for t in scales))
+    return TensorwiseScales(*(
+        t if preserve_broadcast and t is not None and all(s == 0 for s in t.stride())
+        and _has_aligned_pointer(t, 4) else maybe_contiguous(t, align_bytes=4)
+        for t in scales
+    ))
 
 
 def _validate_block_scales(
@@ -682,6 +688,7 @@ def _flash_attn_fwd(
         for t in (q, k, v, qv, learnable_sink)
     )
     fake_mode = is_fake_mode()
+    arch = _get_device_arch() if _arch is None else _arch
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
@@ -720,7 +727,8 @@ def _flash_attn_fwd(
             pass
         case TensorwiseScales():
             descales = _validate_tensorwise_scales(
-                scales, q, v, qv, batch_size=batch_size, num_head_kv=num_head_kv
+                scales, q, v, qv, batch_size=batch_size, num_head_kv=num_head_kv,
+                preserve_broadcast=arch // 10 == 12,
             )
         case BlockScales():
             block_scales = _validate_block_scales(
@@ -809,7 +817,6 @@ def _flash_attn_fwd(
                 learnable_sink,
             )
         ), "inputs must be on CUDA device"
-    arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
@@ -836,11 +843,10 @@ def _flash_attn_fwd(
         if (qv is not None or gather_kv_indices is not None or page_table is not None
                 or learnable_sink is not None or score_mod is not None or mask_mod is not None
                 or block_sparse_tensors is not None or aux_tensors is not None
-                or aux_scalars is not None or softcap is not None or num_splits > 1
-                or scheduler_metadata is not None or seqlen_k_per_split is not None):
+                or aux_scalars is not None or softcap is not None):
             raise NotImplementedError(
-                "SM120 FP8 supports dense/varlen causal or local attention with num_splits<=1; "
-                "MLA, paged/gather KV, sinks, modifiers, sparsity and scheduler metadata are unsupported"
+                "SM120 FP8 supports dense/varlen causal or local attention with SplitKV; "
+                "MLA, paged/gather KV, sinks, modifiers and sparsity are unsupported"
             )
         if min(head_dim, head_dim_v) <= 0 or max(head_dim, head_dim_v) > 256 or head_dim % 16 or head_dim_v % 16:
             raise ValueError("SM120 FP8 head dimensions must be positive multiples of 16, at most 256")
@@ -977,12 +983,12 @@ def _flash_attn_fwd(
     use_dynamic_varlen = (
         mla_kernel is None and config.use_dynamic_varlen and scheduler_metadata is None
     )
-    if is_fp8 and arch // 10 == 12:
-        if host_max_seqlen_k <= 0:
+    if arch // 10 == 12:
+        if is_fp8 and host_max_seqlen_k <= 0:
             raise ValueError("SM120 FP8 max_seqlen_k must be positive for nonempty inputs")
         if not FlashAttentionForwardSm120.can_implement(
                 dtype, head_dim, head_dim_v, config.tile_m, config.tile_n, 1, 128, causal):
-            raise ValueError("SM120 FP8 tile exceeds the supported MMA/layout or 99 KiB shared-memory limits")
+            raise ValueError("SM120 tile exceeds the supported MMA/layout or 99 KiB shared-memory limits")
 
 
 
@@ -1192,7 +1198,7 @@ def _flash_attn_fwd(
     cu_total_m_blocks = None
     cu_total_splits_m_blocks = None
     blocks_to_batch_idx = None
-    use_single_tile_varlen_scheduler = tile_count_semaphore is None
+    use_single_tile_varlen_scheduler = arch // 10 == 12 or tile_count_semaphore is None
     use_cu_hint = (
         is_varlen_q
         and not use_swapab
@@ -1385,7 +1391,10 @@ def _flash_attn_fwd(
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
         descale_tensors_tensor = (
-            DescaleTensors(*(to_cute_tensor(t, assumed_align=4, leading_dim=1) for t in descales))
+            DescaleTensors(*(to_cute_tensor(
+                t, assumed_align=4, leading_dim=1,
+                fully_dynamic=arch // 10 == 12 and t is not None and t.stride(-1) == 0,
+            ) for t in descales))
             if has_descale
             else None
         )
@@ -1575,6 +1584,8 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
+                seqlen_k_per_split=seqlen_k_per_split,
                 pack_gqa=config.pack_gqa,
                 tile_m=config.tile_m,
                 tile_n=config.tile_n,
@@ -1670,6 +1681,10 @@ def _flash_attn_fwd(
                     compile_args.append(tensormap_workspace_tensor)
             if arch // 10 in [8, 12]:
                 compile_args.append(descale_tensors_tensor)
+            if arch // 10 == 12:
+                compile_args.extend([num_splits_dynamic_tensor, virtual_batch_idx_tensor])
+            elif arch // 10 == 8:
+                compile_args.extend([None, None])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
@@ -1768,6 +1783,10 @@ def _flash_attn_fwd(
                     call_args.append(tensormap_workspace)
             if arch // 10 in [8, 12]:
                 call_args.append(descale_tensors)
+            if arch // 10 == 12:
+                call_args.extend([num_splits_dynamic, virtual_batch_idx])
+            elif arch // 10 == 8:
+                call_args.extend([None, None])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         # Combine writes a seqlen-contiguous LSE. The MLA LSE is (..., s, h) contiguous, so
