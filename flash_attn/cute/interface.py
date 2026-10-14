@@ -296,6 +296,21 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.device == expected_device, f"{name} device {t.device} != expected {expected_device}"
     assert t.is_cuda, f"{name} must be on CUDA"
 
+
+def _storage_overlaps(a, b):
+    if a.device != b.device or a.numel() == 0 or b.numel() == 0:
+        return False
+    fake = is_fake_mode()
+    if fake and not torch._C._overlaps(a, b):
+        return False
+    bounds = []
+    for t in (a, b):
+        start = t.storage_offset() * t.element_size() if fake else t.data_ptr()
+        extent = 1 + sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+        bounds.append((start, start + extent * t.element_size()))
+    return bounds[0][0] < bounds[1][1] and bounds[1][0] < bounds[0][1]
+
+
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -2268,7 +2283,7 @@ def _validate_bf16_dq_output(dq, inputs):
             if stride < span:
                 raise ValueError("bf16_dq requires a non-overlapping dq layout")
             span += (size - 1) * stride
-    if any(t is not None and torch._C._overlaps(dq, t) for t in inputs):
+    if any(t is not None and _storage_overlaps(dq, t) for t in inputs):
         raise ValueError("bf16_dq requires dq storage separate from inputs and other outputs")
 
 
@@ -2473,6 +2488,7 @@ def _flash_attn_bwd(
         or seqused_k is not None
     )
 
+    original_inputs = (q, k, v, out, dout, lse, dlse) if bf16_dq else ()
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink = [
         maybe_contiguous(t)
         for t in (
@@ -2606,7 +2622,7 @@ def _flash_attn_bwd(
     else:
         _validate_tensor(dq, "dq", q.shape, out_torch_dtype, device)
         if bf16_dq:
-            _validate_bf16_dq_output(dq, (q, k, v, out, dout, lse, dlse, dk, dv))
+            _validate_bf16_dq_output(dq, (*original_inputs, dk, dv))
 
     if dk is None:
         dk = torch.empty_like(k)
