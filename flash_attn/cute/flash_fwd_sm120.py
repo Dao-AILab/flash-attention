@@ -7,15 +7,13 @@
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
-from cutlass.cute.nvgpu import cpasync, warp
+from cutlass import Float32
+from cutlass.cute.nvgpu import warp
 import cutlass.utils as utils_basic
 from cutlass.base_dsl.arch import Arch
-import cuda.bindings.driver as cuda
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute import ampere_helpers as sm80_utils
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 
 
 class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
@@ -43,23 +41,6 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
             p = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_n)
         return q, k, v, o, p
 
-    def _setup_attributes(self):
-        super()._setup_attributes()
-        if self.is_fp8:
-            # Packed V is K-major for the PV instruction: (D_v, sequence).
-            vt = cute.tile_to_shape(
-                sm80_utils.get_smem_layout_atom(self.dtype, self.tile_n),
-                (self.tile_hdimv, self.tile_n, 1), (0, 1, 2),
-            )
-            self.sV_layout = cute.make_composed_layout(
-                vt.inner, vt.offset, cute.select(vt.outer, mode=[1, 0, 2])
-            )
-            self.gmem_tiled_copy_V = cute.make_tiled_copy_tv(
-                cute.make_copy_atom(cpasync.CopyG2SOp(), self.dtype, num_bits_per_copy=64),
-                cute.make_ordered_layout((self.tile_n // 8, self.num_threads // (self.tile_n // 8)), order=(0, 1)),
-                cute.make_layout((8, 1)),
-            )
-
     def _get_shared_storage_cls(self):
         if not self.is_fp8:
             return super()._get_shared_storage_cls()
@@ -78,6 +59,26 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
             buffer: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, size], 1024]
 
         return SharedStorage
+
+    @cute.jit
+    def gemm_pv_fp8(self, tiled_mma, acc, tCrA, tCrB, tCsA, tCsB,
+                    smem_thr_copy_A, smem_thr_copy_B):
+        tCrA_copy = smem_thr_copy_A.retile(tCrA)
+        # ldmatrix.b8 returns (byte, n8, k16), while MMA B owns
+        # (byte, k16, n8). A register view selects the destinations directly.
+        paired = cute.logical_divide(tCrB, (None, 2, None))
+        b, s = paired.shape, paired.stride
+        tCrB_copy = cute.make_tensor(tCrB.iterator, cute.make_layout(
+            (((4, 2, 2), 1), b[1][1], b[2]),
+            stride=(((s[0][0], s[1][0], s[0][1]), 0), s[1][1], s[2]),
+        ))
+        cute.copy(smem_thr_copy_A, tCsA[None, None, 0], tCrA_copy[None, None, 0])
+        cute.copy(smem_thr_copy_B, tCsB[None, None, 0], tCrB_copy[None, None, 0])
+        for k in cutlass.range_constexpr(cute.size(tCsA.shape[2])):
+            if k < cute.size(tCsA.shape[2]) - 1:
+                cute.copy(smem_thr_copy_A, tCsA[None, None, k + 1], tCrA_copy[None, None, k + 1])
+                cute.copy(smem_thr_copy_B, tCsB[None, None, k + 1], tCrB_copy[None, None, k + 1])
+            cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
     @staticmethod
     def can_implement(
@@ -133,82 +134,3 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
         if (tile_m * 2) % num_threads != 0:
             return False
         return True
-
-
-class PackVSm120:
-    """Byte-preserving 64x32 transpose; packed rows are padded and zero-filled.
-
-    One packed buffer per KV head (not per query head), with each varlen batch
-    independently based at a 64-byte sequence boundary for aligned PV loads.
-    """
-
-    @cute.jit
-    def __call__(self, mV: cute.Tensor, mPacked: cute.Tensor,
-                 mCuSeqlens: cute.Tensor | None, mSeqUsed: cute.Tensor | None,
-                 stream: cuda.CUstream = None):
-        mV = assume_tensor_aligned(mV)
-        mPacked = cute.make_tensor(mPacked.iterator, cute.make_layout(mPacked.shape, stride=tuple(
-            s if i == 1 or isinstance(s, int) else cute.assume(s, divby=64)
-            for i, s in enumerate(mPacked.stride))))
-        layout = cute.tile_to_shape(sm80_utils.get_smem_layout_atom(cutlass.Uint8, 32),
-                                    (64, 32), (0, 1))
-        load = cute.make_tiled_copy_tv(
-            cute.make_copy_atom(cpasync.CopyG2SOp(), cutlass.Uint8, num_bits_per_copy=128),
-            cute.make_ordered_layout((64, 2), order=(1, 0)), cute.make_layout((1, 16)),
-        )
-        store = cute.make_tiled_copy_tv(
-            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Uint8, num_bits_per_copy=64),
-            cute.make_ordered_layout((8, 16), order=(0, 1)), cute.make_layout((8, 1)),
-        )
-        self.kernel(mV, mPacked, mCuSeqlens, mSeqUsed, layout, load, store).launch(
-            grid=(cute.ceil_div(mPacked.shape[1], 64), cute.ceil_div(mPacked.shape[3], 32),
-                  mPacked.shape[0] * mPacked.shape[2]),
-            block=(128, 1, 1), smem=cute.cosize(layout), stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(self, mV: cute.Tensor, mPacked: cute.Tensor,
-               mCuSeqlens: cute.Tensor | None, mSeqUsed: cute.Tensor | None,
-               layout: cute.ComposedLayout, load: cute.TiledCopy, store: cute.TiledCopy):
-        tid, _, _ = cute.arch.thread_idx()
-        seq_tile, dim_tile, bh = cute.arch.block_idx()
-        batch, head = bh // mPacked.shape[2], bh % mPacked.shape[2]
-        if const_expr(mCuSeqlens is None):
-            source = mV[batch, None, head, None]
-            length = Int32(mV.shape[1])
-        else:
-            begin = mCuSeqlens[batch]
-            length = mCuSeqlens[batch + 1] - begin
-            source = cute.domain_offset((begin, 0), mV[None, head, None])
-        if const_expr(mSeqUsed is not None):
-            length = mSeqUsed[batch]
-        target = mPacked[batch, None, head, None]
-        gSrc = cute.local_tile(source, (64, 32), (seq_tile, dim_tile))
-        gDst = cute.local_tile(target, (64, 32), (seq_tile, dim_tile))
-        smem = cutlass.utils.SmemAllocator().allocate_tensor(
-            cutlass.Uint8, layout.outer, byte_alignment=128, swizzle=layout.inner)
-        loader, storer = load.get_slice(tid), store.get_slice(tid)
-        tSrc, tShared = loader.partition_S(gSrc), loader.partition_D(smem)
-        coords = loader.partition_S(cute.make_identity_tensor((64, 32)))
-        pred = cute.make_rmem_tensor((1, coords.shape[1], coords.shape[2]), cutlass.Boolean)
-        for m in cutlass.range(cute.size(pred.shape[1]), unroll_full=True):
-            for n in cutlass.range(cute.size(pred.shape[2]), unroll_full=True):
-                row, dim = coords[0, m, n]
-                pred[0, m, n] = row + seq_tile*64 < length and dim + dim_tile*32 < mPacked.shape[3]
-        zeros = cute.make_rmem_tensor(tShared.shape, cutlass.Uint8)
-        zeros.fill(0)
-        cute.autovec_copy(zeros, tShared)
-        cute.arch.barrier()
-        cute.copy(load, tSrc, tShared, pred=pred)
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
-        tRead, tDst = storer.partition_S(smem), storer.partition_D(gDst)
-        values = cute.make_rmem_tensor(tRead.shape, cutlass.Uint8)
-        cute.autovec_copy(tRead, values)
-        out_coords = storer.partition_D(cute.make_identity_tensor((64, 32)))
-        out_pred = cute.make_rmem_tensor((1, out_coords.shape[1], out_coords.shape[2]), cutlass.Boolean)
-        for m in cutlass.range(cute.size(out_pred.shape[1]), unroll_full=True):
-            for n in cutlass.range(cute.size(out_pred.shape[2]), unroll_full=True):
-                out_pred[0, m, n] = out_coords[0, m, n][1] + dim_tile*32 < mPacked.shape[3]
-        cute.copy(store, values, tDst, pred=out_pred)
