@@ -365,14 +365,7 @@ def _get_fwd_config(
             if head_dim > 64:
                 cfg = FwdConfig(128, 64, True, True)
             if is_fp8:
-                # FP8 keeps P and O fragments live together. Use smaller tiles for
-                # wide V heads, or when the default grid cannot fill one SM wave.
-                q_rows = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
-                num_m_blocks = (q_rows + 127) // 128
-                num_heads = num_head_kv * (1 if pack_gqa else qhead_per_kvhead)
-                num_ctas = batch_size * num_heads * num_m_blocks
-                if head_dim_v > 128 or num_ctas < get_num_sms_for_selection(device.index, arch):
-                    cfg = FwdConfig(64, 64, True, True)
+                cfg = FwdConfig(64, 64, True, True)
         elif arch // 10 == 8:
             cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
