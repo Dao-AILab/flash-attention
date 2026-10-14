@@ -43,7 +43,28 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
 
     def _get_shared_storage_cls(self):
         if not self.is_fp8:
-            return super()._get_shared_storage_cls()
+            # The unsplit O overlay may be wider than Q for unequal head dimensions.
+            q_size = max(cute.cosize(self.sQ_layout), cute.cosize(self.sO_layout))
+            if self.Q_in_regs:
+                q_size = max(q_size, cute.cosize(self.sV_layout))
+            q_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, q_size], 1024]
+            k_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sK_layout)], 1024]
+            v_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sV_layout)], 1024]
+
+            @cute.struct
+            class SharedStorageQKV:
+                sV: v_struct
+                sQ: q_struct
+                sK: k_struct
+
+            @cute.struct
+            class SharedStorageQV:
+                sQ: q_struct
+                sK: k_struct
+
+            storage = SharedStorageQV if self.Q_in_regs else SharedStorageQKV
+            assert storage.size_in_bytes() <= utils_basic.get_smem_capacity_in_bytes("sm_120")
+            return storage
         # O reuses the whole mainloop workspace only after its final barrier.
         # Its BF16 width must not be charged as an extra live Q allocation.
         align = lambda n: (n + 1023) // 1024 * 1024
@@ -119,10 +140,12 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
             return False
         if num_threads % 32 != 0:
             return False
-        # Shared memory usage: Q tile + (K tile + V tile)
-        smem_usage_Q = tile_m * head_dim * 2
-        smem_usage_K = tile_n * head_dim * num_stages * 2
-        smem_usage_V = tile_n * head_dim_v * num_stages * 2
+        # Match the padded mainloop allocations and the unsplit O overlay.
+        d, dv = ((value + 15) // 16 * 16 for value in (head_dim, head_dim_v))
+        align = lambda n: (n + 1023) // 1024 * 1024
+        smem_usage_Q = align(tile_m * max(d, dv) * 2)
+        smem_usage_K = align(tile_n * d * num_stages * 2)
+        smem_usage_V = align(tile_n * dv * num_stages * 2)
         smem_usage_QV = (
             (smem_usage_Q + smem_usage_V) if not Q_in_regs else max(smem_usage_Q, smem_usage_V)
         )
