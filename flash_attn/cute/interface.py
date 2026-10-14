@@ -42,7 +42,7 @@ from flash_attn.cute.cute_dsl_utils import (
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
-from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120, PackVSm120
+from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess, PackGQA
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -677,35 +677,6 @@ def _mla_fwd_plan(
     return mla_1cta, cls, cfg_mla
 
 
-def _pack_v_sm120(v, cu_seqlens_k, seqused_k, batch_size, max_seqlen_k, fake_mode):
-    """Allocate and fill a byte-exact sequence-major V buffer for FP8 warp MMA."""
-    padded_s = (max_seqlen_k + 63) // 64 * 64
-    heads, dim = v.shape[-2:]
-    packed = torch.empty_strided(
-        (batch_size, padded_s, heads, dim),
-        (heads * dim * padded_s, 1, dim * padded_s, padded_s),
-        dtype=v.dtype, device=v.device,
-    )
-    key = (cu_seqlens_k is not None, seqused_k is not None)
-    if key not in _pack_v_sm120.compile_cache:
-        _pack_v_sm120.compile_cache[key] = cute.compile(
-            PackVSm120(),
-            to_cute_tensor(v.view(torch.uint8)),
-            to_cute_tensor(packed.view(torch.uint8), leading_dim=1),
-            to_cute_tensor(cu_seqlens_k, assumed_align=4, leading_dim=0),
-            to_cute_tensor(seqused_k, assumed_align=4, leading_dim=0),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    if not fake_mode:
-        _pack_v_sm120.compile_cache[key](v.view(torch.uint8), packed.view(torch.uint8),
-                                        cu_seqlens_k, seqused_k)
-    return packed
-
-
-_pack_v_sm120.compile_cache = get_jit_cache("sm120_fp8_pack_v")
-
-
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -1108,7 +1079,6 @@ def _flash_attn_fwd(
         if not FlashAttentionForwardSm120.can_implement(
                 dtype, head_dim, head_dim_v, tile_m, tile_n, 1, num_threads, causal):
             raise ValueError("SM120 FP8 tile exceeds the supported MMA/layout or 99 KiB shared-memory limits")
-        v = _pack_v_sm120(v, cu_seqlens_k, seqused_k, batch_size, max_seqlen_k, fake_mode)
     q_stage = fwd_cfg.q_stage
     num_splits = fwd_cfg.num_splits
     mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
@@ -1626,7 +1596,7 @@ def _flash_attn_fwd(
             else None
         )
         q_tensor, k_tensor = [to_cute_tensor(t) for t in (q, k)]
-        v_tensor = to_cute_tensor(v, leading_dim=1 if is_fp8 and arch // 10 == 12 else -1)
+        v_tensor = to_cute_tensor(v)
         o_align = 32 if head_dim_v == 512 else 16
         o_tensor = to_cute_tensor(out if not is_split_kv else out_partial, assumed_align=o_align)
         if is_split_kv:
