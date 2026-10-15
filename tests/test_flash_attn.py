@@ -2646,6 +2646,44 @@ def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block
     assert not out.isnan().any()
 
 
+@pytest.mark.parametrize("append_knew", [False, True])
+def test_flash_attn_kvcache_paged_cuda_graph(append_knew):
+    torch.manual_seed(0)
+    device, dtype = "cuda", torch.float16
+    batch_size, nheads, nheads_k, d = 2, 4, 1, 64
+    page_size = 256
+    k_cache = torch.randn(4, page_size, nheads_k, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    block_table = torch.tensor([[0, 2], [1, 3]], device=device, dtype=torch.int32)
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+    k_new = torch.randn(batch_size, 1, nheads_k, d, device=device, dtype=dtype) if append_knew else None
+    v_new = torch.randn_like(k_new) if append_knew else None
+    cache_seqlens = torch.tensor([127, 256], device=device, dtype=torch.int32)
+
+    def run():
+        return flash_attn_with_kvcache(
+            q, k_cache, v_cache, k=k_new, v=v_new, cache_seqlens=cache_seqlens,
+            block_table=block_table, causal=True,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+
+    # Replay with changed inputs, crossing a page boundary and reaching cache capacity.
+    for lengths in ([127, 256], [257, 512 - int(append_knew)]):
+        cache_seqlens.copy_(torch.tensor(lengths, device=device, dtype=torch.int32))
+        q.normal_()
+        graph.replay()
+        expected = run()
+        torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+
+
 @pytest.mark.skipif(USE_TRITON_ROCM, reason="compat-slot assert is only in the CUDA extension")
 def test_flash_attn_generator_arg_must_be_none():
     """The optional RNG `generator` slot is retained only for backwards-compat arg
