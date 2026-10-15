@@ -70,8 +70,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.seqused_q
     };
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
-    int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
-    dim3 grid_m(num_m_block, params.h, params.b);
+    // A varlen launch covers the batch's padded block space (varlen_num_blocks), each CTA finding
+    // its sequence and block from cu_seqlens.
+    int num_m_block = is_varlen_q ? flash::varlen_num_blocks(params.total_q, params.b, kBlockM) : cute::ceil_div(params.seqlen_q, kBlockM);
+    dim3 grid_m(num_m_block, params.h, is_varlen_q ? 1 : params.b);
     CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
@@ -93,10 +95,17 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         flash::CollectiveEpilogueBwd<TileShape_MNK, Element, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, dKV_swapAB, NumMmaWarpGroups * (Arch >= 90 ? 1 : cutlass::NumWarpsPerWarpGroup) / AtomLayoutNdKV>,
         flash::CollectiveEpilogueBwdGQA<TileShape_MNK, ElementAccum, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, Deterministic>
     >;
+    // A packed batch's CTAs cover its padded key block space (varlen_num_blocks), unless the
+    // deterministic order's semaphores need the (sequence, block) grid.
+    static constexpr bool CompactVarlen = Varlen && !Deterministic;
     using Scheduler = std::conditional_t<
-        Is_causal,
-        flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Is_causal && Deterministic /*SPT*/>,
-        flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>
+        CompactVarlen,
+        flash::VarlenBlockScheduler<kBlockN>,
+        std::conditional_t<
+            Is_causal,
+            flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Is_causal && Deterministic /*SPT*/>,
+            flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>
+        >
     >;
     using AttnKernel = std::conditional_t<
         Arch >= 90,
@@ -175,6 +184,9 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
     int num_blocks_n = cutlass::ceil_div(params.seqlen_k, get<1>(TileShape_MNK{}));
     num_blocks_n = cutlass::round_up(num_blocks_n, size<1>(ClusterShape{}));
+    if constexpr (CompactVarlen) {
+        num_blocks_n = is_varlen_k ? flash::varlen_num_blocks(params.total_k, params.b, kBlockN) : params.b * num_blocks_n;
+    }
     typename flash::TileSchedulerArguments scheduler_args {
         num_blocks_n, params.h, params.b, 1 /*num_splits*/,
         params.h / params.h_k,
@@ -236,11 +248,14 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
         params.scale_softmax,
         params.cu_seqlens_q,
-        params.seqused_q
+        params.seqused_q,
+        params.b
     };
     typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
-    int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
-    dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
+    int num_m_block_postprocess = is_varlen_q
+        ? flash::varlen_num_blocks(params.total_q, params.b, get<0>(TileShape_MK{}))
+        : cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
+    dim3 grid_m_postprocess(num_m_block_postprocess, params.h, is_varlen_q ? 1 : params.b);
     int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
     if (smem_size_postprocess >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
@@ -263,7 +278,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             {params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride},  // stride_dK
             1.f,
             params.cu_seqlens_k,
-            params.seqused_k
+            params.seqused_k,
+            params.b
         };
         typename PostprocessKerneldKV::Params postprocess_dK_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dK_args);
         typename PostprocessKerneldKV::Arguments postprocess_dV_args {
@@ -275,11 +291,14 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             {params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride},  // stride_dV
             1.f,
             params.cu_seqlens_k,
-            params.seqused_k
+            params.seqused_k,
+            params.b
         };
         typename PostprocessKerneldKV::Params postprocess_dV_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dV_args);
-        int num_n_block_postprocess = cute::ceil_div(params.seqlen_k, get<0>(TileShape_NK{}));
-        dim3 grid_n_postprocess(num_n_block_postprocess, params.h_k, params.b);
+        int num_n_block_postprocess = is_varlen_k
+            ? flash::varlen_num_blocks(params.total_k, params.b, get<0>(TileShape_NK{}))
+            : cute::ceil_div(params.seqlen_k, get<0>(TileShape_NK{}));
+        dim3 grid_n_postprocess(num_n_block_postprocess, params.h_k, is_varlen_k ? 1 : params.b);
         int smem_size_postprocess = PostprocessKerneldKV::SharedStorageSize;
         if (smem_size_postprocess >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));

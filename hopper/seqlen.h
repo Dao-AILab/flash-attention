@@ -6,6 +6,43 @@
 
 namespace flash {
 
+// The blocks of kBlock rows of a varlen batch of `total` rows in `num_batch` sequences, numbered
+// in its padded block space: sequence b's blocks start at cu_seqlens[b] / kBlock + b, the rows the
+// backward pads its accumulators by (SeqlenInfo::offset_padded). Each sequence leaves at most one
+// gap after its last block, so the space spans this many blocks however long the longest sequence
+// is, where a grid of num_batch * ceil_div(max_seqlen, kBlock) gives every (sequence, block) pair
+// a CTA, most of which find their sequence already ended when most sequences are short or empty.
+inline int varlen_num_blocks(int total, int num_batch, int block) {
+    return (total + block - 1) / block + num_batch;
+}
+
+// The `block_idx`-th block of the padded block space (varlen_num_blocks) as (bidb, block within
+// the sequence), or (-1, 0) in a gap or past the batch: a binary search over cu_seqlens for the
+// last sequence starting at or before it. Without cu_seqlens, each sequence holds seqlen_static
+// rows' blocks.
+template <int kBlock>
+CUTLASS_DEVICE
+cute::tuple<int, int> varlen_block_coord(int const block_idx, int const num_batch, int const* const cu_seqlens,
+                                         int const* const seqused, int const seqlen_static) {
+    int bidb, block, seqlen;
+    if (cu_seqlens) {
+        int last = num_batch - 1;
+        bidb = 0;
+        while (bidb < last) {
+            int const middle = (bidb + last + 1) / 2;
+            if (cu_seqlens[middle] / kBlock + middle <= block_idx) { bidb = middle; } else { last = middle - 1; }
+        }
+        block = block_idx - (cu_seqlens[bidb] / kBlock + bidb);
+        seqlen = seqused ? seqused[bidb] : cu_seqlens[bidb + 1] - cu_seqlens[bidb];
+    } else {
+        int const blocks = cute::ceil_div(seqlen_static, kBlock);
+        bidb = block_idx / blocks;
+        block = block_idx % blocks;
+        seqlen = bidb < num_batch ? (seqused ? seqused[bidb] : seqlen_static) : 0;
+    }
+    return block < cute::ceil_div(seqlen, kBlock) ? cute::make_tuple(bidb, block) : cute::make_tuple(-1, 0);
+}
+
 // We consolidate all the info related to sequence length here. This is so that we can do all
 // the gmem reads once at the beginning of each tile, rather than having to repeat these reads
 // to compute various things like n_block_min, n_block_max, etc.
