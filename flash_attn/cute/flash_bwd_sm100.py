@@ -96,6 +96,7 @@ class FlashAttentionBackwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         q_subtile_factor: cutlass.Constexpr[int] = 1,
         kv_subtile_factor: cutlass.Constexpr[int] = 1,
+        bf16_dq: bool = False,
     ):
         # Pad head_dim to a multiple of 32 (k_block_size). Must stay a multiple of 32 so
         # that the dQ accumulator reduce (dQ_reduce_ncol up to 32) tiles evenly and matches
@@ -118,6 +119,12 @@ class FlashAttentionBackwardSm100:
 
         self.use_2cta_instrs = bool(use_2cta_instrs and cluster_size == 2)
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
+        self.bf16_dq = bf16_dq
+        if bf16_dq:
+            assert self.use_2cta_instrs and head_dim == head_dim_v == 128
+            assert tile_m == tile_n == 128
+            assert not deterministic
+            assert score_mod is None and score_mod_bwd is None and mask_mod is None
 
         assert self.tile_hdim != 192 or self.use_2cta_instrs, "Must use 2CTA for hdim 192"
 
@@ -332,6 +339,9 @@ class FlashAttentionBackwardSm100:
                 self.dQ_reduce_ncol = 32
                 self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
                 self.dQ_reduce_ncol_t2r = self.dQ_reduce_ncol
+        if self.bf16_dq:
+            self.dQ_reduce_ncol = 16
+            self.sdQaccum_stage = 2
         assert (self.tile_hdim // self.cta_group_size) % self.dQ_reduce_ncol == 0
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
         self.dQaccum_reduce_stage_t2r = self.tile_hdim // self.dQ_reduce_ncol_t2r
@@ -564,6 +574,10 @@ class FlashAttentionBackwardSm100:
 
         self.is_varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
         self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
+        if const_expr(self.bf16_dq):
+            assert self.q_dtype == self.dqaccum_dtype == cutlass.BFloat16
+            assert not self.is_varlen_q and not self.is_varlen_k
+            assert blocksparse_tensors is None
         self.use_tma_store = not (self.qhead_per_kvhead == 1 and mCuSeqlensK is not None)
         # self.use_tma_store = not self.qhead_per_kvhead == 1
         self.dKV_postprocess = self.qhead_per_kvhead > 1
@@ -585,10 +599,12 @@ class FlashAttentionBackwardSm100:
 
         # (b, n, s) --> (s, n, b) or (n, t) --> (t, n)
         LSE_dPsum_dQaccum_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
-        mLSE, mdPsum, mdQaccum = [
+        mLSE, mdPsum = [
             layout_utils.select(t, mode=LSE_dPsum_dQaccum_transpose)
-            for t in (mLSE, mdPsum, mdQaccum)
+            for t in (mLSE, mdPsum)
         ]
+        if const_expr(not self.bf16_dq):
+            mdQaccum = layout_utils.select(mdQaccum, mode=LSE_dPsum_dQaccum_transpose)
 
         if const_expr(not self.dKV_postprocess):
             layout_dKV_transpose = KV_layout_transpose
@@ -629,6 +645,24 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_dQ,
         ) = self._get_tiled_mma()
         self._setup_smem_layout()
+
+        tma_atom_dQ = None
+        if const_expr(self.bf16_dq):
+            b, s, h, _ = mdQaccum.shape
+            sb, ss, sh, sd = mdQaccum.stride
+            assert sd == 1
+            mdQaccum = cute.make_tensor(
+                mdQaccum.iterator,
+                cute.make_layout((64, s, 2, h, b), stride=(1, ss, 64, sh, sb)),
+            )
+            self.dQ_tma_tile = (self.dQ_reduce_ncol, 64, 2)
+            dQ_tma_smem_layout = cute.make_layout(
+                self.dQ_tma_tile, stride=(1, self.dQ_reduce_ncol, 64 * self.dQ_reduce_ncol)
+            )
+            tma_atom_dQ, mdQaccum = cpasync.make_tiled_tma_atom(
+                cpasync.CopyReduceBulkTensorTileS2GOp(), mdQaccum,
+                dQ_tma_smem_layout, self.dQ_tma_tile, 1,
+            )
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -1062,6 +1096,7 @@ class FlashAttentionBackwardSm100:
             tma_atom_dOt,
             tma_atom_dV,
             tma_atom_dK,
+            tma_atom_dQ,
             self.sQ_layout,
             self.sQt_layout,
             self.sK_layout,
@@ -1145,6 +1180,7 @@ class FlashAttentionBackwardSm100:
         tma_atom_dOt: Optional[cute.CopyAtom],
         tma_atom_dV: Optional[cute.CopyAtom],
         tma_atom_dK: Optional[cute.CopyAtom],
+        tma_atom_dQ: Optional[cute.CopyAtom],
         sQ_layout: cute.ComposedLayout,
         sQt_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
@@ -1714,19 +1750,25 @@ class FlashAttentionBackwardSm100:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
-            self.dQacc_reduce(
-                mdQaccum,
-                sdQaccum,
-                thr_mma_dQ,
-                tdQtdQ,
-                pipeline_dQ,
-                dQaccum_empty_mbar_ptr,
-                block_info,
-                SeqlenInfoCls,
-                TileSchedulerCls,
-                mdQ_semaphore,
-                blocksparse_tensors,
-            )
+            if const_expr(self.bf16_dq):
+                self.dQ_bf16_reduce(
+                    mdQaccum, sdQaccum, thr_mma_dQ, tdQtdQ, pipeline_dQ,
+                    tma_atom_dQ, softmax_scale, block_info, SeqlenInfoCls, TileSchedulerCls,
+                )
+            else:
+                self.dQacc_reduce(
+                    mdQaccum,
+                    sdQaccum,
+                    thr_mma_dQ,
+                    tdQtdQ,
+                    pipeline_dQ,
+                    dQaccum_empty_mbar_ptr,
+                    block_info,
+                    SeqlenInfoCls,
+                    TileSchedulerCls,
+                    mdQ_semaphore,
+                    blocksparse_tensors,
+                )
             tmem_alloc_barrier.arrive()
 
         return
@@ -3686,6 +3728,80 @@ class FlashAttentionBackwardSm100:
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+    @cute.jit
+    def dQ_bf16_reduce(
+        self, mdQ: cute.Tensor, sdQaccum: cute.Tensor,
+        thr_mma_dQ: cute.ThrMma, tdQtdQ: cute.Tensor,
+        pipeline_dQ: PipelineAsync, tma_atom_dQ: cute.CopyAtom,
+        softmax_scale: Float32, block_info: BlockInfo,
+        SeqlenInfoCls: Callable, TileSchedulerCls: Callable,
+    ):
+        tidx = cute.arch.thread_idx()[0] % 128
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        load_atom = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32)
+        thr_copy = tcgen05.make_tmem_copy(load_atom, tdQtdQ).get_slice(tidx)
+        tmem = thr_copy.partition_S(tdQtdQ)
+        coords = thr_mma_dQ.partition_C(cute.make_identity_tensor(self.mma_tiler_dsk[:2]))
+        rshape = thr_copy.partition_D(coords).shape
+        assert cute.size(rshape) == 64
+        consumer = pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, 1)
+        producer = pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.sdQaccum_stage)
+        scheduler = TileSchedulerCls()
+        work = scheduler.initial_work_tile_info()
+        while work.is_valid_tile:
+            n_block, head_idx, batch_idx, _ = work.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            m_min, m_max = block_info.get_m_block_min_max(seqlen, n_block // 2)
+            for m_block in cutlass.range(m_min, m_max, unroll=1):
+                pipeline_dQ.consumer_wait(consumer)
+                values = cute.make_rmem_tensor(rshape, Float32)
+                cute.copy(thr_copy, tmem, values)
+                cute.arch.fence_view_async_tmem_load()
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    pipeline_dQ.consumer_release(consumer)
+                consumer.advance()
+                flat = cute.make_tensor(values.iterator, cute.make_layout(64))
+                converted = cute.make_rmem_tensor(64, cutlass.BFloat16)
+                converted.store((flat.load() * softmax_scale).to(cutlass.BFloat16))
+                for slice_idx in cutlass.range_constexpr(64 // self.dQ_reduce_ncol):
+                    smem_idx = producer.index
+                    srow = cute.make_tensor(
+                        sdQaccum[None, smem_idx].iterator + tidx * self.dQ_reduce_ncol,
+                        cute.make_layout(self.dQ_reduce_ncol),
+                    )
+                    rrow = cute.make_tensor(
+                        converted.iterator + slice_idx * self.dQ_reduce_ncol,
+                        cute.make_layout(self.dQ_reduce_ncol),
+                    )
+                    cute.autovec_copy(rrow, srow)
+                    cute.arch.fence_view_async_shared()
+                    self.reduce_sync_barrier.arrive_and_wait()
+                    if warp_idx == 0:
+                        sdQ = cute.make_tensor(
+                            sdQaccum[None, smem_idx].iterator,
+                            cute.make_layout(
+                                self.dQ_tma_tile,
+                                stride=(1, self.dQ_reduce_ncol, 64 * self.dQ_reduce_ncol),
+                            ),
+                        )
+                        gdQ = cute.local_tile(
+                            mdQ[None, None, None, head_idx, batch_idx], self.dQ_tma_tile,
+                            (slice_idx, m_block * 2 + cta_rank, 0),
+                        )
+                        ts, tg = cpasync.tma_partition(
+                            tma_atom_dQ, 0, cute.make_layout(1),
+                            cute.group_modes(sdQ, 0, 3), cute.group_modes(gdQ, 0, 3),
+                        )
+                        cute.copy(tma_atom_dQ, ts, tg)
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    self.reduce_sync_barrier.arrive_and_wait()
+                    producer.advance()
+            scheduler.advance_to_next_work()
+            work = scheduler.get_current_work()
 
     @cute.jit
     def _dq_semaphore_lock_value(

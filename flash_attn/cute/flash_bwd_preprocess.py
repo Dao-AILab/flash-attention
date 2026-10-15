@@ -139,7 +139,6 @@ class FlashAttentionBackwardPreprocess:
         mPdPsum: cute.Tensor,  # (batch, nheads, seqlen_padded) or (nheads, total_q_padded)
         mLSE: Optional[cute.Tensor],  # (batch, nheads, seqlen) or (nheads, total_q)
         mLSElog2: Optional[cute.Tensor],  # same shape as mPdPsum
-        # (batch, nheads, seqlen_padded * head_dim_v) or (nheads, total_q_padded * head_dim_v)
         mdQaccum: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],  # (batch + 1,)
         mSeqUsedQ: Optional[cute.Tensor],  # (batch,)
@@ -166,8 +165,12 @@ class FlashAttentionBackwardPreprocess:
             assert self.nheads_major is False
             assert self.pack_gqa is False
             assert self.use_padded_offsets is True
-            if const_expr(mdQaccum.element_type not in [Float32]):
-                raise TypeError("dQaccum tensor must be Float32")
+            if const_expr(mdQaccum.element_type == cutlass.BFloat16):
+                assert self.dtype == cutlass.BFloat16
+                assert self.head_dim_padded == self.head_dim_v_padded == 128
+                assert mCuSeqlensQ is None and mSeqUsedQ is None
+            elif const_expr(mdQaccum.element_type != Float32):
+                raise TypeError("dQaccum tensor must be Float32 or BFloat16")
         if const_expr(mLSE is not None):
             if const_expr(mLSE.element_type not in [Float32]):
                 raise TypeError("LSE tensor must be Float32")
@@ -206,10 +209,15 @@ class FlashAttentionBackwardPreprocess:
             # (batch, seqlen, nheads) -> (seqlen, nheads, batch) or
             # (total_q, nheads) -> (total_q, nheads)
             transpose = [1, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 1]
-        mPdPsum, mLSE, mLSElog2, mdLSE, mdQaccum = [
+        mPdPsum, mLSE, mLSElog2, mdLSE = [
             layout_utils.select(mX, transpose) if mX is not None else None
-            for mX in (mPdPsum, mLSE, mLSElog2, mdLSE, mdQaccum)
+            for mX in (mPdPsum, mLSE, mLSElog2, mdLSE)
         ]
+        if const_expr(mdQaccum is not None):
+            mdQaccum = layout_utils.select(
+                mdQaccum,
+                QO_layout_transpose if const_expr(mdQaccum.element_type == cutlass.BFloat16) else transpose,
+            )
 
         # (b, s, n, h) => (s, n, h, b) or
         # (total, n, h) == (total, n, h)
@@ -467,20 +475,31 @@ class FlashAttentionBackwardPreprocess:
 
             # Clear dQaccum
             if const_expr(mdQaccum is not None):
-                mdQaccum_cur = seqlen.offset_batch(
-                    mdQaccum,
-                    batch_idx,
-                    dim=2,
-                    padded=self.use_padded_offsets,
-                    multiple=self.head_dim_padded,
-                )[None, head_idx]
-                blkdQaccum_shape = (self.tile_m * self.head_dim_padded,)
-                gdQaccum = cute.local_tile(mdQaccum_cur, blkdQaccum_shape, (m_block,))
-                gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
-                tdQgdQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
-                zero = cute.make_rmem_tensor_like(tdQgdQaccum)
-                zero.fill(0.0)
-                cute.copy(gmem_tiled_copy_dQaccum, zero, tdQgdQaccum)
+                if const_expr(mdQaccum.element_type == cutlass.BFloat16):
+                    gdQ = cute.local_tile(
+                        mdQaccum[None, None, head_idx, batch_idx], blk_shape, (m_block, 0)
+                    )
+                    tdQgdQ = gmem_thr_copy_O.partition_D(gdQ)
+                    zero = cute.make_rmem_tensor_like(tdQgdQ)
+                    zero.fill(0.0)
+                    for m in cutlass.range(cute.size(zero.shape[1]), unroll_full=True):
+                        if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
+                            copy(zero[None, m, None], tdQgdQ[None, m, None])
+                else:
+                    mdQaccum_cur = seqlen.offset_batch(
+                        mdQaccum,
+                        batch_idx,
+                        dim=2,
+                        padded=self.use_padded_offsets,
+                        multiple=self.head_dim_padded,
+                    )[None, head_idx]
+                    blkdQaccum_shape = (self.tile_m * self.head_dim_padded,)
+                    gdQaccum = cute.local_tile(mdQaccum_cur, blkdQaccum_shape, (m_block,))
+                    gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
+                    tdQgdQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
+                    zero = cute.make_rmem_tensor_like(tdQgdQaccum)
+                    zero.fill(0.0)
+                    cute.copy(gmem_tiled_copy_dQaccum, zero, tdQgdQaccum)
 
             LOG2_E = math.log2(math.e)
             lse_log2 = lse * LOG2_E if lse != -Float32.inf else 0.0

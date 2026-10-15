@@ -78,8 +78,6 @@ from flash_attn.cute.utils import AuxData
 # === TUNING KNOBS (agent-editable) ===
 # Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
 # Values:
-#   ex2_emu_freq: int — how often to use emulated exp2 (0=all hardware exp2, higher=more emulation).
-#                        SM103 has fast native exp2, so set freq=0 there.
 #   ex2_emu_start_frg: int — fragment index to start emulation from
 #   num_regs_softmax: int — register count for softmax warps (multiple of 8)
 #   num_regs_correction: int — register count for correction warps (multiple of 8)
@@ -166,7 +164,13 @@ class FlashAttentionForwardSm100:
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
         use_s_ping_pong: cutlass.Constexpr[bool] = False,
+        ex2_emu_freq: Optional[int] = None,
+        approximate_softmax: bool = False,
+        packed_masked_scores: bool = False,
     ):
+        self.approximate_softmax = approximate_softmax
+        self.packed_masked_scores = packed_masked_scores
+        self.ex2_emu_freq_override = ex2_emu_freq
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -186,7 +190,7 @@ class FlashAttentionForwardSm100:
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
         # between compute the last couple columns of P and the P @ V MMA.
-        self.split_P_arrive = n_block_size // 4 * 3
+        self.split_P_arrive = n_block_size // 2 if approximate_softmax else n_block_size // 4 * 3
         self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
@@ -250,6 +254,7 @@ class FlashAttentionForwardSm100:
             and self.score_mod is None
             and self.mask_mod is None
             and self.head_dim_padded != 32
+            and not self.approximate_softmax
         )
         # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
         _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
@@ -377,6 +382,8 @@ class FlashAttentionForwardSm100:
         # Look up tuning config for register counts and ex2_emu params
         _tune_key = (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103)
         self._tune = _TUNING_CONFIG.get(_tune_key, {})
+        if ex2_emu_freq is not None:
+            self._tune = {**self._tune, "ex2_emu_freq": ex2_emu_freq}
         if "ex2_emu_freq" in self._tune:
             self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
         if self.head_dim_padded < 96:
@@ -552,6 +559,7 @@ class FlashAttentionForwardSm100:
             self.ex2_emu_freq = self._tune.get("ex2_emu_freq", 16)
             if const_expr(
                 self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
+                and self.ex2_emu_freq_override is None
             ):
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
 
@@ -1430,7 +1438,13 @@ class FlashAttentionForwardSm100:
 
             if const_expr(not self.s0_s1_barrier):
                 stage = Int32(0 if const_expr(self.q_stage == 1) or warp_idx < self.softmax1_warp_ids[0] else 1)
-                softmax_loop(stage=stage, tStS=tStS)
+                if const_expr(self.approximate_softmax):
+                    if cute.arch.make_warp_uniform(aux_data.tensors[0][0]) != 0:
+                        softmax_loop(stage=stage, tStS=tStS, packed_allowed=True)
+                    else:
+                        softmax_loop(stage=stage, tStS=tStS, packed_allowed=False)
+                else:
+                    softmax_loop(stage=stage, tStS=tStS, packed_allowed=False)
             else:
                 # If there's s0_s1_barrier, it's faster to have 2 WGs having different code
                 if warp_idx < self.softmax1_warp_ids[0]:
@@ -2200,6 +2214,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        packed_allowed: cutlass.Constexpr[bool] = False,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2377,6 +2392,7 @@ class FlashAttentionForwardSm100:
 
             softmax_step = partial(
                 self.softmax_step,
+                packed_allowed=packed_allowed,
                 softmax=softmax,
                 thr_mma_qk=thr_mma_qk,
                 pipeline_s_p_o=pipeline_s_p_o,
@@ -2593,6 +2609,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
+        packed_allowed: cutlass.Constexpr[bool] = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2685,7 +2702,8 @@ class FlashAttentionForwardSm100:
             sm_stats_barrier.arrive_w_index(index=sm_stats_index * 4 + warp_idx)
 
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
-        softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
+        if const_expr(not packed_allowed):
+            softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.wait(stage, s0_s1_sequence_phase)
@@ -2696,18 +2714,26 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
-        softmax.apply_exp2_convert(
-            tSrS_t2r,
-            tSrP_r2t,
-            ex2_emu_freq=self.ex2_emu_freq,
-            ex2_emu_start_frg=self.ex2_emu_start_frg,
-        )
+        if const_expr(not packed_allowed):
+            softmax.apply_exp2_convert(
+                tSrS_t2r,
+                tSrP_r2t,
+                ex2_emu_freq=self.ex2_emu_freq,
+                ex2_emu_start_frg=self.ex2_emu_start_frg,
+            )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.arrive(1 - stage, dst=None)
         # print(tSrP_r2t_f32, tStP_r2t)
         # cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
+        if const_expr(packed_allowed):
+            score_fragments = cute.logical_divide(tSrS_t2r, cute.make_layout(32))
+            p_fragments = cute.logical_divide(tSrP_r2t, cute.make_layout(32))
         for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2])):
+            if const_expr(packed_allowed):
+                softmax.apply_approximate_exp2_convert(
+                    score_fragments[None, i], p_fragments[None, i], masked=mask_fn is not None and self.packed_masked_scores
+                )
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
             if const_expr(self.split_P_arrive > 0):
                 split_P_arrive_idx = cute.size(tStP_r2t.shape[2]) * self.split_P_arrive // self.n_block_size
@@ -2729,7 +2755,11 @@ class FlashAttentionForwardSm100:
             )
         else:
             pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
-        softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+        if const_expr(packed_allowed):
+            tile_sum = utils.fadd_reduce(tSrS_t2r.load(), arch=100)
+            softmax.row_sum[0] = tile_sum if const_expr(is_first) else softmax.row_sum[0] * acc_scale + tile_sum
+        else:
+            softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
         if const_expr(self.use_s_ping_pong):
             return s_p_o_consumer_count + 1, sm_stats_producer_phase, s0_s1_sequence_phase ^ 1

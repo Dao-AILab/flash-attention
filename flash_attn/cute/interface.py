@@ -296,6 +296,21 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.device == expected_device, f"{name} device {t.device} != expected {expected_device}"
     assert t.is_cuda, f"{name} must be on CUDA"
 
+
+def _storage_overlaps(a, b):
+    if a.device != b.device or a.numel() == 0 or b.numel() == 0:
+        return False
+    fake = is_fake_mode()
+    if fake and not torch._C._overlaps(a, b):
+        return False
+    bounds = []
+    for t in (a, b):
+        start = t.storage_offset() * t.element_size() if fake else t.data_ptr()
+        extent = 1 + sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+        bounds.append((start, start + extent * t.element_size()))
+    return bounds[0][0] < bounds[1][1] and bounds[1][0] < bounds[0][1]
+
+
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -717,6 +732,8 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    ex2_emu_freq: Optional[int] = None,
+    approximate_softmax: bool = False,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -739,6 +756,8 @@ def _flash_attn_fwd(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
     )
     fake_mode = is_fake_mode()
+    original_qkv = (q, k, v) if approximate_softmax else ()
+    original_outputs = (out, lse) if approximate_softmax else ()
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
@@ -843,6 +862,31 @@ def _flash_attn_fwd(
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+    if ex2_emu_freq is not None and not (
+        type(ex2_emu_freq) is int and ex2_emu_freq >= 0
+        and arch // 10 in (10, 11) and q is not None and k is not None
+        and qv is None and q.dtype in (torch.float16, torch.bfloat16)
+        and q.device == k.device == v.device
+    ):
+        raise ValueError("ex2_emu_freq requires a nonnegative int and standard SM100/SM110 FP16 or BF16 attention")
+    if approximate_softmax and not (
+        arch // 10 in (10, 11) and q is not None and k is not None
+        and q.ndim == 4 and q.dtype == torch.bfloat16
+        and q.device == k.device == v.device
+        and num_head > 0 and num_head_kv > 0
+        and ex2_emu_freq is None and softcap in (None, 0.0) and num_splits == 1
+        and (softmax_scale is None or (
+            isinstance(softmax_scale, (int, float))
+            and math.isfinite(softmax_scale) and softmax_scale > 0
+        ))
+        and all(t is None for t in (
+            qv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table,
+            learnable_sink, score_mod,
+            mask_mod, block_sparse_tensors, gather_kv_indices, scheduler_metadata,
+            aux_tensors, aux_scalars, seqlen_k_per_split, q_descale, k_descale, v_descale,
+        ))
+    ):
+        raise ValueError("approximate_softmax requires SM100 BF16 attention with a finite positive scale and no score modifiers")
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
     if arch // 10 not in [8, 12]:
@@ -893,6 +937,22 @@ def _flash_attn_fwd(
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
         validate_output_layout(lse, "lse", align_bytes=4)
+
+    if approximate_softmax:
+        for dst in original_outputs:
+            if dst is not None:
+                span = 1
+                for stride, size in sorted(zip(dst.stride(), dst.shape)):
+                    if size > 1:
+                        if stride < span:
+                            raise ValueError("approximate_softmax requires non-overlapping output layouts")
+                        span += (size - 1) * stride
+                if any(_storage_overlaps(dst, t) for t in original_qkv):
+                    raise ValueError("approximate_softmax requires output storage separate from inputs")
+        if all(t is not None for t in original_outputs) and _storage_overlaps(*original_outputs):
+            raise ValueError("approximate_softmax requires separate out and lse storage")
+        if min(seqlen_q, seqlen_k) < 16384:
+            approximate_softmax, ex2_emu_freq = False, 32
 
     if seqlen_k == 0 or total_q == 0:
         out.zero_()
@@ -1056,6 +1116,8 @@ def _flash_attn_fwd(
     num_splits = fwd_cfg.num_splits
     mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     intra_wg_overlap = fwd_cfg.intra_wg_overlap
+    if approximate_softmax and (tile_m != 128 or tile_n not in (64, 128)):
+        approximate_softmax = False
 
     seqlen_q_packgqa = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
     max_m_blocks_leq_one = seqlen_q_packgqa <= q_stage * tile_m
@@ -1168,6 +1230,9 @@ def _flash_attn_fwd(
         block_sparse_broadcast_pattern = block_sparse_config.broadcast_pattern
         q_subtile_factor = block_sparse_config.q_subtile_factor
         kv_subtile_factor = block_sparse_config.kv_subtile_factor
+    if approximate_softmax:
+        from flash_attn.cute.norm_certificate import attention_norm_certificate
+        aux_tensors = [attention_norm_certificate(q, k, v, softmax_scale)]
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
@@ -1432,6 +1497,7 @@ def _flash_attn_fwd(
     num_n_blocks_per_split = cute.ceil_div(cute.ceil_div(s_ping_pong_seqlen_k_loaded, tile_n), num_splits)
     use_s_ping_pong = (
         not requested_disable_s_ping_pong
+        and not approximate_softmax
         and arch // 10 in (10, 11)
         and q_stage == 1
         and head_dim in (64, 128, 256)
@@ -1449,6 +1515,7 @@ def _flash_attn_fwd(
         )
     )
 
+    packed_masked_scores = approximate_softmax and (causal or local or seqlen_k % tile_n != 0)
     compile_key = (
         mla_1cta,
         mla_1cta_kb64,
@@ -1518,6 +1585,9 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
+        ex2_emu_freq,
+        approximate_softmax,
+        packed_masked_scores,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1747,6 +1817,9 @@ def _flash_attn_fwd(
                     seqlen_k_per_split=seqlen_k_per_split,
                     has_tile_count_semaphore=tile_count_semaphore is not None,
                     use_s_ping_pong=use_s_ping_pong,
+                    ex2_emu_freq=ex2_emu_freq,
+                    approximate_softmax=approximate_softmax,
+                    packed_masked_scores=packed_masked_scores,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -2038,6 +2111,7 @@ def _compile_bwd_preprocess(
     has_cu_total_m_blocks,
     hdim_multiple_of,
     has_o_lo=False,
+    bf16_dq=False,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -2049,7 +2123,7 @@ def _compile_bwd_preprocess(
     mSequsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
     mdLSE = fake_tensor(Float32, mLSE.shape, divisibility=1) if has_dlse else None
     mLSElog2 = mLSElog2 if has_lse_log2 else None
-    mdQaccum = mdQaccum if has_dq_accum else None
+    mdQaccum = mdQ if bf16_dq else mdQaccum if has_dq_accum else None
     mRowMax = fake_tensor(Float32, mScaleP.shape, divisibility=1) if has_scaleP else None
     mScaleP = fake_tensor(Float32, mScaleP.shape, divisibility=1) if has_scaleP else None
     softmax_scale = Float32(1.0)
@@ -2130,6 +2204,7 @@ def _bwd_preprocess(
         cu_total_m_blocks is not None,
         hdim_multiple_of,
         o_lo is not None,
+        dq_accum is not None and dq_accum.dtype == torch.bfloat16,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
@@ -2234,6 +2309,32 @@ def _bwd_postprocess_convert(
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
 
 
+def _validate_bf16_dq(q, k, v, supported):
+    if not (
+        supported and all(t is not None and t.ndim == 4 for t in (q, k, v))
+        and q.is_cuda and q.dtype == torch.bfloat16
+        and q.dtype == k.dtype == v.dtype and q.device == k.device == v.device
+        and k.shape == v.shape and q.shape[0] == k.shape[0]
+        and q.shape[-1] == k.shape[-1] == 128
+        and q.shape[2] > 0 and k.shape[2] > 0 and q.shape[2] % k.shape[2] == 0
+        and _get_device_arch() // 10 in (10, 11)
+        and not utils._get_disable_2cta_default()
+    ):
+        raise ValueError("bf16_dq requires nondeterministic two-CTA SM100 BF16 D128 attention")
+
+
+def _validate_bf16_dq_output(dq, inputs):
+    validate_output_layout(dq, "dq", align_bytes=16)
+    span = 1
+    for stride, size in sorted(zip(dq.stride(), dq.shape)):
+        if size > 1:
+            if stride < span:
+                raise ValueError("bf16_dq requires a non-overlapping dq layout")
+            span += (size - 1) * stride
+    if any(t is not None and _storage_overlaps(dq, t) for t in inputs):
+        raise ValueError("bf16_dq requires dq storage separate from inputs and other outputs")
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2277,8 +2378,18 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    bf16_dq: bool = False,
 ) -> Tuple[torch.Tensor, ...]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
+    if bf16_dq:
+        softcap = 0.0 if softcap is None else softcap
+        _validate_bf16_dq(q, k, v,
+            not deterministic and softcap in (None, 0.0)
+            and all(t is None for t in (
+                cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
+                score_mod, score_mod_bwd,
+                mask_mod, block_sparse_tensors, learnable_sink, aux_tensors, aux_scalars,
+            )))
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
@@ -2293,6 +2404,12 @@ def _flash_attn_bwd(
         assert arch // 10 in [9, 10, 11], "Learnable sink backward is supported on SM90 and SM100/SM110"
         assert lse is not None, "learnable_sink backward requires LSE"
     if q.numel() == 0 or k.numel() == 0:
+        if bf16_dq:
+            for output, name, source in ((dq, "dq", q), (dk, "dk", k), (dv, "dv", v)):
+                if output is not None:
+                    _validate_tensor(output, name, source.shape, source.dtype, source.device)
+            if dq is not None:
+                _validate_bf16_dq_output(dq, (q, k, v, out, dout, lse, dlse, dk, dv))
         dq = torch.zeros_like(q) if dq is None else dq.zero_()
         dk = torch.zeros_like(k) if dk is None else dk.zero_()
         dv = torch.zeros_like(v) if dv is None else dv.zero_()
@@ -2419,6 +2536,7 @@ def _flash_attn_bwd(
         or seqused_k is not None
     )
 
+    original_inputs = (q, k, v, out, dout, lse, dlse) if bf16_dq else ()
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink = [
         maybe_contiguous(t)
         for t in (
@@ -2551,6 +2669,8 @@ def _flash_attn_bwd(
         dq = torch.empty_like(q)
     else:
         _validate_tensor(dq, "dq", q.shape, out_torch_dtype, device)
+        if bf16_dq:
+            _validate_bf16_dq_output(dq, (*original_inputs, dk, dv))
 
     if dk is None:
         dk = torch.empty_like(k)
@@ -2562,12 +2682,15 @@ def _flash_attn_bwd(
     else:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
 
+    if bf16_dq and (not use_2cta_instrs or (m_block_size, n_block_size) != (128, 128)):
+        raise ValueError("bf16_dq requires the 128x128 two-CTA backward kernel")
+
     # Keep accumulator allocation, zeroing, and readback aligned with SM90's swapped MMA.
     hdim_multiple_of = 64 if arch // 10 == 9 and dKV_swapAB else 32
     head_dim_rounded = (head_dim + hdim_multiple_of - 1) // hdim_multiple_of * hdim_multiple_of
 
     if cu_seqlens_q is None:
-        dq_accum = (
+        dq_accum = dq if bf16_dq else (
             None
             if use_dedicated_hd256_kernel
             else torch.empty(
@@ -2831,6 +2954,7 @@ def _flash_attn_bwd(
             use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
         )
 
+    compile_key = (*compile_key, bf16_dq)
     if compile_key not in _flash_attn_bwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         cute_aux_tensors = (
@@ -2959,6 +3083,7 @@ def _flash_attn_bwd(
                     has_aux_tensors=aux_tensors is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
+                    bf16_dq=bf16_dq,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -3071,21 +3196,22 @@ def _flash_attn_bwd(
             num_threads_post_dQ = 128
             num_threads_post_dKV = 128
 
-        _bwd_postprocess_convert(
-            dq_accum, dq, softmax_scale,
-            cu_seqlens_q, seqused_q,
-            arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
-            AtomLayoutMdQ, dQ_swapAB,
-            use_2cta_instrs=use_2cta_instrs, cluster_size=1,
-            cu_total_m_blocks=cu_total_m_blocks_q,
-            sink_tensors=(
-                LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
-                if learnable_sink is not None
-                else None
-            ),
-            fake_mode=fake_mode,
-            hdim_multiple_of=hdim_multiple_of,
-        )
+        if not bf16_dq:
+            _bwd_postprocess_convert(
+                dq_accum, dq, softmax_scale,
+                cu_seqlens_q, seqused_q,
+                arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
+                AtomLayoutMdQ, dQ_swapAB,
+                use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+                cu_total_m_blocks=cu_total_m_blocks_q,
+                sink_tensors=(
+                    LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
+                    if learnable_sink is not None
+                    else None
+                ),
+                fake_mode=fake_mode,
+                hdim_multiple_of=hdim_multiple_of,
+            )
 
         if dKV_postprocess:
             # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
@@ -3758,6 +3884,9 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        bf16_dq: bool = False,
+        ex2_emu_freq: Optional[int] = None,
+        approximate_softmax: bool = False,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3788,10 +3917,14 @@ class FlashAttnFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            ex2_emu_freq=ex2_emu_freq,
+            approximate_softmax=approximate_softmax,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
         ctx.shared_kv = shared_kv
+        ctx.bf16_dq = bf16_dq
+        ctx.approximate_softmax = approximate_softmax
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -3809,6 +3942,8 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
+        if ctx.approximate_softmax:
+            raise ValueError("approximate_softmax is forward-only")
         q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
@@ -3835,9 +3970,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 17)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 14)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 17)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3860,13 +3995,14 @@ class FlashAttnFunc(torch.autograd.Function):
                 block_sparse_tensors=ctx.block_sparse_tensors_bwd,
                 dlse=dlse,
                 learnable_sink=learnable_sink,
+                bf16_dq=ctx.bf16_dq,
             )
             if learnable_sink is None:
                 dq, dk, dv = bwd_result
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 14)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 17)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3906,6 +4042,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        ex2_emu_freq: Optional[int] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3947,6 +4084,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            ex2_emu_freq=ex2_emu_freq,
         )
         ctx.save_for_backward(
             q,
@@ -4020,9 +4158,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 16)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 17)
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 17)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4056,7 +4194,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 16)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 17)
 
 
 def _validate_gather_bwd_kwargs(
@@ -4120,7 +4258,25 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    bf16_dq: bool = False,
+    ex2_emu_freq: Optional[int] = None,
+    approximate_softmax: bool = False,
 ):
+    if ex2_emu_freq is not None and softcap is None:
+        softcap = 0.0
+    if bf16_dq:
+        _validate_bf16_dq(q, k, v,
+            not deterministic and softcap in (None, 0.0)
+            and all(t is None for t in (
+                qv, gather_kv_indices, learnable_sink, score_mod, score_mod_bwd,
+                mask_mod, aux_tensors, aux_scalars, block_sparse_tensors, block_sparse_tensors_bwd,
+            )))
+    if approximate_softmax and (bf16_dq or ex2_emu_freq is not None):
+        raise ValueError("approximate_softmax does not support bf16_dq or ex2_emu_freq")
+    if approximate_softmax and torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
+    ):
+        raise ValueError("approximate_softmax is forward-only")
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -4162,6 +4318,9 @@ def flash_attn_func(
         return_lse,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        bf16_dq,
+        ex2_emu_freq,
+        approximate_softmax,
     )
 
 
@@ -4199,6 +4358,7 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    ex2_emu_freq: Optional[int] = None,
 ):
     """
     Tensor arguments:
@@ -4265,6 +4425,8 @@ def flash_attn_varlen_func(
         Must be a positive int (anything else raises); requires varlen or batch 1 (warns
         and runs unchunked otherwise). Small launch-overhead cost. None disables.
     """
+    if ex2_emu_freq is not None and softcap is None:
+        softcap = 0.0
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -4302,6 +4464,7 @@ def flash_attn_varlen_func(
         disable_scheduler_metadata,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        ex2_emu_freq,
     )
 
 
