@@ -717,6 +717,7 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    split_anchor: str = "relative",
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -1256,6 +1257,10 @@ def _flash_attn_fwd(
         p = row_max = o_lo = None
 
 
+    if split_anchor not in ("relative", "absolute"):
+        raise ValueError(f"split_anchor must be 'relative' or 'absolute', got {split_anchor!r}")
+    if split_anchor == "absolute" and seqlen_k_per_split is None:
+        raise ValueError("split_anchor='absolute' requires seqlen_k_per_split")
     reuse_scheduler_metadata = scheduler_metadata is not None
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
     cluster_shape_m = 2 if use_2cta_instrs else 1
@@ -1509,6 +1514,7 @@ def _flash_attn_fwd(
         cu_total_splits_m_blocks is not None,
         blocks_to_batch_idx is not None,
         seqlen_k_per_split,
+        split_anchor,
         is_static_persistent,
         q is not None,
         qv is not None,
@@ -1745,6 +1751,7 @@ def _flash_attn_fwd(
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
                     seqlen_k_per_split=seqlen_k_per_split,
+                    split_anchor_absolute=split_anchor == "absolute",
                     has_tile_count_semaphore=tile_count_semaphore is not None,
                     use_s_ping_pong=use_s_ping_pong,
                 )
@@ -3758,6 +3765,8 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        seqlen_k_per_split: Optional[int] = None,
+        split_anchor: str = "relative",
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3788,6 +3797,8 @@ class FlashAttnFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            seqlen_k_per_split=seqlen_k_per_split,
+            split_anchor=split_anchor,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -3835,9 +3846,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 14)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3866,7 +3877,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 14)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3906,6 +3917,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        split_anchor: str = "relative",
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3947,6 +3959,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            split_anchor=split_anchor,
         )
         ctx.save_for_backward(
             q,
@@ -4020,9 +4033,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 16)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 17)
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 17)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4056,7 +4069,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 16)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 17)
 
 
 def _validate_gather_bwd_kwargs(
@@ -4120,7 +4133,11 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    seqlen_k_per_split: Optional[int] = None,
+    split_anchor: str = "relative",
 ):
+    # seqlen_k_per_split / split_anchor: fixed-size, optionally position-anchored KV splits; see
+    # flash_attn_varlen_func. split_anchor="absolute" is for batch-invariant inference.
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -4162,6 +4179,8 @@ def flash_attn_func(
         return_lse,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        seqlen_k_per_split,
+        split_anchor,
     )
 
 
@@ -4199,6 +4218,7 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    split_anchor: str = "relative",
 ):
     """
     Tensor arguments:
@@ -4247,6 +4267,15 @@ def flash_attn_varlen_func(
 
     seqlen_k_per_split: when using dynamic (per-batch) num_splits, can set a fixed seqlen_k to be
         covered per split for bitwise reproducibility.
+
+    split_anchor: where the fixed-size splits of seqlen_k_per_split start.
+        "relative" (default): split s covers [s * S, (s + 1) * S) counted from the first key the
+        query tile can see, which under a sliding window moves with the query position.
+        "absolute": split s owns the absolute keys [s * S, (s + 1) * S). A query row's reduction
+        order then depends only on its own keys, independent of batch composition, query count,
+        tiling and num_splits. Use it for batch-invariant inference, where decode must match a
+        prefill (or training forward) of the same tokens bitwise, also with sliding windows.
+        Without a window, both modes give identical results.
 
     disable_scheduler_metadata: if True, ignores scheduler_metadata if it is passed and skips
         computing metadata fresh.
@@ -4302,6 +4331,7 @@ def flash_attn_varlen_func(
         disable_scheduler_metadata,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        split_anchor,
     )
 
 

@@ -166,6 +166,7 @@ class FlashAttentionForwardSm100:
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
         use_s_ping_pong: cutlass.Constexpr[bool] = False,
+        split_anchor_absolute: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -194,6 +195,7 @@ class FlashAttentionForwardSm100:
         self.num_n_blocks_per_split = (
             seqlen_k_per_split // n_block_size if seqlen_k_per_split is not None else None
         )
+        self.split_anchor_absolute = split_anchor_absolute
         self.arch = BaseDSL._get_dsl().get_arch_enum()
         assert self.arch.is_family_of(Arch.sm_100f) or self.arch.is_family_of(Arch.sm_110f), \
             "Only SM 10.x and 11.x are supported"
@@ -1199,6 +1201,7 @@ class FlashAttentionForwardSm100:
             num_splits=num_splits,
             pack_split_idx=num_splits_dynamic_ptr is not None,
             num_n_blocks_per_split=self.num_n_blocks_per_split,
+            split_anchor_absolute=self.split_anchor_absolute,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,

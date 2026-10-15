@@ -3782,9 +3782,10 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
 @pytest.mark.parametrize("page_size", [None, 128])
 @pytest.mark.parametrize("window_left", [None, 1500])
 def test_flash_attn_varlen_anchored_split_decode_matches_prefill(dtype, page_size, window_left):
-    """seqlen_k_per_split: decode == prefill bitwise, for any num_splits / batch / window.
+    """split_anchor="absolute": decode == prefill bitwise, for any num_splits / batch / window.
 
-    Split s owns the absolute keys [s * S, (s + 1) * S), so a query row's reduction order depends
+    Batch-invariant inference: split s owns the absolute keys [s * S, (s + 1) * S), so a query row's
+    reduction order depends
     only on its own keys. A causal (optionally sliding-window) prefill over a batch of sequences
     and decode steps (one or a few new tokens per request, in random batches, optionally from a
     paged cache) give bitwise identical outputs, although they launch different numbers of splits
@@ -3809,7 +3810,7 @@ def test_flash_attn_varlen_anchored_split_decode_matches_prefill(dtype, page_siz
     out_prefill, _ = flash_attn_varlen_func(
         q, k, v, cu_seqlens_q=cu, cu_seqlens_k=cu,
         max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens), causal=True, window_size=window_size,
-        num_splits=4, seqlen_k_per_split=split,
+        num_splits=4, seqlen_k_per_split=split, split_anchor="absolute",
     )
 
     if page_size is not None:
@@ -3843,6 +3844,7 @@ def test_flash_attn_varlen_anchored_split_decode_matches_prefill(dtype, page_siz
         kwargs = dict(
             cu_seqlens_q=cu_q, max_seqlen_q=n_new, max_seqlen_k=max(seqlens), seqused_k=seqused_k,
             causal=True, window_size=window_size, num_splits=num_splits, seqlen_k_per_split=split,
+            split_anchor="absolute",
         )
         if page_size is None:
             k_dec = torch.cat([k[cu_host[i] : cu_host[i] + p + n_new] for i, p in reqs])
@@ -3858,4 +3860,39 @@ def test_flash_attn_varlen_anchored_split_decode_matches_prefill(dtype, page_siz
         assert torch.equal(out_dec, ref), (
             f"anchored split decode != prefill (window_left={window_left}, batch={batch}, "
             f"n_new={n_new}, num_splits={num_splits}): max_diff={max_diff}"
+        )
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SplitKV is only supported on SM100")
+@pytest.mark.skipif(DISABLE_SPLIT, reason="SplitKV disabled")
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="compares outputs bitwise")
+def test_flash_attn_split_anchor_modes():
+    """split_anchor: without a window both modes are identical; "absolute" on the dense
+    (flash_attn_func) path matches the varlen path bitwise; "absolute" needs seqlen_k_per_split."""
+    device, dtype, d = "cuda", torch.bfloat16, 128
+    torch.random.manual_seed(0)
+    b, s, h, hk = 2, 3000, 8, 2
+    q = torch.randn(b, s, h, d, device=device, dtype=dtype)
+    k = torch.randn(b, s, hk, d, device=device, dtype=dtype)
+    v = torch.randn(b, s, hk, d, device=device, dtype=dtype)
+    cu = torch.arange(0, (b + 1) * s, s, dtype=torch.int32, device=device)
+
+    def varlen(anchor, window=(None, None)):
+        out, _ = flash_attn_varlen_func(
+            q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1), cu_seqlens_q=cu, cu_seqlens_k=cu,
+            max_seqlen_q=s, max_seqlen_k=s, causal=True, window_size=window, num_splits=4,
+            seqlen_k_per_split=1024, split_anchor=anchor,
+        )
+        return out
+
+    assert torch.equal(varlen("relative"), varlen("absolute"))
+    dense, _ = flash_attn_func(
+        q, k, v, causal=True, window_size=(1500, 0), num_splits=4, seqlen_k_per_split=1024,
+        split_anchor="absolute",
+    )
+    assert torch.equal(dense.flatten(0, 1), varlen("absolute", (1500, 0)))
+    with pytest.raises(ValueError):
+        flash_attn_varlen_func(
+            q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1), cu_seqlens_q=cu, cu_seqlens_k=cu,
+            max_seqlen_q=s, max_seqlen_k=s, causal=True, num_splits=4, split_anchor="absolute",
         )
