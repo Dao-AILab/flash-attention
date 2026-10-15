@@ -2584,6 +2584,70 @@ def test_flash_attn_varlen_paged_kv_num_splits(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_k",
+    [
+        ([5, 1, 30], [40, 0, 50]),
+        ([1] * 7 + [512], [64] * 6 + [0, 64]),
+        ([3, 200, 17], [100, 64, 300]),
+    ],
+    ids=["seq_without_keys", "late_seq_without_keys", "more_queries_than_keys"],
+)
+def test_flash_attn_varlen_paged_kv_empty_rows(seqlens_q, seqlens_k, d, causal, dtype):
+    # Paged KV runs the split-KV kernel. Rows that see no key (a sequence without keys, or causal
+    # rows before the first key) take its early exit, which also writes softmax_lse.
+    device = "cuda"
+    # set seed
+    torch.random.manual_seed(0)
+    nheads, nheads_k = 6, 2
+    page_block_size = 256
+    batch_size = len(seqlens_q)
+    max_blocks_per_seq = max(1, max((s + page_block_size - 1) // page_block_size for s in seqlens_k))
+    num_blocks = batch_size * max_blocks_per_seq
+    q = torch.randn(sum(seqlens_q), nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(num_blocks, page_block_size, nheads_k, d, device=device, dtype=dtype)
+    v_cache = torch.randn(num_blocks, page_block_size, nheads_k, d, device=device, dtype=dtype)
+    block_table = rearrange(
+        torch.randperm(num_blocks, dtype=torch.int32, device=device),
+        "(b nblocks) -> b nblocks",
+        b=batch_size,
+    )
+    cu_seqlens_q = F.pad(torch.tensor(seqlens_q, device=device).cumsum(0), (1, 0)).to(torch.int32)
+    cu_seqlens_k = F.pad(torch.tensor(seqlens_k, device=device).cumsum(0), (1, 0)).to(torch.int32)
+
+    _, lse, _ = flash_attn_varlen_func(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max(seqlens_q),
+        max(seqlens_k),
+        causal=causal,
+        return_attn_probs=True,
+        block_table=block_table,
+    )
+
+    # The LSE of a row without keys is inf, as in normalize_flash_attn_S.
+    lse_ref = torch.full_like(lse, float("inf"))
+    for b in range(batch_size):
+        q_b = q[cu_seqlens_q[b] : cu_seqlens_q[b + 1]]
+        k_b = rearrange(k_cache[block_table[b].long()], "n page h d -> (n page) h d")[: seqlens_k[b]]
+        k_b = repeat(k_b, "s h d -> s (h g) d", g=nheads // nheads_k)
+        scores = torch.einsum("thd,shd->hts", q_b.float(), k_b.float()) / math.sqrt(d)
+        if causal:
+            causal_mask = construct_local_mask(seqlens_q[b], seqlens_k[b], (-1, 0), device=device)
+            scores.masked_fill_(causal_mask, float("-inf"))
+        lse_b = torch.logsumexp(scores, dim=-1)
+        lse_ref[:, cu_seqlens_q[b] : cu_seqlens_q[b + 1]] = lse_b.masked_fill(lse_b == float("-inf"), float("inf"))
+    wrong = ~torch.isclose(lse, lse_ref, rtol=0, atol=1e-3)
+    print(f"LSE wrong entries: {wrong.sum().item()} of {wrong.numel()}")
+    assert not wrong.any()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("paged_kv_block_size", [256])
 @pytest.mark.parametrize("append_knew", [False, True])
 def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block_size, dtype):
