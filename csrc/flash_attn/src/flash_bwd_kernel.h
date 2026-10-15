@@ -826,10 +826,20 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
-    // The block index for the batch.
-    const int bidb = blockIdx.y;
     // The block index for the head.
     const int bidh = blockIdx.z;
+    // A varlen launch covers the batch's padded key block space (varlen_num_blocks), unless the
+    // deterministic order's per-CTA dQ_accum buffers need the (sequence, block) grid.
+    if (params.cu_seqlens_k != nullptr && params.is_seqlens_k_cumulative && !params.deterministic) {
+        auto const coord = varlen_block_coord<Kernel_traits::kBlockN>(blockIdx.x, params.b, params.cu_seqlens_k,
+                                                                      params.seqused_k);
+        if (get<0>(coord) >= 0) {
+            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true>(params, get<0>(coord), bidh, get<1>(coord));
+        }
+        return;
+    }
+    // The block index for the batch.
+    const int bidb = blockIdx.y;
 
     // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
     for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {

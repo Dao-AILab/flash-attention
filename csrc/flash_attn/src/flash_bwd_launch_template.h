@@ -71,15 +71,21 @@ __global__ void flash_bwd_convert_dkv_kernel(const Flash_bwd_params params) {
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) {
-    const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-    dim3 grid_m(num_m_block, params.b, params.h);
-    const int num_n_block = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
+    // A varlen launch covers the batch's padded block space (varlen_num_blocks), each CTA finding
+    // its sequence and block from cu_seqlens; the deterministic order keeps the (sequence, block) grid.
+    const bool varlen_q = params.cu_seqlens_q != nullptr;
+    const bool varlen_k = params.cu_seqlens_k != nullptr && params.is_seqlens_k_cumulative && !params.deterministic;
+    const int num_m_block = varlen_q ? varlen_num_blocks(params.total_q, params.b, Kernel_traits::kBlockM)
+                                     : (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+    dim3 grid_m(num_m_block, varlen_q ? 1 : params.b, params.h);
+    const int num_n_block = varlen_k ? varlen_num_blocks(params.total_k, params.b, Kernel_traits::kBlockN)
+                                     : (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
     int gridDimx = num_n_block;
     if (params.deterministic) {
         int num_sm = get_num_sm(get_current_device());
         gridDimx = (num_sm + params.b * params.h - 1) / (params.b * params.h);
     }
-    dim3 grid_n(gridDimx, params.b, params.h);
+    dim3 grid_n(gridDimx, varlen_k ? 1 : params.b, params.h);
 
     if (!params.deterministic) {
         flash_bwd_dot_do_o_kernel<true, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);

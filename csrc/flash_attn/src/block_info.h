@@ -9,6 +9,31 @@ namespace FLASH_NAMESPACE {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// The blocks of kBlock rows of a varlen batch of `total` rows in `num_batch` sequences, numbered
+// in its padded block space: sequence b's blocks start at cu_seqlens[b] / kBlock + b. Each sequence
+// leaves at most one gap after its last block, so the space spans this many blocks however long
+// the longest sequence is, where a grid of num_batch * ceil_div(max_seqlen, kBlock) gives every
+// (sequence, block) pair a CTA, most of which find their sequence already ended.
+inline int varlen_num_blocks(int total, int num_batch, int block) {
+    return (total + block - 1) / block + num_batch;
+}
+
+// The `block_idx`-th block of the padded block space (varlen_num_blocks) as (bidb, block within the
+// sequence), or (-1, 0) in a gap or past the batch: a binary search over cu_seqlens for the last
+// sequence starting at or before it.
+template <int kBlock>
+__forceinline__ __device__ cute::tuple<int, int> varlen_block_coord(const int block_idx, const int num_batch,
+                                                                    const int *cu_seqlens, const int *seqused) {
+    int bidb = 0, last = num_batch - 1;
+    while (bidb < last) {
+        const int middle = (bidb + last + 1) / 2;
+        if (cu_seqlens[middle] / kBlock + middle <= block_idx) { bidb = middle; } else { last = middle - 1; }
+    }
+    const int block = block_idx - (cu_seqlens[bidb] / kBlock + bidb);
+    const int seqlen = seqused ? seqused[bidb] : cu_seqlens[bidb + 1] - cu_seqlens[bidb];
+    return block < (seqlen + kBlock - 1) / kBlock ? cute::make_tuple(bidb, block) : cute::make_tuple(-1, 0);
+}
+
 template<bool Varlen=true>
 struct BlockInfo {
 

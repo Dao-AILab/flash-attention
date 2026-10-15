@@ -1201,6 +1201,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      /*unpadded_lse*/true);
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
     params.total_q = total_q;
+    params.total_k = total_k;
 
     auto launch = &run_mha_bwd;
 
