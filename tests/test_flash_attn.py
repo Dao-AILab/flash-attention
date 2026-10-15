@@ -2686,3 +2686,41 @@ def test_flash_attn_generator_arg_must_be_none():
     with pytest.raises(RuntimeError, match=match):
         flash_attn_gpu.varlen_bwd(qf, qf, kf, vf, qf, lse, None, None, None, cu, cu, None,
                                   seqlen, seqlen, 0.0, scale, False, True, -1, -1, 0.0, False, bad, None)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_varlen_gqa_zero_length_q(dtype):
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k = 2, 1, 17
+    nheads, nheads_k, d = 6, 2, 64
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+    # Query lengths [0, 1]: max_seqlen_q == 1 does not imply total_q == batch_size.
+    query_padding_mask = torch.tensor([[False], [True]], device=device)
+    key_padding_mask = query_padding_mask.expand(batch_size, seqlen_k)
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        _,
+        _,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask)
+
+    out_unpad = flash_attn_varlen_func(
+        q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k, dropout_p=0.0, causal=False,
+    )
+    out_ref, _ = attention_ref(
+        q, k, v, query_padding_mask=query_padding_mask, key_padding_mask=key_padding_mask,
+    )
+    torch.testing.assert_close(output_pad_fn(out_unpad), out_ref, atol=2e-2, rtol=2e-2)
