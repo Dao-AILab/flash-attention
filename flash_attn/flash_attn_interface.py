@@ -1490,7 +1490,7 @@ def flash_attn_with_kvcache(
     v=None,
     rotary_cos=None,
     rotary_sin=None,
-    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    cache_seqlens: Optional[Union[int, torch.Tensor]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
@@ -1592,6 +1592,12 @@ def flash_attn_with_kvcache(
     """
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    if (k is None) != (v is None):
+        raise ValueError("k and v must either both be provided or both be None")
+    if (rotary_cos is None) != (rotary_sin is None):
+        raise ValueError(
+            "rotary_cos and rotary_sin must either both be provided or both be None"
+        )
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -1599,9 +1605,13 @@ def flash_attn_with_kvcache(
         cache_seqlens = torch.full(
             (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
-        cache_seqlens = maybe_contiguous(cache_seqlens)
+    cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
+    cache_leftpad = maybe_contiguous(cache_leftpad)
     block_table = maybe_contiguous(block_table)
+    rotary_cos = rotary_cos.contiguous() if rotary_cos is not None else None
+    rotary_sin = rotary_sin.contiguous() if rotary_sin is not None else None
+    alibi_slopes = maybe_contiguous(alibi_slopes)
     out, softmax_lse = flash_attn_gpu.fwd_kvcache(
         q,
         k_cache,
