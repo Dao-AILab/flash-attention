@@ -4171,23 +4171,27 @@ class FlashAttentionBackwardSm100:
                                 1,
                             )
 
+                # With more than one staging stage the tile's newest bulk adds are still in
+                # flight here (each stage only waits for the older groups). Drain them once
+                # when something below needs them complete: the deterministic semaphore
+                # release (the next CTA in order must find the adds performed, which the
+                # deterministic read_flag = False waits for) and the exchange-buffer alias
+                # handshake (the peer's dS exchange reuses sdQaccum once its reads are done).
+                release_dQ_semaphore = self.deterministic and not delay_semaphore_release
+                if const_expr(
+                    self.sdQaccum_stage > 1
+                    and (release_dQ_semaphore or self.xchg_aliases_dQaccum)
+                ):
+                    if is_tma_warp and not m_block_oob_upper:
+                        cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                    self.reduce_sync_barrier.arrive_and_wait()
                 if const_expr(self.xchg_aliases_dQaccum):
-                    if const_expr(self.sdQaccum_stage > 1):
-                        if is_tma_warp:
-                            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                        self.reduce_sync_barrier.arrive_and_wait()
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(dQaccum_empty_mbar_ptr)
 
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
-                if const_expr(self.deterministic and not delay_semaphore_release):
-                    if const_expr(
-                        self.sdQaccum_stage > 1 and self.cta_schedule != CtaSchedule.TWO_CTA_SERIAL
-                    ):
-                        if is_tma_warp and not m_block_oob_upper:
-                            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                        self.reduce_sync_barrier.arrive_and_wait()
+                if const_expr(release_dQ_semaphore):
                     if not m_block_oob_upper:
                         barrier.arrive_inc(
                             mdQ_semaphore_cur[m_block, None].iterator,
