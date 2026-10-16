@@ -20,6 +20,7 @@ from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
 from flash_attn.cute import pipeline
+from flash_attn.cute.bwd_accum_tile import AccumTileOrder, accum_tile_layout
 from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -113,13 +114,20 @@ class FlashAttentionBackwardSm100:
         self.tile_m = tile_m
         self.tile_n = tile_n
 
-        assert self.tile_hdim <= 128 or (self.tile_hdim == 192 and self.tile_hdimv == 128)
-        assert self.tile_hdimv <= 128
+        is_hdim256 = self.tile_hdim == 256 and self.tile_hdimv == 256
+        assert (
+            self.tile_hdim <= 128
+            or (self.tile_hdim == 192 and self.tile_hdimv == 128)
+            or is_hdim256
+        )
+        assert self.tile_hdimv <= 128 or is_hdim256
 
         self.use_2cta_instrs = bool(use_2cta_instrs and cluster_size == 2)
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
 
-        assert self.tile_hdim != 192 or self.use_2cta_instrs, "Must use 2CTA for hdim 192"
+        assert self.tile_hdim not in (192, 256) or self.use_2cta_instrs, (
+            "Must use 2CTA for hdim 192 / 256"
+        )
 
         # NOTE [2CTA schedules]
         # Two 2CTA schedules exist and a 2CTA configuration runs exactly one of them:
@@ -127,11 +135,13 @@ class FlashAttentionBackwardSm100:
         #   pipelines S(t+1) with dK/dP/dQ/dV, and dQ overlaps the tail of S in TMEM, so the
         #   dS pipeline also signals that S has been read.
         # - serial (hdim 192): Qt and dOt alias Q and dO (one stage), sdS_xchg aliases
-        #   sdQaccum (guarded by dQaccum_empty_mbar), the MMAs run serially, and dP overlaps
-        #   the tail of S, so S is released right after it is read.
+        #   sdQaccum (guarded by dQaccum_empty_mbar; M=128 layout only), the MMAs run
+        #   serially, and dP overlaps the tail of S, so S is released right after it is read.
+        # hdim 192 and 256 need the serial schedule's SMEM aliasing; hdim <= 128 runs the
+        # pipelined one.
         if not self.use_2cta_instrs:
             self.cta_schedule = CtaSchedule.ONE_CTA
-        elif self.tile_hdim == 192:
+        elif self.tile_hdim in (192, 256):
             self.cta_schedule = CtaSchedule.TWO_CTA_SERIAL
         else:  # hdim <= 128; in practice 128 (the interface enables 2CTA for hdim >= 128 only)
             self.cta_schedule = CtaSchedule.TWO_CTA_PIPELINED
@@ -142,9 +152,23 @@ class FlashAttentionBackwardSm100:
         # of the same 64 rows. Every accumulator then takes N // 2 columns, and P / dS are
         # staged in SMEM as the A operands of the dV / dK MMAs instead of living in TMEM.
         self.acc_m64 = self.use_2cta_instrs and tile_n == 64
-        assert not self.acc_m64 or self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED, (
-            "the 64-row KV tile is only wired for the pipelined 2CTA schedule"
+        # With P / dS^T in SMEM, the dS half the peer needs for its dQ MMA is a contiguous
+        # block of sdS_dK in exactly the peer's dQ A-operand layout (checked in
+        # _check_dS_exchange_layouts), so the exchange is copied from there: no sdS_xchg
+        # staging buffer, and no sdS_xchg / sdQaccum alias in the serial schedule.
+        self.has_sdS_xchg = self.use_2cta_instrs and not self.acc_m64
+        self.xchg_aliases_dQaccum = (
+            self.has_sdS_xchg and self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL
         )
+        # Storage order of the fp32 accumulate tiles the postprocess reads (bwd_accum_tile).
+        self.dQaccum_order, self.dKVaccum_order = self.accum_tile_orders(
+            self.use_2cta_instrs, tile_n
+        )
+        # hdim 256: dK + dV + S + dP + dQ only fit TMEM with the M=64 layout, and only the serial
+        # schedule's SMEM aliasing fits the 256-wide Q / dO / K / V tiles.
+        assert not is_hdim256 or (
+            self.acc_m64 and self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL
+        ), "hdim 256 backward needs 2CTA with a 64-row KV tile (serial schedule)"
 
         # CTA tiler
         self.cta_tiler = (tile_n, tile_m, self.tile_hdim)
@@ -254,7 +278,7 @@ class FlashAttentionBackwardSm100:
 
         if self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL:
             assert self.tile_m == 128
-            assert self.tile_n == 128
+            assert self.tile_n in (64, 128)
             self.tmem_dV_offset = 0
             self.tmem_dK_offset = self.tmem_dV_offset + self.tmem_cols_dV
             self.tmem_S_offset = self.tmem_dK_offset + self.tmem_cols_dK
@@ -320,6 +344,87 @@ class FlashAttentionBackwardSm100:
         )
         self.buffer_align_bytes = 1024
 
+    @staticmethod
+    def accum_tile_orders(
+        use_2cta_instrs: bool, tile_n: int
+    ) -> tuple[AccumTileOrder, AccumTileOrder]:
+        """(dQ, dK / dV) accumulate tile orders of a configuration; the interface compiles the
+        postprocess for the same orders. dQ is reduced out of its TMEM fragment, per CTA pair
+        with 2CTA. GQA dK / dV come out of the M=128 epilogue in fragment order and out of the
+        M=64 one (2CTA, 64-row KV tile, NOTE [M=64 accumulator layout]) row-major."""
+        acc_m64 = use_2cta_instrs and tile_n == 64
+        dQaccum_order = (
+            AccumTileOrder.TMEM_FRAG_2CTA if use_2cta_instrs else AccumTileOrder.TMEM_FRAG_1CTA
+        )
+        dKVaccum_order = AccumTileOrder.ROW_MAJOR if acc_m64 else AccumTileOrder.TMEM_FRAG_1CTA
+        return dQaccum_order, dKVaccum_order
+
+    def _check_accum_tile_orders(self):
+        """The reduce epilogues stream fixed-width column stages of a TMEM fragment with 1-D
+        copies (dQacc_reduce, epilogue_dK_or_dV_reduce_ncol); check on sample coordinates that
+        accum_tile_layout(order) describes the storage order those copies produce. The M=64
+        dK / dV epilogue derives its addresses from the layout instead (epilogue_dK_or_dV)."""
+        rows, hdim = self.tile_m, self.tile_hdim
+        assert len(self.reduce_warp_ids) == 4, "the 1-D copies below assume 128 threads"
+        # dQ: CTA rank r streams stage s (ncol columns of its fragment) as the flat block
+        # (s + stages_per_cta * r) * 128 * ncol, thread t holding lane t, 4 columns per copy.
+        # Lane t is row t with one CTA; with two it is row t % 64 of CTA r's 64 rows, column
+        # half t // 64.
+        dQ_layout = accum_tile_layout(self.dQaccum_order, rows, hdim)
+        ncol = self.dQ_reduce_ncol
+        stages_per_cta = self.dQaccum_reduce_stage // self.cta_group_size
+        for r in range(self.cta_group_size):
+            for s in range(stages_per_cta):
+                for t in (0, 1, 63, 64, 127):
+                    for j in (0, 1, 3, 4, ncol - 1):
+                        flat = (
+                            (s + stages_per_cta * r) * 128 * ncol + 4 * t + j % 4 + 512 * (j // 4)
+                        )
+                        if self.cta_group_size == 1:
+                            row, col = t, s * ncol + j
+                        else:
+                            row, col = t % 64 + 64 * r, s * ncol + j + hdim // 2 * (t // 64)
+                        assert cute.crd2idx((row, col), dQ_layout) == flat, (
+                            "dQaccum_order does not match the dQ reduce"
+                        )
+        if self.dKVaccum_order == AccumTileOrder.ROW_MAJOR:
+            # M=64 dK / dV: the tile goes out as two row halves through a half-tile staging
+            # buffer, so each half must be one block laid out like a half-height tile.
+            rows_per_half = self.tile_n // 2
+            for hd in (self.tile_hdim, self.tile_hdimv):
+                tile_layout = accum_tile_layout(self.dKVaccum_order, self.tile_n, hd)
+                half_layout = accum_tile_layout(self.dKVaccum_order, rows_per_half, hd)
+                for half in range(2):
+                    for r in (0, 1, rows_per_half - 1):
+                        for c in (0, 1, 4, hd - 1):
+                            assert cute.crd2idx((half * rows_per_half + r, c), tile_layout) == (
+                                half * rows_per_half * hd + cute.crd2idx((r, c), half_layout)
+                            ), "dKVaccum_order must store each row half of the tile as one block"
+        else:
+            assert self.dKVaccum_order == AccumTileOrder.TMEM_FRAG_1CTA
+            # M=128 dK / dV: warpgroup w owns columns [w * hdim / 2, (w + 1) * hdim / 2) of
+            # the tile_n rows as the flat block w * tile_n * hdim / 2, streamed as
+            # dK_reduce_ncol-column stages, thread t holding row t, 4 columns per copy.
+            assert self.tile_n == 128
+            ncol = self.dK_reduce_ncol
+            for hd in (self.tile_hdim, self.tile_hdimv):
+                layout = accum_tile_layout(self.dKVaccum_order, self.tile_n, hd)
+                for w in range(2):
+                    for s in range(hd // 2 // ncol):
+                        for t in (0, 1, 127):
+                            for j in (0, 1, 3, 4, ncol - 1):
+                                flat = (
+                                    w * self.tile_n * hd // 2
+                                    + s * self.tile_n * ncol
+                                    + 4 * t
+                                    + j % 4
+                                    + 512 * (j // 4)
+                                )
+                                col = w * hd // 2 + s * ncol + j
+                                assert cute.crd2idx((t, col), layout) == flat, (
+                                    "dKVaccum_order does not match the dK / dV reduce"
+                                )
+
     def _setup_attributes(self):
         self.Q_stage = 1 if self.use_2cta_instrs else 2
         self.dO_stage = 1
@@ -331,8 +436,17 @@ class FlashAttentionBackwardSm100:
         # todo: try 32/1 or 48/2 for 2cta d=192 dv=128
         if self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL:
             self.dQ_reduce_ncol_t2r = 32
-            self.dQ_reduce_ncol = 24 if not self.is_causal else 32
-            self.sdQaccum_stage = 2 if not self.is_causal else 1
+            if self.tile_hdim == 192:
+                # 24 tiles the 96 columns per CTA
+                self.dQ_reduce_ncol = 24 if not self.is_causal else 32
+                self.sdQaccum_stage = 2 if not self.is_causal else 1
+            else:
+                # hdim 256: 1 KB under the SMEM limit (the separate sKt tile for the cluster-wide
+                # dQ reduction costs 32 KB), so 16 KB of staging as two 16-column stages, which
+                # measured faster than one 32-column stage.
+                assert self.tile_hdim == 256
+                self.dQ_reduce_ncol = 16
+                self.sdQaccum_stage = 2
         else:
             if self.use_2cta_instrs:
                 self.dQ_reduce_ncol = 16 if self.deterministic else 8
@@ -348,6 +462,7 @@ class FlashAttentionBackwardSm100:
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
         # number of tma reduce adds for dKacc and dVacc epilogue (must divide hdim_per_wg)
         self.dK_reduce_ncol = math.gcd(32, self.tile_hdim // 2)
+        self._check_accum_tile_orders()
         # CTA group for MMA operations
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -482,6 +597,8 @@ class FlashAttentionBackwardSm100:
             1,
         )
         self.sdS_layout = cute.slice_(sdS_layout, (None, None, None, 0))
+        if self.acc_m64:
+            self._check_dS_exchange_layouts()
         sKt_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_dQ,
             self.mma_tiler_dsk,
@@ -865,15 +982,18 @@ class FlashAttentionBackwardSm100:
             assert sdK_bytes <= sK_bytes, "sdK doesn't fit in sK storage allocation (2-CTA)"
 
         if const_expr(self.use_2cta_instrs):
-            # The serial schedule aliases Qt / dOt into Q / dO and sdS_xchg into sdQaccum.
+            # The serial schedule aliases Qt / dOt into Q / dO and sdS_xchg into sdQaccum; the
+            # M=64 layout has no exchange staging buffer at all (see xchg_aliases_dQaccum).
             own_xchg = const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED)
             sQt_size = cute.cosize(self.sQt_layout) if own_xchg else 0
             sdOt_size = cute.cosize(self.sdOt_layout) if own_xchg else 0
-            sdS_xchg_size = cute.cosize(self.sdS_xchg_layout) if own_xchg else 0
+            sdS_xchg_size = (
+                cute.cosize(self.sdS_xchg_layout) if own_xchg and self.has_sdS_xchg else 0
+            )
             # M=64 layout: P^T and this CTA's dS^T are the SMEM A operands of the dV / dK MMAs.
             sP_size = cute.cosize(self.tP_layout) if const_expr(self.acc_m64) else 0
             sdS_dK_size = cute.cosize(self.sdSt_layout) if const_expr(self.acc_m64) else 0
-            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
+            if const_expr(self.xchg_aliases_dQaccum):
                 assert cute.size_in_bytes(
                     self.ds_dtype, self.sdS_xchg_layout
                 ) <= cute.size_in_bytes(self.dqaccum_dtype, self.sdQaccum_layout), (
@@ -1245,16 +1365,20 @@ class FlashAttentionBackwardSm100:
             dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr
             dS_cluster_empty_mbar_ptr = storage.dS_cluster_empty_mbar_ptr
             dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr
-            dQaccum_empty_mbar_ptr = storage.dQaccum_empty_mbar_ptr
         else:
             dS_cluster_full_mbar_ptr = None
             dS_cluster_empty_mbar_ptr = None
             dS_cluster_leader_mbar_ptr = None
+        # The dQaccum_empty handshake exists only where sdS_xchg aliases sdQaccum; the roles
+        # specialize on this handle (and on sdS_xchg) rather than on the configuration.
+        if const_expr(self.xchg_aliases_dQaccum):
+            dQaccum_empty_mbar_ptr = storage.dQaccum_empty_mbar_ptr
+        else:
             dQaccum_empty_mbar_ptr = None
 
         # Barrier initialization
         if const_expr(self.use_2cta_instrs):
-            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
+            if const_expr(dQaccum_empty_mbar_ptr is not None):
                 if warp_idx == 2:
                     cute.arch.mbarrier_init(
                         dQaccum_empty_mbar_ptr,
@@ -1444,7 +1568,7 @@ class FlashAttentionBackwardSm100:
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         sdSt = storage.sdS.get_tensor(sdSt_layout.outer, swizzle=sdSt_layout.inner)
         sdS = cute.make_tensor(cute.recast_ptr(sdSt.iterator, sdS_layout.inner), sdS_layout.outer)
-        if const_expr(self.use_2cta_instrs):
+        if const_expr(self.has_sdS_xchg):
             if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
                 sdS_xchg = storage.sdS_xchg.get_tensor(sdS_xchg_layout)
             else:
@@ -2962,6 +3086,43 @@ class FlashAttentionBackwardSm100:
         # pipeline_dKV.producer_tail(producer_state_dKV)
         # pipeline_dQ.producer_tail(producer_state_dQ)
 
+    def _check_dS_exchange_layouts(self):
+        """The dS exchange of the M=64 layout copies the peer's Q-column half of this CTA's
+        dS^T from sdS_dK (K-major (kv, q), q = tile_m // 2 per K block) into the peer's sdS
+        (M-major (q, kv)) at this CTA's KV-row block (_dS_exchange_source). Check that
+        contract on the layouts: same swizzle, both halves one contiguous block at the same
+        offset, same element order."""
+        src = self.sdSt_layout.outer  # ((kv, q16), 1, (q16_chunks, q_half))
+        dst = cute.logical_divide(
+            self.sdS_layout.outer, (None, None, cute.size(self.sdS_layout.outer.shape[2]) // 2)
+        )  # ((q, kv16), 1, (kv16_chunks, kv_block))
+        assert str(self.sdSt_layout.inner) == str(self.sdS_layout.inner)
+        assert cute.crd2idx((0, 0, (0, 1)), src) == cute.crd2idx((0, 0, (0, 1)), dst)
+        for kv in (0, 1, 17, self.tile_n - 1):
+            for q in (0, 1, 15, 16, self.tile_m // 2 - 1):
+                assert cute.crd2idx(((kv, q % 16), 0, (q // 16, 1)), src) == cute.crd2idx(
+                    ((q, kv % 16), 0, (kv // 16, 1)), dst
+                ), "dS exchange: sdS_dK half is not in the peer's dQ A-operand layout"
+
+    def _dS_exchange_source(
+        self,
+        sdS_xchg: Optional[cute.Tensor],
+        sdS_dK: Optional[cute.Tensor],
+        peer_cta_rank_in_cluster: Int32,
+    ) -> cute.Tensor:
+        """The SMEM tile this CTA sends its peer in the dS exchange: the peer's Q-column half of
+        this CTA's dS^T, in the layout of the peer's dQ A-operand half (sdS, M-major (q, kv))
+        at this CTA's KV-row block.
+
+        With the M=128 layout the compute warps stage that half in sdS_xchg. With P / dS^T in
+        SMEM (M=64 layout) it already sits in sdS_dK, the dK A operand, as the peer's K block
+        (the layout contract is checked at setup, _check_dS_exchange_layouts).
+        """
+        if const_expr(sdS_xchg is not None):
+            return sdS_xchg
+        assert sdS_dK is not None
+        return sdS_dK[None, None, (None, peer_cta_rank_in_cluster)]
+
     @cute.jit
     def split_wg(
         self,
@@ -3099,7 +3260,7 @@ class FlashAttentionBackwardSm100:
         mdV: cute.Tensor,
         mdK: cute.Tensor,
         sdS: cute.Tensor,
-        sdS_xchg: cute.Tensor,
+        sdS_xchg: Optional[cute.Tensor],
         sP: Optional[cute.Tensor],
         sdS_dK: Optional[cute.Tensor],
         pipeline_LSE: PipelineAsync,
@@ -3111,7 +3272,7 @@ class FlashAttentionBackwardSm100:
         pipeline_P: Optional[PipelineAsync],
         dS_cluster_empty_mbar_ptr: cute.Pointer,
         dS_cluster_full_mbar_ptr: cute.Pointer,
-        dQaccum_empty_mbar_ptr: cute.Pointer,
+        dQaccum_empty_mbar_ptr: Optional[cute.Pointer],
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         block_info: BlockInfo,
@@ -3221,7 +3382,7 @@ class FlashAttentionBackwardSm100:
             sdS_epi = cute.make_tensor(sdS.iterator, sdS_layout)
             tRS_sdS = thr_copy_r2s.partition_D(sdS_epi)
 
-            if const_expr(self.use_2cta_instrs):
+            if const_expr(sdS_xchg is not None):
                 sdS_xchg_epi = cute.make_tensor(
                     cute.recast_ptr(sdS_xchg.iterator, sdS_epi_layout.inner), sdS_layout
                 )
@@ -3274,26 +3435,18 @@ class FlashAttentionBackwardSm100:
             tRS_sP = self.split_wg(thr_copy_r2s.partition_D(sP_epi), wg_idx, num_wg)
             sdS_dK_epi = cute.make_tensor(sdS_dK.iterator, sdS_layout)
             tRS_sdS_dK = self.split_wg(thr_copy_r2s.partition_D(sdS_dK_epi), wg_idx, num_wg)
-            # The exchange buffer holds one Q-column half; view it as the full (tile_n, tile_m)
-            # tile with both column halves aliased, so a thread stores its chunk at its natural
-            # column modulo tile_m // 2.
-            xchg_stride = sdS_layout_2d.stride
-            sdS_xchg_layout_full = cute.make_layout(
-                (sdS_layout_2d.shape, 1, 1),
-                stride=((xchg_stride[0], (xchg_stride[1][0], 0)), 0, 0),
-            )
-            sdS_xchg_epi = cute.make_tensor(
-                cute.recast_ptr(sdS_xchg.iterator, sdS_epi_layout.inner), sdS_xchg_layout_full
-            )
-            tRS_sdS_xchg = self.split_wg(thr_copy_r2s.partition_D(sdS_xchg_epi), wg_idx, num_wg)
             # Q-column half this thread's chunk belongs to (from its partition coordinates); the
-            # CTA keeps the half it owns for dQ and exchanges the other one.
+            # CTA keeps the half it owns for dQ (the peer's half reaches it from sdS_dK, see the
+            # exchange copy below).
             q_half = tScS_t2r[0][1] // (self.tile_m // 2)
 
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         dS_cluster_empty_phase = Int32(1)
         # 2-CTA: CTA 0 exchanges stage 1 (bottom half), CTA 1 exchanges stage 0 (top half)
         exchange_stage = cta_rank_in_cluster ^ 1 if const_expr(self.use_2cta_instrs) else Int32(0)
+        if const_expr(self.use_2cta_instrs):
+            peer_cta_rank_in_cluster = cta_rank_in_cluster ^ 1
+            sdS_xchg_src = self._dS_exchange_source(sdS_xchg, sdS_dK, peer_cta_rank_in_cluster)
 
         consumer_state_S_P_dP = pipeline.make_pipeline_state(  # Our impl has shortcut for stage==1
             cutlass.pipeline.PipelineUserType.Consumer, 1
@@ -3630,14 +3783,12 @@ class FlashAttentionBackwardSm100:
                             tdPrdS_xchg = cute.make_fragment_like(tdPrdS_cvt, self.ds_dtype)
 
                     if const_expr(self.acc_m64):
-                        # dS^T for the dK MMA: this CTA's rows, both Q-column halves.
+                        # dS^T for the dK MMA: this CTA's rows, both Q-column halves; the half
+                        # the peer needs for its dQ MMA is exchanged straight from here.
                         cute.autovec_copy(tdPrdS_cvt, tRS_sdS_dK[None, 0, 0, 0])
-                        # dS for the dQ MMA: keep the Q-column half this CTA owns, stage the
-                        # other half for the peer.
+                        # dS for this CTA's own dQ MMA: the Q-column half it owns.
                         if q_half == cta_rank_in_cluster:
                             cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, 0, 0, 0])
-                        else:
-                            cute.autovec_copy(tdPrdS_cvt, tRS_sdS_xchg[None, 0, 0, 0])
                     else:
                         # RMEM->TMEM: always write to TMEM for MMA
                         if const_expr(not self.use_smem_dS_for_mma_dK or self.use_2cta_instrs):
@@ -3668,9 +3819,9 @@ class FlashAttentionBackwardSm100:
                 consumer_state_S_P_dP.advance()
 
                 # After the loop: copy exchange registers to sdS_xchg buffer
-                if const_expr(self.use_2cta_instrs and not self.acc_m64):
-                    # serial schedule: sdS_xchg aliases sdQaccum
-                    if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
+                if const_expr(sdS_xchg is not None):
+                    # sdS_xchg aliases sdQaccum: wait until the dQ reduce has read it
+                    if const_expr(dQaccum_empty_mbar_ptr is not None):
                         cute.arch.mbarrier_wait(
                             dQaccum_empty_mbar_ptr, phase=producer_state_dS.phase
                         )
@@ -3692,13 +3843,12 @@ class FlashAttentionBackwardSm100:
                         pipeline_dS.producer_commit(producer_state_dS)
                     producer_state_dS.advance()
 
-                # 2-CTA: DSMEM copy from sdS_xchg to peer's sdS buffer
+                # 2-CTA: DSMEM copy of the exchanged dS half to the peer's sdS buffer
                 if const_expr(self.use_2cta_instrs):
                     stage_copy_bytes = const_expr(self.tma_copy_bytes["dS"] // 2)
                     stage_copy_elems = const_expr(stage_copy_bytes // (self.ds_dtype.width // 8))
                     if tidx == 0:
-                        peer_cta_rank_in_cluster = cta_rank_in_cluster ^ 1
-                        smem_src_ptr = sdS_xchg.iterator
+                        smem_src_ptr = sdS_xchg_src.iterator
                         # Destination is peer's sdS at our CTA's offset (exchange_stage position)
                         smem_dst_ptr = sdS.iterator + cta_rank_in_cluster * stage_copy_elems
                         cute.arch.mbarrier_arrive_and_expect_tx(
@@ -4129,23 +4279,27 @@ class FlashAttentionBackwardSm100:
                                 1,
                             )
 
-                if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
-                    if const_expr(self.sdQaccum_stage > 1):
-                        if is_tma_warp:
-                            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                        self.reduce_sync_barrier.arrive_and_wait()
+                # With more than one staging stage the tile's newest bulk adds are still in
+                # flight here (each stage only waits for the older groups). Drain them once
+                # when something below needs them complete: the deterministic semaphore
+                # release (the next CTA in order must find the adds performed, which the
+                # deterministic read_flag = False waits for) and the exchange-buffer alias
+                # handshake (the peer's dS exchange reuses sdQaccum once its reads are done).
+                release_dQ_semaphore = self.deterministic and not delay_semaphore_release
+                if const_expr(
+                    self.sdQaccum_stage > 1
+                    and (release_dQ_semaphore or dQaccum_empty_mbar_ptr is not None)
+                ):
+                    if is_tma_warp and not m_block_oob_upper:
+                        cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                    self.reduce_sync_barrier.arrive_and_wait()
+                if const_expr(dQaccum_empty_mbar_ptr is not None):
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(dQaccum_empty_mbar_ptr)
 
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
-                if const_expr(self.deterministic and not delay_semaphore_release):
-                    if const_expr(
-                        self.sdQaccum_stage > 1 and self.cta_schedule != CtaSchedule.TWO_CTA_SERIAL
-                    ):
-                        if is_tma_warp and not m_block_oob_upper:
-                            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                        self.reduce_sync_barrier.arrive_and_wait()
+                if const_expr(release_dQ_semaphore):
                     if not m_block_oob_upper:
                         barrier.arrive_inc(
                             mdQ_semaphore_cur[m_block, None].iterator,
@@ -4425,11 +4579,16 @@ class FlashAttentionBackwardSm100:
             )  # (TMA, EPI_STAGE) and (TMA, EPI_STAGE)
         else:
             # GQA: fp32 accumulate into the flat (tile_n * hdim) tile of the dK/dV accumulate
-            # buffer, which the postprocess reads row-major (accum_row_major). The fp32 staging
-            # buffer holds half the tile, so the tile goes out as two contiguous row halves.
+            # buffer in the order the postprocess reads it (self.dKVaccum_order). The fp32
+            # staging buffer holds half the tile, so the tile goes out as its two row halves,
+            # which the order has to store as one block each, laid out like a half-height tile
             rows_per_half = self.tile_n // 2
-            half_bytes = rows_per_half * tile_hdim * Float32.width // 8
+            half_elems = rows_per_half * tile_hdim
+            half_bytes = half_elems * Float32.width // 8
             assert cute.size_in_bytes(dtype, sdKV) >= half_bytes, "fp32 staging too small"
+            # (_check_accum_tile_orders holds the order to that.)
+            tile_layout = accum_tile_layout(self.dKVaccum_order, self.tile_n, tile_hdim)
+            half_layout = accum_tile_layout(self.dKVaccum_order, rows_per_half, tile_hdim)
             if const_expr(not seqlen.has_cu_seqlens_k):
                 mdKV_cur = mdKV[None, head_idx_kv, batch_idx]  # (seqlen * hdim)
             else:
@@ -4437,12 +4596,10 @@ class FlashAttentionBackwardSm100:
                     (seqlen.padded_offset_k * tile_hdim,), mdKV[None, head_idx_kv]
                 )
             gdKV_flat = cute.local_tile(mdKV_cur, (self.tile_n * tile_hdim,), (n_block,))
-            # the two row halves of the tile: ((elems_per_half, 2))
-            gdKV_halves = cute.logical_divide(gdKV_flat, (rows_per_half * tile_hdim,))
-            sdKV_rm = cute.make_tensor(
-                cute.recast_ptr(sdKV.iterator, dtype=Float32),
-                cute.make_layout((rows_per_half, tile_hdim), stride=(tile_hdim, 1)),
-            )
+            gdKV_tile = cute.make_tensor(gdKV_flat.iterator, tile_layout)  # (tile_n, hdim)
+            sdKV_half = cute.make_tensor(
+                cute.recast_ptr(sdKV.iterator, dtype=Float32), half_layout
+            )  # (rows_per_half, hdim)
 
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
@@ -4526,15 +4683,16 @@ class FlashAttentionBackwardSm100:
                         col0 = tdKVcdKV_t2r[(0, chunk, 0, 0)][1]
                         # this thread's chunk of the staging half: the chunk_cols columns of
                         # row (row - half * rows_per_half) starting at col0
-                        row_view = cute.domain_offset((row - half * rows_per_half, col0), sdKV_rm)
+                        row_view = cute.domain_offset((row - half * rows_per_half, col0), sdKV_half)
                         dst = cute.local_tile(row_view[0, None], (chunk_cols,), (0,))
                         cute.autovec_copy(tdKVrdKV[None, chunk, 0, 0], dst)
                 cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
                 if wg_idx == 0 and leader_warp:
+                    gdKV_half = cute.local_tile(gdKV_tile, (rows_per_half, tile_hdim), (half, 0))
                     with cute.arch.elect_one():
                         copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdKV_rm.iterator, gdKV_halves[((None, half),)].iterator, half_bytes
+                            sdKV_half.iterator, gdKV_half.iterator, half_bytes
                         )
                     cute.arch.cp_async_bulk_commit_group()
                     # Deterministic: the adds must have landed before the next head is released.
