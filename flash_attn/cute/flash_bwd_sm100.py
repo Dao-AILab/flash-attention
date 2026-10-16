@@ -20,6 +20,7 @@ from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
 from flash_attn.cute import pipeline
+from flash_attn.cute.bwd_accum_tile import AccumTileOrder, accum_tile_layout
 from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -158,6 +159,10 @@ class FlashAttentionBackwardSm100:
         self.has_sdS_xchg = self.use_2cta_instrs and not self.acc_m64
         self.xchg_aliases_dQaccum = (
             self.has_sdS_xchg and self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL
+        )
+        # Storage order of the fp32 accumulate tiles the postprocess reads (bwd_accum_tile).
+        self.dQaccum_order, self.dKVaccum_order = self.accum_tile_orders(
+            self.use_2cta_instrs, tile_n
         )
         # hdim 256: dK + dV + S + dP + dQ only fit TMEM with the M=64 layout, and only the serial
         # schedule's SMEM aliasing fits the 256-wide Q / dO / K / V tiles.
@@ -339,6 +344,87 @@ class FlashAttentionBackwardSm100:
         )
         self.buffer_align_bytes = 1024
 
+    @staticmethod
+    def accum_tile_orders(
+        use_2cta_instrs: bool, tile_n: int
+    ) -> tuple[AccumTileOrder, AccumTileOrder]:
+        """(dQ, dK / dV) accumulate tile orders of a configuration; the interface compiles the
+        postprocess for the same orders. dQ is reduced out of its TMEM fragment, per CTA pair
+        with 2CTA. GQA dK / dV come out of the M=128 epilogue in fragment order and out of the
+        M=64 one (2CTA, 64-row KV tile, NOTE [M=64 accumulator layout]) row-major."""
+        acc_m64 = use_2cta_instrs and tile_n == 64
+        dQaccum_order = (
+            AccumTileOrder.TMEM_FRAG_2CTA if use_2cta_instrs else AccumTileOrder.TMEM_FRAG_1CTA
+        )
+        dKVaccum_order = AccumTileOrder.ROW_MAJOR if acc_m64 else AccumTileOrder.TMEM_FRAG_1CTA
+        return dQaccum_order, dKVaccum_order
+
+    def _check_accum_tile_orders(self):
+        """The reduce epilogues stream fixed-width column stages of a TMEM fragment with 1-D
+        copies (dQacc_reduce, epilogue_dK_or_dV_reduce_ncol); check on sample coordinates that
+        accum_tile_layout(order) describes the storage order those copies produce. The M=64
+        dK / dV epilogue derives its addresses from the layout instead (epilogue_dK_or_dV)."""
+        rows, hdim = self.tile_m, self.tile_hdim
+        assert len(self.reduce_warp_ids) == 4, "the 1-D copies below assume 128 threads"
+        # dQ: CTA rank r streams stage s (ncol columns of its fragment) as the flat block
+        # (s + stages_per_cta * r) * 128 * ncol, thread t holding lane t, 4 columns per copy.
+        # Lane t is row t with one CTA; with two it is row t % 64 of CTA r's 64 rows, column
+        # half t // 64.
+        dQ_layout = accum_tile_layout(self.dQaccum_order, rows, hdim)
+        ncol = self.dQ_reduce_ncol
+        stages_per_cta = self.dQaccum_reduce_stage // self.cta_group_size
+        for r in range(self.cta_group_size):
+            for s in range(stages_per_cta):
+                for t in (0, 1, 63, 64, 127):
+                    for j in (0, 1, 3, 4, ncol - 1):
+                        flat = (
+                            (s + stages_per_cta * r) * 128 * ncol + 4 * t + j % 4 + 512 * (j // 4)
+                        )
+                        if self.cta_group_size == 1:
+                            row, col = t, s * ncol + j
+                        else:
+                            row, col = t % 64 + 64 * r, s * ncol + j + hdim // 2 * (t // 64)
+                        assert cute.crd2idx((row, col), dQ_layout) == flat, (
+                            "dQaccum_order does not match the dQ reduce"
+                        )
+        if self.dKVaccum_order == AccumTileOrder.ROW_MAJOR:
+            # M=64 dK / dV: the tile goes out as two row halves through a half-tile staging
+            # buffer, so each half must be one block laid out like a half-height tile.
+            rows_per_half = self.tile_n // 2
+            for hd in (self.tile_hdim, self.tile_hdimv):
+                tile_layout = accum_tile_layout(self.dKVaccum_order, self.tile_n, hd)
+                half_layout = accum_tile_layout(self.dKVaccum_order, rows_per_half, hd)
+                for half in range(2):
+                    for r in (0, 1, rows_per_half - 1):
+                        for c in (0, 1, 4, hd - 1):
+                            assert cute.crd2idx((half * rows_per_half + r, c), tile_layout) == (
+                                half * rows_per_half * hd + cute.crd2idx((r, c), half_layout)
+                            ), "dKVaccum_order must store each row half of the tile as one block"
+        else:
+            assert self.dKVaccum_order == AccumTileOrder.TMEM_FRAG_1CTA
+            # M=128 dK / dV: warpgroup w owns columns [w * hdim / 2, (w + 1) * hdim / 2) of
+            # the tile_n rows as the flat block w * tile_n * hdim / 2, streamed as
+            # dK_reduce_ncol-column stages, thread t holding row t, 4 columns per copy.
+            assert self.tile_n == 128
+            ncol = self.dK_reduce_ncol
+            for hd in (self.tile_hdim, self.tile_hdimv):
+                layout = accum_tile_layout(self.dKVaccum_order, self.tile_n, hd)
+                for w in range(2):
+                    for s in range(hd // 2 // ncol):
+                        for t in (0, 1, 127):
+                            for j in (0, 1, 3, 4, ncol - 1):
+                                flat = (
+                                    w * self.tile_n * hd // 2
+                                    + s * self.tile_n * ncol
+                                    + 4 * t
+                                    + j % 4
+                                    + 512 * (j // 4)
+                                )
+                                col = w * hd // 2 + s * ncol + j
+                                assert cute.crd2idx((t, col), layout) == flat, (
+                                    "dKVaccum_order does not match the dK / dV reduce"
+                                )
+
     def _setup_attributes(self):
         self.Q_stage = 1 if self.use_2cta_instrs else 2
         self.dO_stage = 1
@@ -376,6 +462,7 @@ class FlashAttentionBackwardSm100:
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
         # number of tma reduce adds for dKacc and dVacc epilogue (must divide hdim_per_wg)
         self.dK_reduce_ncol = math.gcd(32, self.tile_hdim // 2)
+        self._check_accum_tile_orders()
         # CTA group for MMA operations
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -4492,11 +4579,16 @@ class FlashAttentionBackwardSm100:
             )  # (TMA, EPI_STAGE) and (TMA, EPI_STAGE)
         else:
             # GQA: fp32 accumulate into the flat (tile_n * hdim) tile of the dK/dV accumulate
-            # buffer, which the postprocess reads row-major (accum_row_major). The fp32 staging
-            # buffer holds half the tile, so the tile goes out as two contiguous row halves.
+            # buffer in the order the postprocess reads it (self.dKVaccum_order). The fp32
+            # staging buffer holds half the tile, so the tile goes out as its two row halves,
+            # which the order has to store as one block each, laid out like a half-height tile
             rows_per_half = self.tile_n // 2
-            half_bytes = rows_per_half * tile_hdim * Float32.width // 8
+            half_elems = rows_per_half * tile_hdim
+            half_bytes = half_elems * Float32.width // 8
             assert cute.size_in_bytes(dtype, sdKV) >= half_bytes, "fp32 staging too small"
+            # (_check_accum_tile_orders holds the order to that.)
+            tile_layout = accum_tile_layout(self.dKVaccum_order, self.tile_n, tile_hdim)
+            half_layout = accum_tile_layout(self.dKVaccum_order, rows_per_half, tile_hdim)
             if const_expr(not seqlen.has_cu_seqlens_k):
                 mdKV_cur = mdKV[None, head_idx_kv, batch_idx]  # (seqlen * hdim)
             else:
@@ -4504,12 +4596,10 @@ class FlashAttentionBackwardSm100:
                     (seqlen.padded_offset_k * tile_hdim,), mdKV[None, head_idx_kv]
                 )
             gdKV_flat = cute.local_tile(mdKV_cur, (self.tile_n * tile_hdim,), (n_block,))
-            # the two row halves of the tile: ((elems_per_half, 2))
-            gdKV_halves = cute.logical_divide(gdKV_flat, (rows_per_half * tile_hdim,))
-            sdKV_rm = cute.make_tensor(
-                cute.recast_ptr(sdKV.iterator, dtype=Float32),
-                cute.make_layout((rows_per_half, tile_hdim), stride=(tile_hdim, 1)),
-            )
+            gdKV_tile = cute.make_tensor(gdKV_flat.iterator, tile_layout)  # (tile_n, hdim)
+            sdKV_half = cute.make_tensor(
+                cute.recast_ptr(sdKV.iterator, dtype=Float32), half_layout
+            )  # (rows_per_half, hdim)
 
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
@@ -4593,15 +4683,16 @@ class FlashAttentionBackwardSm100:
                         col0 = tdKVcdKV_t2r[(0, chunk, 0, 0)][1]
                         # this thread's chunk of the staging half: the chunk_cols columns of
                         # row (row - half * rows_per_half) starting at col0
-                        row_view = cute.domain_offset((row - half * rows_per_half, col0), sdKV_rm)
+                        row_view = cute.domain_offset((row - half * rows_per_half, col0), sdKV_half)
                         dst = cute.local_tile(row_view[0, None], (chunk_cols,), (0,))
                         cute.autovec_copy(tdKVrdKV[None, chunk, 0, 0], dst)
                 cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
                 if wg_idx == 0 and leader_warp:
+                    gdKV_half = cute.local_tile(gdKV_tile, (rows_per_half, tile_hdim), (half, 0))
                     with cute.arch.elect_one():
                         copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdKV_rm.iterator, gdKV_halves[((None, half),)].iterator, half_bytes
+                            sdKV_half.iterator, gdKV_half.iterator, half_bytes
                         )
                     cute.arch.cp_async_bulk_commit_group()
                     # Deterministic: the adds must have landed before the next head is released.

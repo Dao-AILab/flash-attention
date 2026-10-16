@@ -20,6 +20,7 @@ from quack import layout_utils
 from quack import sm90_utils
 
 from flash_attn.cute import utils
+from flash_attn.cute.bwd_accum_tile import AccumTileOrder, accum_tile_layout
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -145,7 +146,7 @@ class FlashAttentionBackwardPostprocess:
         use_2cta_instrs: bool = False,
         cluster_size: int = 1,  # for varlen offsets
         hdim_multiple_of: int = 32,
-        accum_row_major: bool = False,
+        accum_order: Optional[AccumTileOrder] = None,
     ):
         """
         :param head_dim: head dimension
@@ -153,6 +154,8 @@ class FlashAttentionBackwardPostprocess:
         :param tile_m: m block size
         :type tile_m: int
         :param hdim_multiple_of: accumulator alignment shared with the main backward kernel.
+        :param accum_order: storage order of the (tile_m, hdim) accumulate tile, as the SM100
+            backward wrote it (bwd_accum_tile); the SM100 paths read the tile through it.
         """
         self.dtype = dtype
         self.tile_m = tile_m
@@ -167,13 +170,14 @@ class FlashAttentionBackwardPostprocess:
         self.dQ_swapAB = dQ_swapAB
         self.use_2cta_instrs = use_2cta_instrs and arch // 10 in [10, 11] and head_dim != 64
         self.cluster_size = cluster_size
-        # Storage order of the (tile_m, hdim) accumulate tile, see _dQaccum_tile_layout: plain
-        # row-major (the SM100 backward with a 64-row KV tile per CTA writes dK/dV this way,
-        # NOTE [M=64 accumulator layout] in flash_bwd_sm100.py) instead of the TMEM fragment
-        # order of the reduce-ncol writers.
-        self.accum_row_major = (
-            accum_row_major and arch // 10 in [10, 11] and not self.use_2cta_instrs
-        )
+        if arch // 10 in [10, 11]:
+            assert accum_order is not None, "the SM100 postprocess needs the writer's tile order"
+            # The 2CTA path loads the tile in the 2CTA fragment order (thread = TMEM lane) and
+            # the other one through the layout of the order, which must match the writer.
+            assert (accum_order == AccumTileOrder.TMEM_FRAG_2CTA) == self.use_2cta_instrs, (
+                "accum_order does not match use_2cta_instrs"
+            )
+        self.accum_order = accum_order
 
     @staticmethod
     def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
@@ -362,31 +366,9 @@ class FlashAttentionBackwardPostprocess:
             )
 
     def _dQaccum_tile_layout(self) -> cute.Layout:
-        """(tile_m, hdim) -> offset in the flat accumulate tile: the storage order of the writer.
-
-        - 2CTA: the M=128 2-SM MMA splits result rows across the CTA pair (m // 64 = CTA
-          rank), and within a CTA the M=64 TMEM atom puts columns [0, hdim/2) on lanes 0-63
-          and [hdim/2, hdim) on lanes 64-127. The bwd main kernel stores the logical 128x128
-          tile as: 4 consecutive columns of row 0, tiled to 64 rows, then the same for columns
-          64-67, then the 64x4x2 pattern over all 128 columns of rows 0-63, then rows 64-127.
-        - reduce-ncol writers (1CTA dQ, M=128 GQA dK/dV): dQ_reduce_ncol-column stages, each
-          stored as 4-column vectors of row 0, tiled over the rows, then the next 4 columns.
-        - row-major: a plain (tile_m, hdim) block (SM100 64-row KV tile GQA dK/dV).
-        """
-        if const_expr(self.use_2cta_instrs):
-            assert self.tile_m == 128 and self.num_threads == 128
-            half_m = self.tile_m // 2
-            return cute.make_layout(
-                ((half_m, 2), (4, self.tile_hdim // 8, 2)),
-                stride=((4, half_m * self.tile_hdim), (1, 4 * half_m * 2, 4 * half_m)),
-            )
-        if const_expr(self.accum_row_major):
-            return cute.make_layout((self.tile_m, self.tile_hdim), stride=(self.tile_hdim, 1))
-        ncol = self.dQ_reduce_ncol
-        return cute.make_layout(
-            (self.tile_m, (4, ncol // 4, self.tile_hdim // ncol)),
-            stride=(4, (1, 4 * self.tile_m, ncol * self.tile_m)),
-        )
+        """(tile_m, hdim) -> offset in the flat accumulate tile: the storage order of the writer
+        (bwd_accum_tile.accum_tile_layout, shared with the SM100 backward)."""
+        return accum_tile_layout(self.accum_order, self.tile_m, self.tile_hdim)
 
     @cute.jit
     def __call__(
