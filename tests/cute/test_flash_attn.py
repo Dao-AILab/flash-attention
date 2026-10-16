@@ -67,7 +67,7 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # goes to 1CTA for <= 64 heads (training: only with recompute-P); every other
 # sparse case falls back to the 2CTA kernel, so the sparse tests run under either setting.
 MLA_1CTA = os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
-# SplitKV is not supported on SM90 or SM120
+# SplitKV is not supported on SM90
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 IS_SM110 = torch.cuda.get_device_capability()[0] == 11
@@ -76,7 +76,7 @@ TEST_BWD_ONLY = False
 VERBOSE = True
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 SplitKV heuristic")
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110 or IS_SM120), reason="SplitKV heuristic")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_auto_splits_more_tiles_than_sms():
     """num_splits=0 asks for the heuristic; with more tiles than SMs it must pick one split."""
@@ -91,7 +91,7 @@ def test_flash_attn_auto_splits_more_tiles_than_sms():
     assert torch.equal(out, ref)
 
 
-@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
+@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV behavior")
 @pytest.mark.parametrize("num_splits", [0, -1])
 def test_flash_attn_sm120_num_splits(num_splits):
     q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
@@ -100,8 +100,25 @@ def test_flash_attn_sm120_num_splits(num_splits):
     out = flash_attn_func(q, k, v)
     out_auto = flash_attn_func(q, k, v, num_splits=num_splits)
     torch.testing.assert_close(out_auto, out)
-    with pytest.raises(AssertionError, match="SM120 forward only supports num_splits=1"):
-        flash_attn_func(q, k, v, num_splits=3)
+    out_1 = flash_attn_func(q, k, v, num_splits=1)
+    out_split = flash_attn_func(q, k, v, num_splits=3)
+    torch.testing.assert_close(out_split, out_1)
+
+
+@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV behavior")
+@pytest.mark.parametrize("num_splits", [0, -1])
+def test_flash_attn_sm120_fp8_num_splits(num_splits):
+    q, k, v = [
+        torch.randn(1, 16, h, 64, device="cuda").to(torch.float8_e4m3fn) for h in (4, 1, 1)
+    ]
+    out = flash_attn_func(q, k, v)
+    out_auto = flash_attn_func(q, k, v, num_splits=num_splits)
+    torch.testing.assert_close(out_auto, out)
+    out_1 = flash_attn_func(q, k, v, num_splits=1)
+    out_split = flash_attn_func(q, k, v, num_splits=3)
+    torch.testing.assert_close(out_split, out_1)
+    with pytest.raises(NotImplementedError, match="SM120 FP8 supports dense/varlen"):
+        flash_attn_func(q, k, v, num_splits=3, softcap=1.0)
 
 
 @pytest.mark.skipif(
@@ -434,7 +451,7 @@ def test_flash_attn_paged_non_tma_partial_loader_tile():
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if IS_SM120 else []))
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
@@ -506,6 +523,8 @@ def test_flash_attn_output(
     mha_type,
     dtype,
 ):
+    if IS_SM120 and dtype == torch.float8_e4m3fn and (softcap > 0.0 or has_qv or has_learnable_sink):
+        pytest.skip("SM120 FP8 does not support softcap, MLA or learnable sinks")
     local = local_enum > 0
     if local and causal:
         pytest.skip()
@@ -667,11 +686,11 @@ def test_flash_attn_output(
         pack_gqa_vals = [True] if has_qv else [False, True, None] if not TEST_BWD_ONLY else [False]
         # SplitKV is not supported for hdim >= 192, except hd256 on SM100
         # pack_gqa_vals = [False]
-        split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
+        split_hdim_ok = d < 192 or ((IS_SM100 or IS_SM120) and d == 256 and dv == 256)
         num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY and not has_qv else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            # SplitKV not supported on SM90/SM120 - skip this iteration
-            if (IS_SM90 or IS_SM120) and num_splits > 1:
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
                 continue
             if IS_SM100 and (d >= 192 and dv >= 192) and not (d == 256 and dv == 256):
                 continue
@@ -1258,7 +1277,7 @@ def test_flash_attn_hd256_output_singleton_strides(dtype, shape):
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if IS_SM120 else []))
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_learnable_sink", [False, True])
@@ -1354,6 +1373,8 @@ def test_flash_attn_varlen_output(
     unpad_q,
     unpad_kv,
 ):
+    if IS_SM120 and dtype == torch.float8_e4m3fn and (softcap > 0.0 or has_qv or has_learnable_sink):
+        pytest.skip("SM120 FP8 does not support softcap, MLA or learnable sinks")
     local = local_enum > 0
     if local and causal:
         pytest.skip()
@@ -1524,8 +1545,11 @@ def test_flash_attn_varlen_output(
         else:
             print("seqused_k = ", seqused_k)
         q_unpad, k_unpad, v_unpad = [
-            x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
+            x.detach().to(dtype).requires_grad_(dtype != torch.float8_e4m3fn)
+            for x in (q_unpad, k_unpad, v_unpad)
         ]
+        if dtype == torch.float8_e4m3fn:
+            q, k, v = [x.detach().to(dtype) for x in (q, k, v)]
 
         out_ref, attn_ref = attention_ref(
             q_ref,
@@ -1578,14 +1602,14 @@ def test_flash_attn_varlen_output(
         # pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
         # SplitKV is not supported for hdim >= 192, except hd256 on SM100
-        split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
+        split_hdim_ok = d < 192 or ((IS_SM100 or IS_SM120) and d == 256 and dv == 256)
         num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         precompute_metadata_vals = [False, True]
         for pack_gqa, num_splits, precompute_metadata in itertools.product(
             pack_gqa_vals, num_splits_vals, precompute_metadata_vals
         ):
-            # SplitKV not supported on SM90/SM120 - skip this iteration
-            if (IS_SM90 or IS_SM120) and num_splits > 1:
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
                 continue
             if precompute_metadata and is_fake_mode():
                 continue
@@ -1620,8 +1644,8 @@ def test_flash_attn_varlen_output(
                     seqused_k=seqused_k if not unpad_kv else None,
                     causal=causal,
                     # qv=qv_unpad,
-                    # q_descale=q_descale,
-                    # k_descale=k_descale, v_descale=v_descale,
+                    q_descale=q_descale,
+                    k_descale=k_descale, v_descale=v_descale,
                     window_size=window_size,
                     # attention_chunk=attention_chunk,
                     learnable_sink=learnable_sink,
@@ -2038,7 +2062,7 @@ def test_flash_attn_varlen_hd256_caller_metadata(causal, qhead_per_kvhead):
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if IS_SM120 else []))
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
@@ -2072,7 +2096,7 @@ def test_flash_attn_varlen_hd256_caller_metadata(causal, qhead_per_kvhead):
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128] + ([256] if IS_SM120 else []))
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -2452,14 +2476,14 @@ def test_flash_attn_kvcache(
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
         # num_splits_vals = [1, 0]
         # SplitKV is not supported for hdim >= 192
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
+        num_splits_vals = [1, 3] if (d < 192 or (IS_SM120 and d == 256)) and not DISABLE_SPLIT else [1]
         precompute_metadata_vals = [False, True]
         # precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
-            # SplitKV not supported on SM90/SM120 - skip this iteration
-            if (IS_SM90 or IS_SM120) and num_splits > 1:
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
                 continue
             if precompute_metadata and is_fake_mode():
                 continue
@@ -3698,7 +3722,7 @@ def test_flash_attn_ex2_emu_decode_prefill_consistency(seqlen_k):
     assert torch.equal(out_prefill[-1], out_decode[0]), (
         f"decode↔prefill diverged: max_diff={max_diff}."
     )
-@pytest.mark.skipif(not IS_SM100, reason="SplitKV is only supported on SM100")
+@pytest.mark.skipif(not (IS_SM100 or IS_SM120), reason="SplitKV architecture support")
 @pytest.mark.skipif(DISABLE_SPLIT, reason="SplitKV disabled")
 @pytest.mark.parametrize("causal", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
@@ -3773,5 +3797,4 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
     assert torch.equal(out_1024, first), (
         f"seqlen_k_per_split not batch-invariant: max_diff={max_diff}."
     )
-
 
