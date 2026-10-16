@@ -831,6 +831,11 @@ struct CollectiveMainloopFwdSm90 {
             Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
             using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumProducerThreads, Element>;
             PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
+            // The QK GEMM reads sQ through the async proxy: wait for this thread's cp.async writes and
+            // fence them before signaling barrier_Q. cute::cp_async_wait<0> is cp.async.wait_all, needed
+            // because load_Q commits no group (flash::cp_async_wait<0> would not wait for these copies).
+            cute::cp_async_wait<0>();
+            cutlass::arch::fence_view_async_shared();
             auto &barrier_Q = shared_storage.pipelines.barrier_Q;
             cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Q));
             barrier_Q.arrive();
@@ -839,6 +844,9 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor sQv_pi = cute::as_position_independent_swizzle_tensor(sQv);
                 using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK_QV{}), get<2>(TileShape_MNK_QV{}), NumProducerThreads, Element>;
                 PackGQAt::load_Q(mQv, sQv_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
+                // Same for sQv, which the Qv GEMM reads through the async proxy.
+                cute::cp_async_wait<0>();
+                cutlass::arch::fence_view_async_shared();
                 auto &barrier_Qv = shared_storage.pipelines.barrier_Qv;
                 cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Qv));
                 barrier_Qv.arrive();
