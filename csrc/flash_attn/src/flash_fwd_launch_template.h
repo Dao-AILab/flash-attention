@@ -247,7 +247,10 @@ template<typename T, bool Is_causal>
 void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x = cc_major == 8 && cc_minor > 0;
+    // sm_120 (Blackwell consumer) shares sm86/89's consumer SM shape: 1536 threads/SM, ~99KB opt-in smem,
+    // so it wants the same tiles (128x32 = 2 CTAs/SM non-causal, 64x64 causal). The generic A100/H100
+    // 128x64 tile needs 64KB smem -> only 1 CTA/SM -> 8% occupancy (confirmed with ncu on sm_120).
+    bool is_sm8x = (cc_major == 8 && cc_minor > 0) || cc_major == 12;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         if constexpr(!Is_dropout) {
             // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
