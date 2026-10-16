@@ -153,8 +153,8 @@ class FlashAttentionBackwardSm100:
         self.acc_m64 = self.use_2cta_instrs and tile_n == 64
         # With P / dS^T in SMEM, the dS half the peer needs for its dQ MMA is a contiguous
         # block of sdS_dK in exactly the peer's dQ A-operand layout (checked in
-        # _setup_smem_layout), so the exchange is copied from there: no sdS_xchg staging buffer,
-        # and no sdS_xchg / sdQaccum alias in the serial schedule.
+        # _check_dS_exchange_layouts), so the exchange is copied from there: no sdS_xchg
+        # staging buffer, and no sdS_xchg / sdQaccum alias in the serial schedule.
         self.has_sdS_xchg = self.use_2cta_instrs and not self.acc_m64
         self.xchg_aliases_dQaccum = (
             self.has_sdS_xchg and self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL
@@ -511,21 +511,7 @@ class FlashAttentionBackwardSm100:
         )
         self.sdS_layout = cute.slice_(sdS_layout, (None, None, None, 0))
         if self.acc_m64:
-            # The dS exchange copies the peer's Q-column half of this CTA's dS^T from sdS_dK
-            # (K-major (kv, q), q = tile_m // 2 per K block) into the peer's sdS (M-major
-            # (q, kv)) at this CTA's KV-row block. Check that contract on the layouts: same
-            # swizzle, both halves one contiguous block at the same offset, same element order.
-            src = self.sdSt_layout.outer  # ((kv, q16), 1, (q16_chunks, q_half))
-            dst = cute.logical_divide(
-                self.sdS_layout.outer, (None, None, cute.size(self.sdS_layout.outer.shape[2]) // 2)
-            )  # ((q, kv16), 1, (kv16_chunks, kv_block))
-            assert str(self.sdSt_layout.inner) == str(self.sdS_layout.inner)
-            assert cute.crd2idx((0, 0, (0, 1)), src) == cute.crd2idx((0, 0, (0, 1)), dst)
-            for kv in (0, 1, 17, self.tile_n - 1):
-                for q in (0, 1, 15, 16, self.tile_m // 2 - 1):
-                    assert cute.crd2idx(((kv, q % 16), 0, (q // 16, 1)), src) == cute.crd2idx(
-                        ((q, kv % 16), 0, (kv // 16, 1)), dst
-                    ), "dS exchange: sdS_dK half is not in the peer's dQ A-operand layout"
+            self._check_dS_exchange_layouts()
         sKt_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_dQ,
             self.mma_tiler_dsk,
@@ -1292,16 +1278,20 @@ class FlashAttentionBackwardSm100:
             dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr
             dS_cluster_empty_mbar_ptr = storage.dS_cluster_empty_mbar_ptr
             dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr
-            dQaccum_empty_mbar_ptr = storage.dQaccum_empty_mbar_ptr
         else:
             dS_cluster_full_mbar_ptr = None
             dS_cluster_empty_mbar_ptr = None
             dS_cluster_leader_mbar_ptr = None
+        # The dQaccum_empty handshake exists only where sdS_xchg aliases sdQaccum; the roles
+        # specialize on this handle (and on sdS_xchg) rather than on the configuration.
+        if const_expr(self.xchg_aliases_dQaccum):
+            dQaccum_empty_mbar_ptr = storage.dQaccum_empty_mbar_ptr
+        else:
             dQaccum_empty_mbar_ptr = None
 
         # Barrier initialization
         if const_expr(self.use_2cta_instrs):
-            if const_expr(self.xchg_aliases_dQaccum):
+            if const_expr(dQaccum_empty_mbar_ptr is not None):
                 if warp_idx == 2:
                     cute.arch.mbarrier_init(
                         dQaccum_empty_mbar_ptr,
@@ -3009,6 +2999,43 @@ class FlashAttentionBackwardSm100:
         # pipeline_dKV.producer_tail(producer_state_dKV)
         # pipeline_dQ.producer_tail(producer_state_dQ)
 
+    def _check_dS_exchange_layouts(self):
+        """The dS exchange of the M=64 layout copies the peer's Q-column half of this CTA's
+        dS^T from sdS_dK (K-major (kv, q), q = tile_m // 2 per K block) into the peer's sdS
+        (M-major (q, kv)) at this CTA's KV-row block (_dS_exchange_source). Check that
+        contract on the layouts: same swizzle, both halves one contiguous block at the same
+        offset, same element order."""
+        src = self.sdSt_layout.outer  # ((kv, q16), 1, (q16_chunks, q_half))
+        dst = cute.logical_divide(
+            self.sdS_layout.outer, (None, None, cute.size(self.sdS_layout.outer.shape[2]) // 2)
+        )  # ((q, kv16), 1, (kv16_chunks, kv_block))
+        assert str(self.sdSt_layout.inner) == str(self.sdS_layout.inner)
+        assert cute.crd2idx((0, 0, (0, 1)), src) == cute.crd2idx((0, 0, (0, 1)), dst)
+        for kv in (0, 1, 17, self.tile_n - 1):
+            for q in (0, 1, 15, 16, self.tile_m // 2 - 1):
+                assert cute.crd2idx(((kv, q % 16), 0, (q // 16, 1)), src) == cute.crd2idx(
+                    ((q, kv % 16), 0, (kv // 16, 1)), dst
+                ), "dS exchange: sdS_dK half is not in the peer's dQ A-operand layout"
+
+    def _dS_exchange_source(
+        self,
+        sdS_xchg: Optional[cute.Tensor],
+        sdS_dK: Optional[cute.Tensor],
+        peer_cta_rank_in_cluster: Int32,
+    ) -> cute.Tensor:
+        """The SMEM tile this CTA sends its peer in the dS exchange: the peer's Q-column half of
+        this CTA's dS^T, in the layout of the peer's dQ A-operand half (sdS, M-major (q, kv))
+        at this CTA's KV-row block.
+
+        With the M=128 layout the compute warps stage that half in sdS_xchg. With P / dS^T in
+        SMEM (M=64 layout) it already sits in sdS_dK, the dK A operand, as the peer's K block
+        (the layout contract is checked at setup, _check_dS_exchange_layouts).
+        """
+        if const_expr(sdS_xchg is not None):
+            return sdS_xchg
+        assert sdS_dK is not None
+        return sdS_dK[None, None, (None, peer_cta_rank_in_cluster)]
+
     @cute.jit
     def split_wg(
         self,
@@ -3146,7 +3173,7 @@ class FlashAttentionBackwardSm100:
         mdV: cute.Tensor,
         mdK: cute.Tensor,
         sdS: cute.Tensor,
-        sdS_xchg: cute.Tensor,
+        sdS_xchg: Optional[cute.Tensor],
         sP: Optional[cute.Tensor],
         sdS_dK: Optional[cute.Tensor],
         pipeline_LSE: PipelineAsync,
@@ -3158,7 +3185,7 @@ class FlashAttentionBackwardSm100:
         pipeline_P: Optional[PipelineAsync],
         dS_cluster_empty_mbar_ptr: cute.Pointer,
         dS_cluster_full_mbar_ptr: cute.Pointer,
-        dQaccum_empty_mbar_ptr: cute.Pointer,
+        dQaccum_empty_mbar_ptr: Optional[cute.Pointer],
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         block_info: BlockInfo,
@@ -3268,7 +3295,7 @@ class FlashAttentionBackwardSm100:
             sdS_epi = cute.make_tensor(sdS.iterator, sdS_layout)
             tRS_sdS = thr_copy_r2s.partition_D(sdS_epi)
 
-            if const_expr(self.use_2cta_instrs):
+            if const_expr(sdS_xchg is not None):
                 sdS_xchg_epi = cute.make_tensor(
                     cute.recast_ptr(sdS_xchg.iterator, sdS_epi_layout.inner), sdS_layout
                 )
@@ -3330,6 +3357,9 @@ class FlashAttentionBackwardSm100:
         dS_cluster_empty_phase = Int32(1)
         # 2-CTA: CTA 0 exchanges stage 1 (bottom half), CTA 1 exchanges stage 0 (top half)
         exchange_stage = cta_rank_in_cluster ^ 1 if const_expr(self.use_2cta_instrs) else Int32(0)
+        if const_expr(self.use_2cta_instrs):
+            peer_cta_rank_in_cluster = cta_rank_in_cluster ^ 1
+            sdS_xchg_src = self._dS_exchange_source(sdS_xchg, sdS_dK, peer_cta_rank_in_cluster)
 
         consumer_state_S_P_dP = pipeline.make_pipeline_state(  # Our impl has shortcut for stage==1
             cutlass.pipeline.PipelineUserType.Consumer, 1
@@ -3702,9 +3732,9 @@ class FlashAttentionBackwardSm100:
                 consumer_state_S_P_dP.advance()
 
                 # After the loop: copy exchange registers to sdS_xchg buffer
-                if const_expr(self.use_2cta_instrs and not self.acc_m64):
-                    # serial schedule: sdS_xchg aliases sdQaccum
-                    if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
+                if const_expr(sdS_xchg is not None):
+                    # sdS_xchg aliases sdQaccum: wait until the dQ reduce has read it
+                    if const_expr(dQaccum_empty_mbar_ptr is not None):
                         cute.arch.mbarrier_wait(
                             dQaccum_empty_mbar_ptr, phase=producer_state_dS.phase
                         )
@@ -3731,16 +3761,7 @@ class FlashAttentionBackwardSm100:
                     stage_copy_bytes = const_expr(self.tma_copy_bytes["dS"] // 2)
                     stage_copy_elems = const_expr(stage_copy_bytes // (self.ds_dtype.width // 8))
                     if tidx == 0:
-                        peer_cta_rank_in_cluster = cta_rank_in_cluster ^ 1
-                        if const_expr(self.acc_m64):
-                            # The peer's Q-column half of this CTA's dS^T, the second K block
-                            # of sdS_dK (its layout matches the peer's dQ A-operand block, see
-                            # _setup_smem_layout).
-                            smem_src_ptr = sdS_dK[
-                                None, None, (None, peer_cta_rank_in_cluster)
-                            ].iterator
-                        else:
-                            smem_src_ptr = sdS_xchg.iterator
+                        smem_src_ptr = sdS_xchg_src.iterator
                         # Destination is peer's sdS at our CTA's offset (exchange_stage position)
                         smem_dst_ptr = sdS.iterator + cta_rank_in_cluster * stage_copy_elems
                         cute.arch.mbarrier_arrive_and_expect_tx(
@@ -4180,12 +4201,12 @@ class FlashAttentionBackwardSm100:
                 release_dQ_semaphore = self.deterministic and not delay_semaphore_release
                 if const_expr(
                     self.sdQaccum_stage > 1
-                    and (release_dQ_semaphore or self.xchg_aliases_dQaccum)
+                    and (release_dQ_semaphore or dQaccum_empty_mbar_ptr is not None)
                 ):
                     if is_tma_warp and not m_block_oob_upper:
                         cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                     self.reduce_sync_barrier.arrive_and_wait()
-                if const_expr(self.xchg_aliases_dQaccum):
+                if const_expr(dQaccum_empty_mbar_ptr is not None):
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(dQaccum_empty_mbar_ptr)
 
