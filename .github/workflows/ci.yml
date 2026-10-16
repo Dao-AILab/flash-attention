@@ -21,6 +21,7 @@ env:
     or test_flash_attn_mla_absorbed and 256-256-False-True-64-True-0-False-False-mqa-dtype0
     or test_flash_attn_mla_absorbed and 256-256-False-False-64-False-0-False-False-mqa-dtype0
     or test_flash_attn_mla_absorbed and 256-256-True-True-64-False-0-False-False-mqa-dtype0
+    or test_cuda_graph
 
 jobs:
   lint:

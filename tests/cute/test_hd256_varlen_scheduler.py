@@ -11,9 +11,9 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from torch.utils._python_dispatch import TorchDispatchMode
 
 from eager_reference import check_against_reference, make_cu_seqlens
+from host_sync import RejectHostScalarExtraction
 
 from flash_attn.cute import flash_attn_varlen_func, interface
 from flash_attn.cute.cache_utils import JITCache
@@ -48,18 +48,6 @@ MAX_MODES = pytest.mark.parametrize(
     "max_mode", ["none", "int", "cuda"], ids=["max_none", "max_int", "max_cuda"]
 )
 CAUSAL = pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
-
-
-class RejectHostScalarExtraction(TorchDispatchMode):
-    """Fail on aten._local_scalar_dense, the op behind .item()/int()/bool() on a tensor."""
-
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if func.name() == "aten::_local_scalar_dense":
-            raise AssertionError(
-                "host scalar extraction (aten::_local_scalar_dense) during a warmed "
-                "varlen call; this is a device-to-host synchronization"
-            )
-        return func(*args, **(kwargs or {}))
 
 
 def make_maxima(max_mode, q_lens, k_lens, cu_seqlens_q, cu_seqlens_k):
