@@ -30,9 +30,7 @@ def test_native_pv_requires_qk_scales(pv_inputs, missing):
 @pytest.mark.parametrize(
     "kwargs,match",
     [
-        ({"causal": True}, "noncausal"),
-        ({"window_size": (None, 0)}, "noncausal"),
-        ({"window_size": (32, 32)}, "nonlocal"),
+        ({"window_size": (32, 32)}, "local"),
         ({"num_splits": 2}, "unsplit"),
         ({"learnable_sink": torch.ones(1)}, "sinks"),
         ({"score_mod": lambda x: x}, "modifiers"),
@@ -51,6 +49,36 @@ def test_native_pv_rejects_unsupported_public_modes(
     q, k, v, scales = pv_inputs
     with pytest.raises(NotImplementedError, match=match):
         interface.flash_attn_func(q, k, v, scales=scales, **kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [{"causal": True}, {"window_size": (None, 0)}])
+def test_causal_native_pv_requires_original_v(pv_inputs, kwargs):
+    q, k, v, scales = pv_inputs
+    with pytest.raises(ValueError, match="requires original v_bf16"):
+        interface.flash_attn_func(q, k, v, scales=scales, **kwargs)
+
+
+@pytest.mark.parametrize("invalid", ["dtype", "shape", "device"])
+def test_causal_native_pv_validates_original_v(pv_inputs, invalid):
+    q, k, v, scales = pv_inputs
+    v_bf16 = v.to(torch.bfloat16)
+    if invalid == "dtype":
+        v_bf16 = v_bf16.float()
+    elif invalid == "shape":
+        v_bf16 = v_bf16[:, :-1]
+    else:
+        v_bf16 = torch.empty(v.shape, dtype=torch.bfloat16, device="meta")
+    with pytest.raises(ValueError, match="same shape and device"):
+        interface.flash_attn_func(q, k, v, scales=scales, causal=True, v_bf16=v_bf16)
+
+
+def test_native_pv_rejects_unused_original_v(pv_inputs):
+    q, k, v, scales = pv_inputs
+    v_bf16 = v.to(torch.bfloat16)
+    with pytest.raises(ValueError, match="only used by causal"):
+        interface.flash_attn_func(q, k, v, scales=scales, v_bf16=v_bf16)
+    with pytest.raises(ValueError, match="v_bf16 requires"):
+        interface.flash_attn_func(q, k, v, scales=scales._replace(v=None), v_bf16=v_bf16)
 
 
 @pytest.mark.parametrize(
