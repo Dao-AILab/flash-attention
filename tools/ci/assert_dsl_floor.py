@@ -61,8 +61,9 @@ def main(pyproject_path: str) -> int:
             print(f"  - {line}", file=sys.stderr)
         print(
             "\nThe SIF was likely baked before a floor bump. Rebake the image "
-            "(tools/ci/docker/build.sh + tag_and_push.sh) and update the digest in "
-            ".github/workflows/ci.yml.",
+            "(tools/ci/docker/build.sh + tag_and_push.sh) and update "
+            "`fa4_image_cu129` and/or `fa4_image_cu130` on the `gpu-test` action "
+            "call in `.github/workflows/ci.yml`.",
             file=sys.stderr,
         )
         return 1
