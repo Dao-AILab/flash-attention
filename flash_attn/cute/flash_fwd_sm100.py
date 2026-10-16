@@ -130,6 +130,47 @@ _FP8_SMALL_HDIM_REGS = {
     False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
     True: {"num_regs_softmax": 152, "num_regs_correction": 96, "num_regs_other": 112},
 }
+# NOTE [softmax stats release order]
+# Correction frees softmax stage s's pipeline_sm_stats slot in either order:
+# - Same-stage (default): right after reading scale[s].
+# - Cross-stage: after rescaling the other stage's O (its own O when q_stage == 1).
+# Both are correct: one release per acquire, with O guarded by pipeline_s_p_o.
+# Only the schedule changes.
+#
+# Cross-stage keeps the two softmax warpgroups about half a step apart, so their
+# exp2 bursts alternate on the MUFU they share per SM sub-partition. Near the
+# MUFU throughput limit, aligned bursts stall on MUFU.
+# _SM_STATS_CROSS_STAGE lists configs where cross-stage measured faster;
+# everything else uses same-stage.
+# Explicit pacing via s0_s1_barrier was slower, so cross-stage provides the pacing.
+# S ping-pong keeps its own order (same slot, after the O rescale).
+# Table key: (path, head_dim_padded, is_causal, is_varlen_q) -> arch families.
+_SM_STATS_CROSS_STAGE = {
+    ("bf16", 64, False, False): ("sm_100",),
+    ("bf16", 64, True, False): ("sm_103", "sm_107"),
+    ("bf16", 64, True, True): ("sm_100",),
+    ("bf16", 96, False, False): ("sm_100", "sm_103", "sm_107"),
+    ("bf16", 96, False, True): ("sm_100", "sm_107"),
+    ("bf16", 128, False, False): ("sm_100",),
+    ("bf16", 128, False, True): ("sm_100",),
+    ("bf16", 128, True, True): ("sm_100",),
+    ("bf16", 192, False, True): ("sm_100",),
+    ("bf16", 192, True, True): ("sm_100",),
+    ("fp16", 64, False, False): ("sm_100",),
+    ("fp16", 64, True, False): ("sm_100", "sm_103", "sm_107"),
+    ("fp16", 96, False, False): ("sm_103", "sm_107"),
+    ("fp16", 96, False, True): ("sm_103",),
+    ("fp16", 96, True, False): ("sm_107",),
+    ("fp16", 96, True, True): ("sm_103",),
+    ("fp16", 128, False, True): ("sm_100",),
+    ("fp16", 128, True, True): ("sm_100",),
+    ("fp16", 192, False, False): ("sm_100",),
+    ("fp16", 192, False, True): ("sm_100",),
+    ("fp8", 64, False, False): ("sm_100",),
+    ("fp8", 64, True, False): ("sm_100",),
+    ("fp8", 96, False, False): ("sm_100",),
+    ("fp8", 96, True, False): ("sm_100",),
+}
 # === END TUNING KNOBS ===
 
 
@@ -203,6 +244,7 @@ class FlashAttentionForwardSm100:
         self.arch = BaseDSL._get_dsl().get_arch_enum()
         assert self.arch.is_family_of(Arch.sm_100f) or self.arch.is_family_of(Arch.sm_110f), \
             "Only SM 10.x and 11.x are supported"
+        self.is_sm107 = self.arch.major == 10 and self.arch.minor >= 7
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape
@@ -559,6 +601,18 @@ class FlashAttentionForwardSm100:
                 self.num_regs_softmax = bf16_tune["num_regs_softmax"]
                 self.num_regs_correction = bf16_tune["num_regs_correction"]
                 self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
+        # See NOTE [softmax stats release order].
+        arch_key = "sm_107" if self.is_sm107 else "sm_103" if self.is_sm103 else "sm_100"
+        if const_expr(self.q_dtype.width == 8):
+            sm_stats_path = "fp8"
+        elif const_expr(self.q_dtype == cutlass.Float16):
+            sm_stats_path = "fp16"
+        else:
+            sm_stats_path = "bf16"
+        cross_stage_key = (sm_stats_path, self.head_dim_padded, self.is_causal, self.is_varlen_q)
+        self.sm_stats_cross_stage_release = (
+            not self.use_s_ping_pong and arch_key in _SM_STATS_CROSS_STAGE.get(cross_stage_key, ())
+        )
         self._setup_attributes()
         self.ex2_emu_freq = 0
         self.ex2_emu_start_frg = self._tune.get("ex2_emu_start_frg", 1)
@@ -2871,13 +2925,14 @@ class FlashAttentionForwardSm100:
 
             if has_work:
                 # Ignore first signal from softmax as no correction is required
-                # pipeline_sm_stats.consumer_wait_w_index_phase(0, sm_stats_consumer_phase)
                 if const_expr(not self.use_s_ping_pong):
-                    sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
-                    pipeline_sm_stats.consumer_release_w_index(0)
-                if const_expr(self.q_stage == 2):
-                    # pipeline_sm_stats.consumer_wait_w_index_phase(1, sm_stats_consumer_phase)
-                    sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
+                    for stage in cutlass.range_constexpr(self.q_stage):
+                        # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+                        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                        # See NOTE [softmax stats release order]: cross-stage holds slot 1 until
+                        # after the next O0 rescale.
+                        if const_expr(stage == 0 or not self.sm_stats_cross_stage_release):
+                            pipeline_sm_stats.consumer_release_w_index(stage)
                 sm_stats_consumer_phase ^= 1
 
                 tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
@@ -2894,6 +2949,10 @@ class FlashAttentionForwardSm100:
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
                         scale = sScale[tidx + sm_stats_index * self.m_block_size]
+                        # Same-stage frees the slot once this thread has loaded its scale; see
+                        # NOTE [softmax stats release order].
+                        if const_expr(not self.use_s_ping_pong and not self.sm_stats_cross_stage_release):
+                            pipeline_sm_stats.consumer_release_w_index(stage)
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         # should_rescale = True
                         # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
@@ -2914,10 +2973,12 @@ class FlashAttentionForwardSm100:
                             o_acc_consumer_count += 1
                         else:
                             pipeline_s_p_o.consumer_release_w_index(stage)
-                            pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
+                            if const_expr(self.sm_stats_cross_stage_release):
+                                pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
                     sm_stats_consumer_phase ^= 1
                     # o_corr_consumer_phase ^= 1
-                if const_expr(self.q_stage == 2):
+                if const_expr(self.q_stage == 2 and self.sm_stats_cross_stage_release):
+                    # See NOTE [softmax stats release order]: the last stage-1 slot read above.
                     pipeline_sm_stats.consumer_release_w_index(1)
                 # End of seqlen_corr_loop_steps
 
