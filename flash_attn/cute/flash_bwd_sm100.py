@@ -16,6 +16,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
 
 from quack import layout_utils
+from quack import copy_utils as quack_copy_utils
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
@@ -706,10 +707,20 @@ class FlashAttentionBackwardSm100:
             )
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+        # Packed varlen: bound the K and V TMA loads by the logical seqlen_k so rows in
+        # [seqlen_k, tile_n) arrive zero-filled instead of as whatever the buffer holds. The
+        # masked P / dS are exactly zero there, but 0 * NaN = NaN in dP = V @ dO.T and dQ = dS @ K.
+        # Loads must use the 2-extra-dim wraparound form (ptr_shift is store-only: it moves the
+        # descriptor base outside mapped memory), which needs rank <= 3, i.e. the (t, h, n) layout.
+        self.ragged_kv_tma = mCuSeqlensK is not None
+        mK_tma, mV_tma = mK, mV
+        if const_expr(self.ragged_kv_tma):
+            mK_tma = quack_copy_utils.create_ragged_tensor_for_tma(mK, ragged_dim=0, ptr_shift=False)
+            mV_tma = quack_copy_utils.create_ragged_tensor_for_tma(mV, ragged_dim=0, ptr_shift=False)
         # S.T = K @ Q.T
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
-            mK,
+            mK_tma,
             cute.select(self.sK_layout, mode=[0, 1, 2]),
             self.mma_tiler_kq,
             self.tiled_mma_S,
@@ -729,7 +740,7 @@ class FlashAttentionBackwardSm100:
         # dP.T = V @ dO.T
         tma_atom_V, tma_tensor_V = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
-            mV,
+            mV_tma,
             cute.select(self.sV_layout, mode=[0, 1, 2]),
             self.mma_tiler_vdo,
             self.tiled_mma_dP,
@@ -775,9 +786,14 @@ class FlashAttentionBackwardSm100:
             Kt_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
                 self.cluster_shape_mnk, self.tiled_mma_dQ.thr_id
             )
+            mKt_tma = layout_utils.select(mK, mode=transpose_sh_k)
+            if const_expr(self.ragged_kv_tma):
+                mKt_tma = quack_copy_utils.create_ragged_tensor_for_tma(
+                    mKt_tma, ragged_dim=1, ptr_shift=False
+                )
             tma_atom_Kt, tma_tensor_Kt = cute.nvgpu.make_tiled_tma_atom_B(
                 Kt_tma_op,
-                layout_utils.select(mK, mode=transpose_sh_k),
+                mKt_tma,
                 cute.select(self.sKt_layout, mode=[0, 1, 2]),
                 self.mma_tiler_dsk,
                 self.tiled_mma_dQ,
@@ -1553,7 +1569,9 @@ class FlashAttentionBackwardSm100:
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0],
-            seqlen_k_static=mK.shape[0],
+            # With ragged K/V TMA tensors mode 0 is a sentinel extent, but cu_seqlens_k is then
+            # always present and the static length is unused.
+            seqlen_k_static=mK.shape[0] if const_expr(not self.ragged_kv_tma) else Int32(0),
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
@@ -1923,8 +1941,12 @@ class FlashAttentionBackwardSm100:
 
             # GMEM tensors (varlen-aware)
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-            mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-            mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+            mK_cur, mV_cur = [
+                seqlen.offset_batch_K(
+                    t, batch_idx, dim=3, ragged=self.ragged_kv_tma, ptr_shift=False
+                )[None, None, head_idx_kv]
+                for t in (mK, mV)
+            ]
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdO_cur = mdO[None, None, head_idx, batch_idx]
             else:
@@ -1943,12 +1965,18 @@ class FlashAttentionBackwardSm100:
                     mdOt_cur = cute.domain_offset((seqlen.offset_q, 0, 0), mdOt)[
                         None, None, head_idx
                     ]
-                if const_expr(not seqlen.has_cu_seqlens_k):
-                    mKt_cur = mKt[None, None, head_idx_kv, batch_idx]
+                if const_expr(not self.ragged_kv_tma):
+                    if const_expr(not seqlen.has_cu_seqlens_k):
+                        mKt_cur = mKt[None, None, head_idx_kv, batch_idx]
+                    else:
+                        mKt_cur = cute.domain_offset((0, seqlen.offset_k, 0), mKt)[
+                            None, None, head_idx_kv
+                        ]
                 else:
-                    mKt_cur = cute.domain_offset((0, seqlen.offset_k, 0), mKt)[
-                        None, None, head_idx_kv
-                    ]
+                    # Ragged Kt is (hdim, ragged_k, nheads_kv, wrap, offset): seqlen is mode 1.
+                    mKt_cur = quack_copy_utils.offset_ragged_tensor(
+                        mKt, seqlen.offset_k, seqlen.seqlen_k, ragged_dim=1, ptr_shift=False
+                    )[None, None, head_idx_kv]
 
             # (1) S.T = K @ Q.T
             gK = cute.local_tile(
