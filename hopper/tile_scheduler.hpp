@@ -8,6 +8,7 @@
 #include "cutlass/arch/barrier.h"
 
 #include "named_barrier.hpp"
+#include "seqlen.h"
 #include "utils.h"
 
 namespace flash {
@@ -131,6 +132,86 @@ public:
     WorkTileInfo
     get_next_work(Params const& params, WorkTileInfo const& current_work) const {
         return {0, 0, -1, 0};
+    }
+
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+// One tile a CTA over a varlen batch's padded block space (varlen_num_blocks), whose gaps find no
+// tile. A grid of num_batch * ceil_div(max_seqlen, kBlock) instead launches a CTA for every
+// (sequence, block) pair, and a kernel whose shared memory fits one CTA an SM runs the early exits
+// of every empty pair one wave at a time.
+template<int kBlock>
+class VarlenBlockScheduler {
+
+public:
+
+    using SharedStorage = int;
+
+    struct Params {
+        int const num_blocks, num_head, num_batch, seqlen;
+        int const* const cu_seqlens;
+        int const* const seqused;
+    };
+
+    static Params
+    to_underlying_arguments(TileSchedulerArguments const& args) {
+        return {args.num_blocks, args.num_head, args.num_batch, args.seqlen, args.cu_seqlens, args.seqused};
+    }
+
+    static dim3
+    get_grid_shape(Params const& params, int num_sm) {
+        return {uint32_t(params.num_blocks * params.num_head)};
+    }
+
+    struct WorkTileInfo {
+        int block;
+        int bidh;
+        int bidb;
+
+        CUTLASS_DEVICE
+        bool
+        is_valid(Params const& params) const {
+            return bidb >= 0;
+        }
+
+        CUTLASS_DEVICE
+        cute::tuple<int32_t, int32_t, int32_t, int32_t>
+        get_block_coord(Params const& params) const {
+            return {block, bidh, bidb, 0 /*split_idx*/};
+        }
+
+    };
+
+    CUTLASS_DEVICE
+    VarlenBlockScheduler(SharedStorage* const smem_scheduler) { }
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_initial_work(Params const& params) const {
+        // The heads of one block are neighbours, so the query heads of a key head read its K and V
+        // tile while it is in L2.
+        int const bidh = int(blockIdx.x) % params.num_head;
+        auto const coord = varlen_block_coord<kBlock>(int(blockIdx.x) / params.num_head, params.num_batch,
+                                                      params.cu_seqlens, params.seqused, params.seqlen);
+        return {get<1>(coord), bidh, get<0>(coord)};
+    }
+
+    CUTLASS_DEVICE
+    void
+    init_consumer() const {}
+
+    CUTLASS_DEVICE
+    void
+    prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {}
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+        return {0, 0, -1};
     }
 
 };
