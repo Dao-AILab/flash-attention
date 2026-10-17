@@ -348,8 +348,11 @@ def attention_ref(
     intermediate_dtype=None,
     return_lse=False,
     gather_kv_indices=None,
+    return_sink_prob=False,
 ):
     assert v is not None
+    if return_sink_prob and learnable_sink is None:
+        raise ValueError("return_sink_prob requires learnable_sink")
     has_qk = q is not None and k is not None
     assert has_qk or qv is not None
     if causal:
@@ -443,9 +446,12 @@ def attention_ref(
         learnable_sink = rearrange(learnable_sink, "h -> h 1 1")
         logits_or_sinks_max = torch.maximum(learnable_sink, logits_max)
         unnormalized_scores = torch.exp(scores_fp32 - logits_or_sinks_max)
-        normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + torch.exp(
-            learnable_sink - logits_or_sinks_max
-        )
+        unnormalized_sink = torch.exp(learnable_sink - logits_or_sinks_max)
+        normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + unnormalized_sink
+        if return_sink_prob:
+            # Keep the sink column in fp32: 1 - sum(attention.to(dtype_og)) can be zero
+            # even when the sink has nonzero probability mass.
+            sink_prob = (unnormalized_sink / normalizer).squeeze(-1)
         # LSE with sink: log(Z) = log(normalizer) + max
         lse = (torch.log(normalizer.squeeze(-1)) + logits_or_sinks_max.squeeze(-1)).to(dtype_og)
         attention = (unnormalized_scores / normalizer).to(v.dtype)
@@ -465,9 +471,12 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    result = (output.to(dtype_og), attention.to(dtype_og))
     if return_lse:
-        return output.to(dtype_og), attention.to(dtype_og), lse.to(dtype_og)
-    return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+        result += (lse.to(dtype_og),)
+    if return_sink_prob:
+        result += (sink_prob,)
+    return result
 
 
 def maybe_fake_tensor_mode(fake: bool = True):
@@ -502,6 +511,21 @@ def check_tensor_vs_ref(name, actual, ref, pt, rtol=2, atol=None):
     assert diff_max <= rtol * diff_pt_max + atol, (
         f"{name}: {diff_max=} too large compared to {diff_pt_max=} for {rtol=}, {atol=}"
     )
+
+
+def dsink_roundoff_atol(out_ref, dout, sink_prob):
+    """Empirical per-head roundoff allowance for randomized sink-gradient tests.
+
+    Use the products before either head-dimension or row cancellation, scaled by the
+    input dtype's unit roundoff. sink_prob is the reference's fp32 sink column, not
+    1 - sum(low-precision attention). This RMS scale is not a worst-case error bound
+    or evidence that a precision fix works; the q=0 backward oracle checks the O
+    residual independently, without this allowance.
+
+    out_ref/dout: (b, s_q, h, d); sink_prob: (b, h, s_q).
+    """
+    products = dout.float() * out_ref.float() * sink_prob.transpose(1, 2).unsqueeze(-1)
+    return (torch.finfo(dout.dtype).eps / 2) * products.square().sum((0, 1, 3)).sqrt()
 
 
 def check_dsink_vs_ref(actual, ref, pt, rtol=2, atol=0.0):

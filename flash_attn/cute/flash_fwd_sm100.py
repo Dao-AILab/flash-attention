@@ -474,6 +474,7 @@ class FlashAttentionForwardSm100:
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         mBlocksToBatchIdx: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
+        mOlo: Optional[cute.Tensor] = None,  # like mO: bf16 rounding residual fp32(O) - bf16(O)
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -513,6 +514,15 @@ class FlashAttentionForwardSm100:
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             num_splits = Int32(1)
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
+        if const_expr(mOlo is not None):
+            # O rounding residual, same shape/dtype/layout as O (see
+            # AI/SPARSE_MLA_DPSUM_PRECISION.md). The correction warps write it straight
+            # from the fp32 TMEM accumulator next to the bf16 O; the backward preprocess
+            # reads O + O_lo so dpsum = rowsum(dO * O) no longer carries O's bf16 rounding.
+            assert not self.is_split_kv, "O residual is not supported with split KV"
+            assert mOlo.element_type == self.o_dtype, "O residual must have O's dtype"
+            mOlo = assume_tensor_aligned(mOlo)
+            mOlo = cute.make_tensor(mOlo.iterator, cute.select(mOlo.layout, mode=O_layout_transpose))
         mLSE = (
             cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
             if const_expr(mLSE is not None)
@@ -638,6 +648,8 @@ class FlashAttentionForwardSm100:
             nheads_kv = mK.shape[2]
             mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            if const_expr(mOlo is not None):
+                mOlo = pack_gqa_layout(mOlo, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
 
@@ -845,6 +857,7 @@ class FlashAttentionForwardSm100:
             mV,
             mO,
             mLSE,
+            mOlo,
             mCuSeqlensQ,
             mCuSeqlensK,
             mSeqUsedQ,
@@ -908,6 +921,7 @@ class FlashAttentionForwardSm100:
         mV: cute.Tensor,  # (d, s_k, h_k, b_k) or (d, total_k, h_k) if there is cu_seqlens_k or (d, page_size, h_k, num_pages) if there is page_table
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mOlo: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
@@ -1477,6 +1491,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                mOlo=mOlo,
             )
             tmem_alloc_barrier.arrive_unaligned()
 
@@ -2762,6 +2777,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        mOlo: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2833,6 +2849,11 @@ class FlashAttentionForwardSm100:
                     cute.flat_divide(gO, (self.mma_tiler_pv[0],)), mode=[0, 2, 1]
                 )  # (128, 128, 2)
                 gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
+            mOlo_cur = None
+            if const_expr(mOlo is not None):
+                # O residual for this (batch, head): rows are addressed per thread in
+                # correction_residual (like the non-TMA O store), so no tile view is needed.
+                mOlo_cur = seqlen.offset_batch_Q(mOlo, batch_idx, dim=3)[None, None, head_idx]
 
             # Default LSE to -inf for invalid split_idx tiles
             stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
@@ -2978,6 +2999,23 @@ class FlashAttentionForwardSm100:
                         # TMA KV loads a dummy tile when seqlen_k == 0 (see correction_epilogue)
                         zero_fill=seqlen.seqlen_k == 0 if const_expr(self.use_tma_KV) else False,
                     )
+                    if const_expr(mOlo_cur is not None):
+                        # O rounding residual: hand sO to the TMA store first so the O store
+                        # drains while the residual pass re-reads TMEM; the TMEM O buffer is
+                        # released after the pass.
+                        if const_expr(not self.use_correction_warps_for_epi):
+                            pipeline_o_epi.producer_commit_w_index(stage)
+                        self.correction_residual(
+                            thr_mma_pv,
+                            tOtO[None, None, None, stage],
+                            tidx,
+                            stage,
+                            m_block,
+                            seqlen.seqlen_q,
+                            scale,
+                            mOlo_cur,
+                            zero_fill=seqlen.seqlen_k == 0 if const_expr(self.use_tma_KV) else False,
+                        )
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
                     if const_expr(self.use_s_ping_pong):
@@ -2985,7 +3023,7 @@ class FlashAttentionForwardSm100:
                         o_acc_consumer_count += 1
                     else:
                         pipeline_s_p_o.consumer_release_w_index(stage)
-                    if const_expr(not self.use_correction_warps_for_epi):
+                    if const_expr(not self.use_correction_warps_for_epi and mOlo_cur is None):
                         pipeline_o_epi.producer_commit_w_index(stage)
                     # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
 
@@ -3033,6 +3071,8 @@ class FlashAttentionForwardSm100:
                         mO_cur,
                         gO,
                         gmem_tiled_copy_O_for_empty_tile,
+                        correction_residual=self.correction_residual,
+                        mOlo_cur=mOlo_cur,
                     )
 
             if const_expr(mLSE is not None):
@@ -3256,6 +3296,113 @@ class FlashAttentionForwardSm100:
                 self._store_O_to_gmem(
                     sO, gO, mO_cur, gmem_tiled_copy_O, tidx, seqlen_q, m_tile_idx
                 )
+
+    @cute.jit
+    def correction_residual(
+        self,
+        thr_mma: cute.ThrMma,
+        tOtO: cute.Tensor,
+        tidx: Int32,
+        stage: Int32,
+        m_block: Int32,
+        seqlen_q: Int32,
+        scale: Float32,
+        mOlo_cur: cute.Tensor,
+        zero_fill: bool | Boolean = False,
+    ):
+        """Write the O rounding residual mOlo = fp32(O) - o_dtype(O) for one stage of this CTA's
+        tile, after correction_epilogue wrote o_dtype(O) to sO.
+
+        The backward preprocess reads O + O_lo, so dpsum = rowsum(dO * O) no longer carries the
+        o_dtype rounding of O (dsink sums exp(sink - lse) * dpsum over all rows with heavy
+        cancellation, which otherwise amplifies that rounding; see issue #2969 and
+        AI/SPARSE_MLA_DPSUM_PRECISION.md). Kept out of the O loop above, which stays untouched:
+        the fp32 O is re-read from TMEM fragment by fragment (as in correction_rescale), scaled
+        like the O pass, and the residual of the same round-to-nearest conversion (exact in
+        fp32, rounded once to o_dtype) goes straight to gmem with 128-bit thread stores.
+        Each thread owns one row of the tile (32dp32b TMEM loads) and corr_tile_size consecutive
+        columns per fragment; its gmem row is addressed once from the tile coordinates (like
+        the non-TMA O store; packed ((qh, s), d) rows with PackGQA). TMEM loads are
+        warp-collective, so they are issued for every thread and only the stores are guarded
+        (rows past seqlen, columns past head_dim_v).
+        """
+        corr_tile_size = 32 if const_expr(self.chunked_split_epi) else 8 * 32 // self.o_dtype.width
+        assert self.epi_head_dim_v == self.head_dim_v_padded, "O residual is not chunked"
+        tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
+        tOtO_i = cute.logical_divide(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOcO_i = cute.logical_divide(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        epi_subtile = (self.epi_tile[0], corr_tile_size)
+        tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
+            self.mma_tiler_pv,
+            self.o_layout,
+            self.o_dtype,
+            self.pv_acc_dtype,
+            epi_subtile,
+            use_2cta_instrs=self.use_2cta_instrs,
+        )
+        tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_i[(None, None), 0])
+        thr_tmem_load = tiled_tmem_load.get_slice(tidx)
+        tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
+        tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
+        # Tile coordinates of this thread's fragments, per CTA (thr_mma slice 0, like sO).
+        cOlo = thr_mma.get_slice(0).partition_C(
+            cute.make_identity_tensor((self.m_block_size, self.epi_head_dim_v))
+        )
+        cOlo_i = cute.logical_divide(cOlo, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOcOlo_t2r = thr_tmem_load.partition_D(cOlo_i[(None, None), None])
+        num_frg = self.epi_head_dim_v // corr_tile_size
+        m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + thr_mma.thr_idx
+        seqlen_rows = (
+            seqlen_q if const_expr(not self.pack_gqa) else seqlen_q * self.qhead_per_kvhead
+        )
+        row, col0 = tOcOlo_t2r[None, 0, 0, 0][0]
+        idx = m_tile_idx * self.m_block_size + row
+        row_ok = idx < seqlen_rows
+        if const_expr(not self.pack_gqa):
+            crd = idx
+        else:
+            m_idx = idx // self.qhead_per_kvhead
+            crd = (idx - m_idx * self.qhead_per_kvhead, m_idx)
+        olo_ptr = cute.make_ptr(
+            self.o_dtype,
+            utils.elem_pointer(mOlo_cur, (crd, col0)).toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        elems_per_store = 128 // self.o_dtype.width
+        n_stores = corr_tile_size // elems_per_store
+        atom_store = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self.o_dtype, num_bits_per_copy=128
+        )
+        # (elements per store, stores per fragment, fragments): the thread's row segment
+        gOlo_row = cute.make_tensor(
+            olo_ptr, cute.make_layout((elems_per_store, n_stores, num_frg))
+        )
+        for i in cutlass.range(num_frg, unroll_full=True):
+            tOrO_frg = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
+            if const_expr(zero_fill is True):
+                tOrO_frg.fill(0.0)
+            elif zero_fill:
+                tOrO_frg.fill(0.0)
+            else:
+                cute.copy(tiled_tmem_load, tOtO_t2r[None, 0, 0, i], tOrO_frg)
+                for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
+                    tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
+                        (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
+                    )
+            o_f32 = tOrO_frg.load()
+            tOrOlo = cute.make_rmem_tensor(tOrO_frg.shape, self.o_dtype)
+            tOrOlo.store((o_f32 - o_f32.to(self.o_dtype).to(self.pv_acc_dtype)).to(self.o_dtype))
+            tOrOlo_v = cute.make_tensor(
+                tOrOlo.iterator, cute.make_layout((elems_per_store, n_stores))
+            )
+            for j in cutlass.range_constexpr(n_stores):
+                if const_expr(self.check_hdim_v_oob):
+                    if row_ok and col0 + i * corr_tile_size + j * elems_per_store < mOlo_cur.shape[1]:
+                        cute.copy(atom_store, tOrOlo_v[None, j], gOlo_row[None, j, i])
+                else:
+                    if row_ok:
+                        cute.copy(atom_store, tOrOlo_v[None, j], gOlo_row[None, j, i])
 
     @cute.jit
     def _store_O_to_gmem(
