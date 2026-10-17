@@ -24,6 +24,7 @@ from flash_attn.cute.testing import (
 )
 from flash_attn.cute.cache_utils import JITCache
 from flash_attn.cute.interface import (
+    TensorwiseScales,
     _flash_attn_bwd_sparse_mla,
     _flash_attn_fwd,
     flash_attn_func,
@@ -718,10 +719,9 @@ def test_flash_attn_mla_1cta_learnable_sink_fp8(causal, num_splits):
     softmax_scale = 1.0 / math.sqrt(hdim + hdimv)
 
     def run(learnable_sink):
-        # Descales are only exposed by the internal entry point.
         out, lse, *_ = _flash_attn_fwd(
             q, k, v, qv=qv, causal=causal, learnable_sink=learnable_sink, num_splits=num_splits,
-            q_descale=q_descale, k_descale=kv_descale, v_descale=kv_descale, return_lse=True,
+            scales=TensorwiseScales(q_descale, kv_descale, kv_descale), return_lse=True,
         )
         return out, lse
 
@@ -774,7 +774,7 @@ def test_flash_attn_mla_1cta_fp8_descales_cuda_graph(num_splits):
     def call():
         out, lse, *_ = _flash_attn_fwd(
             q, k, v, qv=qv, causal=True, learnable_sink=sink, num_splits=num_splits,
-            q_descale=q_descale, k_descale=kv_descale, v_descale=kv_descale, return_lse=True,
+            scales=TensorwiseScales(q_descale, kv_descale, kv_descale), return_lse=True,
         )
         return out, lse
 
@@ -804,26 +804,25 @@ def test_flash_attn_mla_1cta_fp8_descales_must_be_shared():
     if not IS_SM100:
         pytest.skip()
     q, qv, k, v, q_descale, kv_descale, sink = _mla_1cta_fp8_inputs()
-    with pytest.raises(AssertionError, match="k_descale and v_descale to be the same tensor"):
+    with pytest.raises(AssertionError, match="scales.k and scales.v to be the same tensor"):
         _flash_attn_fwd(
-            q, k, v, qv=qv, q_descale=q_descale, k_descale=kv_descale,
-            v_descale=kv_descale.clone(),
+            q, k, v, qv=qv, scales=TensorwiseScales(q_descale, kv_descale, kv_descale.clone())
         )
 
 
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_fp8_descale_without_rope(monkeypatch):
     """Without a rope part (q = k = None) S = Qv @ V^T, so the latent cache's descale is
-    v_descale; a lone k_descale would be ignored, so it must be rejected."""
+    scales.v; a lone scales.k would be ignored, so it must be rejected."""
     if not IS_SM100:
         pytest.skip()
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "1")  # fp8 MLA is 1CTA-only
     _, qv, _, v, q_descale, kv_descale, _ = _mla_1cta_fp8_inputs()
     with pytest.raises(AssertionError, match="no rope part"):
-        _flash_attn_fwd(None, None, v, qv=qv, q_descale=q_descale, k_descale=kv_descale)
-    out, *_ = _flash_attn_fwd(None, None, v, qv=qv, q_descale=q_descale, v_descale=kv_descale)
+        _flash_attn_fwd(None, None, v, qv=qv, scales=TensorwiseScales(q_descale, k=kv_descale))
+    out, *_ = _flash_attn_fwd(None, None, v, qv=qv, scales=TensorwiseScales(q_descale, v=kv_descale))
     out_shared, *_ = _flash_attn_fwd(
-        None, None, v, qv=qv, q_descale=q_descale, k_descale=kv_descale, v_descale=kv_descale
+        None, None, v, qv=qv, scales=TensorwiseScales(q_descale, kv_descale, kv_descale)
     )
     if is_fake_mode():
         return
@@ -833,7 +832,7 @@ def test_flash_attn_mla_1cta_fp8_descale_without_rope(monkeypatch):
 @pytest.mark.parametrize("present", ["q", "kv"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_1cta_fp8_partial_descales(present, monkeypatch):
-    """q_descale alone or the shared k / v descale alone: a missing one is 1 (bitwise equal
+    """scales.q alone or the shared k / v descale alone: a missing one is 1 (bitwise equal
     to passing ones), with no member shifting slots across the kernel boundary."""
     if not IS_SM100:
         pytest.skip()
@@ -844,7 +843,7 @@ def test_flash_attn_mla_1cta_fp8_partial_descales(present, monkeypatch):
     def call(qd, kvd):
         return _flash_attn_fwd(
             q, k, v, qv=qv, causal=True, learnable_sink=sink,
-            q_descale=qd, k_descale=kvd, v_descale=kvd, return_lse=True,
+            scales=TensorwiseScales(qd, kvd, kvd), return_lse=True,
         )[:2]
 
     if present == "q":
@@ -1400,7 +1399,7 @@ def test_flash_attn_mla_1cta_sparse_fp8(nheads, causal):
     def run(learnable_sink):
         out, lse, *_ = _flash_attn_fwd(
             q, k, v, qv=qv, causal=causal, gather_kv_indices=idx, learnable_sink=learnable_sink,
-            q_descale=q_descale, k_descale=kv_descale, v_descale=kv_descale, return_lse=True,
+            scales=TensorwiseScales(q_descale, kv_descale, kv_descale), return_lse=True,
         )
         return out, lse
 
