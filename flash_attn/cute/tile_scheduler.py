@@ -476,6 +476,7 @@ class SingleTileLPTScheduler:
         lpt: cutlass.Constexpr[bool] = True
         use_cluster_idx: cutlass.Constexpr[bool] = True
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None
+        tile_count_semaphore: Optional[cute.Pointer] = None
 
         @staticmethod
         @cute.jit
@@ -486,9 +487,14 @@ class SingleTileLPTScheduler:
             loc=None,
             ip=None,
         ) -> "SingleTileLPTScheduler.Params":
-            assert scheduling_mode in (SchedulingMode.STATIC, SchedulingMode.CLC), (
-                f"Only STATIC and CLC are supported, got {scheduling_mode!r}"
-            )
+            assert scheduling_mode in (
+                SchedulingMode.STATIC,
+                SchedulingMode.CLC,
+                SchedulingMode.DYNAMIC,
+            ), f"Only STATIC, CLC and DYNAMIC are supported, got {scheduling_mode!r}"
+            if const_expr(scheduling_mode == SchedulingMode.DYNAMIC):
+                assert args.tile_count_semaphore is not None
+                assert not args.is_split_kv and args.cluster_shape_mn[0] == 1
             # int64: this product overflows int32 once seqlen_k * (headdim +
             # headdim_v) * element_size > 2**31 (seqlen_k > ~4M for hdim-128 bf16).
             size_one_kv_head = (
@@ -504,6 +510,10 @@ class SingleTileLPTScheduler:
             swizzle = (
                 1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
             )
+            if const_expr(scheduling_mode == SchedulingMode.DYNAMIC and not args.lpt):
+                # Equal-cost tiles: walk m blocks of one head before moving to the next head so
+                # concurrently running tiles share K/V in L2.
+                swizzle = Int32(1)
             # If we're in the last section (called residual), we don't want to divide by
             # swizzle. Instead we want to divide by the remainder.
             num_hb_quotient = (args.num_head * args.num_batch) // swizzle
@@ -527,6 +537,7 @@ class SingleTileLPTScheduler:
                 lpt=args.lpt,
                 use_cluster_idx=args.use_cluster_idx,
                 num_splits_dynamic_ptr=args.num_splits_dynamic_ptr,
+                tile_count_semaphore=args.tile_count_semaphore,
             )
 
     def __init__(
@@ -589,7 +600,7 @@ class SingleTileLPTScheduler:
     def create(
         params: Params, ctx: SchedulerState | None = None, *, loc=None, ip=None
     ) -> "SingleTileLPTScheduler":
-        if const_expr(params.scheduling_mode == SchedulingMode.CLC):
+        if const_expr(params.scheduling_mode in (SchedulingMode.CLC, SchedulingMode.DYNAMIC)):
             return SingleTileLPTScheduler(
                 params, cute.arch.block_idx()[0], Int32(0), ctx, loc=loc, ip=ip
             )
@@ -609,6 +620,9 @@ class SingleTileLPTScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         if const_expr(params.scheduling_mode == SchedulingMode.CLC):
             return SingleTileLPTScheduler._clc_grid_shape(params)
+        if const_expr(params.scheduling_mode == SchedulingMode.DYNAMIC):
+            sm_count = HardwareInfo().get_device_multiprocessor_count()
+            return (cutlass.min(sm_count, params.total_blocks), Int32(1), Int32(1))
         grid_x = params.total_blocks
         if const_expr(params.cluster_shape_m > 1 and params.use_cluster_idx):
             # Convert clusters to CTAs.
@@ -694,6 +708,23 @@ class SingleTileLPTScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
             self._ctx.prefetch_next_work(loc=loc, ip=ip)
+        elif const_expr(self.params.scheduling_mode == SchedulingMode.DYNAMIC):
+            self._prefetch_next_work_dynamic()
+
+    @cute.jit
+    def _prefetch_next_work_dynamic(self):
+        """Called by one warp: lane 0 claims the next tile, the warp publishes it to smem."""
+        next_tile_idx = Int32(0)
+        if cute.arch.lane_idx() == 0:
+            next_tile_idx = cute.arch.grid_dim()[0] + utils.atomic_add_i32(
+                1, self.params.tile_count_semaphore
+            )
+        next_tile_idx = cute.arch.shuffle_sync(next_tile_idx, 0)
+        self._ctx.producer_acquire()
+        with cute.arch.elect_one():
+            self._ctx.write_work_info(next_tile_idx, Int32(0), Int32(0), Int32(0))
+            self._ctx.producer_commit()
+        self._ctx.advance_producer_state()
 
     def advance_to_next_work(self, *, loc=None, ip=None):
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
@@ -701,18 +732,23 @@ class SingleTileLPTScheduler:
             work = self.get_current_work()
             self._ctx.consumer_release(loc=loc, ip=ip)
             return work
+        if const_expr(self.params.scheduling_mode == SchedulingMode.DYNAMIC):
+            self._ctx.consumer_wait(loc=loc, ip=ip)
+            self._tile_idx = self._ctx._work_info[0]
+            self._ctx.consumer_release(loc=loc, ip=ip)
+            return self.get_current_work()
         # Single tile scheduler - set to invalid tile_idx to indicate no more work
         self._tile_idx = self.params.total_blocks
         return self.get_current_work()
 
     def producer_tail(self, *, loc=None, ip=None):
-        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+        if const_expr(self.params.scheduling_mode in (SchedulingMode.CLC, SchedulingMode.DYNAMIC)):
             self._ctx.producer_tail(loc=loc, ip=ip)
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
         objs = [self.params, self._tile_idx, self._split_idx]
-        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+        if const_expr(self.params.scheduling_mode in (SchedulingMode.CLC, SchedulingMode.DYNAMIC)):
             objs += [self._ctx]
         for obj in objs:
             obj_values = cutlass.extract_mlir_values(obj)
@@ -723,7 +759,7 @@ class SingleTileLPTScheduler:
     def __new_from_mlir_values__(self, values):
         obj_list = []
         objs = [self.params, self._tile_idx, self._split_idx]
-        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+        if const_expr(self.params.scheduling_mode in (SchedulingMode.CLC, SchedulingMode.DYNAMIC)):
             objs += [self._ctx]
         for obj, n_items in zip(objs, self._values_pos):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
