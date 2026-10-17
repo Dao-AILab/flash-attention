@@ -860,11 +860,19 @@ def select_lpt_global(
 # Host model of FlashAttentionForwardSm100's SharedStorage: barriers and row statistics, then
 # 1024-byte aligned sO, sQ, and the sK/sV buffer (K and V alias one buffer per stage).
 SM100_SMEM_BYTES = 227 * 1024
+# sm_107 has more shared memory per CTA (CuTeDSL's sm_107 capacity).
+SM107_SMEM_BYTES = 327 * 1024
 # kv_stage selection budget for Q/O plus KV stages; the rest holds barriers and sScale.
 _SM100_KV_STAGE_BUDGET_BYTES = 224 * 1024
 # Small head dims would otherwise pick up to 52 stages and overflow the barrier region.
 SM100_MAX_KV_STAGE = 32
 _SM100_SMEM_ALIGN_BYTES = 1024
+
+
+def sm100_smem_capacity(device_arch: int) -> int:
+    """Per-CTA shared memory the SM100-family forward may use: more on sm_107."""
+    is_sm107 = device_arch // 10 == 10 and device_arch % 10 >= 7
+    return SM107_SMEM_BYTES if is_sm107 else SM100_SMEM_BYTES
 
 
 def sm100_uneven_kv_smem(
@@ -1747,11 +1755,12 @@ def validate_sm100_smem_layout(config: FwdConfig, inputs: FwdHeuristicInputs) ->
             f"1CTA head-dim 192/128 with kv_stage=3 needs tile_n divisible by 32, got {config.tile_n}"
         )
     smem_bytes = sm100_fwd_smem_bytes(config, inputs)
-    if smem_bytes > SM100_SMEM_BYTES:
+    capacity = sm100_smem_capacity(inputs.device_arch)
+    if smem_bytes > capacity:
         raise ValueError(
             f"SM100 forward layout (tile_n={config.tile_n}, q_stage={config.q_stage}, "
             f"overlap_sO_sQ={config.overlap_sO_sQ}, kv_stage={config.kv_stage}) needs "
-            f"{smem_bytes} bytes of shared memory; SM100 provides {SM100_SMEM_BYTES}"
+            f"{smem_bytes} bytes of shared memory; SM{inputs.device_arch} provides {capacity}"
         )
 
 
