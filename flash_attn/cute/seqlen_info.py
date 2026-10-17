@@ -193,8 +193,13 @@ class SeqlenInfoQK:
         padded: cutlass.Constexpr[bool] = False,
         ragged: cutlass.Constexpr[bool] = False,
         multiple: int = 1,
+        ptr_shift: cutlass.Constexpr[bool] = True,
     ) -> cute.Tensor:
-        """Seqlen must be the first dimension of mK"""
+        """Seqlen must be the first dimension of mK.
+
+        ragged: mK was built with copy_utils.create_ragged_tensor_for_tma; ptr_shift must match the
+        form used there (ptr_shift=True is store-only, loads need the wraparound form).
+        """
         if const_expr(not ragged):
             if const_expr(not self.has_cu_seqlens_k):
                 idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mK) - 1 - dim)
@@ -213,7 +218,7 @@ class SeqlenInfoQK:
                 offset_k = self.offset_k if const_expr(not padded) else self.padded_offset_k
                 offset_k *= multiple
             return copy_utils.offset_ragged_tensor(
-                mK, offset_k, self.seqlen_k, ragged_dim=0, ptr_shift=True
+                mK, offset_k, self.seqlen_k, ragged_dim=0, ptr_shift=ptr_shift
             )
 
 

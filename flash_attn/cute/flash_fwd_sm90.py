@@ -286,6 +286,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         tma_atom_K, tma_tensor_K = None, None
         tma_atom_V, tma_tensor_V = None, None
+        # Packed varlen: bound the V TMA load by the logical seqlen_k so rows in
+        # [seqlen_k, tile_n) arrive zero-filled instead of as whatever the buffer holds. P is
+        # exactly zero there, but 0 * NaN = NaN in O = P @ V. K needs no bound: masked scores
+        # become -inf before exp. Loads must use the 2-extra-dim wraparound form (ptr_shift is
+        # store-only), which needs rank <= 3, i.e. the (t, d, h) layout. Paged KV is excluded
+        # (finite rows past seqused_k in a page are a caller contract), as are broadcast
+        # (seq-stride 0) V views.
+        self.ragged_tma_V = (
+            self.use_tma_KV
+            and mPageTable is None
+            and mCuSeqlensK is not None
+            and not (isinstance(mV.stride[0], int) and mV.stride[0] == 0)
+        )
+        mV_tma = mV
+        if const_expr(self.ragged_tma_V):
+            mV_tma = copy_utils.create_ragged_tensor_for_tma(mV, ragged_dim=0, ptr_shift=False)
         if const_expr(self.use_tma_KV):
             tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
@@ -296,7 +312,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
             tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
-                mV,
+                mV_tma,
                 cute.select(self.sV_layout, mode=[0, 1]),
                 (self.tile_n, self.tile_hdimv),
                 1,  # No mcast for now
@@ -710,9 +726,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[
                             None, None, head_idx_kv
                         ]
-                        mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[
-                            None, None, head_idx_kv
-                        ]
+                        mV_cur = seqlen.offset_batch_K(
+                            mV, batch_idx, dim=3, ragged=self.ragged_tma_V, ptr_shift=False
+                        )[None, None, head_idx_kv]
                         gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
                         gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
                     # TODO: mcast
