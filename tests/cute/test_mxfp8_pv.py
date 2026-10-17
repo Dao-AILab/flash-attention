@@ -119,3 +119,60 @@ def test_mxfp8_pv_persistent_replay():
         sampled = actual[:, rows].double() * (1 if i % 2 == 0 else -1)
         error = (sampled - expected).square().sum(dim=(1, 3)).sqrt()
         assert (error / expected.square().sum(dim=(1, 3)).sqrt() <= 2e-3).all()
+
+
+def causal_reference(q, k, v, causal_offset):
+    """FP64 causal attention on the dequantized operands (sanity bound, not bitwise)."""
+    rep = q.shape[2] // k.shape[2]
+    k, v = [x.repeat_interleave(rep, dim=2).transpose(1, 2).double() for x in (k, v)]
+    q = q.transpose(1, 2).double()
+    logits = q @ k.transpose(-1, -2) / math.sqrt(q.shape[-1])
+    rows = torch.arange(q.shape[-2], device=q.device)[:, None] + causal_offset
+    logits = logits.masked_fill(torch.arange(k.shape[-2], device=q.device)[None, :] > rows, -math.inf)
+    return (torch.softmax(logits, -1).nan_to_num() @ v).transpose(1, 2)
+
+
+@pytest.mark.parametrize(
+    "dim,sq,sk,hq,hk",
+    [
+        (64, 257, 386, 4, 2),  # unaligned seqlen_k - seqlen_q, GQA
+        (128, 385, 129, 2, 2),  # leading query tile fully masked
+        (128, 1000, 2049, 4, 1),  # 17 KV blocks, unaligned offset
+    ],
+)
+def test_mxfp8_pv_causal_no_future_leakage(dim, sq, sk, hq, hk):
+    """Scaling V at future positions must leave every earlier row bitwise unchanged."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family GPU")
+    g = torch.Generator(device="cuda").manual_seed(7)
+    q = torch.randn(1, sq, hq, dim, generator=g, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, sk, hk, dim, generator=g, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, sk, hk, dim, generator=g, device="cuda", dtype=torch.bfloat16)
+    q8, sfq, qs = quantize_to_fp8_with_sf(q)
+    k8, sfk, ks = quantize_to_fp8_with_sf(k)
+    sfq, sfk = interleave_sf(sfq, 32), interleave_sf(sfk, 32)
+
+    def run(v_bf16):
+        v8, sfv, _ = quantize_v_to_fp8_with_sf(v_bf16)
+        return flash_attn_func(
+            q8, k8, v8, scales=BlockScales(sfq, sfk, sfv), v_bf16=v_bf16, causal=True,
+            return_lse=True,
+        )
+
+    out, lse = run(v)
+    assert torch.isfinite(out).all()
+    fp64 = causal_reference(
+        dequantize_fp8_with_sf(q8, qs), dequantize_fp8_with_sf(k8, ks), v.float(), sk - sq
+    )
+    # E4M3 P / MXFP8 V error on fully visible blocks; BF16 on the diagonal.
+    assert (out.double() - fp64).norm() <= 6e-2 * fp64.norm()
+    for t0 in (sk // 4 + 17, sk // 2 + 5, 3 * sk // 4 + 29):
+        rows = t0 - (sk - sq)  # rows [0, rows) attend only keys < t0
+        if rows <= 0 or t0 >= sk:
+            continue
+        for factor in (16.0, 1024.0):
+            v2 = v.clone()
+            v2[:, t0:] = (v2[:, t0:].float() * factor).to(torch.bfloat16)
+            out2, lse2 = run(v2)
+            assert torch.equal(out2[:, :rows].view(torch.uint8), out[:, :rows].view(torch.uint8))
+            assert torch.equal(lse2[..., :rows].view(torch.uint8), lse[..., :rows].view(torch.uint8))

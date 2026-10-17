@@ -718,6 +718,7 @@ def _validate_scales(
     gather_kv_indices: torch.Tensor | None,
     layout_inputs: tuple,
     pv_unsupported: tuple,
+    v_bf16: torch.Tensor | None,
 ) -> TensorwiseScales | BlockScales | None:
     """Check scales against the inputs; return them normalized for the kernel, or None.
 
@@ -726,13 +727,16 @@ def _validate_scales(
     dequantization) slot in as a new type and a new branch.
 
     BlockScales are returned flattened. layout_inputs are the varlen, paged, and block-sparse
-    inputs, which MXFP8 does not support. Native PV (scales.v) also rejects causal/local masks,
+    inputs, which MXFP8 does not support. Native PV (scales.v) also rejects local masks,
     gather_kv_indices, softcap, and pv_unsupported: the sinks, modifiers, and auxiliary data.
+    Causal native PV requires v_bf16, the original BF16 V.
     """
+    pv = isinstance(scales, BlockScales) and scales.v is not None
+    if v_bf16 is not None and not pv:
+        raise ValueError("v_bf16 requires native MXFP8 PV (scales.v)")
     if scales is None:
         return None
     if isinstance(scales, BlockScales):
-        pv = scales.v is not None
         mode = "Native MXFP8 PV" if pv else "QK MXFP8"
         if scales.q is None or scales.k is None:
             raise ValueError(f"{mode} requires both scales.q and scales.k")
@@ -742,10 +746,19 @@ def _validate_scales(
             pv_causal, pv_local, _, _ = _resolve_causal_local_window(
                 causal, window_size_left, window_size_right
             )
-            if causal or pv_causal or pv_local:
-                raise NotImplementedError(
-                    "Native MXFP8 PV supports only noncausal, nonlocal attention"
-                )
+            if pv_local:
+                raise NotImplementedError("Native MXFP8 PV does not support local attention")
+            if causal or pv_causal:
+                if v_bf16 is None:
+                    raise ValueError("Causal native MXFP8 PV requires original v_bf16")
+            elif v_bf16 is not None:
+                raise ValueError("v_bf16 is only used by causal native MXFP8 PV")
+            if v_bf16 is not None and (
+                v_bf16.dtype != torch.bfloat16
+                or v_bf16.shape != v.shape
+                or v_bf16.device != v.device
+            ):
+                raise ValueError("v_bf16 must be BF16 with the same shape and device as V")
             layout_inputs += (gather_kv_indices,)
         if any(t is not None for t in layout_inputs) or num_splits != 1:
             raise NotImplementedError(f"{mode} supports only dense, unsplit attention")
@@ -761,7 +774,7 @@ def _validate_scales(
                              else "QK MXFP8 requires e4m3 Q/K and bf16 V")
         if q.shape[-1] not in (64, 128) or v.shape[-1] not in (64, 128):
             raise NotImplementedError(f"{mode} supports head dimensions 64 and 128")
-        if requires_grad:
+        if requires_grad or (v_bf16 is not None and v_bf16.requires_grad):
             raise NotImplementedError(f"{mode} is forward-only")
         # (scales, operand, name, MN extent, K extent); K is the scaled (reduction) axis.
         sf_layouts = [
@@ -851,6 +864,7 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    v_bf16: torch.Tensor | None = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -870,14 +884,16 @@ def _flash_attn_fwd(
         scales: Dequantization scales of low-precision Q/K/V (see TensorwiseScales and
             BlockScales). BlockScales give BF16 output and support only dense, unsplit,
             forward-only attention. BlockScales.v selects native MXFP8 PV with e4m3 V, which
-            is also noncausal and unmodified.
+            is also nonlocal and unmodified.
+        v_bf16: Original BF16 V for causal native PV's masked KV blocks. Must not
+            be reconstructed from the along-key quantized V, which leaks future scales.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
     )
     fake_mode = is_fake_mode()
-    q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
+    q, k, v, qv, v_bf16 = [maybe_contiguous(t) for t in (q, k, v, qv, v_bf16)]
     assert q is not None or qv is not None
     assert v is not None
     page_table = maybe_contiguous(page_table, align_bytes=4)
@@ -912,6 +928,7 @@ def _flash_attn_fwd(
         num_splits=num_splits, softcap=softcap, gather_kv_indices=gather_kv_indices,
         layout_inputs=(cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table, block_sparse_tensors),
         pv_unsupported=(learnable_sink, score_mod, mask_mod, aux_tensors, aux_scalars),
+        v_bf16=v_bf16,
     )
     descales = scales if isinstance(scales, TensorwiseScales) else None
     block_scales = scales if isinstance(scales, BlockScales) else None
@@ -1637,7 +1654,8 @@ def _flash_attn_fwd(
     )
 
     if qk_blockscaled:
-        compile_key += ("mxfp8_qk", v.dtype, pv_blockscaled)
+        compile_key += ("mxfp8_qk", v.dtype, pv_blockscaled,
+                        get_broadcast_dims(v_bf16) if v_bf16 is not None else None)
 
     if compile_key not in _flash_attn_fwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1953,6 +1971,7 @@ def _flash_attn_fwd(
                     if t is not None:
                         t.element_type = cutlass.Float8E8M0FNU
                 compile_args.extend(sf_tensors)
+                compile_args.append(to_cute_tensor(v_bf16) if v_bf16 is not None else None)
             elif arch // 10 in [8, 9, 12]:
                 compile_args.extend([
                     cu_total_m_blocks_tensor,
@@ -2044,6 +2063,7 @@ def _flash_attn_fwd(
                     max_seqlen_q,
                     *(t.view(torch.uint8) if t is not None else None
                       for t in block_scales or BlockScales(None, None)),
+                    v_bf16,
                 ])
             elif arch // 10 in [8, 9, 12]:
                 call_args.extend([
@@ -3922,6 +3942,7 @@ class FlashAttnFunc(torch.autograd.Function):
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
         scales: TensorwiseScales | BlockScales | None = None,
+        v_bf16: torch.Tensor | None = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3953,6 +3974,7 @@ class FlashAttnFunc(torch.autograd.Function):
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             scales=scales,
+            v_bf16=v_bf16,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -4000,9 +4022,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 15)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 15)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4031,7 +4053,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 15)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -4288,6 +4310,7 @@ def flash_attn_func(
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
     scales: TensorwiseScales | BlockScales | None = None,
+    v_bf16: torch.Tensor | None = None,
 ):
     """Compute attention.
 
@@ -4295,9 +4318,12 @@ def flash_attn_func(
         (FP8 then uses descale 1).
         - TensorwiseScales: FP8 Q/K/V.
         - BlockScales(q, k): MXFP8 Q/K with BF16 V.
-        - BlockScales(q, k, v): native, noncausal MXFP8 PV with e4m3 V. v is the contiguous
-          UE8M0 buffer from quantize_v_to_fp8_with_sf (MN=V channels, K=key positions, groups
-          of 32 keys). Local and modified attention are not supported.
+        - BlockScales(q, k, v): native MXFP8 PV with e4m3 V. v is the contiguous UE8M0 buffer
+          from quantize_v_to_fp8_with_sf (MN=V channels, K=key positions, groups of 32 keys).
+          Causal attention additionally requires the original v_bf16 (same shape as V): every
+          KV block intersecting the query tile's diagonal uses BF16 P and V, so future tokens
+          cannot leak through shared along-key scales. Local and modified attention are not
+          supported.
         BlockScales return BF16 output and optional FP32 LSE, and support only dense, unsplit
         attention.
     """
@@ -4346,6 +4372,7 @@ def flash_attn_func(
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
         scales,
+        v_bf16,
     )
 
 
