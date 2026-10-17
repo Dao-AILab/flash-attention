@@ -633,11 +633,13 @@ class SingleTileLPTScheduler:
             return WorkTileInfo(self._static_coords(tile_idx).tile_idx, work.is_valid_tile)
         block_idx = work.tile_idx[0]
         if const_expr(self.params.cluster_shape_m > 1):
+            # 2CTA forward kernels index m blocks per cluster, so both CTAs keep the cluster's block.
             block_idx = block_idx // self.params.cluster_shape_m
         if const_expr(self.params.lpt):
             # Longest-processing-time-first: reverse block order
             if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
-                num_block = self.params.num_block // self.params.cluster_shape_m
+                # num_block counts CTA blocks; an odd count leaves the last cluster half full.
+                num_block = cute.ceil_div(self.params.num_block, self.params.cluster_shape_m)
             else:
                 num_block = self.params.num_block
             block_idx = num_block - 1 - block_idx
@@ -646,9 +648,6 @@ class SingleTileLPTScheduler:
             batch_idx, split_idx = divmod(work.tile_idx[2], self.params.num_splits_divmod)
         else:
             batch_idx = work.tile_idx[2]
-        if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
-            bidx_in_cluster = cute.arch.block_in_cluster_idx()
-            block_idx = block_idx * self.params.cluster_shape_m + bidx_in_cluster[0]
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
         if const_expr(self.params.is_split_kv and self.params.num_splits_dynamic_ptr is not None):
             if work.is_valid_tile:
