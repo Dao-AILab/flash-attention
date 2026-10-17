@@ -719,6 +719,7 @@ def _validate_scales(
     layout_inputs: tuple,
     pv_unsupported: tuple,
     v_bf16: torch.Tensor | None,
+    mxfp8_pv_softmax: str,
 ) -> TensorwiseScales | BlockScales | None:
     """Check scales against the inputs; return them normalized for the kernel, or None.
 
@@ -729,9 +730,14 @@ def _validate_scales(
     BlockScales are returned flattened. layout_inputs are the varlen, paged, and block-sparse
     inputs, which MXFP8 does not support. Native PV (scales.v) also rejects local masks,
     gather_kv_indices, softcap, and pv_unsupported: the sinks, modifiers, and auxiliary data.
-    Causal native PV requires v_bf16, the original BF16 V.
+    Causal native PV requires v_bf16, the original BF16 V. mxfp8_pv_softmax ("exact" or
+    "fast") selects the native PV softmax recipe.
     """
     pv = isinstance(scales, BlockScales) and scales.v is not None
+    if mxfp8_pv_softmax not in ("exact", "fast"):
+        raise ValueError(f'mxfp8_pv_softmax must be "exact" or "fast", got {mxfp8_pv_softmax!r}')
+    if mxfp8_pv_softmax != "exact" and not pv:
+        raise ValueError("mxfp8_pv_softmax requires native MXFP8 PV (scales.v)")
     if v_bf16 is not None and not pv:
         raise ValueError("v_bf16 requires native MXFP8 PV (scales.v)")
     if scales is None:
@@ -865,6 +871,7 @@ def _flash_attn_fwd(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     v_bf16: torch.Tensor | None = None,
+    mxfp8_pv_softmax: str = "exact",
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -887,6 +894,7 @@ def _flash_attn_fwd(
             is also nonlocal and unmodified.
         v_bf16: Original BF16 V for causal native PV's masked KV blocks. Must not
             be reconstructed from the along-key quantized V, which leaks future scales.
+        mxfp8_pv_softmax: Native MXFP8 PV softmax recipe, "exact" or "fast"; see flash_attn_func.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
@@ -928,7 +936,7 @@ def _flash_attn_fwd(
         num_splits=num_splits, softcap=softcap, gather_kv_indices=gather_kv_indices,
         layout_inputs=(cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table, block_sparse_tensors),
         pv_unsupported=(learnable_sink, score_mod, mask_mod, aux_tensors, aux_scalars),
-        v_bf16=v_bf16,
+        v_bf16=v_bf16, mxfp8_pv_softmax=mxfp8_pv_softmax,
     )
     descales = scales if isinstance(scales, TensorwiseScales) else None
     block_scales = scales if isinstance(scales, BlockScales) else None
@@ -1655,7 +1663,7 @@ def _flash_attn_fwd(
 
     if qk_blockscaled:
         compile_key += ("mxfp8_qk", v.dtype, pv_blockscaled,
-                        get_broadcast_dims(v_bf16) if v_bf16 is not None else None)
+                        get_broadcast_dims(v_bf16) if v_bf16 is not None else None, mxfp8_pv_softmax)
 
     if compile_key not in _flash_attn_fwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1876,6 +1884,7 @@ def _flash_attn_fwd(
                     use_s_ping_pong=use_s_ping_pong,
                     qk_blockscaled=qk_blockscaled,
                     pv_blockscaled=pv_blockscaled,
+                    pv_softmax=mxfp8_pv_softmax,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -3943,6 +3952,7 @@ class FlashAttnFunc(torch.autograd.Function):
         gather_bwd_token_chunk: Optional[int] = None,
         scales: TensorwiseScales | BlockScales | None = None,
         v_bf16: torch.Tensor | None = None,
+        mxfp8_pv_softmax: str = "exact",
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3975,6 +3985,7 @@ class FlashAttnFunc(torch.autograd.Function):
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             scales=scales,
             v_bf16=v_bf16,
+            mxfp8_pv_softmax=mxfp8_pv_softmax,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -4022,9 +4033,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 17)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 17)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4053,7 +4064,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 17)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -4311,6 +4322,7 @@ def flash_attn_func(
     gather_bwd_token_chunk: Optional[int] = None,
     scales: TensorwiseScales | BlockScales | None = None,
     v_bf16: torch.Tensor | None = None,
+    mxfp8_pv_softmax: str = "exact",
 ):
     """Compute attention.
 
@@ -4326,6 +4338,16 @@ def flash_attn_func(
           supported.
         BlockScales return BF16 output and optional FP32 LSE, and support only dense, unsplit
         attention.
+
+    mxfp8_pv_softmax selects the native PV softmax recipe:
+      - "exact" (default): O is normalized by the sum of the E4M3 P that the PV MMA consumes,
+        with P biased by 2^8 and no lag in the running row max, so the output matches a
+        quantized-P reference to BF16 rounding.
+      - "fast": rows are normalized by the FP32 sum of the unquantized probabilities, P is
+        biased by 2^4, and the running row max may lag by up to 4 (log2 units) before O is
+        rescaled. On peaked rows the normalization can differ from the quantized P that PV
+        consumed by a few percent.
+    LSE always uses the FP32 sum. Causal attention uses BF16 diagonal blocks in both modes.
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -4373,6 +4395,7 @@ def flash_attn_func(
         gather_bwd_token_chunk,
         scales,
         v_bf16,
+        mxfp8_pv_softmax,
     )
 
 

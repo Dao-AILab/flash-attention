@@ -38,8 +38,14 @@ def inputs(batch, sq, sk, hq, hk, dim, dim_v=None):
     )
 
 
-def reference(q, k, v):
-    """Independent reverse-block online attention with e4m3 P and FP32 statistics."""
+def reference(q, k, v, pv_softmax="exact"):
+    """Independent reverse-block online attention with e4m3 P and FP32 statistics.
+
+    "exact" sums the E4M3 P with a 2^8 bias. "fast" sums the FP32 P with a 2^4 bias and keeps
+    the row max until a block raises it by more than 4 (log2 units).
+    """
+    fast = pv_softmax == "fast"
+    offset, threshold = (4, 4.0) if fast else (8, 0.0)
     rep = q.shape[2] // k.shape[2]
     k, v = [x.repeat_interleave(rep, dim=2).transpose(1, 2).double() for x in (k, v)]
     q = q.transpose(1, 2).double()
@@ -56,15 +62,16 @@ def reference(q, k, v):
     for start in reversed(range(0, k.shape[-2], 128)):
         s = scores[..., start : start + 128]
         new_max = torch.maximum(maximum, s.amax(-1))
+        new_max = torch.where((maximum - new_max) * scale_log2 >= -threshold, maximum, new_max)
         alpha = torch.exp2((maximum - new_max) * scale_log2)
-        bias = 8 - new_max * scale_log2
+        bias = offset - new_max * scale_log2
         # Round the affine transform once, matching the packed FFMA.
-        p = torch.exp2(
+        p32 = torch.exp2(
             (s.double() * scale_log2.double() + bias.double()[..., None]).float()
         )
-        p = p.to(torch.float8_e4m3fn).float()
+        p = p32.to(torch.float8_e4m3fn).float()
         out = out * alpha[..., None] + p @ v[..., start : start + 128, :].float()
-        rowsum = rowsum * alpha + p.sum(-1)
+        rowsum = rowsum * alpha + (p32 if fast else p).sum(-1)
         maximum = new_max
     expected = (out / rowsum[..., None]).transpose(1, 2)
     return expected, ref64, torch.logsumexp(logits, -1)
@@ -80,12 +87,15 @@ def reference(q, k, v):
         (128, 64, 257, 385, 4, 1),
     ],
 )
-def test_mxfp8_pv(dim, dim_v, sq, sk, hq, hk):
+@pytest.mark.parametrize("pv_softmax", ["exact", "fast"])
+def test_mxfp8_pv(dim, dim_v, sq, sk, hq, hk, pv_softmax):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family GPU")
     (q, k, v, sfq, sfk, sfv), deq = inputs(2, sq, sk, hq, hk, dim, dim_v)
-    expected, fp64, lse_ref = reference(*deq)
-    actual, lse = flash_attn_func(q, k, v, scales=BlockScales(sfq, sfk, sfv), return_lse=True)
+    expected, fp64, lse_ref = reference(*deq, pv_softmax=pv_softmax)
+    actual, lse = flash_attn_func(
+        q, k, v, scales=BlockScales(sfq, sfk, sfv), return_lse=True, mxfp8_pv_softmax=pv_softmax
+    )
     assert torch.isfinite(actual).all()
     assert (actual.float() - expected).norm() / expected.norm() <= 2e-3
     assert (actual.double() - fp64).norm() <= (
@@ -93,9 +103,14 @@ def test_mxfp8_pv(dim, dim_v, sq, sk, hq, hk):
     ).norm() + 2e-3 * fp64.norm()
     torch.testing.assert_close(lse, lse_ref.float(), atol=2e-4, rtol=2e-5)
     ones, sfones, _ = quantize_v_to_fp8_with_sf(torch.ones_like(deq[2]))
-    normalized, _ = flash_attn_func(q, k, ones, scales=BlockScales(sfq, sfk, sfones))
+    normalized, _ = flash_attn_func(
+        q, k, ones, scales=BlockScales(sfq, sfk, sfones), mxfp8_pv_softmax=pv_softmax
+    )
+    # "exact" divides by the sum of the P that PV consumed. "fast" divides by the FP32 sum, so
+    # each row is off by at most the E4M3 rounding of P (2^-4 relative).
+    atol = 1e-5 if pv_softmax == "exact" else 2**-4
     torch.testing.assert_close(
-        normalized.float(), torch.ones_like(normalized.float()), atol=1e-5, rtol=0
+        normalized.float(), torch.ones_like(normalized.float()), atol=atol, rtol=0
     )
 
 
@@ -140,7 +155,8 @@ def causal_reference(q, k, v, causal_offset):
         (128, 1000, 2049, 4, 1),  # 17 KV blocks, unaligned offset
     ],
 )
-def test_mxfp8_pv_causal_no_future_leakage(dim, sq, sk, hq, hk):
+@pytest.mark.parametrize("pv_softmax", ["exact", "fast"])
+def test_mxfp8_pv_causal_no_future_leakage(dim, sq, sk, hq, hk, pv_softmax):
     """Scaling V at future positions must leave every earlier row bitwise unchanged."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family GPU")
@@ -156,7 +172,7 @@ def test_mxfp8_pv_causal_no_future_leakage(dim, sq, sk, hq, hk):
         v8, sfv, _ = quantize_v_to_fp8_with_sf(v_bf16)
         return flash_attn_func(
             q8, k8, v8, scales=BlockScales(sfq, sfk, sfv), v_bf16=v_bf16, causal=True,
-            return_lse=True,
+            return_lse=True, mxfp8_pv_softmax=pv_softmax,
         )
 
     out, lse = run(v)

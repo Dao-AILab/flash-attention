@@ -131,3 +131,21 @@ def test_qk_only_still_requires_bf16_v(pv_inputs):
     q, k, v, scales = pv_inputs
     with pytest.raises(ValueError, match="QK MXFP8 requires e4m3 Q/K and bf16 V"):
         interface.flash_attn_func(q, k, v, scales=scales._replace(v=None))
+
+
+@pytest.mark.parametrize("value", ["lazy", "Fast", None])
+def test_pv_softmax_rejects_unknown_value(pv_inputs, value):
+    q, k, v, scales = pv_inputs
+    with pytest.raises(ValueError, match='"exact" or "fast"'):
+        interface.flash_attn_func(q, k, v, scales=scales, mxfp8_pv_softmax=value)
+
+
+@pytest.mark.parametrize("qk_scales", [False, True])
+def test_fast_pv_softmax_requires_native_pv(pv_inputs, qk_scales):
+    q, k, v, scales = pv_inputs
+    scales = scales._replace(v=None)
+    if not qk_scales:
+        scales = None
+        q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
+    with pytest.raises(ValueError, match="requires native MXFP8 PV"):
+        interface.flash_attn_func(q, k, v.to(torch.bfloat16), scales=scales, mxfp8_pv_softmax="fast")
