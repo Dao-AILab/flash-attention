@@ -345,6 +345,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             element_size=self.dtype.width // 8,
             is_persistent=False,
             lpt=self.is_causal or self.is_local,
+            # Sections sized for the full 50 MB L2 thrash it on H100 (up to 30% slower causal
+            # attention at some seqlens); 16 MB measured best across head dims and seqlens.
+            l2_size_bytes=16 * 1024 * 1024,
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
         )
