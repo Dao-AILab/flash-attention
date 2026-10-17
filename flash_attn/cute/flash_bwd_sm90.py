@@ -472,15 +472,25 @@ class FlashAttentionBackwardSm90:
             cute.select(self.sQ_layout, mode=[0, 1]),
             (self.tile_m, self.tile_hdim),
         )
+        # Packed varlen: bound the K and V TMA loads by the logical seqlen_k so rows in
+        # [seqlen_k, tile_n) arrive zero-filled instead of as whatever the buffer holds. The
+        # masked P / dS are exactly zero there, but 0 * NaN = NaN in dP = dO @ V.T and dQ = dS @ K.
+        # Loads must use the 2-extra-dim wraparound form (ptr_shift is store-only: it moves the
+        # descriptor base outside mapped memory), which needs rank <= 3, i.e. the (t, d, h) layout.
+        self.ragged_kv_tma = mCuSeqlensK is not None
+        mK_tma, mV_tma = mK, mV
+        if const_expr(self.ragged_kv_tma):
+            mK_tma = copy_utils.create_ragged_tensor_for_tma(mK, ragged_dim=0, ptr_shift=False)
+            mV_tma = copy_utils.create_ragged_tensor_for_tma(mV, ragged_dim=0, ptr_shift=False)
         tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
-            mK,
+            mK_tma,
             cute.select(self.sK_layout, mode=[0, 1]),
             (self.tile_n, self.tile_hdim),
         )
         tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
-            mV,
+            mV_tma,
             cute.select(self.sV_layout, mode=[0, 1]),
             (self.tile_n, self.tile_hdimv),
         )
@@ -743,7 +753,9 @@ class FlashAttentionBackwardSm90:
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0],
-            seqlen_k_static=mK.shape[0],
+            # With ragged K/V TMA tensors mode 0 is a sentinel extent, but cu_seqlens_k is then
+            # always present and the static length is unused.
+            seqlen_k_static=mK.shape[0] if const_expr(not self.ragged_kv_tma) else Int32(0),
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
@@ -898,8 +910,12 @@ class FlashAttentionBackwardSm90:
                     if const_expr(self.qhead_per_kvhead == 1)
                     else head_idx // qhead_per_kvhead_divmod
                 )
-                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-                mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+                mK_cur, mV_cur = [
+                    seqlen.offset_batch_K(
+                        t, batch_idx, dim=3, ragged=self.ragged_kv_tma, ptr_shift=False
+                    )[None, None, head_idx_kv]
+                    for t in (mK, mV)
+                ]
                 gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (n_block, 0))
 
