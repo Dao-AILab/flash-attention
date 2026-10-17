@@ -40,13 +40,33 @@ def gemm_blockscaled(
     tCtSFA: cute.Tensor,
     tCtSFB: cute.Tensor,
     zero_init: bool | Boolean = True,
+    mbar_ptr: Optional[cute.Pointer] = None,
+    mbar_phase: Optional[Int32] = None,
+    split_k: cutlass.Constexpr[int] = 0,
 ) -> None:
-    """QK MMA with per-32 UE8M0 scales; fragment K follows the target instruction."""
-    for k in cutlass.range(cute.size(tCrA.shape[2]), unroll_full=True):
-        tiled_mma.set(tcgen05.Field.SFA, tCtSFA[None, None, k].iterator)
-        tiled_mma.set(tcgen05.Field.SFB, tCtSFB[None, None, k].iterator)
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
-        cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
+    """Block-scaled MMA with per-32 UE8M0 scales and the target instruction's K.
+
+    With mbar_ptr, wait on it (parity mbar_phase) before the K block split_k, so the first
+    blocks overlap the producer's last writes of A (split P arrival).
+    """
+    if const_expr(mbar_ptr is None):
+        for k in cutlass.range(cute.size(tCrA.shape[2]), unroll_full=True):
+            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[None, None, k].iterator)
+            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[None, None, k].iterator)
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
+            cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
+    else:
+        for k in cutlass.range(split_k, unroll_full=True):
+            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[None, None, k].iterator)
+            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[None, None, k].iterator)
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
+            cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
+        cute.arch.mbarrier_wait(mbar_ptr, mbar_phase)
+        for k in cutlass.range(split_k, cute.size(tCrA.shape[2]), unroll_full=True):
+            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[None, None, k].iterator)
+            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[None, None, k].iterator)
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+            cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
 @cute.jit
