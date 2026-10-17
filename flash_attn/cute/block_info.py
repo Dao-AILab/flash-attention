@@ -48,6 +48,10 @@ class BlockInfo:
             n_idx = m_idx_min + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_left = n_idx - self.window_size_left
             n_block_min = cutlass.max(n_idx_left // self.tile_n, 0)
+        if const_expr(seqlen_info.kv_start is not None):
+            # kv_start is non-decreasing, so the tile's first row has the leftmost edge.
+            row = self._q_row_min(seqlen_info, m_block)
+            n_block_min = cutlass.max(n_block_min, seqlen_info.kv_start[row] // self.tile_n)
         if cutlass.const_expr(self.is_split_kv):
             if const_expr(self.pack_split_idx):
                 # Unpack num_splits from top 16 bits of split_idx (packed by scheduler)
@@ -66,6 +70,22 @@ class BlockInfo:
             n_block_min = n_block_min + split_idx * num_n_blocks_per_split
             n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
         return n_block_min, n_block_max
+
+    @cute.jit
+    def _q_row_min(self, seqlen_info: SeqlenInfoQK, m_block: Int32) -> Int32:
+        """First query row of an m_block, clamped to the sequence."""
+        m_idx_min = m_block * self.tile_m
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa
+        return cutlass.min(m_idx_min, seqlen_info.seqlen_q - 1)
+
+    @cute.jit
+    def _q_row_max(self, seqlen_info: SeqlenInfoQK, m_block: Int32) -> Int32:
+        """Last query row of an m_block, clamped to the sequence."""
+        m_idx_max = (m_block + 1) * self.tile_m
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
+        return cutlass.min(m_idx_max, seqlen_info.seqlen_q) - 1
 
     def has_kv_work(self, n_block_min: Int32, n_block_max: Int32):
         """Whether a (tile, split) owns KV blocks.
@@ -93,6 +113,12 @@ class BlockInfo:
             m_idx = n_idx_max + seqlen_info.seqlen_q - seqlen_info.seqlen_k
             m_idx_left = m_idx + self.window_size_left
             m_block_max = min(m_block_max, cute.ceil_div(m_idx_left, self.tile_m))
+        if const_expr(seqlen_info.q_end is not None):
+            # q_end is non-decreasing, so the tile's last key reaches the furthest query.
+            col = cutlass.min((n_block + 1) * self.tile_n, seqlen_info.seqlen_k) - 1
+            m_block_max = cutlass.min(
+                m_block_max, cute.ceil_div(seqlen_info.q_end[col], self.tile_m)
+            )
         return m_block_min, m_block_max
 
     @cute.jit
@@ -153,15 +179,20 @@ class BlockInfo:
         n_block_min: Int32,
     ) -> Int32:
         """If we have separate iterations with local masking at the end, where do we stop the non-masked iterations"""
-        if const_expr(not self.is_local or self.window_size_left is None):
-            return n_block_min
-        else:
+        if const_expr(self.is_local and self.window_size_left is not None):
             m_idx_max = (m_block + 1) * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa > 1):
                 m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_left = n_idx - self.window_size_left
-            return cutlass.max(n_block_min, cute.ceil_div(n_idx_left, self.tile_n))
+            n_block_min = cutlass.max(n_block_min, cute.ceil_div(n_idx_left, self.tile_n))
+        if const_expr(seqlen_info.kv_start is not None):
+            # Key blocks at or right of the tile's last row's left edge need no left masking.
+            row = self._q_row_max(seqlen_info, m_block)
+            n_block_min = cutlass.max(
+                n_block_min, cute.ceil_div(seqlen_info.kv_start[row], self.tile_n)
+            )
+        return n_block_min
 
     @cute.jit
     def get_n_block_max_for_m_block(

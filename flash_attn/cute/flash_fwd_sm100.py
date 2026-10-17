@@ -474,6 +474,9 @@ class FlashAttentionForwardSm100:
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         mBlocksToBatchIdx: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
+        # (b, s_q) int32 first key each query may attend, non-decreasing; with is_local and
+        # window_size_right=0 this is causal attention with a per-row left edge (document masking).
+        mKvStart: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -834,6 +837,10 @@ class FlashAttentionForwardSm100:
             raise NotImplementedError("Block sparsity + S ping-pong not supported on SM100")
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
             raise NotImplementedError("Block sparsity + paged KV not supported on SM100")
+        if cutlass.const_expr(mKvStart is not None):
+            assert self.is_local, "mKvStart needs is_local (window_size_right sets the right edge)"
+            assert not self.use_block_sparsity, "mKvStart replaces block sparsity"
+            assert mCuSeqlensQ is None and mCuSeqlensK is None, "mKvStart supports batched inputs only"
         if cutlass.const_expr(self.use_block_sparsity and self.is_varlen_q):
             assert const_expr(blocksparse_tensors.cu_total_m_blocks is not None), (
                 "blocksparse_tensors.cu_total_m_blocks must be provided for varlen blocksparsity"
@@ -879,6 +886,7 @@ class FlashAttentionForwardSm100:
             aux_data,
             fastdiv_mods,
             head_divmod,
+            mKvStart,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -942,6 +950,7 @@ class FlashAttentionForwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
+        mKvStart: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1218,6 +1227,7 @@ class FlashAttentionForwardSm100:
                 if blocksparse_tensors is not None
                 else None
             ),
+            mKvStart=mKvStart,
         )
         AttentionMaskCls = self._generate_attention_mask_cls(
             window_size_left, window_size_right
@@ -2499,7 +2509,10 @@ class FlashAttentionForwardSm100:
                                 s_p_o_consumer_count, sm_stats_producer_phase, s0_s1_sequence_phase, n_block,
                             )
                     # Separate iterations with local masking on the left
-                    if const_expr(self.is_local and block_info.window_size_left is not None):
+                    if const_expr(
+                        self.is_local
+                        and (block_info.window_size_left is not None or seqlen.kv_start is not None)
+                    ):
                         n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
                         for n_tile in cutlass.range(0, n_block_max - n_block_min, unroll=1):
                             n_block = n_block_max - 1 - n_tile
