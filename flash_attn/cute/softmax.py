@@ -189,6 +189,7 @@ class Softmax(ParamsBase):
         acc_S: cute.Tensor,
         is_first: cutlass.Constexpr[bool] = False,
         check_inf: cutlass.Constexpr[bool] = True,
+        max_first: cutlass.Constexpr[bool] = False,
     ) -> cute.Tensor:
         """Apply online softmax and return the row_scale to rescale O.
 
@@ -206,17 +207,30 @@ class Softmax(ParamsBase):
         scale_log2 = self.scale_log2
         arch = self.arch
 
+        row_max_new = None
+        if cutlass.const_expr(max_first):
+            # Reduce the max of every row before any exp2 (as C++ FA3 does)
+            row_max_new = cute.make_fragment_like(self.row_max, Float32)
+            for r in cutlass.range(cute.size(row_max), unroll_full=True):
+                m = utils.fmax_reduce(
+                    acc_S_mn[r, None].load(),
+                    init_val=row_max[r] if cutlass.const_expr(not is_first) else None,
+                    arch=arch,
+                )
+                row_max_new[r] = cute.arch.warp_reduction_max(m, threads_in_group=4)
         # Each iteration processes one row of acc_S
         for r in cutlass.range(cute.size(row_max), unroll_full=True):
             acc_S_row = acc_S_mn[r, None].load()  # (n_block_size)
 
-            row_max_cur = utils.fmax_reduce(
-                acc_S_row,
-                init_val=row_max[r] if cutlass.const_expr(not is_first) else None,
-                arch=arch,
-            )
-
-            row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
+            if cutlass.const_expr(max_first):
+                row_max_cur = row_max_new[r]
+            else:
+                row_max_cur = utils.fmax_reduce(
+                    acc_S_row,
+                    init_val=row_max[r] if cutlass.const_expr(not is_first) else None,
+                    arch=arch,
+                )
+                row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
             # Update row_max before changing row_max_cur to safe value for -inf
             row_max_prev = row_max[r]
             row_max[r] = row_max_cur
