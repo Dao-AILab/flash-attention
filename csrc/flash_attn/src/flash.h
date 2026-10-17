@@ -64,6 +64,8 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The dimensions.
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q;
+    // The keys' packed rows, read by a varlen backward to size its grid (varlen_num_blocks).
+    int total_k = 0;
 
     // The scaling factors for the kernel.
     float scale_softmax;
