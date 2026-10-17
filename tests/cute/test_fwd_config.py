@@ -158,6 +158,8 @@ def test_invalid_geometry_and_features_are_rejected():
         select_fwd_config(make_inputs(head_dim=72, head_dim_v=72, page_size=64))
     with pytest.raises(AssertionError, match="SM120 forward only supports num_splits=1"):
         select_fwd_config(make_inputs(device_arch=120, requested_num_splits=3))
+    # Automatic SplitKV resolves to one split on SM120.
+    assert select_fwd_config(make_inputs(device_arch=120, requested_num_splits=None)).num_splits == 1
 
 
 def test_sm90_flags_follow_tile_overrides_and_stay_sm90_only():

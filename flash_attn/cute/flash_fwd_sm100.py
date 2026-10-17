@@ -166,6 +166,8 @@ class FlashAttentionForwardSm100:
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
         use_s_ping_pong: cutlass.Constexpr[bool] = False,
+        *,
+        use_tma_o: bool,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -218,12 +220,9 @@ class FlashAttentionForwardSm100:
         # Half-width fp32 sO preserves two KV stages; unchanged column bounds require exact hd256.
         self.chunked_split_epi = self.is_split_kv and head_dim_v == 256
         self.epi_head_dim_v = 128 if self.chunked_split_epi else self.head_dim_v_padded
-        self.use_tma_O = (
-            not self.chunked_split_epi
-            and not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
-            and not (self.pack_gqa and self.is_split_kv)
-            and not is_varlen_q
-        )
+        # FwdConfig.use_tma_o; config.can_use_tma_o states when TMA O is supported.
+        assert not (use_tma_o and self.chunked_split_epi), "hd256 SplitKV uses a chunked epilogue"
+        self.use_tma_O = use_tma_o
         self.use_correction_warps_for_epi = not self.use_tma_O
         self.q_subtile_factor = q_subtile_factor
         self.kv_subtile_factor = kv_subtile_factor
