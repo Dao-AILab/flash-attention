@@ -832,8 +832,12 @@ class FlashAttentionBackwardSm100:
         self.ragged_kv_tma = mCuSeqlensK is not None
         mK_tma, mV_tma = mK, mV
         if const_expr(self.ragged_kv_tma):
-            mK_tma = quack_copy_utils.create_ragged_tensor_for_tma(mK, ragged_dim=0, ptr_shift=False)
-            mV_tma = quack_copy_utils.create_ragged_tensor_for_tma(mV, ragged_dim=0, ptr_shift=False)
+            mK_tma = quack_copy_utils.create_ragged_tensor_for_tma(
+                mK, ragged_dim=0, ptr_shift=False
+            )
+            mV_tma = quack_copy_utils.create_ragged_tensor_for_tma(
+                mV, ragged_dim=0, ptr_shift=False
+            )
         # S.T = K @ Q.T
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
