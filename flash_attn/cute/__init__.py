@@ -8,11 +8,13 @@ except PackageNotFoundError:
     __version__ = "0.0.0"
 
 from .interface import (
+    TensorwiseScales,
     flash_attn_func,
     flash_attn_varlen_func,
 )
 
 __all__ = [
+    "TensorwiseScales",
     "flash_attn_func",
     "flash_attn_varlen_func",
 ]
