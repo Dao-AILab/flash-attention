@@ -455,6 +455,10 @@ def test_mxfp8_pv_register_splits():
         select_fwd_config(pv._replace(device_arch=107, mxfp8_path=None, pack_gqa=False,
                                       disable_2cta=True)).registers
     )
+    # Causal native PV runs a single-tile scheduler, so sm_103 keeps the sm_100 split, and
+    # sm_107 hd64 keeps the FP8 one.
+    assert registers(device_arch=103, causal=True) == (184, 80, 64)
+    assert registers(device_arch=107, head_dim=64, head_dim_v=64, causal=True) == (168, 96, 80)
 
 
 def test_mxfp8_pv_keeps_hardware_exp2():
