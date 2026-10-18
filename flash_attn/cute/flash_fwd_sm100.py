@@ -171,7 +171,46 @@ _SM_STATS_CROSS_STAGE = {
     ("fp8", 96, False, False): ("sm_100",),
     ("fp8", 96, True, False): ("sm_100",),
 }
+# NOTE [causal CLC]
+# Dense causal forward runs the CLC persistent scheduler where it measured faster than the
+# non-persistent LPT grid. Persistence removes the per-tile launch, prologue and epilogue cost.
+# SingleTileLPTScheduler.clc_work_to_coords maps each claimed CTA through the non-persistent
+# L2-swizzled LPT order, so L2 locality is kept, and the late claim (clc_late_claim) avoids
+# reserving the next tile a whole tile early. FA_CLC=1 / FA_CLC=0 override the default.
+class ClcTuning(NamedTuple):
+    """A config that runs CLC by default."""
+
+    # Softmax, correction and other registers whenever this config runs CLC (also under FA_CLC=1);
+    # None keeps the non-persistent split.
+    regs: tuple[int, int, int] | None = None
+
+
+# Keyed by (path, head_dim_padded, is_causal, is_varlen_q), then arch family.
+_CLC_DEFAULT = {
+    ("bf16", 64, True, False): {"sm_100": ClcTuning()},
+    ("bf16", 96, True, False): {"sm_100": ClcTuning(), "sm_103": ClcTuning(), "sm_107": ClcTuning()},
+    ("bf16", 128, True, False): {"sm_100": ClcTuning(), "sm_103": ClcTuning(), "sm_107": ClcTuning()},
+    ("bf16", 192, True, False): {"sm_103": ClcTuning()},
+    ("fp16", 64, True, False): {"sm_103": ClcTuning(regs=(184, 64, 80))},
+    ("fp16", 96, True, False): {"sm_103": ClcTuning(), "sm_107": ClcTuning()},
+    ("fp16", 128, True, False): {"sm_100": ClcTuning(), "sm_103": ClcTuning(), "sm_107": ClcTuning()},
+    ("fp16", 192, True, False): {"sm_100": ClcTuning(regs=(192, 64, 64)), "sm_103": ClcTuning()},
+    ("fp8", 64, True, False): {"sm_100": ClcTuning(), "sm_103": ClcTuning(), "sm_107": ClcTuning()},
+    ("fp8", 128, True, False): {"sm_100": ClcTuning(), "sm_103": ClcTuning(), "sm_107": ClcTuning()},
+}
 # === END TUNING KNOBS ===
+
+
+def arch_family(arch: int) -> str:
+    """Tuning-table arch family of a compute capability such as 100, 103 or 107."""
+    major, minor = divmod(arch, 10)
+    return "sm_107" if major == 10 and minor >= 7 else "sm_103" if major == 10 and minor >= 3 else "sm_100"
+
+
+def default_use_clc(arch: int, path: str, head_dim: int, is_causal: bool, is_varlen_q: bool) -> bool:
+    """See NOTE [causal CLC]."""
+    head_dim_padded = int(math.ceil(head_dim / 16) * 16)
+    return arch_family(arch) in _CLC_DEFAULT.get((path, head_dim_padded, is_causal, is_varlen_q), {})
 
 
 class DescaleTensors(NamedTuple):
@@ -406,6 +445,17 @@ class FlashAttentionForwardSm100:
                 "dynamic persistent scheduling requires an empty warp to serve as the scheduler warp"
             )
         self.scheduler_warp_id = self.empty_warp_ids[0] if self.dynamic_persistent else None
+        # Late CLC claim: with 1-CTA clusters on the LPT scheduler, the load warp issues the CLC
+        # try_cancel for the next tile once it has issued the current tile's loads, instead of the
+        # scheduler warp at the start of the tile. A CTA that claims at tile start holds its next
+        # tile for a whole tile, which unbalances the long causal tiles at the end of the launch.
+        self.clc_late_claim = (
+            self.use_clc_scheduler
+            and self.cta_group_size == 1
+            and self.TileScheduler is SingleTileLPTScheduler
+            and not self.is_split_kv
+            and len(self.load_warp_ids) == 1
+        )
 
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [
@@ -609,9 +659,9 @@ class FlashAttentionForwardSm100:
             sm_stats_path = "fp16"
         else:
             sm_stats_path = "bf16"
-        cross_stage_key = (sm_stats_path, self.head_dim_padded, self.is_causal, self.is_varlen_q)
+        tuning_key = (sm_stats_path, self.head_dim_padded, self.is_causal, self.is_varlen_q)
         self.sm_stats_cross_stage_release = (
-            not self.use_s_ping_pong and arch_key in _SM_STATS_CROSS_STAGE.get(cross_stage_key, ())
+            not self.use_s_ping_pong and arch_key in _SM_STATS_CROSS_STAGE.get(tuning_key, ())
         )
         self._setup_attributes()
         self.ex2_emu_freq = 0
@@ -622,6 +672,9 @@ class FlashAttentionForwardSm100:
                 self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
             ):
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
+        clc_tuning = _CLC_DEFAULT.get(tuning_key, {}).get(arch_key, ClcTuning())
+        if const_expr(self.use_clc_scheduler and clc_tuning.regs is not None):
+            self.num_regs_softmax, self.num_regs_correction, self.num_regs_other = clc_tuning.regs
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         q_major_mode = cute.nvgpu.OperandMajorMode.K
@@ -1360,8 +1413,8 @@ class FlashAttentionForwardSm100:
         if const_expr(self.dynamic_persistent):
             if warp_idx == self.scheduler_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
-                # CLC: only leader CTA produces.
-                if is_leader_cta:
+                # CLC: only leader CTA produces. With the late claim the load warp produces.
+                if is_leader_cta and not self.clc_late_claim:
                     self.scheduler_warp(tile_scheduler)
                 else:
                     self.empty_warp(tile_scheduler)
@@ -1797,7 +1850,8 @@ class FlashAttentionForwardSm100:
                     self.kv_subtile_factor,
                 )
 
-
+            if const_expr(self.clc_late_claim):
+                tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.advance_to_next_work()
             if const_expr(pipeline_load_epi is not None):
                 pipeline_load_epi.consumer_wait(load_epi_consumer_state)
@@ -1805,6 +1859,8 @@ class FlashAttentionForwardSm100:
                     pipeline_load_epi.consumer_release(load_epi_consumer_state)
                 load_epi_consumer_state.advance()
 
+        if const_expr(self.clc_late_claim):
+            tile_scheduler.producer_tail()
         if issue_kv_for_this_warp:
             pipeline_kv.producer_tail(kv_producer_state)
         # This is equivalent to pipeline_q.producer_tail for the TMA-Q producer warp.
