@@ -104,7 +104,7 @@ def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
 
 def _get_bwd_pack_gqa_override() -> Optional[bool]:
     """FLASH_ATTENTION_BWD_PACK_GQA=0/1 forces the SM100 backward GQA head packing off / on
-    (NOTE [bwd pack_gqa] in flash_bwd_sm100.py); unset or "auto" leaves it to the heuristic."""
+    (NOTE [bwd pack_gqa] in pack_gqa.py); unset or "auto" leaves it to the heuristic."""
     value = os.getenv("FLASH_ATTENTION_BWD_PACK_GQA")
     if value is None or value == "" or value == "auto":
         return None

@@ -26,7 +26,7 @@ from cutlass.cutlass_dsl import Arch, BaseDSL
 from quack import copy_utils, layout_utils
 
 from flash_attn.cute import utils
-from flash_attn.cute.seqlen_info import SeqlenInfo
+from flash_attn.cute.seqlen_info import SeqlenInfo, sequence_row_offset
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
     SingleTileScheduler,
@@ -34,6 +34,13 @@ from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
 )
 from flash_attn.cute.pack_gqa import pack_gqa_layout
+
+
+def offset_rows(mT: cute.Tensor, row_offset) -> cute.Tensor:
+    """``mT`` (rows, ...) moved by ``row_offset`` rows; a packed ``((qh, t), ...)`` row mode
+    (PackGQA.PER_QHEAD_OUTPUTS) is moved along its token mode."""
+    off = row_offset if const_expr(cute.rank(mT.shape[0]) == 1) else (0, row_offset)
+    return cute.domain_offset((off,) + (None,) * (cute.rank(mT) - 1), mT)
 
 
 class PackGQA(enum.Enum):
@@ -44,8 +51,8 @@ class PackGQA(enum.Enum):
     OFF = "off"
     # per query head, written through the same packed views (MLA backward)
     PER_QHEAD_OUTPUTS = "per_qhead_outputs"
-    # allocated per KV head in packed row order, qhead_per_kvhead rows per position (the SM100
-    # backward's pack_gqa, NOTE [bwd pack_gqa] in flash_bwd_sm100.py)
+    # allocated per KV head in packed row order, qhead_per_kvhead rows per token (the SM100
+    # backward's pack_gqa, NOTE [bwd pack_gqa] in pack_gqa.py)
     PACKED_ROW_OUTPUTS = "packed_row_outputs"
 
 
@@ -85,8 +92,7 @@ class FlashAttentionBackwardPreprocess:
         self.num_threads = num_threads
         self.use_padded_offsets = use_padded_offsets
         self.nheads_major = nheads_major
-        self.pack_gqa = pack_gqa != PackGQA.OFF
-        self.packed_row_outputs = pack_gqa == PackGQA.PACKED_ROW_OUTPUTS
+        self.pack_gqa = pack_gqa
         self.qhead_per_kvhead = qhead_per_kvhead
         self.nheads_kv = nheads_kv
 
@@ -180,7 +186,7 @@ class FlashAttentionBackwardPreprocess:
         if const_expr(mdQaccum is not None):
             assert self.nheads_major is False
             # pack_gqa: only with dQaccum allocated per KV head in packed row order
-            assert not self.pack_gqa or self.packed_row_outputs
+            assert self.pack_gqa in (PackGQA.OFF, PackGQA.PACKED_ROW_OUTPUTS)
             assert self.use_padded_offsets is True
             if const_expr(mdQaccum.element_type not in [Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
@@ -195,7 +201,7 @@ class FlashAttentionBackwardPreprocess:
                 raise TypeError("dLSE tensor must be Float32")
         if const_expr(mScaleP is not None):
             assert self.nheads_major is True
-            assert self.pack_gqa is True
+            assert self.pack_gqa != PackGQA.OFF
             assert mRowMax is not None
             if const_expr(mScaleP.element_type not in [Float32]):
                 raise TypeError("ScaleP tensor must be Float32")
@@ -236,7 +242,7 @@ class FlashAttentionBackwardPreprocess:
             mScaleP = layout_utils.select(mScaleP, rowmax_layout_transpose)
 
         # pack gqa
-        if const_expr(self.pack_gqa):
+        if const_expr(self.pack_gqa != PackGQA.OFF):
             mO, mdO, mRowMax, mScaleP, mOlo = [
                 pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
                 if mX is not None
@@ -250,7 +256,7 @@ class FlashAttentionBackwardPreprocess:
                 for mX in (mLSE, mdLSE)
             ]
             # (dQaccum, dPsum, LSElog2 are packed below unless already in packed row order)
-            if const_expr(not self.packed_row_outputs):
+            if const_expr(self.pack_gqa == PackGQA.PER_QHEAD_OUTPUTS):
                 mPdPsum, mLSElog2, mdQaccum = [
                     pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
                     if mX is not None
@@ -282,7 +288,9 @@ class FlashAttentionBackwardPreprocess:
             tile_shape_mn=(self.tile_m, 1),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead_packgqa=(
+                self.qhead_per_kvhead if const_expr(self.pack_gqa != PackGQA.OFF) else 1
+            ),
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
         )
 
@@ -357,22 +365,27 @@ class FlashAttentionBackwardPreprocess:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
-            seqlen_static = mO.shape[0] if const_expr(not self.pack_gqa) else mO.shape[0][1]
+            seqlen_static = (
+                mO.shape[0] if const_expr(self.pack_gqa == PackGQA.OFF) else mO.shape[0][1]
+            )
             seqlen = SeqlenInfo.create(
                 batch_idx, seqlen_static, mCuSeqlensQ, mSeqUsedQ, tile=self.tile_m
             )
-            if const_expr(self.packed_row_outputs):
-                # outputs are per KV head in packed rows, qhead_per_kvhead per position
-                seqlen_rows = SeqlenInfo.create(
-                    batch_idx,
-                    seqlen_static,
-                    mCuSeqlensQ,
-                    mSeqUsedQ,
-                    tile=self.tile_m,
-                    scale=self.qhead_per_kvhead,
-                )
-            else:
-                seqlen_rows = seqlen
+            # varlen offset of this sequence's dPsum / LSElog2 / dQaccum rows: with
+            # PACKED_ROW_OUTPUTS they are per KV head, qhead_per_kvhead rows per token (with
+            # PER_QHEAD_OUTPUTS they keep the packed (qh, t) row mode, see offset_rows)
+            rows_per_token = (
+                self.qhead_per_kvhead
+                if const_expr(self.pack_gqa == PackGQA.PACKED_ROW_OUTPUTS)
+                else 1
+            )
+            row_offset = sequence_row_offset(
+                seqlen.offset,
+                batch_idx,
+                rows_per_token,
+                self.tile_m,
+                padded=self.use_padded_offsets,
+            )
             # (seqlen, dv)
             mO_cur, mdO_cur = [
                 seqlen.offset_batch(mX, batch_idx, dim=3)[None, None, head_idx] for mX in (mO, mdO)
@@ -380,13 +393,15 @@ class FlashAttentionBackwardPreprocess:
             mOlo_cur = None
             if const_expr(mOlo is not None):
                 mOlo_cur = seqlen.offset_batch(mOlo, batch_idx, dim=3)[None, None, head_idx]
-            mPdPsum_cur = seqlen_rows.offset_batch(
-                mPdPsum, batch_idx, dim=2, padded=self.use_padded_offsets
-            )[None, head_idx]
+            mPdPsum_cur = (
+                mPdPsum[None, head_idx, batch_idx]
+                if const_expr(not seqlen.has_cu_seqlens)
+                else offset_rows(mPdPsum[None, head_idx], row_offset)
+            )
             headdim_v = mO_cur.shape[1]
             seqlen_q = (
                 seqlen.seqlen
-                if const_expr(not self.pack_gqa)
+                if const_expr(self.pack_gqa == PackGQA.OFF)
                 else seqlen.seqlen * self.qhead_per_kvhead
             )
             seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
@@ -503,13 +518,11 @@ class FlashAttentionBackwardPreprocess:
 
             # Clear dQaccum
             if const_expr(mdQaccum is not None):
-                mdQaccum_cur = seqlen_rows.offset_batch(
-                    mdQaccum,
-                    batch_idx,
-                    dim=2,
-                    padded=self.use_padded_offsets,
-                    multiple=self.head_dim_padded,
-                )[None, head_idx]
+                mdQaccum_cur = (
+                    mdQaccum[None, head_idx, batch_idx]
+                    if const_expr(not seqlen.has_cu_seqlens)
+                    else offset_rows(mdQaccum[None, head_idx], row_offset * self.head_dim_padded)
+                )
                 blkdQaccum_shape = (self.tile_m * self.head_dim_padded,)
                 gdQaccum = cute.local_tile(mdQaccum_cur, blkdQaccum_shape, (m_block,))
                 gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
@@ -521,9 +534,11 @@ class FlashAttentionBackwardPreprocess:
             LOG2_E = math.log2(math.e)
             lse_log2 = lse * LOG2_E if lse != -Float32.inf else 0.0
             if const_expr(mLSElog2 is not None):
-                mLSElog2_cur = seqlen_rows.offset_batch(
-                    mLSElog2, batch_idx, dim=2, padded=self.use_padded_offsets
-                )[None, head_idx]
+                mLSElog2_cur = (
+                    mLSElog2[None, head_idx, batch_idx]
+                    if const_expr(not seqlen.has_cu_seqlens)
+                    else offset_rows(mLSElog2[None, head_idx], row_offset)
+                )
                 gLSElog2 = cute.local_tile(mLSElog2_cur, (self.tile_m,), (m_block,))
                 # Without padded per-sequence offsets there is no slack past seqlen: the
                 # +inf tail would alias the next sequence's rows (or fall off the buffer).

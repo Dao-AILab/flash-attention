@@ -2195,8 +2195,7 @@ def _compile_bwd_postprocess(
     learnable_sink_dtype,
     hdim_multiple_of,
     accum_order=None,
-    pack_gqa=False,
-    qhead_per_kvhead=1,
+    pack_factor=1,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -2207,7 +2206,7 @@ def _compile_bwd_postprocess(
     mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
     mSeqUsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
     mCuTotalMBlocks = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cu_total_m_blocks else None
-    if pack_gqa:
+    if pack_factor > 1:
         # dQaccum is per KV head (its own head symbol): (b, h_kv, rows*hd) dense, (h_kv, rows*hd)
         # varlen; dQ keeps its own shape
         accum_shape = (
@@ -2232,8 +2231,7 @@ def _compile_bwd_postprocess(
         cluster_size=cluster_size,
         hdim_multiple_of=hdim_multiple_of,
         accum_order=accum_order,
-        pack_gqa=pack_gqa,
-        qhead_per_kvhead=qhead_per_kvhead,
+        pack_factor=pack_factor,
     )
     return cute.compile(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
@@ -2254,8 +2252,7 @@ def _bwd_postprocess_convert(
     sink_tensors=None,
     hdim_multiple_of=32,
     accum_order=None,
-    pack_gqa=False,
-    qhead_per_kvhead=1,
+    pack_factor=1,
     *,
     fake_mode,
 ):
@@ -2283,8 +2280,7 @@ def _bwd_postprocess_convert(
         ),
         hdim_multiple_of,
         accum_order,
-        pack_gqa,
-        qhead_per_kvhead,
+        pack_factor,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
@@ -2538,9 +2534,7 @@ def _flash_attn_bwd(
         dQaccum_order, dKVaccum_order = FlashAttentionBackwardSm100.accum_tile_orders(
             use_2cta_instrs, n_block_size
         )
-        # NOTE [bwd pack_gqa] (flash_bwd_sm100.py); the head-dependent part of the decision is
-        # below, once qhead_per_kvhead is known. The FLASH_ATTENTION_BWD_TILE_N test knob
-        # exercises the 64-row tile without packing.
+        # pack_gqa (NOTE [bwd pack_gqa], pack_gqa.py) unless the tile_n test knob is set
         bwd_pack_gqa_request = not utils._get_bwd_tile_n_override()
         # hdim 256 (64-row KV tile, serial schedule) and block-sparse hdim 192 need 2CTA.
         needs_2cta = (
@@ -2721,7 +2715,7 @@ def _flash_attn_bwd(
         override = utils._get_bwd_pack_gqa_override()
         if override is None:
             bwd_pack_gqa = _bwd_pack_gqa_heuristic(
-                num_sms=torch.cuda.get_device_properties(q.device).multi_processor_count,
+                num_sms=get_num_sms_for_selection(q.device.index, arch),
                 batch_size=batch_size,
                 num_head=num_head,
                 num_head_kv=num_head_kv,
@@ -2772,65 +2766,32 @@ def _flash_attn_bwd(
     hdim_multiple_of = 64 if arch // 10 == 9 and dKV_swapAB else 32
     head_dim_rounded = (head_dim + hdim_multiple_of - 1) // hdim_multiple_of * hdim_multiple_of
 
+    # Per-head scratch (dq_accum, dpsum, lse_log2, dQ_semaphore): pack_gqa stores it per KV
+    # head with qhead_per_kvhead rows per token (NOTE [bwd pack_gqa]).
+    scratch_heads = num_head_kv if bwd_pack_gqa else num_head
+    rows_per_token = qhead_per_kvhead if bwd_pack_gqa else 1
+    seqlen_q_rows_rounded = (
+        (seqlen_q * rows_per_token + m_block_size - 1) // m_block_size * m_block_size
+    )
     if cu_seqlens_q is None:
-        if bwd_pack_gqa:
-            # packed rows (qhead_per_kvhead * seqlen_q) per KV head, see NOTE [bwd pack_gqa]
-            seqlen_q_packed_rounded = (
-                (seqlen_q * qhead_per_kvhead + m_block_size - 1) // m_block_size * m_block_size
-            )
-            dq_accum = torch.empty(
-                batch_size,
-                num_head_kv,
-                seqlen_q_packed_rounded * head_dim_rounded,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            dq_accum = (
-                None
-                if use_dedicated_hd256_kernel
-                else torch.empty(
-                    batch_size,
-                    num_head,
-                    seqlen_q_rounded * head_dim_rounded,
-                    dtype=torch.float32,
-                    device=device,
-                )
-            )
-        dpsum_heads = num_head_kv if bwd_pack_gqa else num_head
-        dpsum_rows = seqlen_q_packed_rounded if bwd_pack_gqa else seqlen_q_rounded
-        dpsum = torch.empty(
-            batch_size, dpsum_heads, dpsum_rows, dtype=torch.float32, device=device
-        )
-        lse_log2 = torch.empty(
-            batch_size, dpsum_heads, dpsum_rows, dtype=torch.float32, device=device
-        )
+        scratch_shape = (batch_size, scratch_heads, seqlen_q_rows_rounded)
     else:
-        total_q_rounded_padded = (
-            (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
+        # one tile of slack per sequence (padded per-sequence offsets)
+        total_q_rows_rounded_padded = (
+            (total_q * rows_per_token + cu_seqlens_q.shape[0] * m_block_size - 1)
+            // m_block_size * m_block_size
         )
-        if bwd_pack_gqa:
-            # per KV head, packed rows (qhead_per_kvhead * total_q), padded per sequence
-            total_q_rows_rounded_padded = (
-                (total_q * qhead_per_kvhead + cu_seqlens_q.shape[0] * m_block_size - 1)
-                // m_block_size * m_block_size
-            )
-            dq_accum = torch.empty(
-                num_head_kv, total_q_rows_rounded_padded * head_dim_rounded,
-                dtype=torch.float32, device=device,
-            )
-            dpsum = torch.empty(num_head_kv, total_q_rows_rounded_padded, dtype=torch.float32, device=device)
-            lse_log2 = torch.empty(num_head_kv, total_q_rows_rounded_padded, dtype=torch.float32, device=device)
-        else:
-            dq_accum = (
-                None
-                if use_dedicated_hd256_kernel
-                else torch.empty(
-                    num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device
-                )
-            )
-            dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
-            lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
+        scratch_shape = (scratch_heads, total_q_rows_rounded_padded)
+    dq_accum = (
+        None
+        if use_dedicated_hd256_kernel
+        else torch.empty(
+            *scratch_shape[:-1], scratch_shape[-1] * head_dim_rounded,
+            dtype=torch.float32, device=device,
+        )
+    )
+    dpsum = torch.empty(*scratch_shape, dtype=torch.float32, device=device)
+    lse_log2 = torch.empty(*scratch_shape, dtype=torch.float32, device=device)
 
     # GQA (qhead_per_kvhead > 1) needs dK/dV accum+postprocess since multiple Q heads
     # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
@@ -2878,22 +2839,17 @@ def _flash_attn_bwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
 
-    if deterministic and bwd_pack_gqa:
-        # one slot per (KV head, packed m block), see NOTE [bwd pack_gqa]
-        seqlen_q_packed_rounded = (
-            (seqlen_q * qhead_per_kvhead + m_block_size - 1) // m_block_size * m_block_size
-        )
+    # The dedicated hd256 backward is deterministic without semaphores.
+    if deterministic and not use_dedicated_hd256_kernel:
+        # one slot per (scratch head, m block of scratch rows)
         dQ_semaphore = torch.zeros(
-            batch_size, num_head_kv, seqlen_q_packed_rounded // m_block_size, cluster_size,
+            batch_size, scratch_heads, seqlen_q_rows_rounded // m_block_size, cluster_size,
             dtype=torch.int32, device=device,
         )
-    # The dedicated hd256 backward is deterministic without semaphores.
-    elif deterministic and not use_dedicated_hd256_kernel:
-        dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device=device)
     else:
         dQ_semaphore = None
 
-    if deterministic and qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel:
+    if deterministic and dKV_postprocess:
         dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
         dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
     else:
@@ -3365,8 +3321,7 @@ def _flash_attn_bwd(
             ),
             fake_mode=fake_mode,
             hdim_multiple_of=hdim_multiple_of,
-            pack_gqa=bwd_pack_gqa,
-            qhead_per_kvhead=qhead_per_kvhead if bwd_pack_gqa else 1,
+            pack_factor=qhead_per_kvhead if bwd_pack_gqa else 1,
         )
 
         if dKV_postprocess:

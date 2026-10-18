@@ -37,6 +37,16 @@ def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx, seqlen_idx=0):
     )
 
 
+# NOTE [bwd pack_gqa]: the SM100 backward packs GQA the way the forward does. The
+# qhead_per_kvhead query heads of a KV head are folded into the rows of the Q tile through
+# pack_gqa_layout (row r of the packed sequence = head r % qh at token r // qh); one tile
+# iterates over the packed rows per KV head, and dK / dV stay in TMEM across the group (no
+# fp32 accumulate, no dK / dV postprocess). Q / dO / LSE (and dQ in the postprocess) are packed
+# views of the per-head tensors. The per-KV-head scratch buffers (LSE_log2, dPsum, dQaccum,
+# dQ_semaphore) are allocated directly in packed row order, qhead_per_kvhead rows per token;
+# their varlen offsets come from seqlen_info.sequence_row_offset.
+
+
 def select_modes(T, order):
     """``T`` with its modes permuted to ``order`` (a full permutation), same data."""
     assert sorted(order) == list(range(cute.rank(T))), f"{order} is not a permutation of modes"

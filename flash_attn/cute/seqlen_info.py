@@ -28,11 +28,8 @@ class SeqlenInfo:
         cu_seqlens: Optional[cute.Tensor] = None,
         seqused: Optional[cute.Tensor] = None,
         tile: cutlass.Constexpr[int] = 128,
-        scale: cutlass.Constexpr[int] = 1,
     ):
-        """`scale` rows per sequence position (the backward's pack_gqa folds the query heads of
-        a KV head into the rows): offsets, padded offsets and lengths come out in rows."""
-        offset = 0 if const_expr(cu_seqlens is None) else cu_seqlens[batch_idx] * scale
+        offset = 0 if const_expr(cu_seqlens is None) else cu_seqlens[batch_idx]
         offset_padded = (
             0
             if const_expr(cu_seqlens is None)
@@ -40,11 +37,11 @@ class SeqlenInfo:
             else cute.assume((offset + batch_idx * tile) // tile * tile, divby=tile)
         )
         if const_expr(seqused is not None):
-            seqlen = seqused[batch_idx] * scale
+            seqlen = seqused[batch_idx]
         elif const_expr(cu_seqlens is not None):
-            seqlen = cu_seqlens[batch_idx + 1] * scale - offset
+            seqlen = cu_seqlens[batch_idx + 1] - cu_seqlens[batch_idx]
         else:
-            seqlen = seqlen_static * scale
+            seqlen = seqlen_static
         return SeqlenInfo(offset, offset_padded, seqlen, has_cu_seqlens=cu_seqlens is not None)
 
     def offset_batch(
@@ -64,6 +61,28 @@ class SeqlenInfo:
             offset = off if const_expr(cute.rank(mT.shape[0]) == 1) else (0, off)
             idx = (offset,) + (None,) * (cute.rank(mT) - 1)
             return cute.domain_offset(idx, mT)
+
+
+def sequence_row_offset(
+    token_offset: Int32,
+    batch_idx: Int32,
+    rows_per_token: cutlass.Constexpr[int],
+    tile_rows: cutlass.Constexpr[int],
+    padded: cutlass.Constexpr[bool] = True,
+) -> Int32:
+    """Offset of a varlen sequence, in storage rows, in a scratch buffer (LSE_log2, dPsum,
+    dQaccum) that holds ``rows_per_token`` rows per token: the SM100 backward's pack_gqa folds
+    the query heads of a KV head into the rows (NOTE [bwd pack_gqa] in pack_gqa.py).
+    ``token_offset`` is the sequence's cu_seqlens offset; it is scaled before the per-sequence
+    padding (``padded``: every sequence starts on a ``tile_rows`` boundary, as
+    ``SeqlenInfo.offset_padded``)."""
+    row_offset = token_offset if const_expr(rows_per_token == 1) else token_offset * rows_per_token
+    if const_expr(padded):
+        # Add divby so that the compiler knows the alignment when moving by the offset
+        row_offset = cute.assume(
+            (row_offset + batch_idx * tile_rows) // tile_rows * tile_rows, divby=tile_rows
+        )
+    return row_offset
 
 
 @dataclass(frozen=True)
@@ -96,11 +115,8 @@ class SeqlenInfoQK:
         mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
-        q_scale: cutlass.Constexpr[int] = 1,
     ):
-        """`q_scale` rows per Q position (the backward's pack_gqa folds the query heads of a KV
-        head into the Q rows): Q offsets, padded offsets and lengths come out in rows."""
-        offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx] * q_scale
+        offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
         offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
         padded_offset_q = (
             0
@@ -113,12 +129,12 @@ class SeqlenInfoQK:
             else cute.assume((offset_k + batch_idx * tile_n) // tile_n * tile_n, divby=tile_n)
         )
         if const_expr(mSeqUsedQ is not None):
-            seqlen_q = mSeqUsedQ[batch_idx] * q_scale
+            seqlen_q = mSeqUsedQ[batch_idx]
         else:
             seqlen_q = (
-                seqlen_q_static * q_scale
+                seqlen_q_static
                 if const_expr(mCuSeqlensQ is None)
-                else mCuSeqlensQ[batch_idx + 1] * q_scale - offset_q
+                else mCuSeqlensQ[batch_idx + 1] - offset_q
             )
         if const_expr(mSeqUsedK is not None):
             seqlen_k = mSeqUsedK[batch_idx]

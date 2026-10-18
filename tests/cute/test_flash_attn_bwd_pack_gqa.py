@@ -2,7 +2,7 @@
 (FLASH_ATTENTION_BWD_PACK_GQA=1) against the per-head path (FLASH_ATTENTION_BWD_PACK_GQA=0) and
 against FP64 eager.
 
-See NOTE [bwd pack_gqa] in flash_bwd_sm100.py: one tile per KV head iterates over the packed
+See NOTE [bwd pack_gqa] in pack_gqa.py: one tile per KV head iterates over the packed
 rows of all its query heads, dK / dV stay in TMEM for the group (no fp32 accumulate, no
 postprocess), dQaccum / LSE / dPsum are per KV head in packed row order.
 """
