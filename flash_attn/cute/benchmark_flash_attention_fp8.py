@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import math
 import time
 from typing import Iterable
@@ -22,7 +21,7 @@ import torch
 from einops import rearrange
 
 from flash_attn.cute.benchmark import benchmark_forward
-from flash_attn.cute.interface import _flash_attn_fwd as flash_attn_cute_fwd
+from flash_attn.cute.interface import TensorwiseScales, _flash_attn_fwd as flash_attn_cute_fwd
 
 try:
     import cudnn
@@ -220,11 +219,6 @@ def cudnn_sdpa_fp8_setup(qkv: torch.Tensor, seqlen_q: int, seqlen_k: int, causal
     return run
 
 
-def _maybe_pass_descales(callable_, **kwargs):
-    sig = inspect.signature(callable_)
-    return {k: v for k, v in kwargs.items() if k in sig.parameters}
-
-
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repeats", type=int, default=30)
@@ -363,14 +357,10 @@ def main(argv: Iterable[str] | None = None) -> int:
                         else:
                             raise
 
-                fa4_kwargs = dict(softmax_scale=softmax_scale, causal=causal)
-                fa4_kwargs.update(
-                    _maybe_pass_descales(
-                        flash_attn_cute_fwd,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                    )
+                fa4_kwargs = dict(
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    scales=TensorwiseScales(q_descale, k_descale, v_descale),
                 )
 
                 try:
