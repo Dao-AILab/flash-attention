@@ -140,7 +140,8 @@ class FwdHeuristicInputs(NamedTuple):
     seqlen_k_capacity: int | None = None
     requires_grad: bool = False  # any input, aux tensors included
     has_aux_scalars: bool = False
-    # MXFP8 block-scaled forward: "qk" (e4m3 Q/K with block scales, BF16 V); None otherwise.
+    # MXFP8 block-scaled forward: "qk" (e4m3 Q/K with block scales, BF16 V), "pv" (native PV:
+    # e4m3 V with block scales too); None otherwise.
     mxfp8_path: str | None = None
 
     @property
@@ -466,6 +467,24 @@ def select_sm_stats_cross_stage(inputs: FwdHeuristicInputs, *, use_s_ping_pong: 
     return sm100_arch_family(inputs.device_arch) in _SM_STATS_CROSS_STAGE.get(key, ())
 
 
+def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs) -> Sm100Registers | None:
+    """Native MXFP8 PV register split; None keeps the FP8 split."""
+    family = sm100_arch_family(inputs.device_arch)
+    if family == "sm_107":
+        # Dedicated scale columns: fewer softmax registers relieve register pressure in the
+        # correction and MMA/load warps at hd64.
+        return Sm100Registers(160, 96, 96) if inputs.head_dim_padded < 96 else None
+    # The MMA warp also issues the PV scale copies and the split-P wait. It spills with the
+    # 48 registers of the hd128 default, and on sm_103 the persistent loop needs 80.
+    if family == "sm_103":
+        softmax, correction = 168, 96
+    elif inputs.head_dim_padded >= 96:
+        softmax, correction = 184, 80
+    else:
+        softmax, correction = 192, 64
+    return Sm100Registers(softmax, correction, 512 - softmax * 2 - correction)
+
+
 def select_sm100_registers(
     inputs: FwdHeuristicInputs, *, tile_n: int, q_stage: int, use_2cta_instrs: bool
 ) -> Sm100Registers:
@@ -478,6 +497,8 @@ def select_sm100_registers(
         sm100_is_sm103_family(inputs.device_arch),
     )
     is_fp8 = has_fp8_pv(inputs)
+    if inputs.mxfp8_path == "pv" and (pv_registers := select_mxfp8_pv_registers(inputs)):
+        return pv_registers
     if head_dim_padded < 96:
         small = SM100_FP8_SMALL_HDIM_REGISTERS if is_fp8 else SM100_SMALL_HDIM_REGISTERS
         return small[paged_kv_non_tma]
@@ -510,6 +531,11 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
     is (0, 0).
     """
     if inputs.device_capacity not in (10, 11):
+        return 0, 0
+    if inputs.mxfp8_path == "pv":
+        # Native PV quantizes P to E4M3. The polynomial exp2 is not bitwise equal to MUFU.EX2,
+        # so it moves some P across E4M3 rounding boundaries and PV no longer sees the
+        # reference P.
         return 0, 0
     head_dim_padded = inputs.head_dim_padded
     is_sm103 = sm100_is_sm103_family(inputs.device_arch)
