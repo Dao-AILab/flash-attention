@@ -147,9 +147,10 @@ class DynamicPersistentSchedulerState(SchedulerState):
 #
 # The SM100 forward passes logical M work tiles in num_block with use_cluster_idx = (C > 1).
 # SingleTileLPTScheduler's CLC grid has grid_x = num_block * C; clc_work_to_coords divides
-# claimed_x by C and optionally reverses M for LPT. StaticPersistentTileScheduler takes
-# num_block as a cluster count, caps the grid at the SM count rounded down to whole clusters,
-# and strides over work by the launched cluster count. Varlen metadata units and the backward/MLA contracts are
+# claimed_x by C and optionally reverses M for LPT, while unsplit 1CTA grids use the
+# L2-swizzled static mapping. StaticPersistentTileScheduler takes num_block as a cluster
+# count, caps the grid at the SM count rounded down to whole clusters, and strides over work
+# by the launched cluster count. Varlen metadata units and the backward/MLA contracts are
 # separate. Row mapping: NOTE [SM100 forward coordinate spaces] in flash_fwd_sm100.py.
 
 
@@ -196,7 +197,7 @@ class TileSchedulerProtocol(Protocol):
         """Producer-side prefetch of next work tile (no-op for static schedulers).
 
         For dynamic schedulers: producer acquire (+ issue CLC query) + producer state advance.
-        Only called by the scheduler warp.
+        Called by the scheduler warp, or the load warp for late CLC claims.
         """
         ...
 
@@ -647,10 +648,15 @@ class SingleTileLPTScheduler:
     def clc_work_to_coords(self, work) -> WorkTileInfo:
         """Convert CLC response (block, head, batch_split) to WorkTileInfo.
 
-        CLC returns raw grid coordinates — no L2 swizzle (hardware decides order).
+        Unsplit 1CTA grids reuse the static L2-swizzled LPT mapping.
         Clustered grids use one m block per cluster; num_block counts clusters. Both CTAs
         of a cluster decode the same logical tile; see NOTE [SM100 forward work coordinates].
         """
+        if const_expr(self.params.cluster_shape_m == 1 and not self.params.is_split_kv):
+            tile_idx = work.tile_idx[0] + self.params.num_block * (
+                work.tile_idx[1] + self.params.num_head * work.tile_idx[2]
+            )
+            return WorkTileInfo(self._static_coords(tile_idx).tile_idx, work.is_valid_tile)
         assert self.params.cluster_shape_m == 1 or self.params.use_cluster_idx, (
             "CLC with clusters requires use_cluster_idx"
         )
@@ -681,10 +687,14 @@ class SingleTileLPTScheduler:
             work = self._ctx.get_current_work()
             self._tile_idx = work.tile_idx[0]
             return self.clc_work_to_coords(work)
-        # Static path: L2-swizzled coordinate mapping
+        return self._static_coords(self._tile_idx)
+
+    @cute.jit
+    def _static_coords(self, tile_idx: Int32) -> WorkTileInfo:
+        # L2-swizzled coordinate mapping (static grid, or unsplit 1CTA CLC)
         params = self.params
         # Implement LPT scheduling coordinate calculation
-        bidhb, l2_mod = divmod(self._tile_idx, params.l2_major_divmod)
+        bidhb, l2_mod = divmod(tile_idx, params.l2_major_divmod)
         # If we're in the last section (called residual), we don't want to divide by
         # swizzle. Instead we want to divide by the remainder.
         block, bidhb_residual = 0, 0
@@ -697,7 +707,7 @@ class SingleTileLPTScheduler:
         # Longest-processing-time-first
         if const_expr(params.lpt):
             block = params.num_block - 1 - block
-        is_valid = self._tile_idx < params.total_blocks
+        is_valid = tile_idx < params.total_blocks
         split_idx = self._split_idx
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
         if const_expr(params.is_split_kv and params.num_splits_dynamic_ptr is not None):
