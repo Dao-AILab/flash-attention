@@ -131,6 +131,52 @@ _FP8_SMALL_HDIM_REGS = {
     False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
     True: {"num_regs_softmax": 152, "num_regs_correction": 96, "num_regs_other": 112},
 }
+
+# Native MXFP8 PV softmax: (normalize O by the FP32 row sum, max_offset, rescale_threshold).
+# "exact" divides O by the sum of the E4M3 P that PV consumed and never lets the row max lag, so
+# the output matches a quantized-P reference to output rounding. "fast" normalizes by the FP32 sum
+# of the unquantized probabilities (no E4M3 decode and sum), biases P by 2^4 and lets the row max
+# lag by 4, which skips most O rescales. See Note [Low Precision Scaling].
+_MXFP8_PV_SOFTMAX = {"exact": (False, 8, 0.0), "fast": (True, 4, 4.0)}
+
+
+class PvFastTuning(NamedTuple):
+    """sm_100/sm_103 scheduling for the "fast" MXFP8 PV softmax."""
+
+    regs: tuple[int, int, int] | None = None  # softmax, correction, other; None: native-PV split
+    ex2_emu_freq: int = 0
+
+
+# Keyed by arch, then (head_dim_padded, is_causal); missing keys keep the defaults. sm_107 is tuned
+# in _SM107_PV_TUNING.
+_PV_FAST_TUNING = {
+    # Partial exp2 emulation pays once the lazy row max removes most O rescales. The hd128 register
+    # splits are the spill-free ones.
+    "sm_100": {
+        (128, False): PvFastTuning(regs=(176, 64, 96), ex2_emu_freq=8),
+        (128, True): PvFastTuning(regs=(192, 64, 64), ex2_emu_freq=8),
+        (64, False): PvFastTuning(ex2_emu_freq=8),
+        (64, True): PvFastTuning(ex2_emu_freq=8),
+    },
+    # The "exact" registers are already the best choice.
+    "sm_103": {},
+}
+
+
+class Sm107PvTuning(NamedTuple):
+    """sm_107 native PV (dedicated scale columns) per-config choices; none changes the arithmetic."""
+
+    # Softmax, correction and other registers; None keeps the generic FP8 split.
+    regs: tuple[int, int, int] | None = None
+
+
+# Keyed by (pv_softmax, head_dim_padded, is_causal); missing keys use the defaults.
+_SM107_PV_TUNING = {
+    ("exact", 64, False): Sm107PvTuning(regs=(160, 96, 96)),
+    ("fast", 128, False): Sm107PvTuning(regs=(168, 96, 80)),
+    ("fast", 64, False): Sm107PvTuning(regs=(168, 96, 80)),
+    ("fast", 64, True): Sm107PvTuning(regs=(192, 64, 64)),
+}
 # NOTE [softmax stats release order]
 # Correction frees softmax stage s's pipeline_sm_stats slot in either order:
 # - Same-stage (default): right after reading scale[s].
@@ -173,6 +219,9 @@ _SM_STATS_CROSS_STAGE = {
     ("fp8", 96, True, False): ("sm_100",),
     ("mxfp8_qk", 64, True, False): ("sm_103", "sm_107"),
     ("mxfp8_pv", 64, True, False): ("sm_100",),
+    ("mxfp8_pv_fast", 64, False, False): ("sm_103", "sm_107"),
+    ("mxfp8_pv_fast", 64, True, False): ("sm_107",),
+    ("mxfp8_pv_fast", 128, False, False): ("sm_100", "sm_107"),
 }
 # NOTE [causal CLC]
 # Dense causal forward runs the CLC persistent scheduler where it measured faster than the
@@ -205,6 +254,10 @@ _CLC_DEFAULT = {
     ("mxfp8_pv", 64, True, False): {"sm_100": ClcTuning(), "sm_103": ClcTuning(regs=(184, 64, 80))},
     ("mxfp8_pv", 128, True, False): {
         "sm_100": ClcTuning(regs=(168, 88, 88)), "sm_103": ClcTuning(regs=(168, 88, 88)), "sm_107": ClcTuning(),
+    },
+    ("mxfp8_pv_fast", 64, True, False): {"sm_100": ClcTuning(), "sm_103": ClcTuning(), "sm_107": ClcTuning()},
+    ("mxfp8_pv_fast", 128, True, False): {
+        "sm_100": ClcTuning(regs=(184, 64, 80)), "sm_103": ClcTuning(regs=(184, 64, 80)), "sm_107": ClcTuning(),
     },
 }
 # === END TUNING KNOBS ===
@@ -288,8 +341,11 @@ class FlashAttentionForwardSm100:
         use_s_ping_pong: cutlass.Constexpr[bool] = False,
         qk_blockscaled: bool = False,
         pv_blockscaled: bool = False,
+        pv_softmax: str = "exact",
     ):
         self.pv_blockscaled = pv_blockscaled
+        assert pv_softmax == "exact" or pv_blockscaled
+        self.pv_fp32_normalizer, self.pv_max_offset, self.pv_rescale_threshold = _MXFP8_PV_SOFTMAX[pv_softmax]
         self.pv_causal_bf16 = pv_blockscaled and is_causal
         if pv_blockscaled:
             assert qk_blockscaled and not is_local
@@ -337,9 +393,13 @@ class FlashAttentionForwardSm100:
         # Otherwise, with two Q stages, QK_i's scale factors alias the other stage's S in TMEM
         # (see mma).
         self.sf_overlap = qk_blockscaled and q_stage == 2 and not self.dedicated_sf
+        self.sm107_pv_tuning = Sm107PvTuning()
         if self.dedicated_sf:
             # The K=64 PV MMAs wait for the whole P; sm_100/sm_103 split P arrival as for BF16.
             self.split_P_arrive = 0
+            self.sm107_pv_tuning = _SM107_PV_TUNING.get(
+                (pv_softmax, self.head_dim_padded, is_causal), Sm107PvTuning()
+            )
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape
@@ -674,6 +734,16 @@ class FlashAttentionForwardSm100:
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
+        # See Note [Low Precision Scaling]. Shared by the softmax and correction warps.
+        if const_expr(self.pv_blockscaled):
+            self.max_offset, self.rescale_threshold = self.pv_max_offset, self.pv_rescale_threshold
+        else:
+            self.max_offset = 8 if self.v_dtype.width == 8 else 0
+            self.rescale_threshold = 8.0 if self.v_dtype.width == 16 else 0.0
+        assert self.max_offset + self.rescale_threshold < _LOG2_DTYPE_MAX[self.v_dtype], (
+            f"max_offset ({self.max_offset}) + rescale_threshold ({self.rescale_threshold}) must "
+            f"stay below log2(max {self.v_dtype} value) to avoid saturating P"
+        )
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
@@ -743,10 +813,6 @@ class FlashAttentionForwardSm100:
                 self.num_regs_softmax = fp8_regs["num_regs_softmax"]
                 self.num_regs_correction = fp8_regs["num_regs_correction"]
                 self.num_regs_other = fp8_regs["num_regs_other"]
-                if const_expr(self.dedicated_sf and not self.is_causal):
-                    # sm_107 non-causal native PV: fewer softmax registers relieve register pressure in the
-                    # correction and MMA/load warps.
-                    self.num_regs_softmax, self.num_regs_correction, self.num_regs_other = 160, 96, 96
             else:
                 fp8_tune = _FP8_TUNING_CONFIG.get(
                     (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103), {}
@@ -769,7 +835,7 @@ class FlashAttentionForwardSm100:
         # See NOTE [softmax stats release order].
         arch_key = "sm_107" if self.is_sm107 else "sm_103" if self.is_sm103 else "sm_100"
         if const_expr(self.pv_blockscaled):
-            sm_stats_path = "mxfp8_pv"
+            sm_stats_path = "mxfp8_pv_fast" if self.pv_fp32_normalizer else "mxfp8_pv"
         elif const_expr(self.qk_blockscaled):
             sm_stats_path = "mxfp8_qk"
         elif const_expr(self.q_dtype.width == 8):
@@ -806,6 +872,17 @@ class FlashAttentionForwardSm100:
             else:
                 self.num_regs_softmax, self.num_regs_correction = 192, 64
             self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
+        if const_expr(self.dedicated_sf):
+            if const_expr(self.sm107_pv_tuning.regs is not None):
+                self.num_regs_softmax, self.num_regs_correction, self.num_regs_other = (
+                    self.sm107_pv_tuning.regs
+                )
+        elif const_expr(self.pv_fp32_normalizer):
+            fast = _PV_FAST_TUNING[arch_key].get((self.head_dim_padded, self.is_causal), PvFastTuning())
+            if const_expr(fast.regs is not None):
+                self.num_regs_softmax, self.num_regs_correction, self.num_regs_other = fast.regs
+            # "fast" has no bitwise quantized-P contract, so the polynomial exp2 is allowed.
+            self.ex2_emu_freq = fast.ex2_emu_freq
         clc_tuning = _CLC_DEFAULT.get(tuning_key, {}).get(arch_key, ClcTuning())
         if const_expr(self.use_clc_scheduler and clc_tuning.regs is not None):
             self.num_regs_softmax, self.num_regs_correction, self.num_regs_other = clc_tuning.regs
@@ -1153,10 +1230,16 @@ class FlashAttentionForwardSm100:
         load_epi_mbar_size = 2 if const_expr(self.overlap_sO_sQ) else 0
         sf_overlap_mbar_size = 4 if const_expr(self.sf_overlap) else 0
         sfp_size = 512 if const_expr(self.pv_blockscaled) else 0
-        # Native PV normalizes O by the sum of the quantized P that PV consumes, but returns LSE
-        # from the FP32 sum: it stores that sum as a third per-row statistic.
-        self.track_unquantized_sum = self.pv_blockscaled and mLSE is not None
-        self.num_stats = 3 if self.track_unquantized_sum else 2
+        # Native PV returns LSE from the FP32 exponential sum. "exact" normalizes O by the sum of
+        # the quantized P that PV consumes and stores the FP32 sum as a third per-row statistic;
+        # "fast" normalizes O by the FP32 sum itself. On sm_107, "fast" still hands the FP32 sum
+        # to the correction warps in the third slot: sharing the row-sum slot between O and LSE
+        # adds register pressure there (it spills at hd128 non-causal).
+        self.track_unquantized_sum = self.pv_blockscaled and (mLSE is not None or self.pv_fp32_normalizer)
+        self.num_stats = (
+            3 if self.pv_blockscaled and mLSE is not None and (not self.pv_fp32_normalizer or self.dedicated_sf)
+            else 2
+        )
 
         @cute.struct
         class SharedStorage:
@@ -2949,8 +3032,6 @@ class FlashAttentionForwardSm100:
 
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
-            # See Note [Low Precision Scaling]
-            max_offset = 8 if cutlass.const_expr(self.v_dtype.width == 8) else 0
             if const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
@@ -2958,17 +3039,11 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = softmax_scale * qk_descale
 
-            rescale_threshold = 8.0 if const_expr(self.v_dtype.width == 16) else 0.0
-            # See Note [Low Precision Scaling]
-            assert max_offset + rescale_threshold < _LOG2_DTYPE_MAX[self.v_dtype], (
-                f"max_offset ({max_offset}) + rescale_threshold ({rescale_threshold}) must stay "
-                f"below log2(max {self.v_dtype} value) to avoid saturating P"
-            )
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2_eff,
-                rescale_threshold=rescale_threshold,
+                rescale_threshold=self.rescale_threshold,
                 softmax_scale=softmax_scale_eff,
-                max_offset=max_offset,
+                max_offset=self.max_offset,
                 track_unquantized_sum=self.track_unquantized_sum,
             )
             softmax.reset()
@@ -3144,7 +3219,7 @@ class FlashAttentionForwardSm100:
                     else:
                         sm_stats_index = stage
                     sScale[tidx + sm_stats_index * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(self.track_unquantized_sum):
+                    if const_expr(self.num_stats == 3):
                         sScale[tidx + (stage + 2 * self.q_stage) * self.m_block_size] = softmax.row_sum_unquantized[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
@@ -3329,7 +3404,7 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=p_dtype), tSrS_t2r.layout
         )
         unquantized_sum_init = None
-        if const_expr(self.track_unquantized_sum and not self.dedicated_sf):
+        if const_expr(self.track_unquantized_sum and (not self.dedicated_sf or self.pv_fp32_normalizer)):
             unquantized_sum_init = Float32(0.0)
             if const_expr(not is_first):
                 unquantized_sum_init = softmax.row_sum_unquantized[0] * acc_scale
@@ -3368,7 +3443,10 @@ class FlashAttentionForwardSm100:
             )
         elif const_expr(not self.sm_stats_late_acquire):
             pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
-        if const_expr(self.pv_blockscaled and not self.dedicated_sf):
+        if const_expr(self.pv_fp32_normalizer):
+            # O and LSE share the FP32 sum reduced per fragment in apply_exp2_convert.
+            softmax.row_sum[0] = softmax.row_sum_unquantized[0]
+        elif const_expr(self.pv_blockscaled and not self.dedicated_sf):
             softmax.update_row_sum_quantized_streaming(tSrP_r2t_f32, p_dtype, acc_scale, is_first)
         elif const_expr(self.pv_blockscaled):
             # E4M3 is exact in FP16, but BF16's small probabilities are not.
@@ -3459,11 +3537,9 @@ class FlashAttentionForwardSm100:
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
 
-            # Must match the softmax warp's max_offset; max_offset_scale = 2^max_offset.
-            max_offset = Float32(8.0) if cutlass.const_expr(self.v_dtype.width == 8) else Float32(0.0)
-            max_offset_scale = (
-                Float32(256.0) if cutlass.const_expr(self.v_dtype.width == 8) else Float32(1.0)
-            )
+            # The softmax warps' max_offset; max_offset_scale = 2^max_offset.
+            max_offset = Float32(float(self.max_offset))
+            max_offset_scale = Float32(float(2**self.max_offset))
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx=split_idx, num_splits=num_splits,
@@ -3597,7 +3673,7 @@ class FlashAttentionForwardSm100:
                         row_max = sScale[tidx + sm_stats_index * self.m_block_size + self.s_p_o_stage * self.m_block_size]
                     else:
                         row_max = None
-                    if const_expr(self.track_unquantized_sum):
+                    if const_expr(self.num_stats == 3):
                         row_sum_lse = sScale[tidx + (stage + 2 * self.q_stage) * self.m_block_size]
                     else:
                         row_sum_lse = row_sum
