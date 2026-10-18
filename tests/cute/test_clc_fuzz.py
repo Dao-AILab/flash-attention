@@ -637,7 +637,7 @@ class TestCLCRepeatability:
         check_output(randn(5, 128, 8, 128), randn(5, 1024, 2, 128), randn(5, 1024, 2, 128))
 
 class TestCLCHd256:
-    """CLC does not map hd256 2CTA tiles; the forward must fall back to non-CLC 2CTA."""
+    """Dense hd256 2CTA uses CLC with per-cluster m blocks; varlen hd256 2CTA falls back to non-CLC."""
 
     @staticmethod
     def assert_2cta_without_clc():
@@ -648,22 +648,44 @@ class TestCLCHd256:
         assert sched_mode != SchedulingMode.CLC, f"Expected CLC disabled for hd256 2CTA, got {sched_mode!r}"
 
     @pytest.mark.parametrize("sq,sk,q_heads,kv_heads", [
+        # An odd number of 128-row M tiles leaves the last cluster half full; the LPT order
+        # must count clusters rounding up (these two cases hit an illegal instruction otherwise).
         (1, 4096, 4, 1),  # decode: single M block
+        (384, 384, 1, 1),
         (256, 256, 1, 1),
-        (384, 384, 1, 1),  # odd number of M tiles
         (512, 512, 1, 1),
     ])
     def test_causal(self, sq, sk, q_heads, kv_heads):
         check_output(
             randn(1, sq, q_heads, 256), randn(1, sk, kv_heads, 256), randn(1, sk, kv_heads, 256),
-            causal=True, assert_clc=False,
+            causal=True, assert_2cta=True,
         )
-        self.assert_2cta_without_clc()
 
     @pytest.mark.parametrize("causal", [False, True])
     def test_varlen_gqa(self, causal):
         check_varlen_output([300, 129, 257, 64], heads=12, d=256, kv_heads=2, causal=causal, assert_sched=False)
         self.assert_2cta_without_clc()
+
+
+class TestCLC2CTASequsedK:
+    """Dense Q with per-batch K lengths is not "dense", so hd128 GQA non-causal runs 2CTA with CLC."""
+
+    @pytest.mark.parametrize("sq,seqlens_k", [(384, [384, 200]), (512, [1000, 129, 64])])
+    def test_noncausal_gqa(self, sq, seqlens_k):
+        batch, max_sk = len(seqlens_k), max(seqlens_k)
+        seqused_k = torch.tensor(seqlens_k, device="cuda", dtype=torch.int32)
+        q, k, v = randn(batch, sq, 8, 128), randn(batch, max_sk, 2, 128), randn(batch, max_sk, 2, 128)
+        _captured_schedulers.clear()
+        out, _ = flash_attn_varlen_func(q, k, v, seqused_k=seqused_k)
+        torch.cuda.synchronize()
+        if _captured_schedulers:
+            _, sched_mode, use_2cta = _captured_schedulers[-1]
+            assert use_2cta and sched_mode == SchedulingMode.CLC, (use_2cta, sched_mode)
+        k_mask = torch.arange(max_sk, device="cuda")[None, :] < seqused_k[:, None]
+        out_ref, _ = attention_ref(q, k, v, key_padding_mask=k_mask)
+        out_pt, _ = attention_ref(q, k, v, key_padding_mask=k_mask, upcast=False, reorder_ops=True)
+        fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + fwd_atol
 
 
 if __name__ == "__main__":

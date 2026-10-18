@@ -1141,8 +1141,8 @@ def _flash_attn_fwd(
         requested_use_clc_scheduler
         and not is_varlen_mha
         and not is_dense_noncausal
-        # CLC does not map hd256 2CTA tiles correctly (wrong output, traps, hangs).
-        and not (is_hdim256 and use_2cta_instrs)
+        # The varlen scheduler's CLC path still maps hd256 2CTA tiles per CTA (wrong output, hangs).
+        and not (is_hdim256 and use_2cta_instrs and is_varlen)
     )
 
     if use_block_sparsity:
