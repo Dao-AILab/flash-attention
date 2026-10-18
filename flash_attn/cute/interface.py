@@ -598,6 +598,16 @@ class TensorwiseScales(NamedTuple):
     v: torch.Tensor | None = None
 
 
+class BlockScales(NamedTuple):
+    """MXFP8 UE8M0 block scales, each the contiguous interleave_sf buffer of its operand.
+
+    q and k scale 32-element blocks of e4m3 Q and K along head_dim; V stays BF16.
+    """
+
+    q: torch.Tensor
+    k: torch.Tensor
+
+
 def _validate_tensorwise_scales(
     scales: TensorwiseScales,
     q: torch.Tensor | None,
@@ -630,6 +640,55 @@ def _validate_tensorwise_scales(
     # copy a shared K / V descale once so that it stays one tensor
     v_descale = k_descale if scales.v is scales.k else maybe_contiguous(scales.v, align_bytes=4)
     return TensorwiseScales(q_descale, k_descale, v_descale)
+
+
+def _validate_block_scales(
+    scales: BlockScales,
+    q: torch.Tensor | None,
+    k: torch.Tensor | None,
+    v: torch.Tensor,
+    qv: torch.Tensor | None,
+    *,
+    requires_grad: bool,
+    num_splits: int,
+    layout_inputs: tuple,
+) -> BlockScales:
+    """Check MXFP8 block scales and the modes they support; return the buffers flattened.
+
+    layout_inputs are the varlen, paged, and block-sparse inputs, which MXFP8 does not support.
+    """
+    if scales.q is None or scales.k is None:
+        raise ValueError("QK MXFP8 requires both scales.q and scales.k")
+    if qv is not None or q is None or k is None:
+        raise NotImplementedError("QK MXFP8 does not support MLA")
+    if any(t is not None for t in layout_inputs) or num_splits != 1:
+        raise NotImplementedError("QK MXFP8 supports only dense, unsplit attention")
+    if any(t.ndim != 4 for t in (q, k, v)):
+        raise ValueError("QK MXFP8 requires Q/K/V in (batch, seqlen, heads, dim) layout")
+    if q.dtype != torch.float8_e4m3fn or k.dtype != q.dtype or v.dtype != torch.bfloat16:
+        raise ValueError("QK MXFP8 requires e4m3 Q/K and bf16 V")
+    if q.shape[-1] not in (64, 128) or v.shape[-1] not in (64, 128):
+        raise NotImplementedError("QK MXFP8 supports head dimensions 64 and 128")
+    if requires_grad:
+        raise NotImplementedError("QK MXFP8 is forward-only")
+    # (scales, operand, name, MN extent, K extent); K is the scaled (reduction) axis.
+    sf_layouts = [
+        (scales.q, q, "scales.q", q.shape[1], q.shape[3]),
+        (scales.k, k, "scales.k", k.shape[1], k.shape[3]),
+    ]
+    for sf, x, name, mn, k_extent in sf_layouts:
+        # interleave_sf stores 512 scales per (batch, head, 128 MN x 128 K tile).
+        num_tiles = math.ceil(mn / 128) * math.ceil(k_extent / 128)
+        expected = x.shape[0] * x.shape[2] * num_tiles * 512
+        if sf.dtype != torch.float8_e8m0fnu or sf.device != x.device:
+            raise ValueError(f"{name} must be UE8M0 on the same device as its operand")
+        if not sf.is_contiguous() or sf.numel() != expected:
+            raise ValueError(
+                f"{name} must be the contiguous interleave_sf buffer with MN={mn}, "
+                f"K={k_extent} ({expected} elements)"
+            )
+    # Flatten physical chunks; the kernel constructs their logical operand views.
+    return BlockScales(*(maybe_contiguous(t.reshape(-1)) for t in scales))
 
 
 def _flash_attn_fwd(
@@ -665,7 +724,7 @@ def _flash_attn_fwd(
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
     aux_scalars: Optional[tuple] = None,
-    scales: TensorwiseScales | None = None,
+    scales: TensorwiseScales | BlockScales | None = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     seqlen_k_per_split: Optional[int] = None,
@@ -689,7 +748,9 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
-        scales: Dequantization scales of low-precision Q/K/V (see TensorwiseScales).
+        scales: Dequantization scales of low-precision Q/K/V (see TensorwiseScales and
+            BlockScales). BlockScales give BF16 output and support only dense, unsplit,
+            forward-only attention.
         config: Fully resolved forward config, or None for the default. Unsupported with qv.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
@@ -726,9 +787,9 @@ def _flash_attn_fwd(
     num_head_kv = v.shape[-2]
     head_dim_v = v.shape[-1]
     # The scale format is the type of scales, not the dtype of its tensors: each format is one
-    # type with one validator. Other formats (block scales, lookup-table or codebook
+    # type with one validator. Other formats (other block-scale formats, lookup-table or codebook
     # dequantization) slot in as a new type and a new case.
-    descales = None
+    descales = block_scales = None
     match scales:
         case None:
             pass
@@ -736,8 +797,18 @@ def _flash_attn_fwd(
             descales = _validate_tensorwise_scales(
                 scales, q, v, qv, batch_size=batch_size, num_head_kv=num_head_kv
             )
+        case BlockScales():
+            block_scales = _validate_block_scales(
+                scales, q, k, v, qv, requires_grad=requires_grad, num_splits=num_splits,
+                layout_inputs=(cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table,
+                               block_sparse_tensors),
+            )
         case _:
-            raise TypeError(f"scales must be TensorwiseScales or None, got {type(scales).__name__}")
+            raise TypeError(
+                f"scales must be TensorwiseScales, BlockScales or None, got {type(scales).__name__}"
+            )
+    qk_blockscaled = block_scales is not None
+    sf_operands = (block_scales.q, block_scales.k) if qk_blockscaled else (None, None)
     if cu_seqlens_k is None:
         if page_table is None:
             assert k is None or k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -766,9 +837,10 @@ def _flash_attn_fwd(
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
     
-    assert all(t is None or t.dtype == v.dtype for t in (q, k, qv)), (
-        "q, k, v, and qv must have the same dtype"
-    )
+    if not qk_blockscaled:
+        assert all(t is None or t.dtype == v.dtype for t in (q, k, qv)), (
+            "q, k, v, and qv must have the same dtype"
+        )
 
     q_dtype = q.dtype if q is not None else qv.dtype
 
@@ -816,11 +888,16 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
+    if qk_blockscaled:
+        if arch // 10 != 10:
+            raise NotImplementedError("QK MXFP8 requires SM100-family hardware")
+        # Scale chunks are token-major; use separate Q heads for GQA.
+        pack_gqa = False
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
-    out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
+    out_torch_dtype = torch.bfloat16 if is_fp8 or qk_blockscaled else q_dtype
     device = v.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
 
@@ -957,6 +1034,7 @@ def _flash_attn_fwd(
             seqlen_k_capacity=k_capacity,
             requires_grad=requires_grad or any(t.requires_grad for t in aux_tensors or ()),
             has_aux_scalars=aux_scalars is not None,
+            mxfp8_path="qk" if qk_blockscaled else None,
         )
         use_swapab = config.use_swapab
         prepare_split_metadata = needs_split_metadata(config, inputs)
@@ -1362,6 +1440,9 @@ def _flash_attn_fwd(
         tensormap_workspace is not None,
     )
 
+    if qk_blockscaled:
+        compile_key += ("mxfp8_qk", v.dtype)
+
     if compile_key not in _flash_attn_fwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         (
@@ -1558,6 +1639,8 @@ def _flash_attn_fwd(
                     )
             else:
                 fwd_cls = FlashAttentionForwardSm100
+                # SwapAB never runs block scales (config.SWAPAB.rejection).
+                mxfp8_kwargs = dict(qk_blockscaled=True) if qk_blockscaled else {}
                 if use_swapab:
                     from flash_attn.cute.flash_fwd_decode_sm100 import FlashAttentionForwardSm100SwapAB
                     fwd_cls = FlashAttentionForwardSm100SwapAB
@@ -1577,6 +1660,7 @@ def _flash_attn_fwd(
                     kv_subtile_factor=kv_subtile_factor,
                     seqlen_k_per_split=seqlen_k_per_split,
                     has_tile_count_semaphore=tile_count_semaphore is not None,
+                    **mxfp8_kwargs,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -1664,6 +1748,14 @@ def _flash_attn_fwd(
                     max_seqlen_q,
                     tensormap_workspace_tensor,
                 ])
+                # The SwapAB kernel takes no block-scale operands; without MXFP8 they are None.
+                if not use_swapab:
+                    sf_tensors = [to_cute_tensor(t.view(torch.uint8)) if t is not None else None
+                                  for t in sf_operands]
+                    for t in sf_tensors:
+                        if t is not None:
+                            t.element_type = cutlass.Float8E8M0FNU
+                    compile_args.extend(sf_tensors)
             elif arch // 10 in [8, 9, 12]:
                 compile_args.extend([
                     cu_total_m_blocks_tensor,
@@ -1679,6 +1771,8 @@ def _flash_attn_fwd(
             t.detach() if t is not None else None
             for t in (q, k, v, qv)
         ]
+        if qk_blockscaled:
+            q_call, k_call = q_call.view(torch.uint8), k_call.view(torch.uint8)
         if is_fp8:
             # need uint8 workaround until we pin torch >= 2.11.0 where fp8 export is supported
             q_call, k_call, v_call, qv_call = [
@@ -1755,6 +1849,8 @@ def _flash_attn_fwd(
                     max_seqlen_q,
                     tensormap_workspace,
                 ])
+                if not use_swapab:
+                    call_args.extend(t.view(torch.uint8) if t is not None else None for t in sf_operands)
             elif arch // 10 in [8, 9, 12]:
                 call_args.extend([
                     cu_total_m_blocks,
@@ -3791,7 +3887,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
-        scales: TensorwiseScales | None = None,
+        scales: TensorwiseScales | BlockScales | None = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -4157,12 +4253,14 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
-    scales: TensorwiseScales | None = None,
+    scales: TensorwiseScales | BlockScales | None = None,
 ):
     """Compute attention.
 
-    scales: dequantization scales of low-precision Q/K/V; TensorwiseScales for FP8, which is
-        forward-only. None for unscaled inputs (FP8 then uses descale 1).
+    scales: dequantization scales of low-precision Q/K/V, forward-only; None for unscaled inputs
+        (FP8 then uses descale 1).
+        - TensorwiseScales: FP8 Q/K/V.
+        - BlockScales(q, k): MXFP8 Q/K with BF16 V; BF16 output, dense, unsplit attention.
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -4311,8 +4409,13 @@ def flash_attn_varlen_func(
         and runs unchunked otherwise). Small launch-overhead cost. None disables.
 
     scales: dequantization scales of low-precision Q/K/V; TensorwiseScales for FP8, which is
-        forward-only. None for unscaled inputs (FP8 then uses descale 1).
+        forward-only. None for unscaled inputs (FP8 then uses descale 1). MXFP8 BlockScales
+        support only dense attention, through flash_attn_func.
     """
+    if isinstance(scales, BlockScales):
+        raise NotImplementedError(
+            "MXFP8 BlockScales support only dense attention: use flash_attn_func"
+        )
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )

@@ -80,6 +80,7 @@ _UNSUPPORTED = [
     # A tensor (device) max_seqlen_q is no host bound.
     ({**_VARLEN_PAGED, "has_max_seqlen_q_hint": False}, "max_seqlen_q == 1"),
     ({"dtype": "torch.float8_e4m3fn"}, "dtype"),
+    ({"mxfp8_path": "qk"}, "MXFP8 block scales"),
     ({"head_dim": 192, "head_dim_v": 128}, "head dimensions"),
     ({"num_heads": 66, "num_heads_kv": 2}, "GQA ratio"),
     ({"page_size": 64}, "page size must be a multiple of 128"),

@@ -140,6 +140,8 @@ class FwdHeuristicInputs(NamedTuple):
     seqlen_k_capacity: int | None = None
     requires_grad: bool = False  # any input, aux tensors included
     has_aux_scalars: bool = False
+    # MXFP8 block-scaled forward: "qk" (e4m3 Q/K with block scales, BF16 V); None otherwise.
+    mxfp8_path: str | None = None
 
     @property
     def device_capacity(self) -> int:
@@ -420,6 +422,7 @@ _SM_STATS_CROSS_STAGE = {
     ("fp8", 64, True, False): ("sm_100",),
     ("fp8", 96, False, False): ("sm_100",),
     ("fp8", 96, True, False): ("sm_100",),
+    ("mxfp8_qk", 64, True, False): ("sm_103", "sm_107"),
 }
 # === END SM100 TUNING KNOBS ===
 
@@ -441,16 +444,25 @@ def sm100_arch_family(device_arch: int) -> str:
     return "sm_103" if sm100_is_sm103_family(device_arch) else "sm_100"
 
 
-def dtype_path(dtype: str) -> str:
-    """Tuning-table dtype path of a torch dtype string."""
+def tuning_path(inputs: FwdHeuristicInputs) -> str:
+    """Tuning-table path: the MXFP8 path, else the dtype."""
+    if inputs.mxfp8_path is not None:
+        return f"mxfp8_{inputs.mxfp8_path}"
+    dtype = inputs.dtype
     return "fp8" if "float8" in dtype else "fp16" if dtype == "torch.float16" else "bf16"
+
+
+def has_fp8_pv(inputs: FwdHeuristicInputs) -> bool:
+    """Whether P and V are FP8. The FP8 register splits and exp2 tuning follow V: MXFP8 QK keeps
+    BF16 V and P."""
+    return "float8" in inputs.dtype and inputs.mxfp8_path != "qk"
 
 
 def select_sm_stats_cross_stage(inputs: FwdHeuristicInputs, *, use_s_ping_pong: bool) -> bool:
     """See NOTE [softmax stats release order]."""
     if inputs.device_capacity not in (10, 11) or use_s_ping_pong:
         return False
-    key = (dtype_path(inputs.dtype), inputs.head_dim_padded, inputs.causal, inputs.is_varlen_q)
+    key = (tuning_path(inputs), inputs.head_dim_padded, inputs.causal, inputs.is_varlen_q)
     return sm100_arch_family(inputs.device_arch) in _SM_STATS_CROSS_STAGE.get(key, ())
 
 
@@ -465,7 +477,7 @@ def select_sm100_registers(
         head_dim_padded,
         sm100_is_sm103_family(inputs.device_arch),
     )
-    is_fp8 = "float8" in inputs.dtype
+    is_fp8 = has_fp8_pv(inputs)
     if head_dim_padded < 96:
         small = SM100_FP8_SMALL_HDIM_REGISTERS if is_fp8 else SM100_SMALL_HDIM_REGISTERS
         return small[paged_kv_non_tma]
@@ -503,7 +515,7 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
     is_sm103 = sm100_is_sm103_family(inputs.device_arch)
     key = (use_2cta_instrs, inputs.causal, head_dim_padded, is_sm103)
     tune = SM100_TUNING.get(key, {})
-    fp8_tune = SM100_FP8_TUNING.get(key, {}) if "float8" in inputs.dtype else {}
+    fp8_tune = SM100_FP8_TUNING.get(key, {}) if has_fp8_pv(inputs) else {}
     if "ex2_emu_freq" in fp8_tune:
         tune = {**tune, **fp8_tune}
     start_frg = tune.get("ex2_emu_start_frg", 1)
@@ -708,6 +720,7 @@ def can_use_s_ping_pong(
         and not inputs.has_mask_mod
         and not inputs.use_block_sparsity
         and not inputs.has_learnable_sink
+        and inputs.mxfp8_path is None
     )
 
 
@@ -726,6 +739,8 @@ def is_2cta_eligible(
     )
     return (
         num_splits == 1
+        # The MXFP8 kernel is 1CTA only.
+        and inputs.mxfp8_path is None
         and (not inputs.has_cu_seqlens_q or (inputs.is_hdim256 and hd256_2cta_varlen_ok(inputs)))
         and not inputs.has_seqused_q
         and not inputs.use_block_sparsity
@@ -879,6 +894,7 @@ class SwapABPolicy:
             and not (inputs.has_max_seqlen_q_hint and inputs.max_seqlen_q == 1),
             "single query token per sequence": is_dense_q and inputs.total_q != inputs.batch_size,
             "dtype": inputs.dtype not in ("torch.float16", "torch.bfloat16"),
+            "MXFP8 block scales": inputs.mxfp8_path is not None,
             "head dimensions": not self.supports_head_dims(inputs.head_dim, inputs.head_dim_v),
             "GQA ratio": inputs.qhead_per_kvhead > self.max_qhead_per_kvhead,
             f"page size must be a multiple of {self.page_multiple}": (
@@ -1016,7 +1032,8 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
             validate_fwd_config(config, inputs)
             return config
     pack_gqa = default_pack_gqa(inputs) if inputs.pack_gqa is None else inputs.pack_gqa
-    if inputs.sparse_mask_per_head:
+    # MXFP8 scale chunks are token-major, so GQA uses separate Q heads.
+    if inputs.sparse_mask_per_head or inputs.mxfp8_path is not None:
         pack_gqa = False
     inputs = inputs._replace(pack_gqa=pack_gqa)
     device_capacity = inputs.device_capacity
@@ -1036,8 +1053,8 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     num_n_blocks = ceil_div(seqlen_k_loaded, tile_n)
     if inputs.requested_num_splits is not None:
         num_splits = max(1, inputs.requested_num_splits)
-    elif not is_sm100_family:
-        # Only SM100/SM110 implement SplitKV.
+    elif not is_sm100_family or inputs.mxfp8_path is not None:
+        # Only SM100/SM110 implement SplitKV, and MXFP8 forward is unsplit.
         num_splits = 1
     else:
         num_splits = num_splits_heuristic(total_mblocks, inputs.num_sms, num_n_blocks, 128)
@@ -1297,6 +1314,11 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
             f"Head-dim 192/128 with tile_n={config.tile_n} needs {hd192_smem_bytes} bytes "
             f"of shared memory; SM100 provides {_SM100_SMEM_BYTES}"
         )
+
+    if inputs.mxfp8_path is not None and (
+        config.tile_n != 128 or config.num_splits != 1 or config.pack_gqa
+    ):
+        raise ValueError("MXFP8 forward requires 128 x 128 tiles, one split, and no PackGQA")
 
     if config.num_splits > 1:
         if inputs.head_dim_v_padded >= 192 and inputs.head_dim_v != 256:
