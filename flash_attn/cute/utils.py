@@ -1128,3 +1128,27 @@ def as_shhb_tensor(
             ),
         ),
     )
+
+
+@dsl_user_op
+def order_after(x: Float32, dep: Float32, zero: cutlass.Int32, *, loc=None, ip=None) -> Float32:
+    """x, made data-dependent on dep: returns the bits x | (dep & zero) for a run-time zero.
+
+    Instructions that consume the result cannot be scheduled before dep is computed. zero must be
+    a value the compiler cannot prove is 0.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(x).ir_value(loc=loc, ip=ip),
+                Float32(dep).ir_value(loc=loc, ip=ip),
+                cutlass.Int32(zero).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n.reg .b32 t;\nand.b32 t, $2, $3;\nor.b32 $0, $1, t;\n}",
+            "=f,f,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )

@@ -79,7 +79,9 @@ from flash_attn.cute.utils import AuxData
 from flash_attn.cute.config import (
     SM100_LAUNCH_REGISTERS,
     SM100_THREADS_PER_CTA,
+    SM107_MXFP8_PV_TUNING,
     FwdConfig,
+    Sm107PvTuning,
 )
 
 # Note [Low Precision Scaling]
@@ -265,9 +267,18 @@ class FlashAttentionForwardSm100:
         # Otherwise, with two Q stages, QK_i's scale factors alias the other stage's S in TMEM
         # (see mma).
         self.sf_overlap = qk_blockscaled and self.q_stage == 2 and not self.dedicated_sf
+        self.sm_stats_mbarrier, self.sm_stats_early = False, False
+        self.sm107_pv_tuning = Sm107PvTuning()
         if self.dedicated_sf:
-            # The K=64 PV MMAs wait for the whole P; sm_100/sm_103 split P arrival as for BF16.
-            self.split_P_arrive = 0
+            # Registers come from FwdConfig; the kernel reads the schedule fields.
+            self.sm107_pv_tuning = SM107_MXFP8_PV_TUNING.get(
+                (pv_softmax, self.head_dim_padded, is_causal), Sm107PvTuning()
+            )
+            # sm_100/sm_103 split P arrival as for BF16. On sm_107 the split point must be a
+            # multiple of the K=64 PV instruction.
+            self.split_P_arrive = 64 if self.sm107_pv_tuning.split_p else 0
+            self.sm_stats_mbarrier = self.sm107_pv_tuning.stats_mbarrier
+            self.sm_stats_early = self.sm107_pv_tuning.early_stats
         # "exact" native PV normalizes O by the sum of the E4M3 P that PV consumed. Instead of
         # decoding and adding P on the softmax warps, the MMA warp issues P @ ones (an all-ones
         # E4M3 B tile, N=pv_ones_n) next to each PV, so the tensor core computes that sum.
@@ -510,8 +521,8 @@ class FlashAttentionForwardSm100:
         # Cap small head_dim from over-staging: the 224*1024 budget undercounts
         # per-stage state, so at hd_padded=16 the unbounded formula picks 52 stages
         # and overflows the 227 KB SMEM cap. No-op for hd_padded >= 32 (max 26).
-        # Keep hd192 staging in sync with config.sm100_hd192_uneven_kv_smem_bytes.
-        kv_stage = min((224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage, 32)
+        smem_budget = self.sm107_pv_tuning.smem_budget_kib * 1024
+        kv_stage = min((smem_budget - smem_size_q_o) // smem_size_kv_per_stage, 32)
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
@@ -3200,8 +3211,10 @@ class FlashAttentionForwardSm100:
                         sScale[
                             tidx + sm_stats_index * self.m_block_size + self.s_p_o_stage * self.m_block_size
                         ] = softmax.row_max[0]
-                    # pipeline_sm_stats.producer_commit_w_index(stage)
-                    sm_stats_barrier.arrive_w_index(index=sm_stats_index * 4 + warp_idx)
+                    if const_expr(self.sm_stats_mbarrier):
+                        pipeline_sm_stats.producer_commit_w_index(sm_stats_index)
+                    else:
+                        sm_stats_barrier.arrive_w_index(index=sm_stats_index * 4 + warp_idx)
 
             # # Write LSE to gmem
             # if const_expr(mLSE is not None):
@@ -3373,9 +3386,15 @@ class FlashAttentionForwardSm100:
             sScale[thread_idx + sm_stats_index * self.m_block_size] = acc_scale
             # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
         # Notify correction wg that row_max is ready
-        # pipeline_sm_stats.producer_commit_w_index(stage)
         if const_expr(not self.use_s_ping_pong or not is_first):
-            sm_stats_barrier.arrive_w_index(index=sm_stats_index * 4 + warp_idx)
+            if const_expr(self.sm_stats_mbarrier):
+                pipeline_sm_stats.producer_commit_w_index(sm_stats_index)
+            else:
+                sm_stats_barrier.arrive_w_index(index=sm_stats_index * 4 + warp_idx)
+        if const_expr(self.sm_stats_early and not is_first):
+            # n_block >> 30 is a run-time zero: only the first step can have n_block < 0
+            # (see Sm107PvTuning.early_stats).
+            row_max = utils.order_after(row_max, acc_scale, n_block >> 30)
 
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
@@ -3598,8 +3617,10 @@ class FlashAttentionForwardSm100:
                 # Ignore first signal from softmax as no correction is required
                 if const_expr(not self.use_s_ping_pong):
                     for stage in cutlass.range_constexpr(self.q_stage):
-                        # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
-                        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                        if const_expr(self.sm_stats_mbarrier):
+                            pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+                        else:
+                            sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
                         # See NOTE [softmax stats release order]: cross-stage holds slot 1 until
                         # after the next O0 rescale.
                         if const_expr(stage == 0 or not self.sm_stats_cross_stage_release):
@@ -3614,8 +3635,10 @@ class FlashAttentionForwardSm100:
                         else:
                             sm_stats_index = stage
                         # wait for S0 / S1
-                        # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
-                        sm_stats_barrier.arrive_and_wait_w_index(index=sm_stats_index * 4 + warp_idx)
+                        if const_expr(self.sm_stats_mbarrier):
+                            pipeline_sm_stats.consumer_wait_w_index_phase(sm_stats_index, sm_stats_consumer_phase)
+                        else:
+                            sm_stats_barrier.arrive_and_wait_w_index(index=sm_stats_index * 4 + warp_idx)
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
@@ -3680,8 +3703,10 @@ class FlashAttentionForwardSm100:
                         sm_stats_index = o_acc_consumer_count & 1
                     else:
                         sm_stats_index = stage
-                    # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
-                    sm_stats_barrier.arrive_and_wait_w_index(index=sm_stats_index * 4 + warp_idx)
+                    if const_expr(self.sm_stats_mbarrier):
+                        pipeline_sm_stats.consumer_wait_w_index_phase(sm_stats_index, sm_stats_consumer_phase)
+                    else:
+                        sm_stats_barrier.arrive_and_wait_w_index(index=sm_stats_index * 4 + warp_idx)
                     # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
