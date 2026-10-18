@@ -379,6 +379,10 @@ class FlashAttentionForwardSm100:
         self.empty_warp_ids = (15,)
         self.tmem_arch = "sm_107" if self.dedicated_sf else "sm_100"
         self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.tmem_arch)
+        # Sum quantized P before waiting for the SMEM slot that passes row statistics to
+        # correction. This register-only sum can overlap the release instead of serializing the
+        # two softmax warpgroups.
+        self.sm_stats_late_acquire = self.dedicated_sf
 
         self.threads_per_cta = cute.arch.WARP_SIZE * len(
             (
@@ -3065,7 +3069,7 @@ class FlashAttentionForwardSm100:
             pipeline_sm_stats.producer_acquire_w_index_phase(
                 s_p_o_consumer_count & 1, 1 ^ ((s_p_o_consumer_count >> 1) & 1)
             )
-        else:
+        elif const_expr(not self.sm_stats_late_acquire):
             pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
         if const_expr(self.pv_blockscaled and not self.dedicated_sf):
             softmax.update_row_sum_quantized_streaming(tSrP_r2t_f32, self.v_dtype, acc_scale, is_first)
@@ -3077,6 +3081,9 @@ class FlashAttentionForwardSm100:
             )
         else:
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+        if const_expr(self.sm_stats_late_acquire):
+            # Wait for correction to release the slot before softmax writes sScale again.
+            pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
         # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
         if const_expr(self.use_s_ping_pong):
             return s_p_o_consumer_count + 1, sm_stats_producer_phase, s0_s1_sequence_phase ^ 1
