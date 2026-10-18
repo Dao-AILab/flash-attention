@@ -1,6 +1,6 @@
 import itertools
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 
@@ -32,8 +32,16 @@ def make_inputs(*, pack_gqa: bool | None = None, **changes) -> FwdHeuristicInput
 
 
 @pytest.mark.parametrize("device_arch", [80, 90, 100, 103, 110, 120])
-def test_every_architecture_selects_a_valid_default(device_arch):
-    select_fwd_config(make_inputs(device_arch=device_arch))
+@pytest.mark.parametrize("causal", [False, True])
+def test_every_architecture_selects_a_valid_default(device_arch, causal):
+    inputs = make_inputs(device_arch=device_arch, causal=causal)
+    config = select_fwd_config(inputs)
+    validate_fwd_config(config, inputs)
+    # Kernel compile-time flags must be concrete, not None.
+    for field in fields(config):
+        if field.name != "registers":
+            value = getattr(config, field.name)
+            assert type(value) is (bool if field.type in (bool, "bool") else int), field.name
 
 
 @pytest.mark.parametrize(
@@ -140,12 +148,18 @@ def test_split_selection(changes, expected_splits, expected_tile_n):
         ({"disable_2cta": True, **_HD128}, dict(use_2cta_instrs=True), None),
         ({"has_cu_seqlens_q": True, "batch_size": 4, "max_seqlen_q": 512},
          dict(use_tma_o=True), "TMA O"),
-        ({"num_heads_kv": 4, "pack_gqa": True, "has_cu_seqlens_k": True,
-          "requested_use_clc_scheduler": True, **_HD128},
-         dict(is_static_persistent=True), "Static persistent scheduling"),
+        # Explicit CLC may run outside the measured defaults, but not with static persistence.
+        ({"num_heads_kv": 4, "pack_gqa": True, "has_cu_seqlens_k": True, **_HD128},
+         dict(use_clc_scheduler=True, is_static_persistent=False), None),
+        ({"num_heads_kv": 4, "pack_gqa": True, "has_cu_seqlens_k": True, **_HD128},
+         dict(use_clc_scheduler=True, is_static_persistent=True), "Static persistent scheduling"),
         ({**_SEMAPHORE, "causal": True, "max_seqlen_q": 1, "num_heads_kv": 4, "pack_gqa": True},
          dict(use_clc_scheduler=True), "CLC"),
-        ({**_HD256, "causal": True}, dict(use_clc_scheduler=True), "CLC"),
+        # hd256 2CTA CLC supports dense, not varlen, cluster mapping.
+        ({**_HD256, "causal": True},
+         dict(use_clc_scheduler=True, is_static_persistent=False), None),
+        ({**_HD256, "causal": True, "has_cu_seqlens_q": True},
+         dict(use_clc_scheduler=True, is_static_persistent=False), "CLC"),
         ({"max_seqlen_q": 1, "has_mask_mod": True, **_HD128},
          dict(use_s_ping_pong=True), "S ping-pong"),
         # SplitKV.
@@ -184,6 +198,107 @@ def test_smem_model_matches_measured_kernel_allocations():
     too_wide = replace(select_fwd_config(hd192), tile_n=192, q_stage=1, use_2cta_instrs=False)
     with pytest.raises(ValueError, match="needs 247808 bytes of shared memory"):
         validate_fwd_config(too_wide, hd192)
+
+
+_DENSE_CAUSAL_103 = dict(device_arch=103, causal=True, **_HD128)
+_DEFAULT_HD64 = Sm100Registers(softmax=200, correction=64, other=48)
+
+
+@pytest.mark.parametrize(
+    ("changes", "clc", "registers"),
+    [
+        (_DENSE_CAUSAL_103, True, None),
+        ({**_DENSE_CAUSAL_103, "causal": False}, False, None),
+        ({**_DENSE_CAUSAL_103, "has_cu_seqlens_k": True}, False, None),
+        ({**_DENSE_CAUSAL_103, "device_arch": 90}, False, None),
+        # BF16 hd64 measured slower on SM103 but faster on SM100.
+        ({"device_arch": 103, "causal": True}, False, None),
+        ({"device_arch": 100, "causal": True}, True, None),
+        # The default split spills once persistent; this CLC cell names its own.
+        ({"device_arch": 103, "causal": True, "dtype": "torch.float16"}, True,
+         Sm100Registers(softmax=184, correction=64, other=80)),
+        # Measured defaults only: varlen GQA stays off CLC by default.
+        ({"device_arch": 103, "causal": True, "dtype": "torch.float16", "num_heads_kv": 4,
+          "pack_gqa": True, "has_cu_seqlens_k": True}, False, _DEFAULT_HD64),
+        # B200 FP16 hd192 measured no better with a CLC split, so it keeps the default.
+        ({"device_arch": 100, "causal": True, "dtype": "torch.float16", **_HD192}, True,
+         Sm100Registers(softmax=192, correction=72, other=56)),
+    ],
+)
+def test_causal_clc_cells(changes, clc, registers):
+    config = select_fwd_config(make_inputs(**changes))
+
+    assert config.use_clc_scheduler is clc
+    if registers is not None:
+        assert config.registers == registers
+
+
+def explicit_clc(config, inputs, use_clc_scheduler):
+    """An explicit config with CLC on or off and the register split that goes with it."""
+    config = replace(
+        config,
+        use_clc_scheduler=use_clc_scheduler,
+        is_static_persistent=config.is_static_persistent and not use_clc_scheduler,
+    )
+    registers = select_registers(
+        inputs._replace(pack_gqa=config.pack_gqa),
+        tile_m=config.tile_m,
+        tile_n=config.tile_n,
+        q_stage=config.q_stage,
+        num_splits=config.num_splits,
+        use_2cta_instrs=config.use_2cta_instrs,
+        use_clc_scheduler=use_clc_scheduler,
+    )
+    config = replace(config, registers=registers)
+    validate_fwd_config(config, inputs)
+    return config
+
+
+@pytest.mark.parametrize(
+    ("changes", "use_clc_scheduler", "registers"),
+    [
+        # Turning CLC off on a cell with a CLC split restores the default split.
+        ({"device_arch": 103, "causal": True, "dtype": "torch.float16"}, False, _DEFAULT_HD64),
+        # CLC outside the measured dense causal class keeps the default split.
+        ({"device_arch": 103, "causal": True, "dtype": "torch.float16", "num_heads_kv": 4,
+          "pack_gqa": True, "has_cu_seqlens_k": True}, True, _DEFAULT_HD64),
+        ({"device_arch": 103}, True, _DEFAULT_HD64),
+    ],
+)
+def test_explicit_clc_configs(changes, use_clc_scheduler, registers):
+    inputs = make_inputs(**changes)
+    selected = select_fwd_config(inputs)
+    assert selected.use_clc_scheduler is not use_clc_scheduler
+
+    config = explicit_clc(selected, inputs, use_clc_scheduler)
+    assert config.registers == registers
+
+
+# 65536 batches put the CLC grid's z extent past CUDA's 65535 limit.
+_CLC_GRID_Z_OVERFLOW = dict(
+    device_arch=100, causal=True, batch_size=65536, total_q=65536 * 129, total_k=65536 * 129,
+    max_seqlen_q=129, max_seqlen_k=129,
+)
+
+
+@pytest.mark.parametrize(
+    ("changes", "clc"),
+    [
+        (_CLC_GRID_Z_OVERFLOW, False),
+        ({**_CLC_GRID_Z_OVERFLOW, "batch_size": 65535}, True),
+        # Grid y holds the launched heads: KV heads when Q heads are packed.
+        ({**_CLC_GRID_Z_OVERFLOW, "batch_size": 1, "num_heads": 65536, "num_heads_kv": 65536},
+         False),
+    ],
+)
+def test_clc_respects_cuda_grid_limits(changes, clc):
+    inputs = make_inputs(**changes)
+    config = select_fwd_config(inputs)
+
+    assert config.use_clc_scheduler is clc
+    if not clc:
+        with pytest.raises(ValueError, match="CLC is not supported"):
+            explicit_clc(config, inputs, True)
 
 
 # Frozen copy of the register policy the forward kernels applied before it moved into the
@@ -243,7 +358,7 @@ def test_sm100_registers_match_the_legacy_kernel_policy():
         inputs = make_inputs(device_arch=device_arch, dtype=dtype, head_dim=d, head_dim_v=d,
                              causal=causal, page_size=page)
         got = select_registers(inputs, tile_m=128, tile_n=128, q_stage=q_stage,
-                               use_2cta_instrs=use_2cta)
+                               num_splits=1, use_2cta_instrs=use_2cta, use_clc_scheduler=False)
         expected = legacy_sm100_registers(
             "float8" in dtype, inputs.head_dim_padded, causal, use_2cta,
             device_arch in (103, 107), page not in (None, 128), q_stage,
@@ -258,7 +373,7 @@ def test_sm90_registers_match_the_legacy_kernel_policy():
         inputs = make_inputs(device_arch=90, num_heads=8 * qhead_per_kvhead, num_heads_kv=8,
                              pack_gqa=pack_gqa, page_size=page)
         got = select_registers(inputs, tile_m=tile_m, tile_n=128, q_stage=1,
-                               use_2cta_instrs=False)
+                               num_splits=1, use_2cta_instrs=False, use_clc_scheduler=False)
         expected = legacy_sm90_registers(
             tile_m, pack_gqa, qhead_per_kvhead, page not in (None, 128)
         )
@@ -268,7 +383,7 @@ def test_sm90_registers_match_the_legacy_kernel_policy():
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", ["torch.bfloat16", "torch.float8_e4m3fn"])
 def test_selected_configs_carry_the_legacy_policy(dtype, causal):
-    # Wiring: select_fwd_config must pass its final tile, stage, and 2CTA choice.
+    # Wiring: select_fwd_config must pass its final tile, stage, split, 2CTA, and scheduler.
     shapes = [
         dict(max_seqlen_q=4096),
         dict(max_seqlen_q=1, max_seqlen_k=16384, num_heads=8, num_heads_kv=1,

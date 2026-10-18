@@ -263,7 +263,7 @@ def _get_fwd_inputs(
     """Build FwdHeuristicInputs; shared by _get_fwd_config and get_scheduler_metadata.
 
     Derived here: the dtype string, the tile_mn / num_splits requests (num_splits < 1 means
-    automatic), and the FA_CLC / 2CTA / S ping-pong environment knobs. Callers pass every other
+    automatic), and the 2CTA / S ping-pong environment knobs. Callers pass every other
     FwdHeuristicInputs field in **fields as host values: device_arch, num_sms, head dims and
     counts, batch and token totals, host sequence bounds, and feature bits.
     """
@@ -273,7 +273,6 @@ def _get_fwd_inputs(
         requested_tile_m=None if tile_mn is None else tile_mn[0],
         requested_tile_n=None if tile_mn is None else tile_mn[1],
         requested_num_splits=None if num_splits < 1 else num_splits,
-        requested_use_clc_scheduler=utils._get_use_clc_scheduler_default(),
         disable_2cta=utils._get_disable_2cta_default(is_fwd=True),
         disable_s_ping_pong=utils._get_disable_s_ping_pong_default(),
     )
