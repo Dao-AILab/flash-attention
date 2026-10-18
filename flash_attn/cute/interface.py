@@ -7,7 +7,7 @@ import operator
 import warnings
 from dataclasses import dataclass, replace
 from functools import lru_cache, partial
-from typing import Callable, NamedTuple, Optional, Tuple
+from typing import Callable, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -606,12 +606,23 @@ class BlockScales(NamedTuple):
     BF16. v_bf16 is the original BF16 V (V's shape), required exactly by causal native PV: every
     KV block that intersects a query tile's diagonal runs with BF16 P and v_bf16, so future keys
     cannot leak through shared along-key scales. Never reconstruct it from the quantized V.
+
+    pv_softmax selects the native PV softmax recipe:
+      - "exact" (default): O is normalized by the sum of the E4M3 P that the PV MMA consumes,
+        with P biased by 2^8 and no lag in the running row max, so the output matches a
+        quantized-P reference to BF16 rounding.
+      - "fast": rows are normalized by the FP32 sum of the unquantized probabilities, P is
+        biased by 2^4, and the running row max may lag by up to 4 (log2 units) before O is
+        rescaled. On peaked rows the normalization can differ from the quantized P that PV
+        consumed by a few percent.
+    LSE always uses the FP32 sum. Causal attention uses BF16 diagonal blocks in both modes.
     """
 
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor | None = None
     v_bf16: torch.Tensor | None = None
+    pv_softmax: Literal["exact", "fast"] = "exact"
 
 
 def _validate_tensorwise_scales(
@@ -670,10 +681,16 @@ def _validate_block_scales(
     layout_inputs are the varlen, paged, and block-sparse inputs, which MXFP8 does not support.
     Native PV (scales.v) also rejects local masks, gather_kv_indices, softcap, and
     pv_unsupported: the sinks, modifiers, and auxiliary data. Causal native PV requires
-    scales.v_bf16.
+    scales.v_bf16, and scales.pv_softmax applies to native PV only.
     """
     pv = scales.v is not None
     v_bf16 = scales.v_bf16
+    if scales.pv_softmax not in ("exact", "fast"):
+        raise ValueError(
+            f'BlockScales.pv_softmax must be "exact" or "fast", got {scales.pv_softmax!r}'
+        )
+    if scales.pv_softmax != "exact" and not pv:
+        raise ValueError("pv_softmax requires native MXFP8 PV (scales.v)")
     if v_bf16 is not None and not pv:
         raise ValueError("v_bf16 requires native MXFP8 PV (scales.v)")
     mode = "Native MXFP8 PV" if pv else "QK MXFP8"
@@ -862,6 +879,7 @@ def _flash_attn_fwd(
         (block_scales.q, block_scales.k, block_scales.v) if qk_blockscaled else (None, None, None)
     )
     v_bf16 = block_scales.v_bf16 if qk_blockscaled else None
+    pv_softmax = block_scales.pv_softmax if qk_blockscaled else "exact"
     if cu_seqlens_k is None:
         if page_table is None:
             assert k is None or k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -1087,7 +1105,11 @@ def _flash_attn_fwd(
             seqlen_k_capacity=k_capacity,
             requires_grad=requires_grad or any(t.requires_grad for t in aux_tensors or ()),
             has_aux_scalars=aux_scalars is not None,
-            mxfp8_path="pv" if pv_blockscaled else "qk" if qk_blockscaled else None,
+            mxfp8_path=(
+                ("pv_fast" if pv_softmax == "fast" else "pv") if pv_blockscaled
+                else "qk" if qk_blockscaled
+                else None
+            ),
         )
         use_swapab = config.use_swapab
         prepare_split_metadata = needs_split_metadata(config, inputs)
@@ -1495,7 +1517,7 @@ def _flash_attn_fwd(
 
     if qk_blockscaled:
         compile_key += ("mxfp8_qk", v.dtype, pv_blockscaled,
-                        get_broadcast_dims(v_bf16) if v_bf16 is not None else None)
+                        get_broadcast_dims(v_bf16) if v_bf16 is not None else None, pv_softmax)
 
     if compile_key not in _flash_attn_fwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1695,7 +1717,9 @@ def _flash_attn_fwd(
                 fwd_cls = FlashAttentionForwardSm100
                 # SwapAB never runs block scales (config.SWAPAB.rejection).
                 mxfp8_kwargs = (
-                    dict(qk_blockscaled=True, pv_blockscaled=pv_blockscaled) if qk_blockscaled else {}
+                    dict(qk_blockscaled=True, pv_blockscaled=pv_blockscaled, pv_softmax=pv_softmax)
+                    if qk_blockscaled
+                    else {}
                 )
                 if use_swapab:
                     from flash_attn.cute.flash_fwd_decode_sm100 import FlashAttentionForwardSm100SwapAB
@@ -4324,6 +4348,8 @@ def flash_attn_func(
         - BlockScales(q, k, v, v_bf16): causal native MXFP8 PV. v_bf16 is the original BF16 V
           (same shape as V): every KV block intersecting the query tile's diagonal uses BF16 P
           and V, so future tokens cannot leak through shared along-key scales.
+        - BlockScales(..., pv_softmax="fast"): native PV with the "fast" softmax recipe (see
+          BlockScales).
         Native MXFP8 PV does not support local or modified attention.
         BlockScales return BF16 output and optional FP32 LSE, and support only dense, unsplit
         attention.

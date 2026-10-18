@@ -468,3 +468,21 @@ def test_mxfp8_pv_keeps_hardware_exp2():
     assert fp8.ex2_emu_freq > 0
     config = select_fwd_config(pv)
     assert (config.ex2_emu_freq, config.ex2_emu_start_frg) == (0, 0)
+
+
+def test_mxfp8_pv_fast_policy():
+    fast = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128,
+                       mxfp8_path="pv_fast")
+    # sm_100 "fast" has its own spill-free splits; sm_103 keeps the "exact" ones.
+    assert astuple(select_fwd_config(fast).registers) == (176, 64, 96)
+    assert select_fwd_config(fast._replace(device_arch=103)).registers == select_fwd_config(
+        fast._replace(device_arch=103, mxfp8_path="pv")
+    ).registers
+    assert astuple(select_fwd_config(fast._replace(device_arch=107)).registers) == (168, 96, 80)
+    causal = select_fwd_config(fast._replace(causal=True))
+    assert astuple(causal.registers) == (192, 64, 64)
+    # "fast" has no quantized-P contract: sm_100 emulates exp2 for half the columns.
+    assert (causal.ex2_emu_freq, causal.ex2_emu_start_frg) == (8, 1)
+    assert select_fwd_config(fast._replace(device_arch=103)).ex2_emu_freq == 0
+    assert select_fwd_config(fast).sm_stats_cross_stage
+    assert not select_fwd_config(fast._replace(mxfp8_path="pv")).sm_stats_cross_stage

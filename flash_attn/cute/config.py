@@ -140,8 +140,8 @@ class FwdHeuristicInputs(NamedTuple):
     seqlen_k_capacity: int | None = None
     requires_grad: bool = False  # any input, aux tensors included
     has_aux_scalars: bool = False
-    # MXFP8 block-scaled forward: "qk" (e4m3 Q/K with block scales, BF16 V), "pv" (native PV:
-    # e4m3 V with block scales too); None otherwise.
+    # MXFP8 block-scaled forward: "qk" (e4m3 Q/K with block scales, BF16 V), "pv" / "pv_fast"
+    # (native PV: e4m3 V with block scales too, "exact" / "fast" softmax); None otherwise.
     mxfp8_path: str | None = None
 
     @property
@@ -382,6 +382,45 @@ SM100_FP8_SMALL_HDIM_REGISTERS = {
     False: Sm100Registers(softmax=168, correction=96, other=80),
     True: Sm100Registers(softmax=152, correction=96, other=112),
 }
+
+
+class PvFastTuning(NamedTuple):
+    """sm_100/sm_103 scheduling for the "fast" MXFP8 PV softmax."""
+
+    registers: Sm100Registers | None = None  # None: native-PV split
+    ex2_emu_freq: int = 0
+
+
+# Keyed by arch, then (head_dim_padded, is_causal); missing keys keep the defaults. sm_107 is tuned
+# in SM107_MXFP8_PV_TUNING. select_ex2_emu reads ex2_emu_freq.
+MXFP8_PV_FAST_TUNING = {
+    # Partial exp2 emulation pays once the lazy row max removes most O rescales. The hd128 register
+    # splits are the spill-free ones.
+    "sm_100": {
+        (128, False): PvFastTuning(Sm100Registers(176, 64, 96), ex2_emu_freq=8),
+        (128, True): PvFastTuning(Sm100Registers(192, 64, 64), ex2_emu_freq=8),
+        (64, False): PvFastTuning(ex2_emu_freq=8),
+        (64, True): PvFastTuning(ex2_emu_freq=8),
+    },
+    # The "exact" registers are already the best choice.
+    "sm_103": {},
+}
+
+
+class Sm107PvTuning(NamedTuple):
+    """sm_107 native PV (dedicated scale columns) choices; none changes the arithmetic."""
+
+    # None keeps the generic FP8 split.
+    registers: Sm100Registers | None = None
+
+
+# Keyed by (pv_softmax, head_dim_padded, is_causal); missing keys use the defaults.
+SM107_MXFP8_PV_TUNING = {
+    ("exact", 64, False): Sm107PvTuning(Sm100Registers(160, 96, 96)),
+    ("fast", 128, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
+    ("fast", 64, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
+    ("fast", 64, True): Sm107PvTuning(Sm100Registers(192, 64, 64)),
+}
 # NOTE [softmax stats release order]
 # The SM100 correction warpgroup frees softmax stage s's pipeline_sm_stats slot in either order:
 # - Same-stage (default): right after reading scale[s].
@@ -425,6 +464,9 @@ _SM_STATS_CROSS_STAGE = {
     ("fp8", 96, True, False): ("sm_100",),
     ("mxfp8_qk", 64, True, False): ("sm_103", "sm_107"),
     ("mxfp8_pv", 64, True, False): ("sm_100",),
+    ("mxfp8_pv_fast", 64, False, False): ("sm_103", "sm_107"),
+    ("mxfp8_pv_fast", 64, True, False): ("sm_107",),
+    ("mxfp8_pv_fast", 128, False, False): ("sm_100", "sm_107"),
 }
 # === END SM100 TUNING KNOBS ===
 
@@ -471,12 +513,14 @@ def select_sm_stats_cross_stage(inputs: FwdHeuristicInputs, *, use_s_ping_pong: 
 def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs) -> Sm100Registers | None:
     """Native MXFP8 PV register split; None keeps the FP8 split."""
     family = sm100_arch_family(inputs.device_arch)
+    key = (inputs.head_dim_padded, inputs.causal)
     if family == "sm_107":
-        # Dedicated scale columns: fewer softmax registers relieve register pressure in the
-        # correction and MMA/load warps at non-causal hd64.
-        if inputs.head_dim_padded < 96 and not inputs.causal:
-            return Sm100Registers(160, 96, 96)
-        return None
+        pv_softmax = "fast" if inputs.mxfp8_path == "pv_fast" else "exact"
+        return SM107_MXFP8_PV_TUNING.get((pv_softmax, *key), Sm107PvTuning()).registers
+    if inputs.mxfp8_path == "pv_fast" and (
+        fast_registers := MXFP8_PV_FAST_TUNING[family].get(key, PvFastTuning()).registers
+    ):
+        return fast_registers
     # The MMA warp also issues the PV scale copies and the split-P wait. It spills with the
     # 48 registers of the hd128 default, and on sm_103 the persistent non-causal loop
     # needs 80 (causal uses a single-tile scheduler).
@@ -501,7 +545,8 @@ def select_sm100_registers(
         sm100_is_sm103_family(inputs.device_arch),
     )
     is_fp8 = has_fp8_pv(inputs)
-    if inputs.mxfp8_path == "pv" and (pv_registers := select_mxfp8_pv_registers(inputs)):
+    native_pv = inputs.mxfp8_path in ("pv", "pv_fast")
+    if native_pv and (pv_registers := select_mxfp8_pv_registers(inputs)):
         return pv_registers
     if head_dim_padded < 96:
         small = SM100_FP8_SMALL_HDIM_REGISTERS if is_fp8 else SM100_SMALL_HDIM_REGISTERS
@@ -536,11 +581,6 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
     """
     if inputs.device_capacity not in (10, 11):
         return 0, 0
-    if inputs.mxfp8_path == "pv":
-        # Native PV quantizes P to E4M3. The polynomial exp2 is not bitwise equal to MUFU.EX2,
-        # so it moves some P across E4M3 rounding boundaries and PV no longer sees the
-        # reference P.
-        return 0, 0
     head_dim_padded = inputs.head_dim_padded
     is_sm103 = sm100_is_sm103_family(inputs.device_arch)
     key = (use_2cta_instrs, inputs.causal, head_dim_padded, is_sm103)
@@ -549,6 +589,17 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
     if "ex2_emu_freq" in fp8_tune:
         tune = {**tune, **fp8_tune}
     start_frg = tune.get("ex2_emu_start_frg", 1)
+    if inputs.mxfp8_path in ("pv", "pv_fast"):
+        # Native PV quantizes P to E4M3. The polynomial exp2 is not bitwise equal to MUFU.EX2,
+        # so "exact" keeps hardware exp2: emulation would move some P across E4M3 rounding
+        # boundaries and PV would no longer see the reference P. "fast" has no bitwise
+        # quantized-P contract, so MXFP8_PV_FAST_TUNING may enable it.
+        freq = 0
+        if inputs.mxfp8_path == "pv_fast":
+            family = sm100_arch_family(inputs.device_arch)
+            fast_tuning = MXFP8_PV_FAST_TUNING.get(family, {})
+            freq = fast_tuning.get((head_dim_padded, inputs.causal), PvFastTuning()).ex2_emu_freq
+        return (freq, start_frg) if freq else (0, 0)
     if "ex2_emu_freq" in tune:
         enabled = tune["ex2_emu_freq"] > 0
     else:
