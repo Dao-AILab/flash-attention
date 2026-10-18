@@ -22,7 +22,7 @@ except ImportError:
     apply_rotary_emb = None
 
 from flash_attn.cute.cache_utils import JITCache
-from flash_attn.cute.config import FwdConfig, Sm100Registers, select_fwd_config
+from flash_attn.cute.config import FwdConfig, Sm100Registers, select_fwd_config, select_registers
 from flash_attn.cute.testing import (
     check_dsink_vs_ref,
     check_tensor_vs_ref,
@@ -106,6 +106,7 @@ def capture_selected_fwd_config():
 
     def capture(inputs):
         selected["config"] = select_fwd_config(inputs)
+        selected["inputs"] = inputs
         return selected["config"]
 
     with mock.patch("flash_attn.cute.interface.select_fwd_config", side_effect=capture):
@@ -114,38 +115,29 @@ def capture_selected_fwd_config():
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 CLC with 2CTA")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_clc_2cta_matches_default(monkeypatch):
+def test_flash_attn_clc_2cta_matches_default():
     """CLC must assign both CTAs of a cluster the same m block."""
-    from flash_attn.cute import utils as cute_utils
-    from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
-    schedules = []
-    init = FlashAttentionForwardSm100.__init__
-
-    def spy_init(self, *args, **kwargs):
-        init(self, *args, **kwargs)
-        schedules.append((self.use_clc_scheduler, self.use_2cta_instrs))
-
-    monkeypatch.setattr(FlashAttentionForwardSm100, "__init__", spy_init)
-
-    def default_and_clc(q, k, v, **kwargs):
-        """Run the default kernel, then the same 2CTA config with FA_CLC=1."""
-        outs = []
-        for use_clc in (False, True):
-            monkeypatch.setattr(cute_utils, "_fa_clc_enabled", use_clc)
-            schedules.clear()
-            outs.append(_flash_attn_fwd(q, k, v, **kwargs)[0])
-            # Only a compile constructs the kernel; cached runs skip the check.
-            assert schedules in ([], [(use_clc, True)]), schedules
-        return outs
+    def clc_config(selected):
+        """Force CLC onto the selected default 2CTA config."""
+        config, inputs = selected["config"], selected["inputs"]
+        assert config.use_2cta_instrs and not config.use_clc_scheduler
+        config = replace(config, use_clc_scheduler=True, is_static_persistent=False)
+        registers = select_registers(
+            inputs._replace(pack_gqa=config.pack_gqa), tile_m=config.tile_m,
+            tile_n=config.tile_n, q_stage=config.q_stage, num_splits=config.num_splits,
+            use_2cta_instrs=True, use_clc_scheduler=True,
+        )
+        return replace(config, registers=registers)
 
     torch.manual_seed(0)
-    # Dense Q with seqused_k uses the non-varlen scheduler.
+    # Dense Q and K use the non-varlen scheduler.
     q_dense = torch.randn(2, 512, 16, 128, device="cuda", dtype=torch.bfloat16)
-    k_dense = torch.randn(2, 1024, 4, 128, device="cuda", dtype=torch.bfloat16)
-    v_dense = torch.randn_like(k_dense)
-    seqused_k = torch.tensor([700, 1024], device="cuda", dtype=torch.int32)
-    dense_ref, dense_out = default_and_clc(q_dense, k_dense, v_dense, seqused_k=seqused_k)
+    k_dense = torch.randn_like(q_dense)
+    v_dense = torch.randn_like(q_dense)
+    with capture_selected_fwd_config() as selected:
+        dense_ref = _flash_attn_fwd(q_dense, k_dense, v_dense)[0]
+    dense_out = _flash_attn_fwd(q_dense, k_dense, v_dense, config=clc_config(selected))[0]
     # Varlen K allows CLC with dense hd128 Q. 900 rows give 15 packed tiles per KV head,
     # leaving the last cluster half full.
     lens_k = [1500, 2600]
@@ -154,7 +146,9 @@ def test_flash_attn_clc_2cta_matches_default(monkeypatch):
     v = torch.randn_like(k)
     cu_seqlens_k = torch.tensor([0, lens_k[0], sum(lens_k)], device="cuda", dtype=torch.int32)
     kwargs = dict(cu_seqlens_k=cu_seqlens_k, max_seqlen_k=max(lens_k), pack_gqa=True)
-    ref, out = default_and_clc(q, k, v, **kwargs)
+    with capture_selected_fwd_config() as selected:
+        ref = _flash_attn_fwd(q, k, v, **kwargs)[0]
+    out = _flash_attn_fwd(q, k, v, config=clc_config(selected), **kwargs)[0]
     if is_fake_mode():
         return
     assert torch.equal(dense_out, dense_ref)
@@ -162,50 +156,46 @@ def test_flash_attn_clc_2cta_matches_default(monkeypatch):
 
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 forward work tiles")
-@pytest.mark.parametrize("epilogue", ["corr_epi", "tma_o"])
+@pytest.mark.parametrize("use_tma_o", [False, True], ids=["corr_epi", "tma_o"])
 @pytest.mark.parametrize("policy", ["grid", "static_persistent", "clc"])
 @pytest.mark.parametrize("q_stage", [1, 2])
 @pytest.mark.parametrize("use_2cta", [False, True], ids=["1cta", "2cta"])
 @pytest.mark.parametrize("causal", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_work_tiles_cover_q(monkeypatch, causal, use_2cta, q_stage, policy, epilogue):
+def test_flash_attn_work_tiles_cover_q(causal, use_2cta, q_stage, policy, use_tma_o):
     """Each scheduling policy writes every valid Q row once (NOTE [SM100 forward work coordinates])."""
-    from flash_attn.cute import interface as fa_interface
-    from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-
     if causal and (use_2cta or policy == "static_persistent"):
         pytest.skip("hd128 causal supports neither 2CTA nor static persistence")
-    if use_2cta and epilogue == "corr_epi":
-        pytest.skip("3-way packed GQA forces the correction epilogue but disables TMA Q")
-    # Force the schedule at the kernel; a fresh compile cache keeps forced kernels separate.
-    forced = dict(
-        q_stage=q_stage,
-        use_2cta_instrs=use_2cta,
-        is_static_persistent=policy == "static_persistent",
-        use_clc_scheduler=policy == "clc",
-    )
-    init = FlashAttentionForwardSm100.__init__
-
-    def forced_init(self, *args, **kwargs):
-        init(self, *args, **{**kwargs, **forced})
-
-    monkeypatch.setattr(FlashAttentionForwardSm100, "__init__", forced_init)
-    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", JITCache())
     torch.manual_seed(0)
     # 1000 rows leave a partial last work tile; 4 * 32 heads give several waves of work tiles.
-    # Packed GQA with 3 Q heads per KV head disables TMA O, so the correction warps store O.
-    batch, seqlen_q, seqlen_k, d = 4, 1000, 1024, 128
-    nheads, nheads_kv = (24, 8) if epilogue == "corr_epi" else (32, 32)
+    batch, seqlen_q, seqlen_k, nheads, d = 4, 1000, 1024, 32, 128
     q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, seqlen_k, nheads_kv, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seqlen_k, nheads, d, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
+    captured = {}
+
+    def capture(inputs):
+        captured["inputs"] = inputs
+        return select_fwd_config(inputs)
+
+    with mock.patch("flash_attn.cute.interface.select_fwd_config", side_effect=capture):
+        _flash_attn_fwd(q, k, v, causal=causal)
+    inputs = captured["inputs"]
+    use_clc = policy == "clc"
+    config = FwdConfig(
+        device_capacity=inputs.device_capacity, tile_m=128, tile_n=128,
+        mma_pv_is_rs=False, intra_wg_overlap=False, q_stage=q_stage, pack_gqa=False,
+        use_clc_scheduler=use_clc, is_static_persistent=policy == "static_persistent",
+        use_tma_o=use_tma_o, use_s_ping_pong=False, num_splits=1, use_2cta_instrs=use_2cta,
+        registers=select_registers(
+            inputs, tile_m=128, tile_n=128, q_stage=q_stage, num_splits=1,
+            use_2cta_instrs=use_2cta, use_clc_scheduler=use_clc,
+        ),
+    )
     # NaN sentinels expose rows that no CTA writes.
     out = torch.full_like(q, float("nan"))
     lse = torch.full((batch, nheads, seqlen_q), float("nan"), device="cuda", dtype=torch.float32)
-    _flash_attn_fwd(
-        q, k, v, causal=causal, out=out, lse=lse, return_lse=True,
-        pack_gqa=epilogue == "corr_epi",
-    )
+    _flash_attn_fwd(q, k, v, causal=causal, out=out, lse=lse, return_lse=True, config=config)
     if is_fake_mode():
         return
     out_ref, _ = attention_ref(q, k, v, causal=causal)
@@ -213,8 +203,7 @@ def test_flash_attn_work_tiles_cover_q(monkeypatch, causal, use_2cta, q_stage, p
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
     assert not out.isnan().any() and not lse.isnan().any()
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + fwd_atol
-    kr = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_kv)
-    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), kr.float()) / math.sqrt(d)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float()) / math.sqrt(d)
     if causal:
         q_idx = torch.arange(seqlen_q, device="cuda")[:, None] + seqlen_k - seqlen_q
         scores.masked_fill_(torch.arange(seqlen_k, device="cuda")[None, :] > q_idx, float("-inf"))
@@ -635,11 +624,8 @@ def test_flash_attn_explicit_config_scheduler_metadata(monkeypatch):
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 varlen scheduler metadata test")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_scheduler_metadata_semaphore_follows_selected_scheduler(monkeypatch):
-    """Varlen MHA metadata needs the tile semaphore even with FA_CLC=1."""
-    from flash_attn.cute import utils as cute_utils
-
-    monkeypatch.setattr(cute_utils, "_fa_clc_enabled", True)
+def test_scheduler_metadata_semaphore_follows_selected_scheduler():
+    """Varlen MHA selects the dynamic persistent scheduler, so its metadata has the semaphore."""
     cu_seqlens = torch.tensor([0, 300, 500], device="cuda", dtype=torch.int32)
     metadata = get_scheduler_metadata(
         nheads=4,
