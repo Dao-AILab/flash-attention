@@ -690,11 +690,14 @@ class TensorwiseScales(NamedTuple):
 class BlockScales(NamedTuple):
     """MXFP8 UE8M0 block scales, each the contiguous interleave_sf buffer of its operand.
 
-    q and k scale 32-element blocks of e4m3 Q and K along head_dim; V stays BF16.
+    q and k scale 32-element blocks of e4m3 Q and K along head_dim. v, for native MXFP8 PV, scales
+    e4m3 V in blocks of 32 keys along seqlen_k (MN=head_dim_v, K=seqlen_k); without v, V stays
+    BF16.
     """
 
     q: torch.Tensor
     k: torch.Tensor
+    v: torch.Tensor | None = None
 
 
 def _validate_tensorwise_scales(
@@ -739,32 +742,57 @@ def _validate_block_scales(
     qv: torch.Tensor | None,
     *,
     requires_grad: bool,
+    causal: bool,
+    window_size_left: int | None,
+    window_size_right: int | None,
     num_splits: int,
+    softcap: float | None,
+    gather_kv_indices: torch.Tensor | None,
     layout_inputs: tuple,
+    pv_unsupported: tuple,
 ) -> BlockScales:
     """Check MXFP8 block scales and the modes they support; return the buffers flattened.
 
     layout_inputs are the varlen, paged, and block-sparse inputs, which MXFP8 does not support.
+    Native PV (scales.v) also rejects causal/local masks, gather_kv_indices, softcap, and
+    pv_unsupported: the sinks, modifiers, and auxiliary data.
     """
+    pv = scales.v is not None
+    mode = "Native MXFP8 PV" if pv else "QK MXFP8"
     if scales.q is None or scales.k is None:
-        raise ValueError("QK MXFP8 requires both scales.q and scales.k")
+        raise ValueError(f"{mode} requires both scales.q and scales.k")
     if qv is not None or q is None or k is None:
-        raise NotImplementedError("QK MXFP8 does not support MLA")
+        raise NotImplementedError(f"{mode} does not support MLA")
+    if pv:
+        pv_causal, pv_local, _, _ = _resolve_causal_local_window(
+            causal, window_size_left, window_size_right
+        )
+        if pv_causal or pv_local:
+            raise NotImplementedError("Native MXFP8 PV supports only noncausal, nonlocal attention")
+        layout_inputs += (gather_kv_indices,)
     if any(t is not None for t in layout_inputs) or num_splits != 1:
-        raise NotImplementedError("QK MXFP8 supports only dense, unsplit attention")
+        raise NotImplementedError(f"{mode} supports only dense, unsplit attention")
+    if pv and (any(t is not None for t in pv_unsupported) or softcap not in (None, 0.0)):
+        raise NotImplementedError(
+            "Native MXFP8 PV does not support sinks, softcap, modifiers, or auxiliary data"
+        )
     if any(t.ndim != 4 for t in (q, k, v)):
-        raise ValueError("QK MXFP8 requires Q/K/V in (batch, seqlen, heads, dim) layout")
-    if q.dtype != torch.float8_e4m3fn or k.dtype != q.dtype or v.dtype != torch.bfloat16:
-        raise ValueError("QK MXFP8 requires e4m3 Q/K and bf16 V")
+        raise ValueError(f"{mode} requires Q/K/V in (batch, seqlen, heads, dim) layout")
+    v_dtype = torch.float8_e4m3fn if pv else torch.bfloat16
+    if q.dtype != torch.float8_e4m3fn or k.dtype != q.dtype or v.dtype != v_dtype:
+        raise ValueError("Native MXFP8 PV requires e4m3 Q/K/V" if pv
+                         else "QK MXFP8 requires e4m3 Q/K and bf16 V")
     if q.shape[-1] not in (64, 128) or v.shape[-1] not in (64, 128):
-        raise NotImplementedError("QK MXFP8 supports head dimensions 64 and 128")
+        raise NotImplementedError(f"{mode} supports head dimensions 64 and 128")
     if requires_grad:
-        raise NotImplementedError("QK MXFP8 is forward-only")
+        raise NotImplementedError(f"{mode} is forward-only")
     # (scales, operand, name, MN extent, K extent); K is the scaled (reduction) axis.
     sf_layouts = [
         (scales.q, q, "scales.q", q.shape[1], q.shape[3]),
         (scales.k, k, "scales.k", k.shape[1], k.shape[3]),
     ]
+    if pv:  # V is scaled along keys
+        sf_layouts.append((scales.v, v, "scales.v", v.shape[3], v.shape[1]))
     for sf, x, name, mn, k_extent in sf_layouts:
         # interleave_sf stores 512 scales per (batch, head, 128 MN x 128 K tile).
         num_tiles = math.ceil(mn / 128) * math.ceil(k_extent / 128)
@@ -777,7 +805,7 @@ def _validate_block_scales(
                 f"K={k_extent} ({expected} elements)"
             )
     # Flatten physical chunks; the kernel constructs their logical operand views.
-    return BlockScales(*(maybe_contiguous(t.reshape(-1)) for t in scales))
+    return BlockScales(*(t if t is None else maybe_contiguous(t.reshape(-1)) for t in scales))
 
 
 def _flash_attn_fwd(
@@ -838,7 +866,8 @@ def _flash_attn_fwd(
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
         scales: Dequantization scales of low-precision Q/K/V (see TensorwiseScales and
             BlockScales). BlockScales give BF16 output and support only dense, unsplit,
-            forward-only attention.
+            forward-only attention. BlockScales.v selects native MXFP8 PV with e4m3 V, which
+            is also noncausal and unmodified.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
@@ -886,16 +915,22 @@ def _flash_attn_fwd(
             )
         case BlockScales():
             block_scales = _validate_block_scales(
-                scales, q, k, v, qv, requires_grad=requires_grad, num_splits=num_splits,
+                scales, q, k, v, qv, requires_grad=requires_grad, causal=causal,
+                window_size_left=window_size_left, window_size_right=window_size_right,
+                num_splits=num_splits, softcap=softcap, gather_kv_indices=gather_kv_indices,
                 layout_inputs=(cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table,
                                block_sparse_tensors),
+                pv_unsupported=(learnable_sink, score_mod, mask_mod, aux_tensors, aux_scalars),
             )
         case _:
             raise TypeError(
                 f"scales must be TensorwiseScales, BlockScales or None, got {type(scales).__name__}"
             )
     qk_blockscaled = block_scales is not None
-    sf_operands = (block_scales.q, block_scales.k) if qk_blockscaled else (None, None)
+    pv_blockscaled = qk_blockscaled and block_scales.v is not None
+    sf_operands = (
+        (block_scales.q, block_scales.k, block_scales.v) if qk_blockscaled else (None, None, None)
+    )
     if cu_seqlens_k is None:
         if page_table is None:
             assert k is None or k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -1631,7 +1666,7 @@ def _flash_attn_fwd(
     )
 
     if qk_blockscaled:
-        compile_key += ("mxfp8_qk", v.dtype)
+        compile_key += ("mxfp8_qk", v.dtype, pv_blockscaled)
 
     if compile_key not in _flash_attn_fwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1851,6 +1886,7 @@ def _flash_attn_fwd(
                     has_tile_count_semaphore=tile_count_semaphore is not None,
                     use_s_ping_pong=use_s_ping_pong,
                     qk_blockscaled=qk_blockscaled,
+                    pv_blockscaled=pv_blockscaled,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -4265,7 +4301,12 @@ def flash_attn_func(
     scales: dequantization scales of low-precision Q/K/V, forward-only; None for unscaled inputs
         (FP8 then uses descale 1).
         - TensorwiseScales: FP8 Q/K/V.
-        - BlockScales(q, k): MXFP8 Q/K with BF16 V; BF16 output, dense, unsplit attention.
+        - BlockScales(q, k): MXFP8 Q/K with BF16 V.
+        - BlockScales(q, k, v): native, noncausal MXFP8 PV with e4m3 V. v is the contiguous
+          UE8M0 buffer from quantize_v_to_fp8_with_sf (MN=V channels, K=key positions, groups
+          of 32 keys). Local and modified attention are not supported.
+        BlockScales return BF16 output and optional FP32 LSE, and support only dense, unsplit
+        attention.
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
