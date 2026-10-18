@@ -283,8 +283,13 @@ def make_smem_desc_base(layout: cute.Layout, swizzle: cute.Swizzle, major: Major
 
 
 def make_smem_desc_start_addr(start_addr: cute.Pointer) -> cutlass.Int32:
-    # 14 bits, remove 4 LSB (bits 0-13 in desc)
-    return (start_addr.toint() & 0x3FFFF) >> 4
+    """Return the descriptor start-address field: the address in 16-byte units.
+
+    The field is 15 bits (descriptor bits 0-14) on sm_107, for its larger shared memory.
+    sm_100/sm_103 use bits 0-13 and stay below 256 KiB of shared memory, so the wider mask
+    leaves their descriptors unchanged.
+    """
+    return (start_addr.toint() & 0x7FFFF) >> 4
 
 
 def smem_desc_base_from_tensor(sA: cute.Tensor, major: Major) -> int:
