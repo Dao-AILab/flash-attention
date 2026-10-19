@@ -342,12 +342,6 @@ class FlashAttentionForwardSm100:
         _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
         self.enable_ex2_emu = _default_enable_ex2_emu
         self.s0_s1_barrier = False
-        self.overlap_sO_sQ = (
-            (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-            # Reuse Q storage for O to leave room for more KV stages.
-            self.head_dim_padded == 256 or
-            (self.head_dim_v_padded >= 128 and self.is_split_kv)
-        )
 
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
@@ -363,6 +357,15 @@ class FlashAttentionForwardSm100:
             has_tile_count_semaphore and is_varlen_q
         ) or self.use_clc_scheduler
         self.is_persistent = self.dynamic_persistent or self.is_static_persistent
+        self.overlap_sO_sQ = (
+            (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
+            # Reuse Q storage for O to leave room for more KV stages. A persistent 2CTA hd256
+            # kernel keeps a separate sO instead (5 -> 3 K/V stages): the next tile's Q then loads
+            # while the previous O is still being stored. 1CTA hd256 (decode with many heads) has
+            # 64 KiB K/V stages and would drop to a single stage, so it keeps the alias.
+            (self.head_dim_padded == 256 and not (self.is_persistent and self.use_2cta_instrs)) or
+            (self.head_dim_v_padded >= 128 and self.is_split_kv)
+        )
         self.sched_stages = 1
         if self.use_clc_scheduler:
             assert self.cluster_shape_mn[1] == 1, f"CLC requires cluster N == 1: {self.cluster_shape_mn}"

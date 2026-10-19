@@ -24,8 +24,9 @@ def test_hd256_kv_stages_above_256kb(monkeypatch, causal):
 
     def setup_deep_kv(self):
         setup(self)
-        # 64 KB of Q plus 8 x 32 KB K/V stages: the last stages start above 256 KB.
-        self.kv_stage = 8
+        # 64 KB of Q (plus 64 KB of sO when it does not alias sQ), then 32 KB K/V stages up to
+        # 320 KB: the last stages start at or above 256 KB.
+        self.kv_stage = 8 if self.overlap_sO_sQ else 6
 
     monkeypatch.setattr(fwd_sm100.FlashAttentionForwardSm100, "_setup_attributes", setup_deep_kv)
     monkeypatch.setattr(interface._flash_attn_fwd, "compile_cache", get_jit_cache("fwd_sm107_deep_kv"))
