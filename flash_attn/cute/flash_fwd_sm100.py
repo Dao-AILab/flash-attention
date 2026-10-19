@@ -36,6 +36,10 @@ from quack import copy_utils, layout_utils
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
+from flash_attn.cute.copy_utils import (
+    create_ragged_tensor_for_tma_load,
+    offset_ragged_tensor_for_tma_load,
+)
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
@@ -698,30 +702,12 @@ class FlashAttentionForwardSm100:
             # Bound V loads by the logical sequence length. Masking P alone cannot
             # prevent unused NaN cache entries from entering the PV MMA (0 * NaN).
             if const_expr(self.ragged_tma_V):
-                # Keep the real feature extent: padded Dv columns must also be
-                # zero-filled. Two address axes encode arbitrary aligned outer
-                # offsets without narrowing a byte offset to a single Int32.
                 v_address_strides = (
                     mV.stride[2],
                     mV.stride[3] if const_expr(mCuSeqlensK is None) else Int64(0),
                     mV.stride[1],
                 )
-                alignment = 128 // self.v_dtype.width
-                # TMA byte strides must be < 2**40. The row and wrap strides
-                # sum to wrap_stride, and v_ragged_rows * wrap_stride == 2**64.
-                # A low-address extent of 2**30 + 1 prevents coalescing the
-                # two address axes into one coordinate wider than Int32.
-                wrap_stride = 2**40 // (self.v_dtype.width // 8)
-                self.v_ragged_rows = 2**64 // wrap_stride
-                mV_tma = cute.make_tensor(
-                    mV.iterator,
-                    cute.make_layout(
-                        (mV.shape[0], self.v_ragged_rows, 2**30 + 1,
-                         2**31 - 1, self.v_ragged_rows + 1),
-                        stride=(1, mV.stride[1], alignment, Int64(alignment * 2**30),
-                                wrap_stride - mV.stride[1]),
-                    ),
-                )
+                mV_tma = create_ragged_tensor_for_tma_load(mV)
             else:
                 mV_tma = mV
             tma_atom_V, mV = cute.nvgpu.make_tiled_tma_atom_B(
@@ -3551,17 +3537,10 @@ class FlashAttentionForwardSm100:
         page_idx: Optional[Int32] = None,
     ):
         assert page_idx is None
-        start = cutlass.max(block, 0) * self.n_block_size
-        valid = cutlass.min(cutlass.max(length - start, 0), self.n_block_size)
-        if block < 0:
-            valid = 0
-        # The row and wrap axes contribute (row - valid) * row_stride
-        # modulo 2^64. The two address axes supply the remaining offset.
-        address = outer_offset + (Int64(offset) + start + valid) * row_stride
-        address = address // (128 // self.v_dtype.width)
-        view = mV[None, None, Int32(address % 2**30), Int32(address // 2**30),
-                  self.v_ragged_rows]
-        view = cute.domain_offset((0, self.v_ragged_rows - valid), view)
+        view = offset_ragged_tensor_for_tma_load(
+            mV, outer_offset, row_stride, offset, length, block,
+            block_size=self.n_block_size, dtype=self.v_dtype,
+        )
         gV = cute.local_tile(view, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
         tOgV = thr_mma.partition_B(gV)
         tVsV, tVgV = cpasync.tma_partition(
