@@ -289,6 +289,57 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
         )
 
 
+def _fit_sm90_bwd_tile_to_block_sparsity(
+    cfg, head_dim, head_dim_v, sparse_block_size_q, sparse_block_size_kv
+):
+    """Shrink SM90 backward tiles to fit explicit sparse blocks.
+
+    As in the forward, sparse Q blocks may span multiple M tiles but tile_n must match the
+    sparse KV block. A smaller tile_n changes which GEMM dimension can sit on WGMMA's 64-row
+    M axis, so the swap and atom-layout flags follow the tile. Unsupported sizes are rejected
+    by normalize_block_sparse_config_bwd.
+    """
+    tile_m, tile_n = cfg.m_block_size, cfg.n_block_size
+    if sparse_block_size_q % tile_m != 0 and sparse_block_size_q % 64 == 0:
+        tile_m = 64
+    if 32 <= sparse_block_size_kv < tile_n and sparse_block_size_kv % 16 == 0:
+        tile_n = sparse_block_size_kv
+    if (tile_m, tile_n) == (cfg.m_block_size, cfg.n_block_size):
+        return cfg
+    SdP_swapAB, AtomLayoutMSdP = cfg.SdP_swapAB, cfg.AtomLayoutMSdP
+    dKV_swapAB, AtomLayoutNdKV = cfg.dKV_swapAB, cfg.AtomLayoutNdKV
+    num_wg = cfg.num_wg
+    if tile_n != cfg.n_block_size:
+        if sparse_block_size_q % 64 != 0:
+            return cfg
+        if all(-(-d // 64) * 64 % (64 * num_wg) == 0 for d in (head_dim, head_dim_v)):
+            # head_dim on M of swapped dK/dV, one warp group per 64 rows, so each warp group
+            # covers all of tile_n. Fastest where head_dim allows it.
+            tile_m, SdP_swapAB, AtomLayoutMSdP, dKV_swapAB, AtomLayoutNdKV = 64, False, 1, True, 1
+        elif tile_n % 64 == 0 and SdP_swapAB and not dKV_swapAB:
+            # tile_n stays on M of the swapped S/dP and unswapped dK/dV, 64 rows per warp group.
+            AtomLayoutMSdP, AtomLayoutNdKV = num_wg * 64 // tile_n, tile_n // 64
+        elif tile_n % (16 * num_wg) == 0:
+            # tile_n split across the warp groups on N of swapped dK/dV. Slices that are not a
+            # multiple of 16 compile but give wrong dK/dV.
+            tile_m, SdP_swapAB, AtomLayoutMSdP, dKV_swapAB, AtomLayoutNdKV = (
+                64, False, 1, True, num_wg
+            )
+        else:
+            return cfg
+    keep_m = tile_m == cfg.m_block_size
+    return replace(
+        cfg,
+        m_block_size=tile_m,
+        n_block_size=tile_n,
+        SdP_swapAB=SdP_swapAB,
+        dKV_swapAB=dKV_swapAB,
+        dQ_swapAB=cfg.dQ_swapAB if keep_m else False,
+        AtomLayoutMSdP=AtomLayoutMSdP,
+        AtomLayoutNdKV=AtomLayoutNdKV,
+        AtomLayoutMdQ=cfg.AtomLayoutMdQ if keep_m else 1,
+    )
+
 
 def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.shape == expected_shape, f"{name} shape {t.shape} != expected {expected_shape}"
@@ -2480,6 +2531,10 @@ def _flash_attn_bwd(
             local,
             sparse_block_size_q=sparse_q,
         )
+        if block_sparse_tensors is not None and block_sparse_tensors.block_size is not None:
+            cfg = _fit_sm90_bwd_tile_to_block_sparsity(
+                cfg, head_dim, head_dim_v, sparse_q, block_sparse_tensors.block_size[1]
+            )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
         num_stages_Q = cfg.num_stages_Q
