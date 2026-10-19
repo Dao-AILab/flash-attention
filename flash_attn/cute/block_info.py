@@ -23,6 +23,9 @@ class BlockInfo:
     # If True, the scheduler packs num_splits into the top 16 bits of split_idx
     pack_split_idx: cutlass.Constexpr[bool] = False
     num_n_blocks_per_split: Optional[cutlass.Constexpr[Int32]] = None
+    # Requires num_n_blocks_per_split (A). If False, split s covers A blocks starting at the row's
+    # first visible block (which follows a local window); if True, it owns blocks [s*A, (s+1)*A).
+    split_anchor_absolute: cutlass.Constexpr[bool] = False
 
     @cute.jit
     def get_n_block_min_max(
@@ -63,8 +66,16 @@ class BlockInfo:
                     if n_block_max <= n_block_min
                     else (n_block_max - n_block_min + num_splits - 1) // num_splits
                 )
-            n_block_min = n_block_min + split_idx * num_n_blocks_per_split
-            n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
+            if const_expr(self.split_anchor_absolute):
+                # Split s owns the key blocks [s * A, (s + 1) * A) regardless of the query position
+                # and the local window, so a row's reduction order depends only on its own keys and
+                # a decode step matches a prefill over the same tokens bitwise.
+                split_n_block_min = split_idx * num_n_blocks_per_split
+                n_block_min = cutlass.max(n_block_min, split_n_block_min)
+                n_block_max = cutlass.min(split_n_block_min + num_n_blocks_per_split, n_block_max)
+            else:
+                n_block_min = n_block_min + split_idx * num_n_blocks_per_split
+                n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
         return n_block_min, n_block_max
 
     def has_kv_work(self, n_block_min: Int32, n_block_max: Int32):
