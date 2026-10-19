@@ -780,8 +780,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         if const_expr(self.use_tma_KV)
                         else cutlass.max(n_block_max - 1, 0)
                     )
+                    # n_block_max == 0 (seqused_k == 0) loads a fully masked dummy tile from page 0.
                     page_idx = (
-                        mPageTable[batch_idx, n_block]
+                        mPageTable[batch_idx, cutlass.max(n_block, 0)]
                         if const_expr(mPageTable is not None and self.use_tma_KV)
                         else None
                     )
@@ -1246,6 +1247,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         row = m_block * self.tile_m + tScS_mn[r][0]
                         q_head_idx = row % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
                         sink_val[r] = Float32(learnable_sink[q_head_idx])
+
+            if const_expr(not self.use_block_sparsity and self.use_tma_KV):
+                # TMA KV loads a dummy tile when seqlen_k == 0: P = 0 times a NaN V row
+                # (e.g. an unused page) is NaN, and scaling by 0 would keep it.
+                if seqlen.seqlen_k == 0:
+                    acc_O.fill(0.0)
 
             # normalize acc_O by row_sum and calculate the lse
             row_scale = softmax.finalize(sink_val=sink_val)
