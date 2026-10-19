@@ -3779,7 +3779,7 @@ class FlashAttentionBackwardSm100:
                     utils.cvt_f16(tdPrdP_cur, tdPrdS_cvt)
                     if const_expr(stage == 0):
                         pipeline_dS.producer_acquire(producer_state_dS)
-                        if const_expr(self.use_2cta_instrs and not self.acc_m64):
+                        if const_expr(dQaccum_empty_mbar_ptr is not None):
                             tdPrdS_xchg = cute.make_fragment_like(tdPrdS_cvt, self.ds_dtype)
 
                     if const_expr(self.acc_m64):
@@ -3795,11 +3795,19 @@ class FlashAttentionBackwardSm100:
                             tdPrdS_r2t_f32 = cute.recast_tensor(tdPrdS_cvt, Float32)
                             cute.copy(thr_copy_r2t, tdPrdS_r2t_f32, tdPtdS_r2t[None, stage, 0, 0])
 
-                        # RMEM->SMEM: For 2-CTA, keep exchange stage in registers, write
-                        # non-exchange to sdS
+                        # RMEM->SMEM: For 2-CTA, the exchange stage goes to sdS_xchg (copied to
+                        # the peer) and the other stage to sdS. sdS_xchg is free once the
+                        # producer_acquire above returns (the dS release follows the previous dQ
+                        # MMA, which waited for both exchange copies), so it is stored here
+                        # instead of holding a register fragment across the stage loop. Only
+                        # when sdS_xchg aliases sdQaccum does the store wait for the dQ reduce,
+                        # after the loop.
                         if const_expr(self.use_2cta_instrs):
                             if exchange_stage == stage:
-                                cute.autovec_copy(tdPrdS_cvt, tdPrdS_xchg)
+                                if const_expr(dQaccum_empty_mbar_ptr is not None):
+                                    cute.autovec_copy(tdPrdS_cvt, tdPrdS_xchg)
+                                else:
+                                    cute.autovec_copy(tdPrdS_cvt, tRS_sdS_xchg[None, 0])
                             else:
                                 cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
                         else:
@@ -3818,13 +3826,10 @@ class FlashAttentionBackwardSm100:
                         pipeline_dP.consumer_release(consumer_state_S_P_dP)
                 consumer_state_S_P_dP.advance()
 
-                # After the loop: copy exchange registers to sdS_xchg buffer
-                if const_expr(sdS_xchg is not None):
-                    # sdS_xchg aliases sdQaccum: wait until the dQ reduce has read it
-                    if const_expr(dQaccum_empty_mbar_ptr is not None):
-                        cute.arch.mbarrier_wait(
-                            dQaccum_empty_mbar_ptr, phase=producer_state_dS.phase
-                        )
+                # sdS_xchg aliases sdQaccum: copy the exchange registers once the dQ reduce has
+                # read it
+                if const_expr(dQaccum_empty_mbar_ptr is not None):
+                    cute.arch.mbarrier_wait(dQaccum_empty_mbar_ptr, phase=producer_state_dS.phase)
                     cute.autovec_copy(tdPrdS_xchg, tRS_sdS_xchg[None, 0])
 
                 cute.arch.fence_view_async_shared()
