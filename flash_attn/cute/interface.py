@@ -940,7 +940,7 @@ def _flash_attn_fwd(
     # Preserve the caller's hint.
     host_max_seqlen_q = max_seqlen_q if not torch.is_tensor(max_seqlen_q) else None
     # Scheduler bounds stay on host; actual lengths stay on device.
-    if arch // 10 in [10, 11]:
+    if arch // 10 in [9, 10, 11]:
         if cu_seqlens_q is not None or seqused_q is not None:
             max_seqlen_q = host_max_seqlen_q
         if (
