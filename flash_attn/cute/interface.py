@@ -777,18 +777,27 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    if arch // 10 == 12 and page_table is not None:
+        if v.dtype != torch.float8_e4m3fn:
+            raise NotImplementedError("SM120 paged KV supports FP8 E4M3 only; BF16/FP16 paged is unsupported")
+        if requires_grad:
+            raise NotImplementedError("SM120 paged KV is forward-only")
+        if seqused_k is None:
+            raise ValueError("SM120 paged KV requires seqused_k")
+        if page_size <= 0 or num_pages <= 0:
+            raise ValueError("SM120 paged KV requires positive page size and backing pages")
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     if is_fp8 and arch // 10 == 12:
         if v.dtype != torch.float8_e4m3fn:
             raise NotImplementedError("SM120 FP8 forward supports E4M3 inputs only")
-        if (qv is not None or gather_kv_indices is not None or page_table is not None
+        if (qv is not None or gather_kv_indices is not None
                 or learnable_sink is not None or score_mod is not None or mask_mod is not None
                 or block_sparse_tensors is not None or aux_tensors is not None
                 or aux_scalars is not None or softcap is not None):
             raise NotImplementedError(
-                "SM120 FP8 supports dense/varlen causal or local attention with SplitKV; "
-                "MLA, paged/gather KV, sinks, modifiers and sparsity are unsupported"
+                "SM120 FP8 supports dense/varlen/paged causal or local attention with SplitKV; "
+                "MLA, gather KV, sinks, modifiers and sparsity are unsupported"
             )
         if min(head_dim, head_dim_v) <= 0 or max(head_dim, head_dim_v) > 256 or head_dim % 16 or head_dim_v % 16:
             raise ValueError("SM120 FP8 head dimensions must be positive multiples of 16, at most 256")

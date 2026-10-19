@@ -768,6 +768,14 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     if device_capacity != 12 and inputs.requested_num_splits is None and num_splits > 1:
         num_splits = max(num_splits, fixed_seqlen_k_num_splits(inputs))
 
+    # Preserve the split heuristic's ordinary tile geometry; wider paged
+    # heads need the conservative per-row copy tile only after split selection.
+    if device_capacity == 12 and inputs.page_size is not None:
+        if max(inputs.head_dim, inputs.head_dim_v) > 64 and tile_n < 128:
+            if inputs.requested_tile_m is not None or inputs.requested_tile_n is not None:
+                raise ValueError("SM120 paged KV requires tile_n >= num_threads for heads wider than 64")
+            tile_n = 128
+
     is_split_kv = num_splits > 1
     use_2cta_instrs = (
         is_sm100_family
@@ -947,8 +955,16 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
                 raise ValueError("SM80 forward does not support paged KV")
             case 9 if config.tile_m not in (64, 128, 192):
                 raise ValueError(f"SM90 tile_m must be 64, 128, or 192, got {config.tile_m}")
-            case 12 if inputs.page_size is not None or inputs.use_block_sparsity:
-                raise ValueError("SM120 forward does not support paged KV or block sparsity")
+            case 12:
+                if inputs.use_block_sparsity:
+                    raise ValueError("SM120 forward does not support block sparsity")
+                if inputs.page_size is not None:
+                    if inputs.dtype != "torch.float8_e4m3fn":
+                        raise NotImplementedError("SM120 paged KV supports FP8 E4M3 only; BF16/FP16 paged is unsupported")
+                    if not inputs.has_seqused_k or inputs.page_size <= 0:
+                        raise ValueError("SM120 paged KV requires seqused_k and positive page size")
+                    if max(inputs.head_dim, inputs.head_dim_v) > 64 and config.tile_n < 128:
+                        raise ValueError("SM120 paged KV requires tile_n >= num_threads for heads wider than 64")
         if capacity == 12 and not sm120_tile_supported(inputs, config.tile_m, config.tile_n):
             raise ValueError("SM120 tile exceeds the supported MMA/layout or 99 KiB shared-memory limits")
         neutral = {k: v for k, v in _FWD_SM100_ONLY_NEUTRAL_FIELDS.items()

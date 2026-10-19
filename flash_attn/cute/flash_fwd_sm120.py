@@ -18,6 +18,7 @@ from flash_attn.cute import ampere_helpers as sm80_utils
 
 class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
     supports_fp8 = True
+    supports_paged_kv = True
 
     def __init__(self, *args, **kwargs):
         """Force SM80 code paths while the DSL still targets the resident SM120 GPU."""
