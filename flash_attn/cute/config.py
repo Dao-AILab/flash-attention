@@ -1,17 +1,17 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 
-"""Host-only forward and backward config selection and validation.
+"""Host-only forward, MLA forward, and backward config selection and validation.
 
-FwdConfig and BwdConfig are fully resolved launch choices; FwdConfig uses exact
-split counts (1 disables SplitKV). Explicit configs are validated, not normalized.
-Selection must not read tensor contents, synchronize CUDA, or allocate device
-memory. MLA (qv) forward uses a separate policy in interface.py.
+FwdConfig, MlaFwdConfig, and BwdConfig are fully resolved launch choices; forward
+configs use exact split counts (1 disables SplitKV). Explicit configs are validated,
+not normalized. Selection must not read tensor contents, synchronize CUDA, or
+allocate device memory.
 """
 
 import math
 from dataclasses import astuple, dataclass
 from functools import lru_cache
-from typing import NamedTuple
+from typing import ClassVar, Literal, NamedTuple
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -970,6 +970,365 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
     ):
         raise ValueError("2CTA instructions are not supported for this forward problem")
     validate_registers(config)
+
+
+# === MLA (qv) forward ===
+# The absorbed-MLA kernels have their own policy: a kernel choice (2CTA, 1CTA, or 1CTA with
+# 64-key blocks), its tiles and split count. Measurements: AI/SPARSE_MLA_1CTA.md.
+
+MlaKernel = Literal["2cta", "1cta", "1cta_kb64"]
+# Sparse MLA pads a token's Q heads to one tile (pack_gqa.qheads_first_tma_view).
+MLA_2CTA_SPARSE_HEAD_TILE = 128
+MLA_1CTA_SPARSE_HEAD_TILE = 64
+# kb64: one token per tile (heads padded to 64) x 64 keys, and at least 4 of those key
+# blocks per split: each split pays a Q load, a 128 KB fp32 O partial and its share of the
+# combine (one block per split measured 30% slower than 32 splits at s_k = 8K, b = 1).
+MLA_KB64_TILE_MN = (64, 64)
+MLA_KB64_MIN_BLOCKS_PER_SPLIT = 4
+
+
+def sparse_mla_qhead_tile(qhead_per_kvhead: int, min_tile: int = 128) -> int:
+    """Rows one token's Q heads occupy in a sparse-MLA tile: the real head count padded to
+    ``min_tile`` (128 in the 2CTA forward and the generic dQ/dQv, 64 in the backward, the
+    1CTA forward and the 64-row dQ/dQv) or to 128 when it exceeds it."""
+    assert 0 < qhead_per_kvhead <= 128, (
+        f"sparse MLA: MQA with 1 to 128 heads, got {qhead_per_kvhead}"
+    )
+    return min_tile if qhead_per_kvhead <= min_tile else 128
+
+
+@dataclass(frozen=True)
+class MlaFwdConfig:
+    """Fully resolved absorbed-MLA (qv) forward launch configuration.
+
+    The kernels take neither tile_m nor q_stage: they size the 1CTA split heuristic only.
+    s_ahead applies to the 1CTA 128-key kernel only.
+    """
+
+    kernel: MlaKernel
+    tile_m: int
+    tile_n: int
+    q_stage: int
+    num_splits: int
+    pack_gqa: bool
+    use_clc_scheduler: bool
+    s_ahead: bool
+    # Generic-kernel knobs, fixed for MLA; ClassVars so equality and astuple ignore them.
+    mma_pv_is_rs: ClassVar[bool] = False
+    intra_wg_overlap: ClassVar[bool] = False
+    use_2cta_instrs: ClassVar[bool] = False
+    is_static_persistent: ClassVar[bool] = False
+    use_tma_o: ClassVar[bool] = False
+    use_s_ping_pong: ClassVar[bool] = False
+    registers: ClassVar[None] = None  # the MLA kernels own their register split
+
+
+class MlaFwdHeuristicInputs(NamedTuple):
+    """Host metadata for MLA forward selection: the shared forward facts plus the qv-only bits.
+
+    mla_1cta_override is FLASH_ATTENTION_MLA_1CTA: True runs 1CTA wherever supported, False never.
+    """
+
+    fwd: FwdHeuristicInputs
+    is_topk_gather: bool = False
+    requires_grad: bool = False
+    gather_bwd_recompute_p: bool = False
+    has_descale: bool = False
+    mla_1cta_override: bool | None = None
+
+    @property
+    def nheads_per_kv(self) -> int:
+        return self.fwd.qhead_per_kvhead
+
+    @property
+    def is_fp8(self) -> bool:
+        return "float8" in self.fwd.dtype
+
+    @property
+    def seqlen_q_hint(self) -> int:
+        """Dense seqlen_q, else the varlen max_seqlen_q (total_q without a caller hint)."""
+        fwd = self.fwd
+        return fwd.max_seqlen_q if fwd.has_cu_seqlens_q else fwd.total_q // fwd.batch_size
+
+    @property
+    def seqlen_q_known(self) -> int | None:
+        """seqlen_q_hint, or None for varlen without a caller max_seqlen_q."""
+        fwd = self.fwd
+        if fwd.has_cu_seqlens_q and not fwd.has_max_seqlen_q_hint:
+            return None
+        return self.seqlen_q_hint
+
+    @property
+    def auto_split(self) -> bool:
+        return self.fwd.requested_num_splits is None
+
+    @property
+    def needs_1cta(self) -> bool:
+        """fp8, descales and explicit split-KV exist only on 1CTA."""
+        num_splits = self.fwd.requested_num_splits
+        return self.is_fp8 or self.has_descale or (num_splits is not None and num_splits > 1)
+
+    @property
+    def ctas_2cta(self) -> int:
+        """2CTA tiles: one per token (sparse) or per batch element (dense decode), 2 CTAs each."""
+        fwd = self.fwd
+        return 2 * fwd.num_heads_kv * (fwd.total_q if self.is_topk_gather else fwd.batch_size)
+
+
+def mla_1cta_supported(inputs: MlaFwdHeuristicInputs) -> bool:
+    """Dense MLA at any shape; sparse up to 64 Q heads (one 64-row tile per token), training
+    only with recompute-P (the 1CTA forward emits no P / row_max)."""
+    return not inputs.is_topk_gather or (
+        inputs.nheads_per_kv <= 64 and (not inputs.requires_grad or inputs.gather_bwd_recompute_p)
+    )
+
+
+def mla_1cta_route(inputs: MlaFwdHeuristicInputs, *, split_kv: bool) -> bool:
+    """Whether an MLA call runs the 1CTA (tcgen05.mma.ws) kernel rather than the 2CTA one.
+
+    Heuristic (measurements: AI/SPARSE_MLA_1CTA.md "Dispatch heuristic"):
+      - fp8, descales or explicit split-KV (needs_1cta; 2CTA has none) -> 1CTA.
+      - One-wave rule: 2CTA spends 2 CTAs on each token (sparse) or batch element (dense
+        decode), ctas_2cta in all; 1CTA beats it only once that exceeds one wave of num_sms.
+      - Sparse -> the one-wave rule.
+      - Dense with the split heuristic (split_kv) -> 1CTA provisionally: selection sizes the
+        split for 1CTA and asks again with split_kv=False if that gives too few splits.
+      - Dense unsplit -> the one-wave rule on decode shapes (seqlen_q x heads per KV head
+        <= 64), else 2CTA. Varlen without a host max_seqlen_q counts as prefill.
+    mla_1cta_override overrides it (True: wherever supported; False: never).
+    """
+    supported = mla_1cta_supported(inputs)
+    if inputs.mla_1cta_override is not None:
+        return inputs.mla_1cta_override and supported
+    if not supported:
+        return False
+    if inputs.needs_1cta:
+        return True
+    past_one_wave = inputs.ctas_2cta > inputs.fwd.num_sms
+    if inputs.is_topk_gather:
+        return past_one_wave
+    if split_kv:
+        return True
+    if inputs.seqlen_q_hint * inputs.nheads_per_kv > 64:
+        return False
+    return past_one_wave
+
+
+def can_use_mla_kb64(inputs: MlaFwdHeuristicInputs) -> bool:
+    """1CTA MLA calls the 64-key-block mainloop serves (the rest run the 128-key mainloop):
+    16-bit, <= 64 heads; sparse at any such head count; dense at 64 heads, or with fewer on
+    decode only -- padding the one-token tile wins there (1.07-1.30x over the 128-key
+    mainloop) but wastes 64 / H of the MMA work on prefill, where the 128-key mainloop packs
+    several tokens per tile (kb64 0.34-0.81x)."""
+    if inputs.is_fp8 or inputs.nheads_per_kv > 64:
+        return False
+    return (
+        inputs.is_topk_gather
+        or inputs.nheads_per_kv == 64
+        or (inputs.fwd.num_heads_kv == 1 and inputs.seqlen_q_hint == 1)
+    )
+
+
+def mla_tiles_sparse_heads(inputs: MlaFwdHeuristicInputs) -> bool:
+    """Sparse MLA below 128 heads tiles one token's heads (pack_gqa) padded to the kernel tile."""
+    return inputs.is_topk_gather and inputs.nheads_per_kv < 128
+
+
+def mla_qhead_tile(inputs: MlaFwdHeuristicInputs, kernel: MlaKernel) -> int:
+    """Q rows per token: sparse MLA pads its heads to the kernel's tile."""
+    if not mla_tiles_sparse_heads(inputs):
+        return inputs.nheads_per_kv
+    min_tile = MLA_2CTA_SPARSE_HEAD_TILE if kernel == "2cta" else MLA_1CTA_SPARSE_HEAD_TILE
+    return sparse_mla_qhead_tile(inputs.nheads_per_kv, min_tile=min_tile)
+
+
+def select_mla_tiles(
+    inputs: MlaFwdHeuristicInputs, kernel: MlaKernel, *, qhead_tile: int, pack_gqa: bool
+) -> tuple[int, int, int, int]:
+    """Return (tile_m, tile_n, q_stage, num_splits) for one MLA kernel.
+
+    The 2CTA kernel runs unsplit. 1CTA sizes the split heuristic with its own tiles: one
+    token per 64-row tile on kb64, packed GQA rows on the 128-key mainloop.
+    """
+    fwd = inputs.fwd
+    tile_m = 128 if fwd.requested_tile_m is None else fwd.requested_tile_m
+    tile_n = 128 if fwd.requested_tile_n is None else fwd.requested_tile_n
+    rows_per_token = qhead_tile if pack_gqa else 1
+    q_stage = 2 if fwd.max_seqlen_q * rows_per_token > tile_m else 1
+    if kernel == "2cta":
+        return tile_m, tile_n, q_stage, 1
+    min_blocks = 1
+    if kernel == "1cta_kb64":
+        if inputs.is_topk_gather or fwd.requested_tile_m is None:
+            tile_m, tile_n = MLA_KB64_TILE_MN
+        q_stage, rows_per_token = 1, MLA_KB64_TILE_MN[0]
+        min_blocks = MLA_KB64_MIN_BLOCKS_PER_SPLIT
+    if inputs.is_topk_gather:
+        return tile_m, tile_n, q_stage, 1
+    if not inputs.auto_split:
+        return tile_m, tile_n, q_stage, fwd.requested_num_splits
+    num_n_blocks = ceil_div(fwd.max_seqlen_k, tile_n)
+    # Tiles per KV head: at most batch x ceil(max rows / tile), and at most the token rows plus
+    # one partial tile per extra sequence (varlen without a host max_seqlen_q has
+    # max_seqlen_q = total_q, which only bounds a single sequence). Whole-token tiles (kb64:
+    # one token per tile) have no partial tiles.
+    m_rows = q_stage * tile_m
+    partial_tiles = 0 if rows_per_token % m_rows == 0 else fwd.batch_size - 1
+    num_tiles = fwd.num_heads_kv * min(
+        fwd.batch_size * ceil_div(fwd.max_seqlen_q * rows_per_token, m_rows),
+        ceil_div(fwd.total_q * rows_per_token, m_rows) + partial_tiles,
+    )
+    max_splits = min(128, max(1, num_n_blocks // min_blocks))
+    num_splits = num_splits_heuristic(num_tiles, fwd.num_sms, num_n_blocks, max_splits)
+    return tile_m, tile_n, q_stage, num_splits
+
+
+@lru_cache(maxsize=1024)
+def select_mla_fwd_config(inputs: MlaFwdHeuristicInputs) -> MlaFwdConfig:
+    """Select one fully resolved MLA forward config from host-visible metadata."""
+    fwd = inputs.fwd
+    use_1cta = mla_1cta_route(inputs, split_kv=inputs.auto_split)
+    kernel: MlaKernel = (
+        "2cta" if not use_1cta else "1cta_kb64" if can_use_mla_kb64(inputs) else "1cta"
+    )
+    # The provisional route fixes the padding: dense never pads and sparse never re-routes.
+    qhead_tile = mla_qhead_tile(inputs, kernel)
+    if mla_tiles_sparse_heads(inputs):
+        pack_gqa = True
+    else:
+        pack_gqa = qhead_tile > 1 if fwd.pack_gqa is None else fwd.pack_gqa
+    if inputs.is_topk_gather and not inputs.auto_split and fwd.requested_num_splits > 1:
+        raise ValueError(
+            f"num_splits={fwd.requested_num_splits} is not supported with gather_kv_indices "
+            "(sparse MLA runs without split-KV)"
+        )
+    tiles = select_mla_tiles(inputs, kernel, qhead_tile=qhead_tile, pack_gqa=pack_gqa)
+    # Too few auto splits for 1CTA to beat 2CTA (AI/SPARSE_MLA_1CTA.md "Auto split"): about
+    # 2 on kb64 and 5 on the 128-key mainloop. Route again unsplit.
+    min_auto_splits = 2 if kernel == "1cta_kb64" else 5
+    if (
+        use_1cta
+        and inputs.auto_split
+        and not inputs.is_topk_gather
+        and tiles[3] < min_auto_splits
+        and not mla_1cta_route(inputs, split_kv=False)
+    ):
+        assert qhead_tile == inputs.nheads_per_kv  # dense: no head padding to redo
+        kernel = "2cta"
+        tiles = select_mla_tiles(inputs, kernel, qhead_tile=qhead_tile, pack_gqa=pack_gqa)
+    tile_m, tile_n, q_stage, num_splits = tiles
+    # Normalize only after the final route: kb64 always packs, even if the caller opts out.
+    if kernel == "1cta_kb64":
+        pack_gqa = True
+
+    seqlen_q_known = inputs.seqlen_q_known
+    match kernel:
+        case "2cta":
+            use_clc_scheduler = True  # the 2CTA kernel always runs the CLC scheduler
+        case "1cta":
+            # Sparse tiles are one token each with uniform cost: the persistent CLC scheduler
+            # overlaps a tile's epilogue with the next tile's gather (~10% at 64 heads).
+            # Dense runs without it unless an explicit MlaFwdConfig asks for it.
+            use_clc_scheduler = inputs.is_topk_gather
+        case "1cta_kb64":
+            # Dense: CLC measured +2-10% on prefill (many tiles per KV stream) and neutral on
+            # decode; varlen without a max_seqlen_q hint counts as decode.
+            use_clc_scheduler = inputs.is_topk_gather or (
+                seqlen_q_known is not None and seqlen_q_known > 1
+            )
+    # fp8 (a two-block V ring): issue S(n) ahead of PVt(n-1) when the tensor core is the
+    # bottleneck, i.e. when many tiles share one KV stream, which then stays L2-resident:
+    # >= 8 tiles of 64 rows, seqlen_q x heads >= 512 (prefill / extend: +33-36%). Decode
+    # streams each tile's KV from DRAM and needs the loads' one-block look-ahead that S-ahead
+    # gives up (-5-16%). Varlen without a max_seqlen_q hint stays in order. kb64 always
+    # issues S ahead of PV.
+    s_ahead = (
+        kernel == "1cta"
+        and inputs.is_fp8
+        and seqlen_q_known is not None
+        and seqlen_q_known * inputs.nheads_per_kv >= 512
+    )
+    config = MlaFwdConfig(
+        kernel=kernel,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        q_stage=q_stage,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        use_clc_scheduler=use_clc_scheduler,
+        s_ahead=s_ahead,
+    )
+    validate_mla_fwd_config(config, inputs)
+    return config
+
+
+@lru_cache(maxsize=1024)
+def validate_mla_fwd_config(config: MlaFwdConfig, inputs: MlaFwdHeuristicInputs) -> None:
+    """Reject MLA configs the kernels do not support."""
+    fwd = inputs.fwd
+    if fwd.device_capacity not in (10, 11):
+        raise ValueError(f"MLA (qv) forward requires SM100/SM110, got SM{fwd.device_capacity}")
+    kernel = config.kernel
+    if kernel not in ("2cta", "1cta", "1cta_kb64"):
+        raise ValueError(f"Unknown MLA kernel {kernel!r}")
+    sparse_heads = mla_tiles_sparse_heads(inputs)
+    # Sparse head tiling and kb64 force pack_gqa; selection ignores the caller's preference.
+    if (
+        not sparse_heads
+        and kernel != "1cta_kb64"
+        and fwd.pack_gqa is not None
+        and fwd.pack_gqa != config.pack_gqa
+    ):
+        raise ValueError(
+            f"pack_gqa={fwd.pack_gqa} disagrees with config.pack_gqa={config.pack_gqa}"
+        )
+    if config.tile_m <= 0 or config.q_stage not in (1, 2):
+        raise ValueError(f"MLA needs a positive tile_m and q_stage 1 or 2, got {config}")
+    if config.num_splits < 1 or config.num_splits > 256:
+        raise ValueError(f"num_splits must be in [1, 256], got {config.num_splits}")
+    if kernel == "2cta":
+        if not 0 < inputs.nheads_per_kv <= 128:
+            raise ValueError(
+                f"The 2CTA MLA kernel needs 1 to 128 Q heads per KV head, got {inputs.nheads_per_kv}"
+            )
+        # Sparse heads are padded to 128; dense packed heads must divide the cluster tile.
+        if config.pack_gqa and not inputs.is_topk_gather and 128 % inputs.nheads_per_kv != 0:
+            raise ValueError(
+                "The 2CTA MLA kernel with pack_gqa=True needs Q heads per KV head to divide "
+                f"128, got {inputs.nheads_per_kv}"
+            )
+        if inputs.has_descale or config.num_splits > 1:
+            raise ValueError(
+                "q_descale/k_descale/v_descale and split kv with qv are only supported by the "
+                "1CTA MLA kernel (FLASH_ATTENTION_MLA_1CTA=1)"
+            )
+        if not config.use_clc_scheduler:
+            raise ValueError("The 2CTA MLA kernel always uses the CLC scheduler")
+    elif not mla_1cta_supported(inputs):
+        raise ValueError(
+            "The 1CTA MLA kernel supports sparse MLA only up to 64 Q heads, and training only "
+            "with gather_bwd_recompute_p"
+        )
+    if kernel == "1cta_kb64":
+        if not config.pack_gqa:
+            raise ValueError("The 64-key-block MLA mainloop requires pack_gqa=True")
+        if not can_use_mla_kb64(inputs):
+            raise ValueError("The 64-key-block 1CTA MLA mainloop does not serve this problem")
+        if config.tile_n != 64 or config.q_stage != 1:
+            raise ValueError(
+                f"The 64-key-block MLA mainloop needs tile_n=64 and q_stage=1, got {config}"
+            )
+    elif config.tile_n != 128:
+        raise ValueError(f"The {kernel} MLA kernel needs tile_n=128, got {config.tile_n}")
+    if config.s_ahead and (kernel != "1cta" or not inputs.is_fp8):
+        raise ValueError("s_ahead is the fp8 schedule of the 1CTA 128-key MLA kernel")
+    if inputs.is_topk_gather:
+        if config.num_splits != 1:
+            raise ValueError("Sparse MLA runs without split-KV")
+        if not config.pack_gqa:
+            raise ValueError("Sparse MLA packs one token's Q heads (pack_gqa)")
+        if sparse_heads and fwd.num_heads_kv != 1:
+            raise ValueError("sparse MLA requires a single KV head")
 
 
 # === Backward ===

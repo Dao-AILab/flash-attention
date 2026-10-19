@@ -10,6 +10,7 @@ from cutlass.cute.nvgpu import cpasync
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
+from flash_attn.cute.config import sparse_mla_qhead_tile  # noqa: F401  re-exported for the kernels
 
 
 def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
@@ -49,16 +50,6 @@ def select_modes(T, order):
 def _heads_first_order(T, head_idx):
     """Mode permutation swapping the seqlen mode (0) with the head mode; its own inverse."""
     return [head_idx, *range(1, head_idx), 0, *range(head_idx + 1, cute.rank(T))]
-
-
-def sparse_mla_qhead_tile(qhead_per_kvhead: int, min_tile: int = 128) -> int:
-    """Rows one token's Q heads occupy in a sparse-MLA tile: the real head count padded to
-    ``min_tile`` (128 in the 2CTA forward and the generic dQ/dQv, 64 in the backward, the
-    1CTA forward and the 64-row dQ/dQv) or to 128 when it exceeds it."""
-    assert 0 < qhead_per_kvhead <= 128, (
-        f"sparse MLA: MQA with 1 to 128 heads, got {qhead_per_kvhead}"
-    )
-    return min_tile if qhead_per_kvhead <= min_tile else 128
 
 
 def qheads_first_tma_view(T, qhead_per_kvhead_valid, head_idx):
