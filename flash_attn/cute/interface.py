@@ -447,6 +447,27 @@ def _get_fwd_config(
     return FwdConfig(tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap, q_stage, num_splits)
 
 
+def _sm120_paged_fwd_config(cfg, dtype, head_dim, head_dim_v, num_threads, causal, tile_mn):
+    """Conservative #2348 page-copy geometry; reject infeasible explicit choices."""
+    if dtype != cutlass.Float8E4M3FN:
+        raise NotImplementedError("SM120 paged KV supports FP8 E4M3 only; BF16/FP16 paged is unsupported")
+    alignment = 16
+    if (min(head_dim, head_dim_v, cfg.m_block_size, cfg.n_block_size, num_threads) <= 0
+            or head_dim % alignment or head_dim_v % alignment):
+        raise ValueError("SM120 paged KV requires positive, aligned dimensions and tiles")
+    if max(head_dim, head_dim_v) > 64 and cfg.n_block_size < num_threads:
+        if tile_mn is not None:
+            raise ValueError("SM120 paged KV requires tile_n >= num_threads for heads wider than 64")
+        cfg = replace(cfg, n_block_size=num_threads)
+    # FP8 shared allocations and native V loads use padded dimensions.
+    multiple = 32
+    d, dv = ((value + multiple - 1) // multiple * multiple for value in (head_dim, head_dim_v))
+    if not FlashAttentionForwardSm120.can_implement(
+            dtype, d, dv, cfg.m_block_size, cfg.n_block_size, 1, num_threads, causal):
+        raise ValueError("SM120 paged KV tile exceeds supported layout or 99 KiB shared-memory limits")
+    return cfg
+
+
 def _resolve_causal_local_window(causal, window_size_left, window_size_right, mask_mod=None):
     """Resolve causal/local/window settings into canonical form.
 
@@ -878,18 +899,27 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    if arch // 10 == 12 and page_table is not None:
+        if v.dtype != torch.float8_e4m3fn:
+            raise NotImplementedError("SM120 paged KV supports FP8 E4M3 only; BF16/FP16 paged is unsupported")
+        if requires_grad:
+            raise NotImplementedError("SM120 paged KV is forward-only")
+        if seqused_k is None:
+            raise ValueError("SM120 paged KV requires seqused_k")
+        if page_size <= 0 or num_pages <= 0:
+            raise ValueError("SM120 paged KV requires positive page size and backing pages")
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     if is_fp8 and arch // 10 == 12:
         if v.dtype != torch.float8_e4m3fn:
             raise NotImplementedError("SM120 FP8 forward supports E4M3 inputs only")
-        if (qv is not None or gather_kv_indices is not None or page_table is not None
+        if (qv is not None or gather_kv_indices is not None
                 or learnable_sink is not None or score_mod is not None or mask_mod is not None
                 or block_sparse_tensors is not None or aux_tensors is not None
                 or aux_scalars is not None or softcap is not None):
             raise NotImplementedError(
-                "SM120 FP8 supports dense/varlen causal or local attention with SplitKV; "
-                "MLA, paged/gather KV, sinks, modifiers and sparsity are unsupported"
+                "SM120 FP8 supports dense/varlen/paged causal or local attention with SplitKV; "
+                "MLA, gather KV, sinks, modifiers and sparsity are unsupported"
             )
         if min(head_dim, head_dim_v) <= 0 or max(head_dim, head_dim_v) > 256 or head_dim % 16 or head_dim_v % 16:
             raise ValueError("SM120 FP8 head dimensions must be positive multiples of 16, at most 256")
@@ -1089,6 +1119,9 @@ def _flash_attn_fwd(
             tile_mn=tile_mn,
             num_sms=get_num_sms_for_selection(device.index, arch),
         )
+    if arch // 10 == 12 and page_table is not None:
+        fwd_cfg = _sm120_paged_fwd_config(
+            fwd_cfg, dtype, head_dim, head_dim_v, num_threads, causal, tile_mn)
     mla_1cta_kb64 = mla_fwd_cls is FlashAttentionMLAForward1CtaKb64Sm100
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     if arch // 10 == 12:
@@ -1835,7 +1868,6 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,

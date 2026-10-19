@@ -61,9 +61,9 @@ class PagedKVManager(ParamsBase):
         arch: cutlass.Constexpr[int] = 100,
     ):
         # SM100 transposes V in gmem to (dv, page_size, num_pages);
-        # SM90 keeps V as (page_size, dv, num_pages), same layout as K.
-        v_gmem_transposed = arch != 90
-        universal_copy_bits = 128
+        # SM90/SM120 keep V as (page_size, dv, num_pages), same layout as K.
+        v_gmem_transposed = arch not in (90, 120)
+        universal_copy_bits = 64 if arch == 120 and dtype.width == 8 else 128
         async_copy_elems = universal_copy_bits // dtype.width
         dtype_bytes = dtype.width // 8
         gmem_k_block_size = math.gcd(
@@ -75,7 +75,8 @@ class PagedKVManager(ParamsBase):
         gmem_threads_per_row = gmem_k_block_size // async_copy_elems
         assert cute.arch.WARP_SIZE % gmem_threads_per_row == 0
         atom_async_copy = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            cpasync.CopyG2SOp(cache_mode=(cpasync.LoadCacheMode.ALWAYS if universal_copy_bits == 64
+                                        else cpasync.LoadCacheMode.GLOBAL)),
             dtype,
             num_bits_per_copy=universal_copy_bits,
         )
@@ -100,9 +101,10 @@ class PagedKVManager(ParamsBase):
         tKcK = gmem_thr_copy_KV.partition_S(cK)
         tKpK = utils.predicate_k(tKcK, limit=mK_paged.shape[1])
 
-        if const_expr(head_dim_padded == head_dim_v_padded):
+        if const_expr(head_dim_padded == head_dim_v_padded and arch != 120):
             tVpV = tKpK
         else:
+            # Equal padded dimensions need not mean equal real K/V widths.
             cV = cute.make_identity_tensor((n_block_size, head_dim_v_padded))
             tVcV = gmem_thr_copy_KV.partition_S(cV)
             # When V is transposed in gmem, dv is shape[0]; otherwise dv is shape[1] (same as K)

@@ -35,10 +35,13 @@ from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 from flash_attn.cute.utils import AuxData
+from flash_attn.cute.paged_kv import PagedKVManager
+from cutlass.cute import FastDivmodDivisorV2
 
 
 class FlashAttentionForwardBase:
     supports_fp8 = False
+    supports_paged_kv = False
 
     def __init__(
         self,
@@ -643,6 +646,101 @@ class FlashAttentionForwardBase:
             )
 
 
+    @cute.jit
+    def _paged_load_page_table_and_ptrs(
+        self,
+        mPageTable: cute.Tensor,
+        mX_paged: cute.Tensor,
+        page_size: Int32,
+        seqlen_k: Int32,
+        leftpad_k: Int32,
+        thread_idx: Int32,
+        block: Int32,
+        gmem_threads_per_row: cutlass.Constexpr[Int32],
+        num_threads: cutlass.Constexpr[Int32],
+        page_entry_per_thread: Int32,
+    ):
+        """Adapted from #2348 (Blake Ledden): immutable per-row page pointers.
+
+        Inline integer division avoids carrying a mutated FastDivmod manager
+        through the mainloop. Never read unused or negative page-table entries.
+        """
+        tPrXPtr = cute.make_rmem_tensor((page_entry_per_thread,), cutlass.Int64)
+        for i in cutlass.range(page_entry_per_thread, unroll=1):
+            row = (
+                i * num_threads
+                + (thread_idx % gmem_threads_per_row)
+                * (num_threads // gmem_threads_per_row)
+                + (thread_idx // gmem_threads_per_row)
+            )
+            row_idx = block * self.tile_n + row
+            shifted_row = row_idx + leftpad_k
+            page_idx = shifted_row // page_size
+            is_valid = (row < self.tile_n and row_idx >= 0 and row_idx < seqlen_k
+                        and shifted_row >= 0 and page_idx < mPageTable.shape[0])
+            page = mPageTable[page_idx] if is_valid else 0
+            page_offset = shifted_row % page_size if is_valid else 0
+            tPrXPtr[i] = utils.elem_pointer(mX_paged, (page_offset, 0, page)).toint()
+        return tPrXPtr
+
+    @cute.jit
+    def paged_load_KV(
+        self,
+        paged_kv_manager: PagedKVManager,
+        page_size: Int32,
+        tXsX: cute.Tensor,
+        tXcX: cute.Tensor,
+        tXpX: cute.Tensor,
+        block: Int32,
+        smem_pipe_write: Int32,
+        seqlen: Int32,
+        need_predicates: cutlass.Constexpr,
+        K_or_V: cutlass.Constexpr[str],
+    ):
+        """#2348 row-wise cp.async path, retaining H4's row-major K and V.
+
+        Page boundaries and padded head lanes are always predicated. A false
+        cp.async still zero-fills SMEM, so out-of-tile destinations must be skipped.
+        """
+        mX = paged_kv_manager.mK_paged if const_expr(K_or_V == "K") else paged_kv_manager.mV_paged
+        head_dim_padded = (paged_kv_manager.head_dim_padded if const_expr(K_or_V == "K")
+                           else paged_kv_manager.head_dim_v_padded)
+        tPrXPtr = self._paged_load_page_table_and_ptrs(
+            paged_kv_manager.mPageTable, mX, page_size, seqlen,
+            paged_kv_manager.leftpad_k, paged_kv_manager.thread_idx, block,
+            paged_kv_manager.gmem_threads_per_row, paged_kv_manager.num_threads,
+            paged_kv_manager.page_entry_per_thread,
+        )
+        stage = smem_pipe_write if const_expr(self.num_stages > 1) else 0
+        for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
+            # Keep the shuffle outside lane-dependent destination guards.
+            x_ptr_i64 = utils.shuffle_sync(
+                tPrXPtr[m // paged_kv_manager.gmem_threads_per_row],
+                m % paged_kv_manager.gmem_threads_per_row,
+                width=paged_kv_manager.gmem_threads_per_row,
+            )
+            x_gmem_ptr = cute.make_ptr(mX.element_type, x_ptr_i64,
+                                      cute.AddressSpace.gmem, assumed_align=16)
+            mX_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim_padded,)))
+            mX_cur_copy = cute.tiled_divide(mX_cur, (paged_kv_manager.async_copy_elems,))
+            row = tXcX[0, m, 0][0]
+            row_idx = block * self.tile_n + row
+            shifted_row = row_idx + paged_kv_manager.leftpad_k
+            row_valid = (row_idx >= 0 and row_idx < seqlen and shifted_row >= 0
+                         and shifted_row < page_size * paged_kv_manager.mPageTable.shape[0])
+            if row < self.tile_n:
+                should_load = cute.make_fragment_like(tXsX[(0, None), m, 0, 0], cute.Boolean)
+                for k in cutlass.range_constexpr(cute.size(tXsX, mode=[2])):
+                    for i in cutlass.range_constexpr(cute.size(should_load)):
+                        should_load[i] = row_valid and tXpX[i, 0, k]
+                    ki = tXcX[0, 0, k][1] // paged_kv_manager.async_copy_elems
+                    mX_ki = mX_cur_copy[None, ki]
+                    tXsX_k = tXsX[None, m, k, stage]
+                    mX_ki = cute.make_tensor(mX_ki.iterator, tXsX_k.layout)
+                    cute.copy(paged_kv_manager.gmem_tiled_copy_KV, mX_ki, tXsX_k,
+                              pred=should_load)
+
+
 class FlashAttentionForwardSm80(FlashAttentionForwardBase):
     def _get_smem_layout_atom(self):
         sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
@@ -720,6 +818,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
         assert learnable_sink is None, "Learnable sink is not supported in this kernel"
+        if const_expr(mPageTable is not None):
+            assert self.supports_paged_kv, "Paged KV requires the SM120 class"
+            assert self.is_fp8, "SM120 paged KV supports FP8 E4M3 only"
+            assert mCuSeqlensK is None and mSeqUsedK is not None
+            assert self.num_stages == 1 and not self.Q_in_regs
+            assert max(self.tile_hdim, self.tile_hdimv) <= 64 or self.tile_n >= self.num_threads
+            assert self.can_implement(self.dtype, self.tile_hdim, self.tile_hdimv,
+                                      self.tile_m, self.tile_n, 1, self.num_threads, self.is_causal)
         if const_expr(self.is_fp8):
             assert mV.stride[-1] == 1, "SM120 E4M3 V must have contiguous head dimension"
             assert self.num_stages == 1 and not self.Q_in_regs
@@ -795,7 +901,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
-        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors)
+        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors, mPageTable)
 
         self.kernel(
             mQ,
@@ -807,6 +913,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mPageTable,
             softmax_scale_log2,
             softmax_scale,
             window_size_left,
@@ -848,6 +955,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mPageTable: Optional[cute.Tensor],
         softmax_scale_log2: Float32,
         softmax_scale: Optional[Float32],
         window_size_left: Optional[Int32],
@@ -930,16 +1038,18 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 if const_expr(descale_tensors.v_descale is not None):
                     v_descale = Float32(descale_tensors.v_descale[batch_size, num_head_kv])
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_size, dim=3)[None, None, num_head]
-            if const_expr(not seqlen.has_cu_seqlens_k):
-                mK_cur = mK[None, None, num_head_kv, batch_size]
-                mV_cur = mV[None, None, num_head_kv, batch_size]
-            else:
-                mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
-                mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
+            if const_expr(mPageTable is None):
+                if const_expr(not seqlen.has_cu_seqlens_k):
+                    mK_cur = mK[None, None, num_head_kv, batch_size]
+                    mV_cur = mV[None, None, num_head_kv, batch_size]
+                else:
+                    mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
+                    mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
             if const_expr(not self.pack_gqa):
                 gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
-            gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
-            gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
+            if const_expr(mPageTable is None):
+                gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
+                gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Get shared memory buffer
@@ -964,13 +1074,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     sV = cute.make_tensor(cute.recast_ptr(sQ.iterator, dtype=self.dtype), sV_layout)
             # Transpose view of V to tensor with layout (head_dim_v, tile_n) for tiled mma
             sVt = layout_utils.transpose_view(sV)
+            if const_expr(mPageTable is None):
+                gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
+                gmem_thr_copy_V = gmem_tiled_copy_V.get_slice(tidx)
+                # (CPY_Atom, CPY_N, CPY_K, n_block)
+                tKsK, tKgK = gmem_thr_copy_K.partition_D(sK), gmem_thr_copy_K.partition_S(gK)
+                # (CPY_Atom, CPY_N, CPY_K, n_block)
+                tVsV, tVgV = gmem_thr_copy_V.partition_D(sV), gmem_thr_copy_V.partition_S(gV)
 
-            gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
-            gmem_thr_copy_V = gmem_tiled_copy_V.get_slice(tidx)
-            # (CPY_Atom, CPY_N, CPY_K, n_block)
-            tKsK, tKgK = gmem_thr_copy_K.partition_D(sK), gmem_thr_copy_K.partition_S(gK)
-            # (CPY_Atom, CPY_N, CPY_K, n_block)
-            tVsV, tVgV = gmem_thr_copy_V.partition_D(sV), gmem_thr_copy_V.partition_S(gV)
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Tile MMA compute thread partitions and allocate accumulators
@@ -1023,29 +1134,26 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 tPsP = smem_thr_copy_P.partition_S(sP)
                 tOrP = thr_mma_pv.make_fragment_A(thr_mma_pv.partition_A(sP))
 
-            # ///////////////////////////////////////////////////////////////////////////////
-            # Predicate: Mark indices that need to copy when problem_shape isn't a multiple
-            # of tile_shape
-            # ///////////////////////////////////////////////////////////////////////////////
-            # Construct identity layout for KV
-            cK = cute.make_identity_tensor((self.tile_n, self.tile_hdim))
-            tKcK = gmem_thr_copy_K.partition_S(cK)
-            t0KcK = gmem_thr_copy_K.get_slice(0).partition_S(cK)
-            if const_expr(self.tile_hdim == self.tile_hdimv and not self.is_fp8):
-                tVcV = tKcK
-                t0VcV = t0KcK
-            else:
-                cV = cute.make_identity_tensor((self.tile_n, self.tile_hdimv))
-                tVcV = gmem_thr_copy_V.partition_S(cV)
-                t0VcV = gmem_thr_copy_V.get_slice(0).partition_S(cV)
-            # Allocate predicate tensors for m and n, here we only allocate the tile of k, and
-            # use "if" on the mn dimension.
-            # This is to reduce register pressure and gets 2-3% performance gain.
-            tKpK = utils.predicate_k(tKcK, limit=mK.shape[1])
-            if const_expr(self.same_hdim_kv and not self.is_fp8):
-                tVpV = tKpK
-            else:
-                tVpV = utils.predicate_k(tVcV, limit=mV.shape[1])
+            if const_expr(mPageTable is None):
+                # Construct identity layout for KV
+                cK = cute.make_identity_tensor((self.tile_n, self.tile_hdim))
+                tKcK = gmem_thr_copy_K.partition_S(cK)
+                t0KcK = gmem_thr_copy_K.get_slice(0).partition_S(cK)
+                if const_expr(self.tile_hdim == self.tile_hdimv and not self.is_fp8):
+                    tVcV = tKcK
+                    t0VcV = t0KcK
+                else:
+                    cV = cute.make_identity_tensor((self.tile_n, self.tile_hdimv))
+                    tVcV = gmem_thr_copy_V.partition_S(cV)
+                    t0VcV = gmem_thr_copy_V.get_slice(0).partition_S(cV)
+                # Allocate predicate tensors for m and n, here we only allocate the tile of k, and
+                # use "if" on the mn dimension.
+                # This is to reduce register pressure and gets 2-3% performance gain.
+                tKpK = utils.predicate_k(tKcK, limit=mK.shape[1])
+                if const_expr(self.same_hdim_kv and not self.is_fp8):
+                    tVpV = tKpK
+                else:
+                    tVpV = utils.predicate_k(tVcV, limit=mV.shape[1])
 
             # shape: (atom_v_m * rest_m)
             softmax = Softmax.create(
@@ -1078,12 +1186,36 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 smem_copy_params.sP = sP
                 smem_copy_params.tPsP = tPsP
                 smem_copy_params.smem_thr_copy_P = smem_thr_copy_P
-            load_K = partial(
-                self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK, seqlen=seqlen.seqlen_k
-            )
-            load_V = partial(
-                self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV, seqlen=seqlen.seqlen_k
-            )
+            if const_expr(mPageTable is not None):
+                # Adapted from #2348; arch120 keeps V row-major and H4 copies 64 bits for FP8.
+                page_size = mK.shape[0]
+                paged_kv_manager = PagedKVManager.create(
+                    mPageTable, mK, mV, FastDivmodDivisorV2(page_size),
+                    bidb=batch_size, bidh=num_head_kv, thread_idx=tidx,
+                    seqlen_k=seqlen.seqlen_k, leftpad_k=Int32(0),
+                    n_block_size=self.tile_n, head_dim_padded=self.tile_hdim,
+                    head_dim_v_padded=self.tile_hdimv, num_threads=self.num_threads,
+                    dtype=self.dtype, arch=120,
+                )
+                thread_copy = paged_kv_manager.gmem_thr_copy_KV
+                tKsK_paged = thread_copy.partition_D(sK)
+                tVsV_paged = thread_copy.partition_D(sV)
+                tKcK_paged = thread_copy.partition_S(cute.make_identity_tensor(blkK_shape))
+                tVcV_paged = thread_copy.partition_S(cute.make_identity_tensor(blkV_shape))
+                load_K = partial(self.paged_load_KV, paged_kv_manager, page_size,
+                                 tKsK_paged, tKcK_paged, paged_kv_manager.tKpK,
+                                 seqlen=seqlen.seqlen_k, K_or_V="K")
+                load_V = partial(self.paged_load_KV, paged_kv_manager, page_size,
+                                 tVsV_paged, tVcV_paged, paged_kv_manager.tVpV,
+                                 seqlen=seqlen.seqlen_k, K_or_V="V")
+            else:
+                load_K = partial(
+                    self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK, seqlen=seqlen.seqlen_k
+                )
+                load_V = partial(
+                    self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV, seqlen=seqlen.seqlen_k
+                )
+
 
             compute_one_n_block = partial(
                 self.compute_one_n_block,
