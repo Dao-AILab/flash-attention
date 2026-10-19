@@ -12,9 +12,9 @@ from flash_attn.cute.interface import (
     flash_attn_func,
     _flash_attn_fwd,
     _flash_attn_bwd,
-    _tile_size_bwd_sm90,
 )
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+from flash_attn.cute.config import select_sm90_bwd_tile
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
@@ -946,15 +946,15 @@ def test_sm90_block_sparse_score_mod_backward_with_dq_swapab():
     block_size_kv = 128
     dtype = torch.bfloat16
 
-    cfg = _tile_size_bwd_sm90(
+    tile = select_sm90_bwd_tile(
         dim,
         dim,
         causal=False,
         local=False,
         sparse_block_size_q=block_size_q,
     )
-    assert cfg.m_block_size == 80
-    assert cfg.dQ_swapAB
+    assert tile["tile_m"] == 80
+    assert tile["dQ_swapAB"]
 
     q, k, v = create_tensors(
         batch_size=batch_size,
