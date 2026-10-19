@@ -136,7 +136,7 @@ class PagedKVManager(ParamsBase):
 
     @cute.jit
     def load_page_table(self, n_block: Int32):
-        for i in cutlass.range(self.page_entry_per_thread, unroll=1):
+        for i in cutlass.range_constexpr(self.page_entry_per_thread):
             row = (
                 i * self.num_threads
                 + (self.thread_idx % self.gmem_threads_per_row)
@@ -162,7 +162,7 @@ class PagedKVManager(ParamsBase):
         # K is always (page_size, d, num_pages). V matches K when not transposed,
         # but is (dv, page_size, num_pages) when transposed (SM100).
         transposed = const_expr(K_or_V == "V" and self.v_gmem_transposed)
-        for i in cutlass.range(self.page_entry_per_thread, unroll=1):
+        for i in cutlass.range_constexpr(self.page_entry_per_thread):
             page = self.tPrPage[i]
             page_offset = self.tPrPageOffset[i]
             if const_expr(transposed):
