@@ -362,6 +362,12 @@ SM100_FP8_TUNING = {
     # (0.94x), hence keyed on is_causal=True only.
     (False, True, 128, False): {"ex2_emu_freq": 8, "ex2_emu_start_frg": 1},
 }
+# BF16-only overrides of the SM100_TUNING register fields; non-TMA paged KV keeps its own budget.
+SM100_BF16_TUNING = {
+    # The shared 184/80 split is spill-free for both dtypes, but BF16 is faster on B200 with more
+    # softmax registers (192/64). FP16 keeps the shared 184/80 entry.
+    (True, False, 128, False): {"num_regs_softmax": 192, "num_regs_correction": 64},
+}
 # head_dim_padded < 96, keyed by paged non-TMA KV.
 SM100_SMALL_HDIM_REGISTERS = {
     False: Sm100Registers(softmax=200, correction=64, other=48),
@@ -404,6 +410,8 @@ def select_sm100_registers(
         softmax, correction = fp8_tune["num_regs_softmax"], fp8_tune["num_regs_correction"]
         return Sm100Registers(softmax, correction, 512 - softmax * 2 - correction)
     tune = SM100_TUNING.get(key, {})
+    if inputs.dtype == "torch.bfloat16":
+        tune = {**tune, **SM100_BF16_TUNING.get(key, {})}
     if paged_kv_non_tma:
         softmax, correction = 184, 64
     elif "num_regs_softmax" in tune:

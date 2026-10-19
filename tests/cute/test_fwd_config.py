@@ -232,12 +232,15 @@ _LEGACY_SM100_TUNING = {
 }
 
 
-def legacy_sm100_registers(fp8, hd_padded, causal, use_2cta, sm103, paged_non_tma, q_stage):
+def legacy_sm100_registers(dtype, hd_padded, causal, use_2cta, sm103, paged_non_tma, q_stage):
+    fp8 = "float8" in dtype
     key = (use_2cta, causal, hd_padded, sm103)
     if hd_padded < 96:
         regs = (184, 64, 80) if paged_non_tma else (200, 64, 48)
     else:
-        if not paged_non_tma and key in _LEGACY_SM100_TUNING:
+        if not paged_non_tma and dtype == "torch.bfloat16" and key == (True, False, 128, False):
+            softmax, correction = 192, 64  # BF16 2CTA hd128 override
+        elif not paged_non_tma and key in _LEGACY_SM100_TUNING:
             softmax, correction = _LEGACY_SM100_TUNING[key]
         elif not paged_non_tma:
             softmax, correction = 192, 80
@@ -313,7 +316,7 @@ def test_sm100_registers_match_the_legacy_kernel_policy():
         got = select_registers(inputs, tile_m=128, tile_n=128, q_stage=q_stage,
                                use_2cta_instrs=use_2cta)
         expected = legacy_sm100_registers(
-            "float8" in dtype, inputs.head_dim_padded, causal, use_2cta,
+            dtype, inputs.head_dim_padded, causal, use_2cta,
             device_arch == 103, page is not None, q_stage,
         )
         assert got == expected, (device_arch, dtype, d, causal, use_2cta, page, q_stage)
@@ -374,7 +377,7 @@ def test_selected_configs_carry_the_legacy_policy(case):
         return
     fp8, sm103 = "float8" in inputs.dtype, inputs.device_arch == 103
     expected_registers = legacy_sm100_registers(
-        fp8, inputs.head_dim_padded, inputs.causal, config.use_2cta_instrs, sm103, False,
+        inputs.dtype, inputs.head_dim_padded, inputs.causal, config.use_2cta_instrs, sm103, False,
         config.q_stage,
     )
     assert config.registers == expected_registers, config
