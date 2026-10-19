@@ -2847,18 +2847,21 @@ def _fp8_decode_reference(q, k, v):
     return torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v)
 
 
-@pytest.mark.skipif(not IS_SM100, reason="SM100 paged KV (TMA pages)")
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="SM90/SM100 paged KV (TMA pages)")
 @pytest.mark.parametrize("d, page_size", [(128, 128), (64, 128), (128, 64)])
 @pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("padding", ["unused_page_nan", "tail_finite_garbage"])
+# Batch 0 empty: its first page index must not be read at n_block = -1.
+@pytest.mark.parametrize("k_lens", [[70, 0, 130, 0], [0, 70, 0, 130]], ids=["b0_used", "b0_empty"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_paged_padding_contract(d, page_size, num_splits, padding):
+def test_flash_attn_paged_padding_contract(d, page_size, num_splits, padding, k_lens):
     """The paged-KV padding contract (see test_flash_attn_mla_paged_padding_contract): rows past
     seqused_k in a partially used page may hold finite garbage; pages an entry does not use may
     hold NaN, including the one a seqused_k = 0 entry's fully masked dummy tile loads. The output
     equals the run with zero padding, bitwise, and is 0 with LSE = -inf for empty entries."""
+    if IS_SM90 and num_splits > 1:
+        pytest.skip("SplitKV is not supported on SM90")
     device, dtype = "cuda", torch.bfloat16
-    k_lens = [70, 0, 130, 0]
     b, h, h_kv, cap = len(k_lens), 8, 2, 256
     pages_per = cap // page_size
     num_pages = b * pages_per + 1
