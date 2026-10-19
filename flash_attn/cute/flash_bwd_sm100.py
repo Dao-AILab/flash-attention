@@ -3813,8 +3813,12 @@ class FlashAttentionBackwardSm100:
                 if const_expr(not self.acc_m64):
                     cute.arch.fence_view_async_tmem_store()
                 cute.arch.fence_view_async_shared()
-                # The P (or S_P) and LSE mbarriers expect one arrival per compute warp
-                if const_expr(self.split_P_dS):
+                # The P (or S_P) and LSE mbarriers expect one arrival per compute warp, so the
+                # mbarrier itself is the cross-warp join for split_P_dS and the pipelined 2CTA
+                # schedule
+                if const_expr(
+                    self.split_P_dS or self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED
+                ):
                     cute.arch.sync_warp()
                 else:
                     self.compute_sync_barrier.arrive_and_wait()
