@@ -56,11 +56,12 @@ from flash_attn.cute.block_sparse_utils import (
 #   * The compute-wide barriers that ordered the P-over-S and dS-over-dP overwrites are
 #     gone. They were cross-warp hazards: a warp's P (dS) columns overlap S (dP) lanes
 #     that another warp still has to load.
-#   * The remaining compute-wide barriers before pipeline arrivals become sync_warp: every
+#   * The remaining compute-wide barriers before pipeline arrivals are sync_warp: every
 #     mbarrier signalled from the compute warps expects one arrival per warp, so the
-#     mbarrier itself is the cross-warp join. This is 1-CTA only: at 2-CTA the barrier
-#     before the dS commit also orders every warp's sdS_xchg write ahead of the
-#     single-thread DSMEM copy to the peer CTA.
+#     mbarrier itself is the cross-warp join. This holds for every 1-CTA configuration
+#     (the aliased layout keeps its own P-over-S / dS-over-dP barriers) and is 1-CTA only:
+#     at 2-CTA the barrier before the dS commit also orders every warp's sdS_xchg write
+#     ahead of the single-thread DSMEM copy to the peer CTA.
 # The S handshake keeps its own phase/state (producer_phase_S, consumer_state_S) so its
 # parity never depends on where the other pipelines flip. Perf evidence in PR #2804; the
 # aliased layout is what every other shape runs.
@@ -3715,7 +3716,7 @@ class FlashAttentionBackwardSm100:
                         cute.arch.fence_view_async_tmem_store()
                     cute.arch.fence_view_async_shared()
                     # The P (or S_P) and LSE mbarriers expect one arrival per compute warp
-                    if const_expr(self.split_P_dS):
+                    if const_expr(not self.use_2cta_instrs):
                         cute.arch.sync_warp()
                     else:
                         self.compute_sync_barrier.arrive_and_wait()
@@ -3862,7 +3863,7 @@ class FlashAttentionBackwardSm100:
 
                     cute.arch.fence_view_async_shared()
                     # The dS and dPsum mbarriers expect one arrival per compute warp
-                    if const_expr(self.split_P_dS):
+                    if const_expr(not self.use_2cta_instrs):
                         cute.arch.sync_warp()
                     else:
                         self.compute_sync_barrier.arrive_and_wait()
