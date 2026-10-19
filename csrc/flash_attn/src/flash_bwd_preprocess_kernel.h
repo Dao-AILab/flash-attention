@@ -60,16 +60,23 @@ inline __device__ void compute_dot_do_o(const Params &params) {
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
 
-    const int m_block = blockIdx.x;
+    constexpr int kBlockM = Kernel_traits::kBlockM;
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+
+    int m_block = blockIdx.x;
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    int bidb = blockIdx.y;
+    // A varlen launch covers the batch's padded block space (varlen_num_blocks).
+    if (params.cu_seqlens_q != nullptr) {
+        auto const coord = varlen_block_coord<kBlockM>(blockIdx.x, params.b, params.cu_seqlens_q, nullptr);
+        bidb = get<0>(coord);
+        m_block = get<1>(coord);
+        if (bidb < 0) return;
+    }
     // The block index for the head.
     const int bidh = blockIdx.z;
     // The thread index.
     const int tidx = threadIdx.x;
-
-    constexpr int kBlockM = Kernel_traits::kBlockM;
-    constexpr int kHeadDim = Kernel_traits::kHeadDim;
 
     const BlockInfo binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
@@ -190,16 +197,23 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
     // Shared memory.
     extern __shared__ char smem_[];
 
-    const int m_block = blockIdx.x;
+    constexpr int kBlockM = Kernel_traits::kBlockM;
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+
+    int m_block = blockIdx.x;
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    int bidb = blockIdx.y;
+    // A varlen launch covers the batch's padded block space (varlen_num_blocks).
+    if (params.cu_seqlens_q != nullptr) {
+        auto const coord = varlen_block_coord<kBlockM>(blockIdx.x, params.b, params.cu_seqlens_q, nullptr);
+        bidb = get<0>(coord);
+        m_block = get<1>(coord);
+        if (bidb < 0) return;
+    }
     // The block index for the head.
     const int bidh = blockIdx.z;
     // The thread index.
     const int tidx = threadIdx.x;
-
-    constexpr int kBlockM = Kernel_traits::kBlockM;
-    constexpr int kHeadDim = Kernel_traits::kHeadDim;
 
     const BlockInfo binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
