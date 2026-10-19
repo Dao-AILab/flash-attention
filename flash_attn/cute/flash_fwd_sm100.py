@@ -53,7 +53,6 @@ from flash_attn.cute.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
     softmax_block_sparse_sm100,
-    handle_block_sparse_empty_tile_correction_sm100,
 )
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute import mma_sm100_desc as sm100_desc
@@ -2983,57 +2982,62 @@ class FlashAttentionForwardSm100:
                 total_block_count = n_block_max - n_block_min
                 has_work = self.process_work_tile(block_info, seqlen, n_block_min, n_block_max)
 
-            if has_work:
-                # Ignore first signal from softmax as no correction is required
-                # pipeline_sm_stats.consumer_wait_w_index_phase(0, sm_stats_consumer_phase)
-                if const_expr(not self.use_s_ping_pong):
-                    sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
-                    pipeline_sm_stats.consumer_release_w_index(0)
-                if const_expr(self.q_stage == 2):
-                    # pipeline_sm_stats.consumer_wait_w_index_phase(1, sm_stats_consumer_phase)
-                    sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
-                sm_stats_consumer_phase ^= 1
-
-                tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
-                for i in cutlass.range(total_block_count - 1, unroll=1):
-                    for stage in cutlass.range_constexpr(self.q_stage):
-                        if const_expr(self.use_s_ping_pong):
-                            sm_stats_index = o_acc_consumer_count & 1
-                        else:
-                            sm_stats_index = stage
-                        # wait for S0 / S1
-                        # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
-                        sm_stats_barrier.arrive_and_wait_w_index(index=sm_stats_index * 4 + warp_idx)
-                        # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
-                        # cute.arch.fence_view_async_tmem_load()
-                        # scale = tSrScale_t2r[0]
-                        scale = sScale[tidx + sm_stats_index * self.m_block_size]
-                        should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
-                        # should_rescale = True
-                        # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
-                        # Don't need O_full anymore, since by the time softmax has signaled the correction
-                        # warps, S_i must have been done, so O_i-1 must have been done as well.
-                        # pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
-                        if should_rescale:
-                            if const_expr(self.use_s_ping_pong):
-                                # Ping-pong issues QK(i+1) before PV(i), so S_i+1 does not imply O_i is done
-                                pipeline_o_acc.consumer_wait_w_index_phase(
-                                    o_acc_consumer_count & 1, (o_acc_consumer_count >> 1) & 1
-                                )
-                            self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
-                        # Notify mma warp that O has been rescaled
-                        if const_expr(self.use_s_ping_pong):
-                            pipeline_s_p_o.consumer_release_w_index((o_acc_consumer_count + 1) & 1)
-                            pipeline_sm_stats.consumer_release_w_index(sm_stats_index)
-                            o_acc_consumer_count += 1
-                        else:
-                            pipeline_s_p_o.consumer_release_w_index(stage)
-                            pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
+            # Block sparsity: a work tile without any KV block (has_work False) skips the KV loop
+            # and still writes its zeros and LSE through the epilogue below, with fully masked
+            # row stats, so the correction warps carry a single inlined correction_epilogue. See
+            # NOTE [SM100 block-sparse empty tiles: mbarrier contract].
+            if const_expr(self.use_block_sparsity) or has_work:
+                if const_expr(not self.use_block_sparsity) or has_work:
+                    # Ignore first signal from softmax as no correction is required
+                    # pipeline_sm_stats.consumer_wait_w_index_phase(0, sm_stats_consumer_phase)
+                    if const_expr(not self.use_s_ping_pong):
+                        sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
+                        pipeline_sm_stats.consumer_release_w_index(0)
+                    if const_expr(self.q_stage == 2):
+                        # pipeline_sm_stats.consumer_wait_w_index_phase(1, sm_stats_consumer_phase)
+                        sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
                     sm_stats_consumer_phase ^= 1
-                    # o_corr_consumer_phase ^= 1
-                if const_expr(self.q_stage == 2):
-                    pipeline_sm_stats.consumer_release_w_index(1)
-                # End of seqlen_corr_loop_steps
+
+                    tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
+                    for i in cutlass.range(total_block_count - 1, unroll=1):
+                        for stage in cutlass.range_constexpr(self.q_stage):
+                            if const_expr(self.use_s_ping_pong):
+                                sm_stats_index = o_acc_consumer_count & 1
+                            else:
+                                sm_stats_index = stage
+                            # wait for S0 / S1
+                            # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+                            sm_stats_barrier.arrive_and_wait_w_index(index=sm_stats_index * 4 + warp_idx)
+                            # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
+                            # cute.arch.fence_view_async_tmem_load()
+                            # scale = tSrScale_t2r[0]
+                            scale = sScale[tidx + sm_stats_index * self.m_block_size]
+                            should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
+                            # should_rescale = True
+                            # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
+                            # Don't need O_full anymore, since by the time softmax has signaled the correction
+                            # warps, S_i must have been done, so O_i-1 must have been done as well.
+                            # pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
+                            if should_rescale:
+                                if const_expr(self.use_s_ping_pong):
+                                    # Ping-pong issues QK(i+1) before PV(i), so S_i+1 does not imply O_i is done
+                                    pipeline_o_acc.consumer_wait_w_index_phase(
+                                        o_acc_consumer_count & 1, (o_acc_consumer_count >> 1) & 1
+                                    )
+                                self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
+                            # Notify mma warp that O has been rescaled
+                            if const_expr(self.use_s_ping_pong):
+                                pipeline_s_p_o.consumer_release_w_index((o_acc_consumer_count + 1) & 1)
+                                pipeline_sm_stats.consumer_release_w_index(sm_stats_index)
+                                o_acc_consumer_count += 1
+                            else:
+                                pipeline_s_p_o.consumer_release_w_index(stage)
+                                pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
+                        sm_stats_consumer_phase ^= 1
+                        # o_corr_consumer_phase ^= 1
+                    if const_expr(self.q_stage == 2):
+                        pipeline_sm_stats.consumer_release_w_index(1)
+                    # End of seqlen_corr_loop_steps
 
                 # Even in the case of self.overlap_sO_sQ, we can write to stage 0 of sO without
                 # additional sync because the MMA in the top half must have been done.
@@ -3065,6 +3069,11 @@ class FlashAttentionForwardSm100:
                         row_max = sScale[tidx + sm_stats_index * self.m_block_size + self.s_p_o_stage * self.m_block_size]
                     else:
                         row_max = None
+                    if const_expr(self.use_block_sparsity):
+                        # Empty tile: the softmax published no stats for these rows
+                        row_sum = row_sum if has_work else Float32(1.0)
+                        if const_expr(row_max is not None):
+                            row_max = row_max if has_work else -Float32.inf
                     pipeline_sm_stats.consumer_release_w_index(sm_stats_index)
                     if const_expr(learnable_sink is not None):
                         # Only the first split owns the sink column; empty rows occur with splitKV.
@@ -3086,11 +3095,16 @@ class FlashAttentionForwardSm100:
                         pipeline_o_acc.consumer_wait_w_index_phase(
                             o_acc_consumer_count & 1, (o_acc_consumer_count >> 1) & 1
                         )
-                    else:
+                    elif const_expr(not self.use_block_sparsity) or has_work:
                         pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     if const_expr(not self.use_correction_warps_for_epi):
                         pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
                     gO_stage = gO[None, None, stage] if const_expr(gO is not None) else None
+                    # TMA KV loads a dummy tile when seqlen_k == 0 (see correction_epilogue); an
+                    # empty block-sparse tile never wrote its O accumulator
+                    zero_fill = seqlen.seqlen_k == 0 if const_expr(self.use_tma_KV) else False
+                    if const_expr(self.use_block_sparsity):
+                        zero_fill = not has_work or zero_fill
                     self.correction_epilogue(
                         thr_mma_pv,
                         tOtO[None, None, None, stage],
@@ -3103,65 +3117,23 @@ class FlashAttentionForwardSm100:
                         mO_cur,
                         gO_stage,
                         gmem_tiled_copy_O,
-                        # TMA KV loads a dummy tile when seqlen_k == 0 (see correction_epilogue)
-                        zero_fill=seqlen.seqlen_k == 0 if const_expr(self.use_tma_KV) else False,
+                        zero_fill=zero_fill,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
                     if const_expr(self.use_s_ping_pong):
                         pipeline_s_p_o.consumer_release_w_index((o_acc_consumer_count + 1) & 1)
                         o_acc_consumer_count += 1
-                    else:
+                    elif const_expr(not self.use_block_sparsity) or has_work:
                         pipeline_s_p_o.consumer_release_w_index(stage)
                     if const_expr(not self.use_correction_warps_for_epi):
                         pipeline_o_epi.producer_commit_w_index(stage)
                     # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
 
-                o_corr_consumer_phase ^= 1
+                if const_expr(not self.use_block_sparsity) or has_work:
+                    o_corr_consumer_phase ^= 1
                 sm_stats_consumer_phase ^= 1
                 corr_epi_producer_phase ^= 1
-            else:
-                gmem_tiled_copy_O_for_empty_tile = None
-                if const_expr(self.use_correction_warps_for_epi):
-                    gmem_tiled_copy_O_for_empty_tile = gmem_tiled_copy_O
-                if const_expr(self.use_block_sparsity):
-                    (
-                        sm_stats_consumer_phase,
-                        o_corr_consumer_phase,
-                        corr_epi_producer_phase,
-                    ) = handle_block_sparse_empty_tile_correction_sm100(
-                        tidx,
-                        self.q_stage,
-                        self.m_block_size,
-                        self.qhead_per_kvhead,
-                        self.pack_gqa,
-                        self.is_split_kv,
-                        learnable_sink,
-                        mLSE,
-                        seqlen,
-                        work_m,
-                        head_idx,
-                        batch_idx,
-                        split_idx,
-                        sScale,
-                        stats,
-                        self.correction_epilogue,
-                        thr_mma_pv,
-                        tOtO,
-                        sO,
-                        pipeline_sm_stats,
-                        sm_stats_barrier,
-                        pipeline_o_epi,
-                        sm_stats_consumer_phase,
-                        o_corr_consumer_phase,
-                        corr_epi_producer_phase,
-                        softmax_scale_log2_eff,
-                        max_offset,
-                        max_offset_scale,
-                        mO_cur,
-                        gO,
-                        gmem_tiled_copy_O_for_empty_tile,
-                    )
 
             if const_expr(mLSE is not None):
                 if const_expr(not seqlen.has_cu_seqlens_q):
@@ -3357,13 +3329,11 @@ class FlashAttentionForwardSm100:
                 tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
                 tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
                 tOrO_frg = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
-                if const_expr(zero_fill is True):
-                    # Empty tile: O accumulator was never written, so write zeros directly
-                    # rather than scaling whatever the TMEM columns happen to hold.
-                    tOrO_frg.fill(0.0)
-                elif zero_fill:
-                    # Run time (seqlen_k == 0 with TMA KV): the fully masked dummy block still loaded
-                    # a KV tile, and P = 0 times a NaN V row is NaN; scaling by 0 would keep it.
+                if zero_fill:
+                    # Empty block-sparse tile: the O accumulator was never written, so write zeros
+                    # rather than scaling whatever the TMEM columns happen to hold. seqlen_k == 0
+                    # with TMA KV: the fully masked dummy block still loaded a KV tile, and P = 0
+                    # times a NaN V row is NaN; scaling by 0 would keep it.
                     tOrO_frg.fill(0.0)
                 else:
                     cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
