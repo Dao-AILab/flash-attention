@@ -287,6 +287,20 @@ class TestCLCHeadDim:
         assert sched_mode == SchedulingMode.STATIC, f"Expected STATIC fallback, got {sched_mode!r}"
 
 
+class TestCLCDefault:
+    """FA_CLC unset: dense causal configs in _CLC_DEFAULT run CLC. FA_CLC=0 forces it off."""
+
+    @pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="_CLC_DEFAULT covers SM10x only")
+    @pytest.mark.parametrize("fa_clc", [None, False], ids=["unset", "off"])
+    def test_bf16_hd128_causal(self, fa_clc):
+        with mock.patch.object(cute_utils, "_fa_clc_enabled", fa_clc):
+            check_output(randn(2, 1024, 4, 128), randn(2, 1024, 4, 128), randn(2, 1024, 4, 128), causal=True, assert_clc=False)
+        assert _captured_schedulers, "No scheduler was captured"
+        sched_cls, sched_mode, _ = _captured_schedulers[-1]
+        assert sched_cls is SingleTileLPTScheduler, sched_cls.__name__
+        assert sched_mode == (SchedulingMode.CLC if fa_clc is None else SchedulingMode.STATIC), sched_mode
+
+
 class TestCLCFallback:
 
     def test_varlen_mha_uses_static(self):

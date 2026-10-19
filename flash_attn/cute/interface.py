@@ -41,7 +41,7 @@ from flash_attn.cute.cute_dsl_utils import (
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors, default_use_clc
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -1122,6 +1122,21 @@ def _flash_attn_fwd(
     # pays work-stealing overhead.
     is_varlen_mha = is_varlen and qhead_per_kvhead == 1
     is_dense_noncausal = not is_varlen and not causal and not local
+    if requested_use_clc_scheduler is None:  # FA_CLC unset: per-config default
+        clc_path = "fp8" if is_fp8 else "fp16" if q_dtype == torch.float16 else "bf16"
+        requested_use_clc_scheduler = (
+            arch // 10 == 10
+            and not is_varlen
+            and qv is None
+            and not local
+            and not is_split_kv
+            and q_stage == 2
+            and page_table is None
+            and not use_block_sparsity
+            and score_mod is None
+            and mask_mod is None
+            and default_use_clc(arch, clc_path, head_dim, causal, is_varlen_q=False)
+        )
     use_clc_scheduler = (
         requested_use_clc_scheduler
         and not is_varlen_mha
@@ -4966,5 +4981,5 @@ def get_scheduler_metadata(
         leftpad_k=leftpad_k,
         seqlen_k_per_split=seqlen_k_per_split,
         zfill_padded_output=True,
-        use_clc_scheduler=utils._get_use_clc_scheduler_default(),
+        use_clc_scheduler=bool(utils._get_use_clc_scheduler_default()),
     )
