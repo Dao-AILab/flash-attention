@@ -422,6 +422,7 @@ class FlashAttentionForwardSm100:
         # Cap small head_dim from over-staging: the 224*1024 budget undercounts
         # per-stage state, so at hd_padded=16 the unbounded formula picks 52 stages
         # and overflows the 227 KB SMEM cap. No-op for hd_padded >= 32 (max 26).
+        # Keep hd192 staging in sync with config.sm100_hd192_uneven_kv_smem_bytes.
         kv_stage = min((224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage, 32)
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
