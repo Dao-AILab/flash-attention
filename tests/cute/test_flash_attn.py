@@ -3778,3 +3778,143 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
     )
 
 
+@pytest.mark.skipif(not IS_SM100, reason="SplitKV is only supported on SM100")
+@pytest.mark.skipif(DISABLE_SPLIT, reason="SplitKV disabled")
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="compares outputs bitwise")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("page_size", [None, 128])
+@pytest.mark.parametrize("window_left", [None, 1500])
+def test_flash_attn_varlen_anchored_split_decode_matches_prefill(dtype, page_size, window_left):
+    """split_anchor="absolute": decode == prefill bitwise, for any num_splits / batch / window.
+
+    Split s owns the absolute keys [s * S, (s + 1) * S), so a query row's reduction order depends
+    only on its own keys. A causal (optionally sliding-window) prefill over a batch of sequences
+    and decode steps (one or a few new tokens per request, in random batches, optionally from a
+    paged cache) give bitwise identical outputs, although they launch different numbers of splits
+    and use different tilings (pack_gqa decode vs. prefill tiles). With a sliding window the split
+    boundaries must not follow the window start, which moves with the query position.
+    """
+    device = "cuda"
+    d = 128
+    nheads, nheads_kv = 8, 2
+    split = 1024
+    seqlens = [3000, 1100, 1024, 257, 1]
+    window_size = (window_left, 0) if window_left is not None else (None, None)
+    torch.random.manual_seed(0)
+    rng = random.Random(0)
+    total = sum(seqlens)
+    cu_host = [0] + list(itertools.accumulate(seqlens))
+    cu = torch.tensor(cu_host, dtype=torch.int32, device=device)
+    q = torch.randn(total, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(total, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(total, nheads_kv, d, device=device, dtype=dtype)
+
+    out_prefill, _ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=cu, cu_seqlens_k=cu,
+        max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens), causal=True, window_size=window_size,
+        num_splits=4, seqlen_k_per_split=split, split_anchor="absolute",
+    )
+
+    if page_size is not None:
+        # Random page order; unused slots hold finite garbage (masked scores, never read as V).
+        n_pages = [(s + page_size - 1) // page_size for s in seqlens]
+        perm = torch.randperm(sum(n_pages) + 3).tolist()
+        k_cache = torch.randn(sum(n_pages) + 3, page_size, nheads_kv, d, device=device, dtype=dtype)
+        v_cache = torch.randn_like(k_cache)
+        page_table = torch.zeros(len(seqlens), max(n_pages), dtype=torch.int32, device=device)
+        c = 0
+        for i, s in enumerate(seqlens):
+            for p in range(n_pages[i]):
+                page_table[i, p] = perm[c]
+                lo, hi = p * page_size, min(s, (p + 1) * page_size)
+                k_cache[perm[c], : hi - lo] = k[cu_host[i] + lo : cu_host[i] + hi]
+                v_cache[perm[c], : hi - lo] = v[cu_host[i] + lo : cu_host[i] + hi]
+                c += 1
+
+    for batch, n_new, num_splits in [(1, 1, 4), (7, 1, 4), (7, 1, 16), (33, 1, 8), (5, 3, 4)]:
+        reqs = []
+        for _ in range(batch):
+            i = rng.choice([j for j, s in enumerate(seqlens) if s >= n_new])
+            pos = rng.randrange(seqlens[i] - n_new + 1)
+            if rng.random() < 0.4:  # land on a split boundary
+                pos = split * rng.randrange(seqlens[i] // split + 1) + rng.choice((-1, 0, 1))
+                pos = min(max(pos, 0), seqlens[i] - n_new)
+            reqs.append((i, pos))
+        q_dec = torch.cat([q[cu_host[i] + p : cu_host[i] + p + n_new] for i, p in reqs])
+        cu_q = torch.arange(0, batch * n_new + 1, n_new, dtype=torch.int32, device=device)
+        seqused_k = torch.tensor([p + n_new for _, p in reqs], dtype=torch.int32, device=device)
+        kwargs = dict(
+            cu_seqlens_q=cu_q, max_seqlen_q=n_new, max_seqlen_k=max(seqlens), seqused_k=seqused_k,
+            causal=True, window_size=window_size, num_splits=num_splits, seqlen_k_per_split=split,
+            split_anchor="absolute",
+        )
+        if page_size is None:
+            k_dec = torch.cat([k[cu_host[i] : cu_host[i] + p + n_new] for i, p in reqs])
+            v_dec = torch.cat([v[cu_host[i] : cu_host[i] + p + n_new] for i, p in reqs])
+            cu_k = torch.tensor([0] + list(itertools.accumulate(p + n_new for _, p in reqs)),
+                                dtype=torch.int32, device=device)
+            out_dec, _ = flash_attn_varlen_func(q_dec, k_dec, v_dec, cu_seqlens_k=cu_k, **kwargs)
+        else:
+            pt = page_table[[i for i, _ in reqs]].contiguous()
+            out_dec, _ = flash_attn_varlen_func(q_dec, k_cache, v_cache, page_table=pt, **kwargs)
+        ref = torch.cat([out_prefill[cu_host[i] + p : cu_host[i] + p + n_new] for i, p in reqs])
+        max_diff = (out_dec.float() - ref.float()).abs().max().item()
+        assert torch.equal(out_dec, ref), (
+            f"anchored split decode != prefill (window_left={window_left}, batch={batch}, "
+            f"n_new={n_new}, num_splits={num_splits}): max_diff={max_diff}"
+        )
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SplitKV is only supported on SM100")
+@pytest.mark.skipif(DISABLE_SPLIT, reason="SplitKV disabled")
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="compares outputs bitwise")
+def test_flash_attn_split_anchor_modes():
+    """split_anchor: "absolute" is accurate; without a window both modes are identical; with a
+    window they differ; the dense path matches varlen bitwise; invalid configs raise."""
+    device, dtype, d = "cuda", torch.bfloat16, 128
+    torch.random.manual_seed(0)
+    b, s, h, hk = 2, 3000, 8, 2
+    window = (1500, 0)
+    q = torch.randn(b, s, h, d, device=device, dtype=dtype)
+    k = torch.randn(b, s, hk, d, device=device, dtype=dtype)
+    v = torch.randn(b, s, hk, d, device=device, dtype=dtype)
+    cu = torch.arange(0, (b + 1) * s, s, dtype=torch.int32, device=device)
+
+    def varlen(anchor, window=(None, None), **kwargs):
+        kwargs = dict(num_splits=4, seqlen_k_per_split=1024) | kwargs
+        out, _ = flash_attn_varlen_func(
+            q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1), cu_seqlens_q=cu, cu_seqlens_k=cu,
+            max_seqlen_q=s, max_seqlen_k=s, causal=True, window_size=window, split_anchor=anchor,
+            **kwargs,
+        )
+        return out.unflatten(0, (b, s))
+
+    out_abs = varlen("absolute", window)
+    # Catches splits that silently drop or double-count KV blocks.
+    out_ref, _ = attention_ref(q, k, v, causal=True, window_size=window)
+    out_pt, _ = attention_ref(
+        q, k, v, causal=True, window_size=window, upcast=False, reorder_ops=True
+    )
+    pt_err = (out_pt - out_ref).abs().max().item()
+    err = (out_abs - out_ref).abs().max().item()
+    assert err <= 2 * pt_err + 1e-4, f"split_anchor='absolute' inaccurate: {err} vs pytorch {pt_err}"
+
+    assert torch.equal(varlen("relative"), varlen("absolute"))
+    assert not torch.equal(varlen("relative", window), out_abs), (
+        "split_anchor did not reach the kernel: modes agree under a sliding window"
+    )
+    dense, _ = flash_attn_func(
+        q, k, v, causal=True, window_size=window, num_splits=4, seqlen_k_per_split=1024,
+        split_anchor="absolute",
+    )
+    assert torch.equal(dense, out_abs)
+
+    with pytest.raises(ValueError, match="requires seqlen_k_per_split"):
+        varlen("absolute", seqlen_k_per_split=None)
+    with pytest.raises(ValueError, match="split_anchor must be"):
+        varlen("start")
+    # 2 splits of 1024 keys cannot cover 3000 keys.
+    with pytest.raises(ValueError, match="requires num_splits >= 3"):
+        varlen("relative", num_splits=2)
+    with pytest.raises(ValueError, match="requires num_splits >= 3"):
+        flash_attn_func(q, k, v, causal=True, num_splits=2, seqlen_k_per_split=1024)
