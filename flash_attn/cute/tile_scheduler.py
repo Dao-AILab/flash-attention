@@ -140,27 +140,18 @@ class DynamicPersistentSchedulerState(SchedulerState):
 
 
 # NOTE [SM100 forward work coordinates]
-# Target contract between the SM100 forward and its schedulers. With C = cta_group_size
-# (2 with 2CTA instructions, else 1):
-# - One logical M work tile spans q_stage * C * m_block_size effective rows; the kernel
-#   derives rows as (m_block * q_stage + stage) * C + rank.
-# - The C cooperating CTAs of a cluster get the same logical (m_block, head, batch, split)
-#   and the same validity. The CTA rank in the cluster is separate, never folded into
-#   m_block.
-# - A logical work id is not a physical cluster id. CUDA and CLC grids stay in physical CTA
-#   units: physical_x = C * cluster_slot + rank.
-# - CLC expands the grid to grid_x = num_work_m * C and decodes a claimed CTA as
-#   claimed_x // C, then applies the ordering (LPT reversal, or the L2-swizzled LPT map
-#   for unsplit 1CTA grids); see SingleTileLPTScheduler.clc_work_to_coords.
-# - Static persistence caps the grid at the SM count and strides clusters over the logical
-#   tile set.
-# - Counts, extents, and varlen metadata name their unit: logical work tiles, clusters, or
-#   CTAs.
-# Current implementation: the SM100 forward passes logical work tiles in num_block
-# (use_cluster_idx=True) for nonpersistent and CLC 2CTA launches, but CTA tiles of
-# q_stage * m_block_size rows for static persistence, whose
-# StaticPersistentTileScheduler.Params.create divides num_block by the cluster size. The
-# backward, MLA, and varlen schedulers keep their own contracts.
+# With C = cta_group_size (2 for 2CTA, else 1), every CTA in a cluster receives the same
+# logical (work_m, head, batch, split) and validity; the CTA rank is not part of work_m.
+# Grids count physical CTAs: physical_x = C * cluster_slot + cta_rank. Persistence can run
+# many logical tiles on one physical cluster, so a work tile id is not a cluster id.
+#
+# The SM100 forward passes logical M work tiles in num_block with use_cluster_idx = (C > 1).
+# SingleTileLPTScheduler's CLC grid has grid_x = num_block * C; clc_work_to_coords divides
+# claimed_x by C and optionally reverses M for LPT, while unsplit 1CTA grids use the
+# L2-swizzled static mapping. StaticPersistentTileScheduler takes num_block as a cluster
+# count, caps the grid at the SM count rounded down to whole clusters, and strides over work
+# by the launched cluster count. Varlen metadata units and the backward/MLA contracts are
+# separate. Row mapping: NOTE [SM100 forward coordinate spaces] in flash_fwd_sm100.py.
 
 
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
@@ -394,7 +385,12 @@ class StaticPersistentTileScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "StaticPersistentTileScheduler.Params":
-            num_block_cluster = cute.ceil_div(args.num_block, cute.size(args.cluster_shape_mn))
+            # use_cluster_idx: num_block already counts clusters (NOTE [SM100 forward work coordinates]).
+            num_block_cluster = (
+                args.num_block
+                if const_expr(args.use_cluster_idx)
+                else cute.ceil_div(args.num_block, cute.size(args.cluster_shape_mn))
+            )
             total_blocks_cluster = num_block_cluster * args.num_head * args.num_batch
             return StaticPersistentTileScheduler.Params(
                 FastDivmodDivisorV2(num_block_cluster),
