@@ -22,7 +22,6 @@ import torch
 
 from eager_reference import check_against_reference, make_cu_seqlens
 
-from flash_attn.cute import utils
 from flash_attn.cute.interface import (
     _flash_attn_bwd,
     flash_attn_func,
@@ -92,11 +91,6 @@ def pack_gqa_env():
             os.environ[key] = value
 
 
-def hd256_on_general_kernel():
-    getter = getattr(utils, "_get_hd256_generic_bwd", None)
-    return getter is None or getter()
-
-
 def run_fwd_bwd_layout(
     layout,
     q,
@@ -155,8 +149,6 @@ def run_fwd_bwd_layout(
 def test_bwd_pack_gqa_matches_unpacked(
     q_lens, k_lens, head_dim, mha_type, fold, layout, feature, causal, pack_gqa_env
 ):
-    if head_dim == 256 and not hd256_on_general_kernel():
-        pytest.skip("hdim 256 backward runs on the dedicated kernels (no packing)")
     pack, head_loop, pack_factor = FOLDS[fold]
     heads_q, heads_kv = HEADS[mha_type]
     qhead_per_kvhead = heads_q // heads_kv
@@ -226,8 +218,6 @@ def test_bwd_pack_gqa_unused_kv_tail(head_dim, mha_type, layout, causal, pack_gq
     are exercised with a different grid. Same layouts as test_flash_attn_sm100_bwd_unused_kv_tail:
     packed K/V with cu_seqlens_k + seqused_k, and dense (batch, seqlen, heads, d) with seqused_k.
     """
-    if head_dim == 256 and not hd256_on_general_kernel():
-        pytest.skip("hdim 256 backward runs on the dedicated kernels (no packing)")
     torch.manual_seed(SEED)
     heads_q, heads_kv = HEADS[mha_type]
     dtype = torch.bfloat16

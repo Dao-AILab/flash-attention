@@ -2,9 +2,8 @@
 
 Shapes sit on the 128-row tile edges (127/128/129), a partial last tile (1000), a long
 sequence (4096) and Q/K length mismatches in both directions, for MHA and 24/4 GQA, causal
-and non-causal. The features the hd256 backward does not support yet (softcap,
-learnable_sink, local windows, deterministic) are parametrized, and skipped, in
-test_flash_attn.py.
+and non-causal. softcap, learnable_sink, local windows and deterministic are covered by the
+d=256 parametrization of test_flash_attn.py.
 """
 
 import pytest
