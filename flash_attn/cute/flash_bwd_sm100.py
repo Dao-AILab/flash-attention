@@ -4353,6 +4353,30 @@ class FlashAttentionBackwardSm100:
                         m_block_max=m_block_max,
                     )
                     m_block_oob_upper = m_block >= m_block_max
+                # semaphore acquire, before waiting for the MMA's dQ tile: the poll of the
+                # previous n_block's release overlaps the MMA instead of serializing after the
+                # TMEM read (adds of this m_block are only issued below, after the acquire).
+                # pipeline_dQ has one stage, so the MMA warp's next dQ tile waits until this
+                # one is read and released below either way; the poll only moves earlier.
+                if const_expr(self.deterministic):
+                    if not m_block_oob_upper:
+                        lock_value = self._dq_semaphore_lock_value(
+                            iter_idx,
+                            curr_q_cnt,
+                            curr_dq_write_order,
+                            curr_dq_write_order_full,
+                            blocksparse_tensors,
+                            block_info,
+                            seqlen,
+                            m_block,
+                            n_block_cta_group,
+                        )
+                        barrier.wait_eq(
+                            mdQ_semaphore_cur[(m_block, None)].iterator,
+                            tidx,
+                            cta_rank_in_cluster,
+                            lock_value,
+                        )
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
                 # TMEM -> RMEM
                 tdQrdQ_t2r = cute.make_rmem_tensor(tdQrdQ_t2r_shape, Float32)
@@ -4380,26 +4404,6 @@ class FlashAttentionBackwardSm100:
                     cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_view_async_shared()
-                    # semaphore acquire
-                    if const_expr(self.deterministic and stage == 0):
-                        if not m_block_oob_upper:
-                            lock_value = self._dq_semaphore_lock_value(
-                                iter_idx,
-                                curr_q_cnt,
-                                curr_dq_write_order,
-                                curr_dq_write_order_full,
-                                blocksparse_tensors,
-                                block_info,
-                                seqlen,
-                                m_block,
-                                n_block_cta_group,
-                            )
-                            barrier.wait_eq(
-                                mdQ_semaphore_cur[(m_block, None)].iterator,
-                                tidx,
-                                cta_rank_in_cluster,
-                                lock_value,
-                            )
                     self.reduce_sync_barrier.arrive_and_wait()
                     # Copy from shared memory to global memory
                     if is_tma_warp and not m_block_oob_upper:
