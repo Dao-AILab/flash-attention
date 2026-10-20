@@ -112,6 +112,17 @@ def _get_bwd_pack_gqa_override() -> Optional[bool]:
     return value == "1"
 
 
+def _get_bwd_head_loop_override() -> Optional[bool]:
+    """FLASH_ATTENTION_BWD_HEAD_LOOP=0/1 forces the SM100 hdim 256 backward head loop (one tile
+    per KV head over its query-head groups) off / on; unset or "auto" leaves it to the fold
+    heuristic."""
+    value = os.getenv("FLASH_ATTENTION_BWD_HEAD_LOOP")
+    if value is None or value == "" or value == "auto":
+        return None
+    assert value in ("0", "1"), f"FLASH_ATTENTION_BWD_HEAD_LOOP must be 0, 1 or auto, got {value}"
+    return value == "1"
+
+
 def _get_hd256_generic_bwd() -> bool:
     """FLASH_ATTENTION_HD256_GENERIC_BWD=1 runs the SM100 hdim 256 backward on
     FlashAttentionBackwardSm100 (64-row KV tile, serial 2CTA schedule) instead of the dedicated
