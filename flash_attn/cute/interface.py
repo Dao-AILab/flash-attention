@@ -1029,6 +1029,8 @@ def _flash_attn_fwd(
         config.use_clc_scheduler,
         config.use_s_ping_pong,
         config.registers,
+        config.overlap_sO_sQ,
+        config.kv_stage,
         num_splits_dynamic is not None,
         mla_fwd_rescale_threshold,
         o_lo is not None,
@@ -1278,6 +1280,8 @@ def _flash_attn_fwd(
                     use_s_ping_pong=config.use_s_ping_pong,
                     use_tma_o=config.use_tma_o,
                     registers=config.registers,
+                    overlap_sO_sQ=config.overlap_sO_sQ,
+                    kv_stage=config.kv_stage,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity

@@ -22,7 +22,7 @@ except ImportError:
     apply_rotary_emb = None
 
 from flash_attn.cute.cache_utils import JITCache
-from flash_attn.cute.config import FwdConfig, Sm100Registers, select_fwd_config, select_registers
+from flash_attn.cute.config import FwdConfig, Sm100Registers, derive_fwd_config, select_fwd_config
 from flash_attn.cute.testing import (
     check_dsink_vs_ref,
     check_tensor_vs_ref,
@@ -122,13 +122,9 @@ def test_flash_attn_clc_2cta_matches_default():
         """Force CLC onto the selected default 2CTA config."""
         config, inputs = selected["config"], selected["inputs"]
         assert config.use_2cta_instrs and not config.use_clc_scheduler
-        config = replace(config, use_clc_scheduler=True, is_static_persistent=False)
-        registers = select_registers(
-            inputs._replace(pack_gqa=config.pack_gqa), tile_m=config.tile_m,
-            tile_n=config.tile_n, q_stage=config.q_stage, num_splits=config.num_splits,
-            use_2cta_instrs=True, use_clc_scheduler=True,
+        return derive_fwd_config(
+            config, inputs, use_clc_scheduler=True, is_static_persistent=False
         )
-        return replace(config, registers=registers)
 
     torch.manual_seed(0)
     # Dense Q and K use the non-varlen scheduler.
@@ -181,16 +177,12 @@ def test_flash_attn_work_tiles_cover_q(causal, use_2cta, q_stage, policy, use_tm
     with mock.patch("flash_attn.cute.interface.select_fwd_config", side_effect=capture):
         _flash_attn_fwd(q, k, v, causal=causal)
     inputs = captured["inputs"]
-    use_clc = policy == "clc"
-    config = FwdConfig(
-        device_capacity=inputs.device_capacity, tile_m=128, tile_n=128,
-        mma_pv_is_rs=False, intra_wg_overlap=False, q_stage=q_stage, pack_gqa=False,
-        use_clc_scheduler=use_clc, is_static_persistent=policy == "static_persistent",
-        use_tma_o=use_tma_o, use_s_ping_pong=False, num_splits=1, use_2cta_instrs=use_2cta,
-        registers=select_registers(
-            inputs, tile_m=128, tile_n=128, q_stage=q_stage, num_splits=1,
-            use_2cta_instrs=use_2cta, use_clc_scheduler=use_clc,
-        ),
+    # derive_fwd_config re-derives registers and the SMEM layout for the forced choices.
+    config = derive_fwd_config(
+        select_fwd_config(inputs), inputs, tile_m=128, tile_n=128, q_stage=q_stage,
+        pack_gqa=False, use_clc_scheduler=policy == "clc",
+        is_static_persistent=policy == "static_persistent", use_tma_o=use_tma_o,
+        use_s_ping_pong=False, num_splits=1, use_2cta_instrs=use_2cta,
     )
     # NaN sentinels expose rows that no CTA writes.
     out = torch.full_like(q, float("nan"))
@@ -575,6 +567,8 @@ def test_flash_attn_forced_split_config_reuses_specializations():
         num_splits=2,
         use_2cta_instrs=False,
         registers=Sm100Registers(softmax=200, correction=64, other=48),
+        overlap_sO_sQ=False,
+        kv_stage=11,
     )
     out_2 = _flash_attn_fwd(q, k, v, config=config_2)[0]
     main_keys = set(_flash_attn_fwd.compile_cache.cache)

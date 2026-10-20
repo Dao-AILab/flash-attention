@@ -5,11 +5,16 @@ from dataclasses import fields, replace
 import pytest
 
 from flash_attn.cute.config import (
+    SM100_SMEM_BYTES,
     FwdHeuristicInputs,
     Sm90Registers,
     Sm100Registers,
+    derive_fwd_config,
     select_fwd_config,
     select_registers,
+    select_sm100_smem_layout,
+    sm100_fwd_smem_bytes,
+    sm100_uneven_kv_smem,
     validate_fwd_config,
 )
 
@@ -183,6 +188,22 @@ def test_split_selection(changes, expected_splits, expected_tile_n):
         ({"device_arch": 90, **_HD128}, dict(registers=Sm90Registers(160, 24)), "MMA registers"),
         ({"device_arch": 80, **_HD128}, dict(registers=Sm100Registers(200, 64, 48)),
          "needs registers of type NoneType"),
+        # SMEM layout: any layout that fits is the caller's choice.
+        ({**_HD128}, dict(kv_stage=2), None),
+        ({**_HD128}, dict(kv_stage=1), r"kv_stage must be in \[2, 32\], got 1"),
+        ({**_HD128}, dict(kv_stage=33), r"kv_stage must be in \[2, 32\], got 33"),
+        ({**_HD128}, dict(kv_stage=7), "needs 248832 bytes of shared memory"),
+        # A layout chosen for 2CTA K/V halves does not fit 1CTA stages.
+        ({**_HD128}, dict(use_2cta_instrs=False), r"kv_stage=6\) needs"),
+        ({"device_arch": 90, **_HD128}, dict(kv_stage=2), "no SM100 SMEM layout"),
+        # hd192 Q tiles leave no room for a separate sO.
+        ({**_HD192}, dict(overlap_sO_sQ=False), "needs 289792 bytes"),
+        # SplitKV fp32 partials double sO for hdim_v 128.
+        ({**_HD128, "requested_num_splits": 3}, dict(overlap_sO_sQ=False), "needs 297984 bytes"),
+        # The uneven [K, V, K] offset, tile_n * 32 elements, must be 1024-element aligned.
+        ({**_HD192, "max_seqlen_q": 128}, dict(tile_n=112), "tile_n divisible by 32"),
+        # 2CTA never uses the uneven layout, so it has no offset to align.
+        ({**_HD192}, dict(tile_n=112, kv_stage=3), None),
     ],
 )
 def test_explicit_config_validation(changes, config_changes, match):
@@ -193,11 +214,62 @@ def test_explicit_config_validation(changes, config_changes, match):
 
 
 def test_smem_model_matches_measured_kernel_allocations():
+    inputs = make_inputs(**_HD128)
+    config = select_fwd_config(inputs)
+    # SharedStorage.size_in_bytes() of this kernel: the selected layout fills SMEM exactly.
+    assert (config.q_stage, config.use_2cta_instrs, config.overlap_sO_sQ, config.kv_stage) == (
+        2, True, False, 6
+    )
+    assert sm100_fwd_smem_bytes(config, inputs) == SM100_SMEM_BYTES == 232448
     # Observed hd192 SMEM allocation at launch.
     hd192 = make_inputs(**_HD192, max_seqlen_q=128)
     too_wide = replace(select_fwd_config(hd192), tile_n=192, q_stage=1, use_2cta_instrs=False)
     with pytest.raises(ValueError, match="needs 247808 bytes of shared memory"):
         validate_fwd_config(too_wide, hd192)
+
+
+def test_2cta_hd192_three_kv_stages_use_the_even_layout():
+    # The [K, V, K] stage-1 offset assumes full K/V tiles; 2CTA halves them per CTA, so V at
+    # stage 1 would overlap K at stage 2.
+    inputs = make_inputs(**_HD192)
+    selected = select_fwd_config(inputs)
+    assert selected.use_2cta_instrs
+    config = replace(selected, kv_stage=3)
+    validate_fwd_config(config, inputs)
+
+    assert not sm100_uneven_kv_smem(192, 128, 3, use_2cta_instrs=True)
+    assert sm100_uneven_kv_smem(192, 128, 3, use_2cta_instrs=False)
+    # Each 2CTA stage holds a full per-CTA K tile: 128 x 192 x 2 bytes / 2.
+    stage_bytes = sm100_fwd_smem_bytes(config, inputs) - sm100_fwd_smem_bytes(
+        replace(config, kv_stage=2), inputs
+    )
+    assert stage_bytes == 128 * 192
+    assert sm100_fwd_smem_bytes(config, inputs) <= SM100_SMEM_BYTES
+
+
+def test_derive_fwd_config_rederives_unset_layout_and_registers():
+    inputs = make_inputs(**_HD192)
+    selected = select_fwd_config(inputs)
+    assert selected.q_stage == 2
+
+    derived = derive_fwd_config(selected, inputs, q_stage=1)
+
+    layout = select_sm100_smem_layout(
+        inputs, tile_m=128, tile_n=selected.tile_n, q_stage=1, num_splits=1,
+        use_2cta_instrs=selected.use_2cta_instrs, is_persistent=selected.is_static_persistent,
+    )
+    registers = select_registers(
+        inputs, tile_m=128, tile_n=selected.tile_n, q_stage=1, num_splits=1,
+        use_2cta_instrs=selected.use_2cta_instrs, use_clc_scheduler=selected.use_clc_scheduler,
+    )
+    assert (derived.overlap_sO_sQ, derived.kv_stage) == layout
+    assert derived.registers == registers
+    assert (derived.kv_stage, derived.registers) != (selected.kv_stage, selected.registers)
+    assert derived == replace(selected, q_stage=1, registers=registers, kv_stage=layout[1])
+    # Explicit fields are kept, and the result is validated.
+    assert derive_fwd_config(selected, inputs, q_stage=1, kv_stage=3).kv_stage == 3
+    with pytest.raises(ValueError, match="kv_stage must be in"):
+        derive_fwd_config(selected, inputs, kv_stage=1)
 
 
 _DENSE_CAUSAL_103 = dict(device_arch=103, causal=True, **_HD128)
@@ -233,27 +305,6 @@ def test_causal_clc_cells(changes, clc, registers):
         assert config.registers == registers
 
 
-def explicit_clc(config, inputs, use_clc_scheduler):
-    """An explicit config with CLC on or off and the register split that goes with it."""
-    config = replace(
-        config,
-        use_clc_scheduler=use_clc_scheduler,
-        is_static_persistent=config.is_static_persistent and not use_clc_scheduler,
-    )
-    registers = select_registers(
-        inputs._replace(pack_gqa=config.pack_gqa),
-        tile_m=config.tile_m,
-        tile_n=config.tile_n,
-        q_stage=config.q_stage,
-        num_splits=config.num_splits,
-        use_2cta_instrs=config.use_2cta_instrs,
-        use_clc_scheduler=use_clc_scheduler,
-    )
-    config = replace(config, registers=registers)
-    validate_fwd_config(config, inputs)
-    return config
-
-
 @pytest.mark.parametrize(
     ("changes", "use_clc_scheduler", "registers"),
     [
@@ -270,7 +321,10 @@ def test_explicit_clc_configs(changes, use_clc_scheduler, registers):
     selected = select_fwd_config(inputs)
     assert selected.use_clc_scheduler is not use_clc_scheduler
 
-    config = explicit_clc(selected, inputs, use_clc_scheduler)
+    # derive_fwd_config re-derives the register split for the scheduler.
+    config = derive_fwd_config(
+        selected, inputs, use_clc_scheduler=use_clc_scheduler, is_static_persistent=False
+    )
     assert config.registers == registers
 
 
@@ -298,11 +352,12 @@ def test_clc_respects_cuda_grid_limits(changes, clc):
     assert config.use_clc_scheduler is clc
     if not clc:
         with pytest.raises(ValueError, match="CLC is not supported"):
-            explicit_clc(config, inputs, True)
+            derive_fwd_config(config, inputs, use_clc_scheduler=True, is_static_persistent=False)
 
 
-# Frozen copy of the register policy the forward kernels applied before it moved into the
-# selector (flash_fwd_sm100.py __init__ and the FP8 override in __call__; flash_fwd_sm90.py).
+# Frozen copies of the register and SMEM policy the forward kernels applied before it moved
+# into the selector (flash_fwd_sm100.py __init__ and the FP8 override in __call__;
+# flash_fwd_sm90.py; FlashAttentionForwardSm100's SharedStorage layout).
 _LEGACY_SM100_TUNING = {
     (True, False, 128, False): (184, 80),
     (False, True, 128, False): (192, 72),
@@ -347,6 +402,27 @@ def legacy_sm90_registers(tile_m, pack_gqa, qhead_per_kvhead, paged_non_tma):
     return Sm90Registers(*regs)
 
 
+def legacy_sm100_smem_layout(
+    element_bytes, hd, hdv, q_stage, tile_n, use_2cta, is_persistent, is_split_kv
+):
+    hd_padded, hdv_padded = -(-hd // 16) * 16, -(-hdv // 16) * 16
+    overlap = (
+        (hd_padded == 192 and hdv_padded >= 64)
+        or (hd_padded == 256 and not (is_persistent and use_2cta))
+        or (hdv_padded >= 128 and is_split_kv)
+    )
+    epi_hdv = 128 if is_split_kv and hdv == 256 else hdv_padded
+    smem_q = q_stage * 128 * hd_padded * element_bytes
+    smem_o = q_stage * 128 * epi_hdv * (4 if is_split_kv else 2)
+    smem_q_o = max(smem_q, smem_o) if overlap else smem_q + smem_o
+    smem_kv = max(tile_n * hd_padded, tile_n * hdv_padded) * element_bytes // (2 if use_2cta else 1)
+    kv_stage = min((224 * 1024 - smem_q_o) // smem_kv, 32)
+    # Deliberate fix: the uneven [K, V, K] layout behind the third stage is 1CTA-only.
+    if hd_padded == 192 and hdv_padded == 128 and kv_stage == 2 and not use_2cta:
+        kv_stage = 3
+    return overlap, kv_stage
+
+
 _DTYPES = {"torch.bfloat16": 2, "torch.float16": 2, "torch.float8_e4m3fn": 1}
 
 
@@ -380,6 +456,24 @@ def test_sm90_registers_match_the_legacy_kernel_policy():
         assert got == expected, (tile_m, pack_gqa, qhead_per_kvhead, page)
 
 
+def test_sm100_smem_layout_matches_the_legacy_kernel_formula():
+    head_dims = [(64, 64), (128, 128), (192, 128), (256, 256)]
+    for (dtype, element_bytes), (hd, hdv), q_stage, tile_n, use_2cta, persistent, splits in (
+        itertools.product(
+            _DTYPES.items(), head_dims, [1, 2], [64, 128, 192], [False, True], [False, True], [1, 3]
+        )
+    ):
+        inputs = make_inputs(dtype=dtype, head_dim=hd, head_dim_v=hdv)
+        got = select_sm100_smem_layout(
+            inputs, tile_m=128, tile_n=tile_n, q_stage=q_stage, num_splits=splits,
+            use_2cta_instrs=use_2cta, is_persistent=persistent,
+        )
+        expected = legacy_sm100_smem_layout(
+            element_bytes, hd, hdv, q_stage, tile_n, use_2cta, persistent, splits > 1
+        )
+        assert got == expected, (dtype, hd, hdv, q_stage, tile_n, use_2cta, persistent, splits)
+
+
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", ["torch.bfloat16", "torch.float8_e4m3fn"])
 def test_selected_configs_carry_the_legacy_policy(dtype, causal):
@@ -398,6 +492,15 @@ def test_selected_configs_carry_the_legacy_policy(dtype, causal):
         inputs = make_inputs(device_arch=device_arch, dtype=dtype, head_dim=hd, head_dim_v=hdv,
                              causal=causal, **shape)
         config = select_fwd_config(inputs)
+        is_persistent = (
+            config.is_static_persistent or config.use_clc_scheduler
+            or (inputs.has_tile_count_semaphore and inputs.is_varlen_q)
+        )
+        expected_layout = legacy_sm100_smem_layout(
+            _DTYPES[dtype], hd, hdv, config.q_stage, config.tile_n,
+            config.use_2cta_instrs, is_persistent, config.num_splits > 1,
+        )
+        assert (config.overlap_sO_sQ, config.kv_stage) == expected_layout, (inputs, config)
         expected_registers = legacy_sm100_registers(
             "float8" in dtype, inputs.head_dim_padded, causal, config.use_2cta_instrs,
             device_arch == 103, False, config.q_stage,
