@@ -540,6 +540,9 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
             # SM120 has 99 KB SMEM: 128×128 is preferred for D<=64, and 128×64
             # avoids the occupancy loss from a 96 KB tile for larger head dimensions.
             tile_n = 64
+            # D=256 needs a 64×64 tile to fit within the 99 KB SMEM limit.
+            if inputs.head_dim == 256:
+                tile_m = 64
 
     if inputs.requested_tile_m is not None:
         tile_m = inputs.requested_tile_m
@@ -909,12 +912,10 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         raise ValueError(f"SM{capacity} forward does not expose SM90 MMA flags")
     if capacity not in (10, 11):
         match capacity:
-            case 8 if inputs.page_size is not None:
-                raise ValueError("SM80 forward does not support paged KV")
             case 9 if config.tile_m not in (64, 128, 192):
                 raise ValueError(f"SM90 tile_m must be 64, 128, or 192, got {config.tile_m}")
-            case 12 if inputs.page_size is not None or inputs.use_block_sparsity:
-                raise ValueError("SM120 forward does not support paged KV or block sparsity")
+            case 12 if inputs.use_block_sparsity:
+                raise ValueError("SM120 forward does not support block sparsity")
         neutral = _FWD_SM100_ONLY_NEUTRAL_FIELDS
         mismatched = [name for name, value in neutral.items() if getattr(config, name) != value]
         if mismatched:
