@@ -675,6 +675,141 @@ def _mla_fwd_plan(
 
 
 
+# Forward launch plans: replay the kernel launch of an earlier identical call without the host path
+# that chose it. See _fwd_plan_key for what "identical" covers and _record_fwd_plan for which
+# launches are replayed.
+_FWD_PLAN_CACHE_ENABLED = os.environ.get("FLASH_ATTENTION_FWD_PLAN_CACHE", "1") == "1"
+_FWD_PLAN_CACHE_MAX = 4096
+_fwd_plans: dict = {}
+_FWD_PLAN_NO_SWITCH = lambda: None  # noqa: E731
+_fwd_plan_s_ping_pong_default = getattr(
+    utils, "_get_disable_s_ping_pong_default", _FWD_PLAN_NO_SWITCH
+)
+
+
+def _fwd_plan_key(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k,
+    softmax_scale, causal, window_size_left, window_size_right, return_lse,
+):
+    """Key of everything _flash_attn_fwd reads on the host for an eligible call, or None."""
+    if (
+        type(q) is not torch.Tensor
+        or type(k) is not torch.Tensor
+        or type(v) is not torch.Tensor
+        or torch.is_tensor(max_seqlen_q)
+        or torch.is_tensor(max_seqlen_k)
+        or fa_logging.get_fa_log_level()
+        or is_fake_mode()
+        # maybe_contiguous copies inputs with unaligned pointers: replay only calls without copies
+        or q.data_ptr() % 16
+        or k.data_ptr() % 16
+        or v.data_ptr() % 16
+    ):
+        return None
+    meta = []
+    for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k):
+        if t is None:
+            meta.append(None)
+        elif type(t) is torch.Tensor:
+            meta.append((t.shape, t.stride(), t.dtype, t.device))
+        else:
+            return None
+    return (
+        q.shape, q.stride(), q.dtype, q.device, q.requires_grad,
+        k.shape, k.stride(), k.dtype, k.device, k.requires_grad,
+        v.shape, v.stride(), v.dtype, v.device, v.requires_grad,
+        *meta,
+        max_seqlen_q, max_seqlen_k, softmax_scale, causal, window_size_left, window_size_right,
+        return_lse,
+        utils._get_use_clc_scheduler_default(),
+        utils._get_disable_2cta_default(is_fwd=True),
+        _fwd_plan_s_ping_pong_default(),
+        os.environ.get("FLASH_ATTENTION_NUM_SMS"),
+        USE_BLOCKS_TO_BATCH,
+        BIN_BATCH_SEARCH_THRESH,
+    )
+
+
+def _fwd_plan_has_tensor(x):
+    if isinstance(x, torch.Tensor):
+        return True
+    if isinstance(x, (tuple, list)):
+        return any(_fwd_plan_has_tensor(y) for y in x)
+    return False
+
+
+class _FwdPlan:
+    """Compiled forward function + argument template; slots 0-4 and 6-9 are per call."""
+
+    __slots__ = ("fn", "template", "out_shape", "out_dtype", "lse_shape", "device")
+
+    def __init__(self, fn, template, out, lse):
+        self.fn = fn
+        self.template = template
+        self.out_shape = tuple(out.shape)
+        self.out_dtype = out.dtype
+        self.lse_shape = None if lse is None else tuple(lse.shape)
+        self.device = out.device
+
+    def __call__(self, q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k):
+        # same allocations, in the same order, as _flash_attn_fwd
+        out = torch.empty(self.out_shape, dtype=self.out_dtype, device=self.device)
+        lse = (
+            None
+            if self.lse_shape is None
+            else torch.empty(self.lse_shape, dtype=torch.float32, device=self.device)
+        )
+        args = self.template.copy()
+        args[0] = q.detach()
+        args[1] = k.detach()
+        args[2] = v.detach()
+        args[3] = out.detach()
+        args[4] = lse
+        args[6] = cu_seqlens_q
+        args[7] = cu_seqlens_k
+        args[8] = seqused_q
+        args[9] = seqused_k
+        self.fn(*args)
+        return out, lse, None, None, None
+
+
+def _record_fwd_plan(
+    key, fn, call_args, inputs, contiguous_inputs, call_inputs, out, lse,
+    cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, replayable,
+):
+    """Store the plan of a completed launch if replaying it reproduces the launch exactly."""
+    if not replayable or len(call_args) < 10:
+        return
+    # maybe_contiguous returned the caller's tensors
+    if any(a is not b for a, b in zip(inputs, contiguous_inputs)):
+        return
+    o = call_args[3]
+    if not (
+        call_args[0] is call_inputs[0]
+        and call_args[1] is call_inputs[1]
+        and call_args[2] is call_inputs[2]
+        and isinstance(o, torch.Tensor)
+        and o.data_ptr() == out.data_ptr()
+        and o.shape == out.shape
+        and o.stride() == out.stride()
+        and o.dtype == out.dtype
+        and call_args[4] is lse
+        and call_args[6] is cu_seqlens_q
+        and call_args[7] is cu_seqlens_k
+        and call_args[8] is seqused_q
+        and call_args[9] is seqused_k
+    ):
+        return
+    template = list(call_args)
+    for j in (0, 1, 2, 3, 4, 6, 7, 8, 9):
+        template[j] = None
+    if any(_fwd_plan_has_tensor(a) for a in template):
+        return
+    if len(_fwd_plans) >= _FWD_PLAN_CACHE_MAX:
+        _fwd_plans.clear()
+    _fwd_plans[key] = _FwdPlan(fn, template, out, lse)
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -734,6 +869,48 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
+    fwd_plan_key = None
+    if (
+        _FWD_PLAN_CACHE_ENABLED
+        and qv is None
+        and q is not None
+        and k is not None
+        and min_seqlen_k is None
+        and page_table is None
+        and softcap is None
+        and learnable_sink is None
+        and tile_mn is None
+        and mma_pv_is_rs is None
+        and intra_wg_overlap is None
+        and num_threads == 384
+        and num_splits == 1
+        and pack_gqa is None
+        and _arch is None
+        and score_mod is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and out is None
+        and lse is None
+        and aux_tensors is None
+        and not aux_scalars
+        and q_descale is None
+        and k_descale is None
+        and v_descale is None
+        and gather_kv_indices is None
+        and scheduler_metadata is None
+        and seqlen_k_per_split is None
+        and not disable_scheduler_metadata
+        and not gather_bwd_recompute_p
+    ):
+        fwd_plan_key = _fwd_plan_key(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k,
+            softmax_scale, causal, window_size_left, window_size_right, return_lse,
+        )
+        if fwd_plan_key is not None:
+            fwd_plan = _fwd_plans.get(fwd_plan_key)
+            if fwd_plan is not None:
+                return fwd_plan(q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+            fwd_plan_inputs = (q, k, v)
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
@@ -1933,7 +2110,31 @@ def _flash_attn_fwd(
                     cu_total_m_blocks,
                     cu_total_splits_m_blocks,
                 ])
-            _flash_attn_fwd.compile_cache[compile_key](*call_args)
+            compiled_fwd = _flash_attn_fwd.compile_cache[compile_key]
+            compiled_fwd(*call_args)
+            if fwd_plan_key is not None:
+                _record_fwd_plan(
+                    fwd_plan_key,
+                    compiled_fwd,
+                    call_args,
+                    fwd_plan_inputs,
+                    (q, k, v),
+                    (q_call, k_call, v_call),
+                    out,
+                    lse,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_q,
+                    seqused_k,
+                    replayable=not (
+                        is_split_kv
+                        or is_fp8
+                        or reuse_scheduler_metadata
+                        or p is not None
+                        or row_max is not None
+                        or o_lo is not None
+                    ),
+                )
     if is_split_kv:
         # Combine writes a seqlen-contiguous LSE. The MLA LSE is (..., s, h) contiguous, so
         # it goes through a seqlen-major staging buffer, copied back below (b*s*h floats).
@@ -2238,6 +2439,119 @@ def _bwd_postprocess_convert(
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
 
 
+# hd256 dK/dV split for GQA/MQA (sm100_hd256_2cta_fmha_backward_dkdvkernel.py): a KV tile's serial
+# h_r x Q-block loop is cut into at most `splits` chunks of about `chunk_iters` iterations each.
+# Defaults tuned on GB300 for MQA (h_r=16) hd256 THD packs that hold one long sequence.
+_HD256_DKDV_SPLITS_DEFAULT = 4
+_HD256_DKDV_CHUNK_ITERS_DEFAULT = 40
+
+
+@lru_cache(maxsize=1)
+def _hd256_dkdv_split_env() -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """FLASH_ATTENTION_HD256_DKDV_{SPLITS,CHUNK_ITERS,SLOTS}, read once per process (None = unset)."""
+    return tuple(
+        int(os.environ[name]) if name in os.environ else None
+        for name in (
+            "FLASH_ATTENTION_HD256_DKDV_SPLITS",
+            "FLASH_ATTENTION_HD256_DKDV_CHUNK_ITERS",
+            "FLASH_ATTENTION_HD256_DKDV_SLOTS",
+        )
+    )
+
+
+@lru_cache(maxsize=None)
+def _hd256_dkdv_default_slots(device_index: Optional[int], arch: int) -> int:
+    """CTA-pair budget per non-causal sequence: FLASH_ATTENTION_HD256_DKDV_SLOTS or one 2-CTA cluster per SM pair."""
+    env_slots = _hd256_dkdv_split_env()[2]
+    if env_slots is not None:
+        return env_slots
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return get_num_sms_for_selection(device_index, arch) // 2
+
+
+def _hd256_dkdv_split_config(
+    qhead_per_kvhead: int,
+    seqlen_q_bound: int,
+    num_splits: Optional[int],
+    chunk_iters: Optional[int],
+) -> Tuple[int, int]:
+    """(num_splits, chunk_iters) for the hd256 dK/dV split; num_splits == 1 keeps the unsplit kernel.
+
+    None reads FLASH_ATTENTION_HD256_DKDV_SPLITS (1 = off) and FLASH_ATTENTION_HD256_DKDV_CHUNK_ITERS, else the
+    defaults.
+    A KV tile runs qhead_per_kvhead * ceil(seqlen_q / 128) iterations at most; no tile is split when that
+    bound fits in one chunk, and MHA (qhead_per_kvhead == 1) is never split.
+    """
+    env_splits, env_chunk_iters, _ = _hd256_dkdv_split_env()
+    if num_splits is None:
+        num_splits = _HD256_DKDV_SPLITS_DEFAULT if env_splits is None else env_splits
+    if chunk_iters is None:
+        chunk_iters = _HD256_DKDV_CHUNK_ITERS_DEFAULT if env_chunk_iters is None else env_chunk_iters
+    assert num_splits >= 1 and chunk_iters >= 1, "dkdv_num_splits and dkdv_split_chunk_iters must be >= 1"
+    if qhead_per_kvhead < 2:
+        return 1, chunk_iters
+    max_tile_iters = qhead_per_kvhead * ((seqlen_q_bound + 127) // 128)
+    return max(1, min(num_splits, (max_tile_iters + chunk_iters - 1) // chunk_iters)), chunk_iters
+
+
+def _hd256_dkdv_num_tiles(
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_k: Optional[int],
+    total_k: int,
+    seqlen_k: int,
+    batch_size: int,
+    num_head_kv: int,
+) -> int:
+    """CTAs of the unsplit hd256 dK/dV grid (tile 64 x cluster 2); mirrors the kernel's grid sizing."""
+    tile_n, cluster = 64, 2
+    if cu_seqlens_k is not None and max_seqlen_k is None:
+        # SingleTileVarlenScheduler.get_grid_shape via compute_sm100_fmha_varlen_grid
+        nseq = cu_seqlens_k.shape[0] - 1
+        blocks = (total_k + nseq * (cluster * tile_n - 1)) // tile_n // cluster * cluster
+        return blocks * num_head_kv
+    k = max_seqlen_k if cu_seqlens_k is not None else seqlen_k
+    blocks = (k + tile_n - 1) // tile_n
+    blocks = (blocks + cluster - 1) // cluster * cluster
+    return blocks * num_head_kv * batch_size
+
+
+_hd256_dkdv_split_buffer_cache: dict = {}
+
+
+def _hd256_dkdv_split_buffers(
+    num_partial: int, num_tiles: int, device: torch.device, fake_mode: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp32 workspace (num_partial) and int32 arrival counters (num_tiles) for the hd256 dK/dV split.
+
+    Cached per (device, stream) and only grown: the kernel leaves every counter it uses at zero and kernels on one
+    stream do not overlap, so nothing is cleared per call. Views are cached per size, so a call allocates nothing.
+    Under CUDA graph capture (and in fake mode) fresh buffers are allocated, which the graph keeps alive.
+    """
+    if fake_mode or torch._C._cuda_isCurrentStreamCapturing():
+        return (
+            torch.empty(num_partial, dtype=torch.float32, device=device),
+            torch.zeros(num_tiles, dtype=torch.int32, device=device),
+        )
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (device_index, torch._C._cuda_getCurrentRawStream(device_index))
+    entry = _hd256_dkdv_split_buffer_cache.get(key)
+    views = None if entry is None else entry[2].get((num_partial, num_tiles))
+    if views is not None:
+        return views
+    partial, semaphore = (None, None) if entry is None else entry[:2]
+    if partial is None or partial.numel() < num_partial:
+        partial = torch.empty(num_partial, dtype=torch.float32, device=device)
+        entry = None
+    if semaphore is None or semaphore.numel() < num_tiles:
+        semaphore = torch.zeros(num_tiles, dtype=torch.int32, device=device)
+        entry = None
+    view_cache = {} if entry is None else entry[2]
+    views = view_cache[(num_partial, num_tiles)] = (partial[:num_partial], semaphore[:num_tiles])
+    _hd256_dkdv_split_buffer_cache[key] = (partial, semaphore, view_cache)
+    return views
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2281,7 +2595,12 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    dkdv_num_splits: Optional[int] = None,
+    dkdv_split_chunk_iters: Optional[int] = None,
+    dkdv_split_slots: Optional[int] = None,
 ) -> Tuple[torch.Tensor, ...]:
+    # dkdv_num_splits / dkdv_split_chunk_iters / dkdv_split_slots: SM100 hd256 GQA/MQA dK/dV split, see
+    # _hd256_dkdv_split_config (None = environment or default, dkdv_num_splits=1 = off, slots 0 = no budget).
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
@@ -2685,6 +3004,25 @@ def _flash_attn_bwd(
                 device=device,
             )
 
+    # hd256 GQA/MQA dK/dV split: fp32 per-chunk workspace + per-tile arrival counters (zero; the kernel
+    # leaves them zero). The reduction order is fixed, so the split path stays deterministic.
+    dkdv_split = False
+    dkdv_partial = dkdv_split_semaphore = None
+    if use_dedicated_hd256_kernel:
+        dkdv_num_splits, dkdv_split_chunk_iters = _hd256_dkdv_split_config(
+            qhead_per_kvhead, seqlen_q, dkdv_num_splits, dkdv_split_chunk_iters
+        )
+        dkdv_split = dkdv_num_splits > 1
+        if dkdv_split:
+            num_dkdv_tiles = _hd256_dkdv_num_tiles(
+                cu_seqlens_k, max_seqlen_k, total_k, seqlen_k, batch_size, num_head_kv
+            )
+            dkdv_partial, dkdv_split_semaphore = _hd256_dkdv_split_buffers(
+                dkdv_num_splits * num_dkdv_tiles * 2 * 64 * head_dim, num_dkdv_tiles, device, fake_mode
+            )
+            if dkdv_split_slots is None:
+                dkdv_split_slots = _hd256_dkdv_default_slots(device.index, arch)
+
     dtype = torch2cute_dtype_map[q.dtype]
 
     # The dedicated hd256 backward is deterministic without semaphores.
@@ -2872,6 +3210,7 @@ def _flash_attn_bwd(
             cu_total_m_blocks_k is not None,
             use_dedicated_hd256_kernel and cu_seqlens_q is not None and max_seqlen_q is None,
             use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
+            dkdv_split,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -3045,6 +3384,12 @@ def _flash_attn_bwd(
                     Int32(max_seqlen_k)
                     if cu_seqlens_k is not None and max_seqlen_k is not None
                     else None,
+                    to_cute_tensor(dkdv_partial, leading_dim=0) if dkdv_split else None,
+                    to_cute_tensor(dkdv_split_semaphore, assumed_align=4, leading_dim=0)
+                    if dkdv_split
+                    else None,
+                    Int32(dkdv_split_chunk_iters) if dkdv_split else None,
+                    Int32(dkdv_split_slots) if dkdv_split else None,
                 )
             )
         compile_args.append(current_stream)
@@ -3100,6 +3445,10 @@ def _flash_attn_bwd(
                     max_seqlen_k
                     if cu_seqlens_k is not None
                     else None,
+                    dkdv_partial,
+                    dkdv_split_semaphore,
+                    dkdv_split_chunk_iters if dkdv_split else None,
+                    dkdv_split_slots if dkdv_split else None,
                 )
             )
         _flash_attn_bwd.compile_cache[compile_key](*call_args)

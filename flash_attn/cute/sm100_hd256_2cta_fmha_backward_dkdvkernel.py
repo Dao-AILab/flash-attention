@@ -6,6 +6,14 @@ Constraints:
 * Supported head dimensions: 256 only
 * cta_tiler_mn must be 64,128
 * Batch size must be the same for Q, K, and V tensors
+
+dK/dV split (optional, `dKV_partial` given): a KV tile loops over h_r x Q blocks. With GQA/MQA that serial chain
+can be much longer than the other tiles' (e.g. MQA h_r=16). The flattened (h_r, Q block) loop of a tile is then cut
+into split_cnt contiguous chunks, one CTA pair each (split index innermost in blockIdx.x):
+split_cnt = min(num_splits, ceil(iters / split_chunk_iters)) and, for non-causal tiles, at most
+split_slots // (KV clusters of the sequence), so one long sequence does not ask for more CTA pairs than the GPU has. Each chunk writes its fp32 dK/dV to a workspace; the last chunk to finish (per-tile
+semaphore) sums the chunks in split order, then scales, converts and stores as the unsplit path does. The sum order
+is fixed, so the result is deterministic. Tiles with split_cnt == 1 take the unsplit epilogue.
 """
 
 import enum
@@ -19,7 +27,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.typing import Int32
+from cutlass.cute.typing import Int32, Int64
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
@@ -35,6 +43,7 @@ from flash_attn.cute.tile_scheduler import (
 )
 
 import flash_attn.cute.copy_utils as fa_copy_utils
+import flash_attn.cute.barrier as fa_barrier
 
 LAYOUT_RANK_CONSTANT = 3
 
@@ -171,6 +180,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.compute_sync_bar_id = 2
         self.epilogue_sync_bar_id = 3
         self.reduce_sync_bar_id = 4
+        # 5 and 6 are used by the epilogue TMA staging; 7 orders the dK/dV split publish/count.
+        self.split_sync_bar_id = 7
 
         self.tmem_dK_offset = 0
         self.tmem_dV_offset = Tmemory_offset(0, cta_tiler[2] // 2)
@@ -222,10 +233,35 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         scale_softmax: cutlass.Float32,
         max_seqlen_k: Int32 | None,
         stream: cuda.CUstream,
+        dKV_partial: cute.Tensor | None = None,
+        dKV_split_semaphore: cute.Tensor | None = None,
+        split_chunk_iters: Int32 | None = None,
+        split_slots: Int32 | None = None,
     ):
-        """Host function to launch CuTeDSL kernel."""
+        """Host function to launch CuTeDSL kernel.
+
+        dK/dV split (all three or none): dKV_partial is a flat fp32 workspace of
+        num_splits * num_tiles * 2 * tile_n * hdim elements, dKV_split_semaphore holds num_tiles int32 zeros
+        (num_tiles = CTAs of the unsplit grid; the kernel leaves them zero), split_chunk_iters is the target
+        (h_r x Q block) iterations per chunk, split_slots the CTA-pair budget per sequence (0 = no budget).
+        """
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
         self.use_varlen_scheduler = cumulative_s_k is not None and max_seqlen_k is None
+        self.use_dkdv_split = dKV_partial is not None
+        if cutlass.const_expr(self.use_dkdv_split):
+            assert (
+                dKV_split_semaphore is not None
+                and split_chunk_iters is not None
+                and split_slots is not None
+            ), "dK/dV split needs dKV_partial, dKV_split_semaphore, split_chunk_iters and split_slots"
+            assert not self.use_clc_scheduler, "dK/dV split does not support the CLC scheduler"
+            num_tiles = dKV_split_semaphore.shape[0]
+            num_splits = cute.size(dKV_partial) // (
+                num_tiles * 2 * self.cta_tiler[1] * self.cta_tiler[2]
+            )
+        else:
+            num_tiles = Int32(0)
+            num_splits = Int32(1)
         # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D).
         h_r = Q.shape[3]
         h_k = Q.shape[2]
@@ -763,6 +799,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     cute.size(B),
                 )
                 bwd_grid = cute.round_up(bwd_grid, self.cluster_shape_mnk)
+        if cutlass.const_expr(self.use_dkdv_split):
+            # Split index innermost: the chunks of a tile are adjacent CTA pairs in launch order.
+            bwd_grid = (bwd_grid[0] * num_splits, bwd_grid[1], bwd_grid[2])
 
         self.dkdv_bwd(
             KQ_tiled_mma,
@@ -812,6 +851,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sdK_epi_layout,
             sdV_epi_layout,
             self.tile_sched_params,
+            dKV_partial,
+            dKV_split_semaphore,
+            split_chunk_iters,
+            num_splits if cutlass.const_expr(self.use_dkdv_split) else None,
+            split_slots,
         ).launch(
             grid=bwd_grid,
             block=[self.threads_per_cta, 1, 1],
@@ -875,11 +919,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             | FmhaClcDynamicTileSchedulerParams
             | SingleTileVarlenScheduler.Params
         ),
+        dKV_partial: cute.Tensor | None = None,
+        dKV_split_semaphore: cute.Tensor | None = None,
+        split_chunk_iters: Int32 | None = None,
+        num_splits: Int32 | None = None,
+        split_slots: Int32 | None = None,
     ):
         """Core CuTeDSL backward kernel."""
         bidx, bidy, bidz = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
+        split_idx = None
+        if cutlass.const_expr(self.use_dkdv_split):
+            split_idx, bidx, _ = self.split_coords(num_splits)
 
         mma_tile_coord_v = bidx % cute.size(KQ_tiled_mma.thr_id.shape)
 
@@ -1556,7 +1608,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         else:
             # ===== STATIC PATH: one logical tile per CTA =====
             if cutlass.const_expr(self.use_varlen_scheduler):
-                tile_sched = SingleTileVarlenScheduler.create(tile_sched_params)
+                if cutlass.const_expr(self.use_dkdv_split):
+                    tile_sched = SingleTileVarlenScheduler(tile_sched_params, bidx, Int32(0))
+                else:
+                    tile_sched = SingleTileVarlenScheduler.create(tile_sched_params)
                 work_tile = tile_sched.initial_work_tile_info()
                 is_valid_tile = work_tile.is_valid_tile
                 blk_coord_k, blk_coord_h_k, blk_coord_b, _ = work_tile.tile_idx
@@ -1614,15 +1669,38 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 problem_shape[2],
                 problem_shape[3],
             )
+            iter_index_start, h_r_start, split_cnt = None, None, None
+            if cutlass.const_expr(self.use_dkdv_split):
+                split_cnt, iter_count, iter_index_start, h_r_start = self.get_split_range(
+                    iter_count,
+                    iter_start,
+                    iter_end,
+                    split_idx,
+                    num_splits,
+                    split_chunk_iters,
+                    split_slots,
+                    cute.ceil_div(seqlen_k_cur_batch, 2 * self.tile_shape_K),
+                )
             if iter_count <= 0:
                 if blk_coord_k * self.tile_shape_K < seqlen_k_cur_batch:
-                    self.epilogue_clear(
-                        blk_coord,
-                        blk_offset,
-                        problem_shape_cur_batch,
-                        dK,
-                        dV,
-                    )
+                    if cutlass.const_expr(self.use_dkdv_split):
+                        # Split 0 has no work only if the whole tile has none; only it zero-fills.
+                        if split_idx == 0:
+                            self.epilogue_clear(
+                                blk_coord,
+                                blk_offset,
+                                problem_shape_cur_batch,
+                                dK,
+                                dV,
+                            )
+                    else:
+                        self.epilogue_clear(
+                            blk_coord,
+                            blk_offset,
+                            problem_shape_cur_batch,
+                            dK,
+                            dV,
+                        )
             # ///////////////////////////////////////////////////////////////////////////////
             #  LOAD
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1681,6 +1759,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     blk_coord_k,
                     blk_coord_h_k,
                     blk_coord_b,
+                    iter_index_start=iter_index_start,
+                    h_r_start=h_r_start,
                 )
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1771,6 +1851,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     dV_tma,
                     sdK_epi_layout,
                     sdV_epi_layout,
+                    iter_index_start=iter_index_start,
+                    dKV_partial=dKV_partial,
+                    dKV_split_semaphore=dKV_split_semaphore,
+                    num_splits=num_splits,
+                    split_cnt=split_cnt,
+                    # Unused without the CLC scheduler; carries split_cnt across the main loop.
+                    sSplitCnt=cute.make_tensor(
+                        storage.clc_response.data_ptr(), cute.make_layout(1)
+                    ),
                 )
 
                 cute.arch.barrier(
@@ -1822,6 +1911,54 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             Q_block_min_tmp = Q_block_min_tmp - Q_block_min_tmp % 2
             Q_block_min = max(Q_block_min_tmp, Q_block_min)
         return Q_block_min, Q_block_max
+
+    @cute.jit
+    def split_coords(self, num_splits: Int32):
+        """(split index, unsplit blockIdx.x, linear unsplit tile index) of this CTA.
+
+        Split grid: blockIdx.x = (cta_pair * num_splits + split) * 2 + rank_in_pair, so the chunks of one KV tile are
+        adjacent in launch order; the unsplit grid is (gridDim.x / num_splits, gridDim.y, gridDim.z).
+        """
+        bidx, bidy, bidz = cute.arch.block_idx()
+        grid_x, grid_y, _ = cute.arch.grid_dim()
+        pair_split = bidx // 2
+        split_idx = pair_split % num_splits
+        bidx_unsplit = (pair_split // num_splits) * 2 + bidx % 2
+        tile_linear = bidx_unsplit + (grid_x // num_splits) * (bidy + grid_y * bidz)
+        return split_idx, bidx_unsplit, tile_linear
+
+    @cute.jit
+    def get_split_range(
+        self,
+        iter_count: Int32,
+        iter_start: Int32,
+        iter_end: Int32,
+        split_idx: Int32,
+        num_splits: Int32,
+        split_chunk_iters: Int32,
+        split_slots: Int32,
+        num_kv_clusters: Int32,
+    ):
+        """Chunk `split_idx` of the tile's flattened loop it = h_r_idx * (iter_end - iter_start) + q_off.
+
+        split_cnt = min(num_splits, ceil(iter_count / split_chunk_iters)); for non-causal tiles (all tiles of a
+        sequence have the same count) also at most max(split_slots // num_kv_clusters, 1), so the chunks of one
+        sequence fit in split_slots CTA pairs. Returns (split_cnt, chunk iter_count, first Q block, first h_r
+        index). Both CTAs of a pair compute the same values. Chunks are contiguous and differ by at most one.
+        """
+        num_q_blocks = max(iter_end - iter_start, 1)
+        split_cnt = Int32(1)
+        if iter_count > split_chunk_iters:
+            split_cnt = min(num_splits, cute.ceil_div(iter_count, split_chunk_iters))
+            if cutlass.const_expr(not (self.is_causal or self.has_sliding_window)):
+                if split_slots > 0:
+                    split_cnt = min(split_cnt, max(split_slots // max(num_kv_clusters, 1), 1))
+        it_lo = split_idx * iter_count // split_cnt
+        it_hi = (split_idx + 1) * iter_count // split_cnt
+        chunk_count = it_hi - it_lo
+        if split_idx >= split_cnt:
+            chunk_count = Int32(0)
+        return split_cnt, chunk_count, iter_start + it_lo % num_q_blocks, it_lo // num_q_blocks
 
     @cute.jit
     def load(
@@ -1877,12 +2014,18 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         blk_coord_k: Int32,
         blk_coord_h_k: Int32,
         blk_coord_b: Int32,
+        iter_index_start: Int32 | None = None,
+        h_r_start: Int32 | None = None,
     ):
-        """TMA load."""
+        """TMA load.
+
+        The loop walks (h_r, Q block) from (h_r_start, iter_index_start) for iter_count steps, wrapping the Q block
+        from iter_end back to iter_start (default: the whole tile from (0, iter_start)).
+        """
         tidx, _, _ = cute.arch.thread_idx()
-        blk_coord_h_r = Int32(0)
+        blk_coord_h_r = Int32(0) if cutlass.const_expr(h_r_start is None) else h_r_start
         blk_coord_h = (blk_coord_h_r, blk_coord_h_k)
-        iter_index = iter_start
+        iter_index = iter_start if cutlass.const_expr(iter_index_start is None) else iter_index_start
         # MMA/TMA use physical CTA rank, not the flat tile index.
         mma_tile_coord_v = cute.arch.block_idx_in_cluster() % cute.size(KQ_tiled_mma.thr_id.shape)
         mma_tile_coord_m = blk_coord_k // cute.size(KQ_tiled_mma.thr_id.shape)
@@ -2576,13 +2719,23 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dV_tma: cute.Tensor,
         sdK_epi_layout: cute.ComposedLayout,
         sdV_epi_layout: cute.ComposedLayout,
+        iter_index_start: Int32 | None = None,
+        dKV_partial: cute.Tensor | None = None,
+        dKV_split_semaphore: cute.Tensor | None = None,
+        num_splits: Int32 | None = None,
+        split_cnt: Int32 | None = None,
+        sSplitCnt: cute.Tensor | None = None,
     ):
         """CuTeDSL kernel for recomputing softmax and producing dk and dv."""
         tidx, _, _ = cute.arch.thread_idx()
         Q, K, _, _ = problem_shape
         _, blk_coord_k, _, _ = blk_coord
+        if cutlass.const_expr(dKV_partial is not None):
+            # Park split_cnt in smem: the main loop runs at the 128-register limit of the compute warps.
+            if tidx == 0:
+                sSplitCnt[0] = split_cnt
 
-        iter_index = iter_start
+        iter_index = iter_start if cutlass.const_expr(iter_index_start is None) else iter_index_start
 
         # adi: TMEM_ST, TMEM_DPT
         tmem_load_op = tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16))
@@ -2803,28 +2956,85 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 iter_index = iter_start
 
         # Epilogue
-        mma_compute_dKdV_consumer = self.epilogue(
-            blk_coord,
-            blk_offset,
-            problem_shape,
-            dK,
-            dV,
-            tdKtdK,
-            tdVtdV,
-            scale_softmax,
-            mma_compute_dKdV_producer,
-            mma_compute_dKdV_consumer,
-            problem_shape_k_cur_batch,
-            tma_atom_dK,
-            dK_tma,
-            tma_atom_dV,
-            dV_tma,
-            sdK_epi_layout,
-            sdV_epi_layout,
-            varlen,
-            sdOT,
-            sP,
-        )
+        if cutlass.const_expr(dKV_partial is not None):
+            # Recomputed from blockIdx / smem so they are not live across the main loop (the loop's
+            # compute_sync barriers order the smem write above before this read).
+            split_idx, _, tile_linear = self.split_coords(num_splits)
+            split_cnt = sSplitCnt[0]
+            if split_cnt > 1:
+                mma_compute_dKdV_consumer = self.epilogue_split(
+                    blk_coord,
+                    blk_offset,
+                    problem_shape,
+                    dK,
+                    dV,
+                    tdKtdK,
+                    tdVtdV,
+                    scale_softmax,
+                    mma_compute_dKdV_consumer,
+                    problem_shape_k_cur_batch,
+                    tma_atom_dK,
+                    dK_tma,
+                    tma_atom_dV,
+                    dV_tma,
+                    sdK_epi_layout,
+                    sdV_epi_layout,
+                    varlen,
+                    sdOT,
+                    sP,
+                    sLSE,
+                    dKV_partial,
+                    dKV_split_semaphore,
+                    split_idx,
+                    split_cnt,
+                    tile_linear,
+                )
+            else:
+                mma_compute_dKdV_consumer = self.epilogue(
+                    blk_coord,
+                    blk_offset,
+                    problem_shape,
+                    dK,
+                    dV,
+                    tdKtdK,
+                    tdVtdV,
+                    scale_softmax,
+                    mma_compute_dKdV_producer,
+                    mma_compute_dKdV_consumer,
+                    problem_shape_k_cur_batch,
+                    tma_atom_dK,
+                    dK_tma,
+                    tma_atom_dV,
+                    dV_tma,
+                    sdK_epi_layout,
+                    sdV_epi_layout,
+                    varlen,
+                    sdOT,
+                    sP,
+                )
+        else:
+            mma_compute_dKdV_consumer = self.epilogue(
+                blk_coord,
+                blk_offset,
+                problem_shape,
+                dK,
+                dV,
+                tdKtdK,
+                tdVtdV,
+                scale_softmax,
+                mma_compute_dKdV_producer,
+                mma_compute_dKdV_consumer,
+                problem_shape_k_cur_batch,
+                tma_atom_dK,
+                dK_tma,
+                tma_atom_dV,
+                dV_tma,
+                sdK_epi_layout,
+                sdV_epi_layout,
+                varlen,
+                sdOT,
+                sP,
+            )
 
         if not cutlass.const_expr(self.use_clc_scheduler):
             compute_mma_P_producer.tail()
@@ -3182,6 +3392,342 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dkdv_handle.release()
 
         return mma_compute_dKdV_consumer
+
+    @cute.jit
+    def epilogue_split(
+        self,
+        blk_coord: cute.Coord,
+        blk_offset: cute.Shape,
+        problem_shape: tuple[Int32, Int32, Int32, tuple[tuple[Int32, Int32], Int32]],
+        dK: cute.Tensor,
+        dV: cute.Tensor,
+        tdKtdK: cute.Tensor,
+        tdVtdV: cute.Tensor,
+        scale_softmax: cutlass.Float32,
+        mma_compute_dKdV_consumer,
+        problem_shape_k_cur_batch: Int32,
+        tma_atom_dK: cute.CopyAtom,
+        dK_tma: cute.Tensor,
+        tma_atom_dV: cute.CopyAtom,
+        dV_tma: cute.Tensor,
+        sdK_epi_layout: cute.ComposedLayout,
+        sdV_epi_layout: cute.ComposedLayout,
+        varlen: bool,
+        sdOT: cute.Tensor,
+        sP: cute.Tensor,
+        sLSE: cute.Tensor,
+        dKV_partial: cute.Tensor,
+        dKV_split_semaphore: cute.Tensor,
+        split_idx: Int32,
+        split_cnt: Int32,
+        tile_linear: Int32,
+    ):
+        """Epilogue of one chunk of a split tile (split_cnt > 1).
+
+        Every chunk writes its fp32 dV and dK (unscaled) to workspace slot (split_idx, tile_linear), then counts
+        itself on the tile semaphore (acq_rel). The last chunk to arrive sums slots 0 .. split_cnt - 1 in that
+        order, so the result does not depend on which chunk arrives last, and stores dV and scale * dK exactly as
+        `epilogue` does. It also resets the semaphore to zero. No chunk waits for another.
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        _, K, D, HB = problem_shape
+        _, blk_coord_k, _, blk_coord_batch = blk_coord
+
+        # adi: TMEM_DK, TMEM_DV
+        tmem_copy_op = tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
+        load_op = cute.make_copy_atom(
+            tmem_copy_op,
+            self.acc_dtype,
+        )
+
+        tdKtdK = tdKtdK[(None, None), 0, 0]
+        mdK_offset = cute.assume(blk_offset[1] * dK.stride[0], divby=64)
+        mdK = cute.make_tensor(
+            dK.iterator + mdK_offset,
+            cute.make_layout((K, self.tile_shape_dQ_K, HB), stride=dK.stride),
+        )
+        gdK = cute.local_tile(mdK, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
+        gdK = gdK[None, None, blk_coord_k, 0, blk_coord_batch]
+        cdK = cute.domain_offset(
+            (blk_coord_k * self.tile_shape_K, 0),
+            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
+        )
+
+        num_warp_groups = self.num_compute_warps // 4
+        dp_idx = tidx % 128
+        wg_idx = (tidx % (self.num_compute_warps * self.threads_per_warp)) // 128
+        leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
+
+        # Path 2 SMEM staging. dV stages through sdOT (already-consumed by the
+        # dV MMA before the dV epilogue begins). dK stages through sP+sdST
+        # (dead after dK MMA completes, before dK epilogue runs).
+        s_epi_dK = cute.make_tensor(
+            cute.recast_ptr(sP.iterator, sdK_epi_layout.inner, dK.element_type),
+            sdK_epi_layout.outer,
+        )
+        s_epi_dV = cute.make_tensor(
+            cute.recast_ptr(sdOT.iterator, sdV_epi_layout.inner, dV.element_type),
+            sdV_epi_layout.outer,
+        )
+
+        # Compile-time: stage tile shape and number of stages.
+        epi_cols_dKV = math.gcd(
+            128 // (dV.element_type.width // 8), self.cta_tiler[2] // num_warp_groups
+        )
+        num_epi_stages_dKV = (self.cta_tiler[2] // num_warp_groups) // epi_cols_dKV
+        total_epi_stages = num_warp_groups * num_epi_stages_dKV
+        epi_tile_dKV = (self.cta_tiler[1], epi_cols_dKV)
+
+        # Local (M, N) coord tensor for SMEM indexing (no global domain offset
+        # — cdK/cdV are domain-offset by blk_coord_k * tile_shape_K to match
+        # the GMEM destination, but the SMEM indexing must be per-CTA-local).
+        cdV_local = cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2]))
+        cdK_local = cdV_local
+
+        tiled_t2r_dK = tcgen05.make_tmem_copy(load_op, tdKtdK)
+        thread_t2r_dK = tiled_t2r_dK.get_slice(dp_idx)
+
+        tTR_cdK = thread_t2r_dK.partition_D(cdK)
+        tTR_cdK = split_wg(tTR_cdK, num_warp_groups, wg_idx)
+        tTR_cdK_local = thread_t2r_dK.partition_D(cdK_local)
+        tTR_cdK_local = split_wg(tTR_cdK_local, num_warp_groups, wg_idx)
+        tTR_gdK = thread_t2r_dK.partition_D(gdK)
+        tTR_gdK = split_wg(tTR_gdK, num_warp_groups, wg_idx)
+        tTR_rdK = cute.make_rmem_tensor(tTR_cdK.shape, self.acc_dtype)
+        tTR_tdK = thread_t2r_dK.partition_S(tdKtdK)
+        tTR_tdK = split_wg(tTR_tdK, num_warp_groups, wg_idx)
+
+        mdV_in = cute.make_tensor(
+            dV.iterator, cute.make_layout((K, self.cta_tiler[2], HB), stride=dV.stride)
+        )
+        offset_mdV = cute.assume(blk_offset[1] * mdV_in.stride[0], divby=64)
+        mdV = cute.make_tensor(mdV_in.iterator + offset_mdV, mdV_in.layout)
+        gdV = cute.local_tile(mdV, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
+        gdV = gdV[None, None, blk_coord_k, 0, blk_coord_batch]
+
+        cdV = cute.domain_offset(
+            (blk_coord_k * self.cta_tiler[1], 0),
+            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
+        )
+
+        tdVtdV = tdVtdV[(None, None), 0, 0]
+
+        tiled_t2r_dV = tcgen05.make_tmem_copy(load_op, tdVtdV)
+        thread_t2r_dV = tiled_t2r_dV.get_slice(dp_idx)
+
+        tTR_cdV = thread_t2r_dV.partition_D(cdV)
+        tTR_cdV = split_wg(tTR_cdV, num_warp_groups, wg_idx)
+        tTR_cdV_local = thread_t2r_dV.partition_D(cdV_local)
+        tTR_cdV_local = split_wg(tTR_cdV_local, num_warp_groups, wg_idx)
+        tTR_gdV = thread_t2r_dV.partition_D(gdV)
+        tTR_gdV = split_wg(tTR_gdV, num_warp_groups, wg_idx)
+        tTR_rdV = cute.make_rmem_tensor(tTR_cdV.shape, self.acc_dtype)
+        tTR_tdV = thread_t2r_dV.partition_S(tdVtdV)
+        tTR_tdV = split_wg(tTR_tdV, num_warp_groups, wg_idx)
+
+        # GMEM destinations for the multi-stage TMA path (gated on not-varlen).
+        if cutlass.const_expr(not varlen):
+            mdV_tma_3d = cute.make_tensor(
+                dV_tma.iterator,
+                cute.make_layout((K, self.cta_tiler[2], HB), stride=dV_tma.stride),
+            )
+            mdV_tma_cur = mdV_tma_3d[None, None, blk_coord_batch]
+            gdV_tma = cute.local_tile(
+                mdV_tma_cur, (self.cta_tiler[1], self.cta_tiler[2]), (blk_coord_k, 0)
+            )
+            gdV_tma_epi = cute.local_tile(gdV_tma, epi_tile_dKV, (0, None))
+
+            mdK_tma_3d = cute.make_tensor(
+                dK_tma.iterator,
+                cute.make_layout((K, self.cta_tiler[2], HB), stride=dK_tma.stride),
+            )
+            mdK_tma_cur = mdK_tma_3d[None, None, blk_coord_batch]
+            gdK_tma = cute.local_tile(
+                mdK_tma_cur, (self.cta_tiler[1], self.cta_tiler[2]), (blk_coord_k, 0)
+            )
+            gdK_tma_epi = cute.local_tile(gdK_tma, epi_tile_dKV, (0, None))
+
+        cta_threads = self.num_compute_warps * self.threads_per_warp
+
+        has_rows = blk_coord_k * self.tile_shape_K < problem_shape_k_cur_batch
+        num_tiles = dKV_split_semaphore.shape[0]
+        # sLSE is dead after the main loop; its first word broadcasts the semaphore value to all compute threads.
+        sFlag = cute.make_tensor(cute.recast_ptr(sLSE.iterator, dtype=Int32), cute.make_layout(1))
+
+        dkdv_handle = mma_compute_dKdV_consumer.wait_and_advance()
+        if has_rows:
+            cute.copy(tiled_t2r_dV, tTR_tdV, tTR_rdV)
+            self.store_dKV_partial(dKV_partial, num_tiles, split_idx, tile_linear, 0, tTR_rdV, tidx)
+        cute.arch.fence_view_async_tmem_load()
+        dkdv_handle.release()
+
+        dkdv_handle = mma_compute_dKdV_consumer.wait_and_advance()
+        if has_rows:
+            cute.copy(tiled_t2r_dK, tTR_tdK, tTR_rdK)
+            self.store_dKV_partial(dKV_partial, num_tiles, split_idx, tile_linear, 1, tTR_rdK, tidx)
+        cute.arch.fence_view_async_tmem_load()
+        dkdv_handle.release()
+
+        if has_rows:
+            # Publish: each thread fences its partial stores; thread 0 counts the chunk (release + acquire).
+            fa_barrier.fence_acq_rel_gpu()
+            cute.arch.barrier(barrier_id=self.split_sync_bar_id, number_of_threads=cta_threads)
+            if tidx == 0:
+                sFlag[0] = fa_barrier.atomic_add_acq_rel(dKV_split_semaphore.iterator + tile_linear, 1)
+            cute.arch.barrier(barrier_id=self.split_sync_bar_id, number_of_threads=cta_threads)
+            if sFlag[0] == split_cnt - 1:
+                # Last chunk of this tile: all other chunks' partials are visible after the acquire.
+                fa_barrier.fence_acq_rel_gpu()
+                if tidx == 0:
+                    dKV_split_semaphore[tile_linear] = Int32(0)
+                self.load_reduced_dKV_partial(dKV_partial, num_tiles, split_cnt, tile_linear, 0, tTR_rdV, tidx)
+                tTR_rdV_cast = cute.make_rmem_tensor(tTR_rdV.shape, dV.element_type)
+                tTR_rdV_cast.store(tTR_rdV.load().to(dV.element_type))
+
+                if cutlass.const_expr(not varlen):
+                    # reg -> SMEM via per-element indexed stores using tTR_cdV's
+                    # per-thread (M, N) coords. (M, N) is per-CTA cdV space (M=0..63,
+                    # N=0..255). We map N=(n%epi_cols, n//epi_cols) → (N_within, stage)
+                    # of the 3D s_epi_dV tensor.
+                    for _i in cutlass.range_constexpr(cute.size(tTR_cdV_local, mode=[2])):
+                        for _j in cutlass.range_constexpr(cute.size(tTR_cdV_local[None, 0, _i])):
+                            c = tTR_cdV_local[None, 0, _i][_j]
+                            m_pos = c[0]
+                            n_pos = c[1]
+                            stage_pos = n_pos // epi_cols_dKV
+                            n_within_pos = n_pos % epi_cols_dKV
+                            v = tTR_rdV_cast[None, 0, _i][_j]
+                            s_epi_dV[m_pos, n_within_pos, stage_pos] = v
+                    cute.arch.fence_view_async_shared()
+                    # Inter-WG barrier — both warp-groups must finish their writes
+                    # before the leader warp reads SMEM via TMA.
+                    cute.arch.barrier(barrier_id=5, number_of_threads=cta_threads)
+                    # TMA bulk store, one (64, 64) box per stage.
+                    if leader_warp and wg_idx == 0:
+                        for _stage in cutlass.range_constexpr(total_epi_stages):
+                            sdV_stage = s_epi_dV[None, None, _stage]
+                            gdV_stage = gdV_tma_epi[None, None, _stage]
+                            td_sdV, td_gdV = cpasync.tma_partition(
+                                tma_atom_dV,
+                                0,
+                                cute.make_layout(1),
+                                cute.group_modes(sdV_stage, 0, 2),
+                                cute.group_modes(gdV_stage, 0, 2),
+                            )
+                            cute.copy(tma_atom_dV, td_sdV, td_gdV)
+                            cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                else:
+                    self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
+
+                self.load_reduced_dKV_partial(dKV_partial, num_tiles, split_cnt, tile_linear, 1, tTR_rdK, tidx)
+                for i in cutlass.range(cute.size(tTR_rdK), unroll_full=True):
+                    tTR_rdK[i] = scale_softmax * tTR_rdK[i]
+
+                tTR_rdK_cast = cute.make_rmem_tensor(tTR_rdK.shape, dK.element_type)
+                tTR_rdK_cast.store(tTR_rdK.load().to(dK.element_type))
+
+                if cutlass.const_expr(not varlen):
+                    for _i in cutlass.range_constexpr(cute.size(tTR_cdK_local, mode=[2])):
+                        for _j in cutlass.range_constexpr(cute.size(tTR_cdK_local[None, 0, _i])):
+                            c = tTR_cdK_local[None, 0, _i][_j]
+                            m_pos = c[0]
+                            n_pos = c[1]
+                            stage_pos = n_pos // epi_cols_dKV
+                            n_within_pos = n_pos % epi_cols_dKV
+                            v = tTR_rdK_cast[None, 0, _i][_j]
+                            s_epi_dK[m_pos, n_within_pos, stage_pos] = v
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.barrier(barrier_id=6, number_of_threads=cta_threads)
+                    if leader_warp and wg_idx == 0:
+                        for _stage in cutlass.range_constexpr(total_epi_stages):
+                            sdK_stage = s_epi_dK[None, None, _stage]
+                            gdK_stage = gdK_tma_epi[None, None, _stage]
+                            td_sdK, td_gdK = cpasync.tma_partition(
+                                tma_atom_dK,
+                                0,
+                                cute.make_layout(1),
+                                cute.group_modes(sdK_stage, 0, 2),
+                                cute.group_modes(gdK_stage, 0, 2),
+                            )
+                            cute.copy(tma_atom_dK, td_sdK, td_gdK)
+                            cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                else:
+                    self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
+
+
+        return mma_compute_dKdV_consumer
+
+    @cute.jit
+    def dKV_partial_slot(
+        self,
+        dKV_partial: cute.Tensor,
+        num_tiles: Int32,
+        split: Int32,
+        tile: Int32,
+        kv: int,
+        frag: int,
+        tidx: Int32,
+    ) -> cute.Tensor:
+        """This thread's (4, frag // 4) view of workspace slot (split, tile, kv); kv 0 = dV, 1 = dK.
+
+        Thread-major layout: element i of compute thread t is at (i // 4) * 4 * threads + 4 * t + i % 4, so one
+        warp-wide vector store covers 512 contiguous bytes. Every chunk of a tile uses the same thread -> element
+        mapping, so the reducing CTA reads back exactly the elements it holds.
+        """
+        cta_threads = self.num_compute_warps * self.threads_per_warp
+        slot = (Int64(split) * num_tiles + tile) * 2 + kv
+        offset = slot * (frag * cta_threads) + Int64(tidx) * 4
+        return cute.make_tensor(
+            dKV_partial.iterator + cute.assume(offset, divby=4),
+            cute.make_layout((4, frag // 4), stride=(1, 4 * cta_threads)),
+        )
+
+    @cute.jit
+    def store_dKV_partial(
+        self,
+        dKV_partial: cute.Tensor,
+        num_tiles: Int32,
+        split: Int32,
+        tile: Int32,
+        kv: int,
+        regs: cute.Tensor,
+        tidx: Int32,
+    ):
+        """Write this thread's fp32 dV (kv=0) or dK (kv=1) fragment to slot (split, tile, kv)."""
+        frag = cute.size(regs)
+        regs_flat = cute.make_tensor(regs.iterator, cute.make_layout((4, frag // 4)))
+        cute.autovec_copy(
+            regs_flat, self.dKV_partial_slot(dKV_partial, num_tiles, split, tile, kv, frag, tidx)
+        )
+
+    @cute.jit
+    def load_reduced_dKV_partial(
+        self,
+        dKV_partial: cute.Tensor,
+        num_tiles: Int32,
+        split_cnt: Int32,
+        tile: Int32,
+        kv: int,
+        regs: cute.Tensor,
+        tidx: Int32,
+    ):
+        """regs = sum of slots (0, tile, kv) .. (split_cnt - 1, tile, kv), added in increasing split order.
+
+        Works on 16 elements at a time to keep register pressure at the level of the unsplit epilogue.
+        """
+        frag = cute.size(regs)
+        acc = cute.make_tensor(regs.iterator, cute.make_layout((4, frag // 4)))
+        part = cute.make_rmem_tensor((4, 4), self.acc_dtype)
+        for j in cutlass.range_constexpr(frag // 16):
+            acc_j = cute.local_tile(acc, (4, 4), (0, j))
+            slot = self.dKV_partial_slot(dKV_partial, num_tiles, Int32(0), tile, kv, frag, tidx)
+            cute.autovec_copy(cute.local_tile(slot, (4, 4), (0, j)), acc_j)
+            for split in cutlass.range(1, split_cnt, unroll=1):
+                slot = self.dKV_partial_slot(dKV_partial, num_tiles, split, tile, kv, frag, tidx)
+                cute.autovec_copy(cute.local_tile(slot, (4, 4), (0, j)), part)
+                acc_j.store(acc_j.load() + part.load())
 
     def get_workspace_tensor(
         self,
