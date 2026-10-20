@@ -4257,9 +4257,24 @@ class FlashAttentionBackwardSm100:
                 assert mdQ_semaphore is not None
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
-            delay_semaphore_release = (
-                self.cta_schedule != CtaSchedule.TWO_CTA_SERIAL and not self.use_block_sparsity
+            # Release m_block - 1 while m_block's adds are being issued (overlapped release),
+            # unless the tile order is block sparse. The serial schedule only has to release
+            # each m_block immediately when sdQaccum aliases the dS exchange buffer (M=128,
+            # handed back to the peer through dQaccum_empty_mbar); the M=64 serial layout
+            # (hdim 256) has no alias.
+            delay_semaphore_release = not self.use_block_sparsity and (
+                self.cta_schedule != CtaSchedule.TWO_CTA_SERIAL or dQaccum_empty_mbar_ptr is None
             )
+            # The overlapped release pays off when the tile has enough m_blocks: on tiles with
+            # fewer than 16 (varlen only; dense hdim 256 tiles have 16 at 1k) the delayed hop
+            # is a large share of the tile and the chain's sibling n_blocks wait on each other
+            # at every m_block (varlen MHA 1k deterministic: -11% with the delay), so those
+            # tiles release each m_block immediately.
+            delay_release_rt = cutlass.Boolean(True)
+            immediate_release_rt = cutlass.Boolean(False)
+            if const_expr(delay_semaphore_release and self.is_varlen_q):
+                delay_release_rt = (m_block_max - m_block_min) >= Int32(16)
+                immediate_release_rt = (m_block_max - m_block_min) < Int32(16)
 
             dq_sem_release_inc = Int32(1)
             if const_expr(
@@ -4403,13 +4418,14 @@ class FlashAttentionBackwardSm100:
                     dQ_tma_store_producer_state.advance()
 
                     if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
-                        if m_block > m_block_min:
-                            barrier.arrive_inc(
-                                mdQ_semaphore_cur[(m_block - 1, None)].iterator,
-                                tidx,
-                                cta_rank_in_cluster,
-                                1,
-                            )
+                        if delay_release_rt:
+                            if m_block > m_block_min:
+                                barrier.arrive_inc(
+                                    mdQ_semaphore_cur[(m_block - 1, None)].iterator,
+                                    tidx,
+                                    cta_rank_in_cluster,
+                                    1,
+                                )
 
                 # With more than one staging stage the tile's newest bulk adds are still in
                 # flight here (each stage only waits for the older groups). Drain them once
@@ -4425,6 +4441,14 @@ class FlashAttentionBackwardSm100:
                     if is_tma_warp and not m_block_oob_upper:
                         cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                     self.reduce_sync_barrier.arrive_and_wait()
+                elif const_expr(
+                    self.sdQaccum_stage > 1 and self.deterministic and delay_semaphore_release
+                ):
+                    # short varlen tile: immediate release, so this m_block's adds must be done
+                    if immediate_release_rt:
+                        if is_tma_warp and not m_block_oob_upper:
+                            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                        self.reduce_sync_barrier.arrive_and_wait()
                 if const_expr(dQaccum_empty_mbar_ptr is not None):
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(dQaccum_empty_mbar_ptr)
@@ -4439,6 +4463,15 @@ class FlashAttentionBackwardSm100:
                             cta_rank_in_cluster,
                             dq_sem_release_inc,
                         )
+                elif const_expr(self.deterministic and delay_semaphore_release):
+                    if immediate_release_rt:
+                        if not m_block_oob_upper:
+                            barrier.arrive_inc(
+                                mdQ_semaphore_cur[m_block, None].iterator,
+                                tidx,
+                                cta_rank_in_cluster,
+                                dq_sem_release_inc,
+                            )
 
             if process_tile:
                 if is_tma_warp:
@@ -4446,12 +4479,13 @@ class FlashAttentionBackwardSm100:
                 self.reduce_sync_barrier.arrive_and_wait()
                 # final semaphore release
                 if const_expr(self.deterministic and delay_semaphore_release):
-                    barrier.arrive_inc(
-                        mdQ_semaphore_cur[(m_block_max - 1, None)].iterator,
-                        tidx,
-                        cta_rank_in_cluster,
-                        1,
-                    )
+                    if delay_release_rt:
+                        barrier.arrive_inc(
+                            mdQ_semaphore_cur[(m_block_max - 1, None)].iterator,
+                            tidx,
+                            cta_rank_in_cluster,
+                            1,
+                        )
 
             if const_expr(
                 self.deterministic
