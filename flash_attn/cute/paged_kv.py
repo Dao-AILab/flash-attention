@@ -61,8 +61,8 @@ class PagedKVManager(ParamsBase):
         arch: cutlass.Constexpr[int] = 100,
     ):
         # SM100 transposes V in gmem to (dv, page_size, num_pages);
-        # SM90 keeps V as (page_size, dv, num_pages), same layout as K.
-        v_gmem_transposed = arch != 90
+        # SM80/SM90/SM120 keep V as (page_size, dv, num_pages), same layout as K.
+        v_gmem_transposed = arch not in (80, 90, 120)
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // dtype.width
         dtype_bytes = dtype.width // 8
@@ -193,6 +193,7 @@ class PagedKVManager(ParamsBase):
         mX_paged_cur_copy: cute.Tensor,
         m: Int32,
         should_load: cute.Tensor,
+        tXpX: cute.Tensor,
     ):
         """Issue cp.async copies for one row across all k-tiles."""
         for k in cutlass.range_constexpr(cute.size(tXsX, mode=[2])):
@@ -200,11 +201,18 @@ class PagedKVManager(ParamsBase):
             mX_paged_cur_copy_ki = mX_paged_cur_copy[None, ki]
             tXsX_k = tXsX[None, m, k]
             mX_paged_cur_copy_ki = cute.make_tensor(mX_paged_cur_copy_ki.iterator, tXsX_k.layout)
+            predicate = should_load
+            if const_expr(self.arch in (80, 120)):
+                # SM80 MMA accepts dimensions padded to 16, including logical
+                # head dimensions that are only multiples of 8.
+                predicate = cute.make_fragment_like(should_load)
+                for i in cutlass.range_constexpr(cute.size(should_load)):
+                    predicate[i] = should_load[i] and tXpX[i, m, k]
             cute.copy(
                 self.gmem_tiled_copy_KV,
                 mX_paged_cur_copy_ki,
                 tXsX_k,
-                pred=should_load,
+                pred=predicate,
             )
 
     @cute.jit
@@ -213,8 +221,8 @@ class PagedKVManager(ParamsBase):
 
         tPrXPtr = self.compute_X_ptr(K_or_V)
 
-        if const_expr(self.arch == 90):
-            # SM90: sX is already stage-sliced by caller (sK[None, None, stage]).
+        if const_expr(self.arch in (80, 90, 120)):
+            # sX is already stage-sliced by caller (sK[None, None, stage]).
             # Flatten hierarchical modes to get (n_block_size, head_dim).
             sX_pi = cute.group_modes(sX, 0, 1)
             # SM90 does NOT transpose V here (it's transposed via utils.transpose_view before MMA)
@@ -245,4 +253,5 @@ class PagedKVManager(ParamsBase):
             )
             mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
             mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
-            self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
+            tXpX = self.tKpK if const_expr(K_or_V == "K") else self.tVpV
+            self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load, tXpX)
