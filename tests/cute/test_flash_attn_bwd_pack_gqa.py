@@ -1,11 +1,14 @@
 """SM100 backward with the query heads of a KV head folded into one tile, against the
 per-head path (FLASH_ATTENTION_BWD_PACK_GQA=0, FLASH_ATTENTION_BWD_HEAD_LOOP=0) and against
-FP64 eager. Three ways to fold:
+FP64 eager. The fold modes:
 
-- pack: FLASH_ATTENTION_BWD_PACK_GQA=1 packs pack_factor (at most 2) query heads into the Q
-  tile rows (NOTE [bwd pack_gqa] in pack_gqa.py); the remaining qhead_per_kvhead // pack_factor
-  sub-groups of a KV head are separate tiles whose dK / dV accumulate in fp32 (+ postprocess).
-- pack_loop: the same packing, and the sub-groups looped inside one tile per KV head
+- pack: FLASH_ATTENTION_BWD_PACK_FACTOR=2 packs 2 query heads into the Q tile rows (NOTE
+  [bwd pack_gqa] in pack_gqa.py); the remaining qhead_per_kvhead // 2 sub-groups of a KV
+  head are separate tiles whose dK / dV accumulate in fp32 (+ postprocess). pack4: the same
+  with 4 (hdim 256: what the deterministic causal fold picks when the dQ chains are few).
+  pack_full: the one full pack (largest power of two dividing qhead_per_kvhead) that the
+  other head dims take.
+- pack_loop: pack 2, and the sub-groups looped inside one tile per KV head
   (FLASH_ATTENTION_BWD_HEAD_LOOP=1, hdim 256): K / V loaded once, dK / dV stay in TMEM and are
   stored directly.
 - loop: head loop only (no packing), every query head of the KV head a pass of the loop.
@@ -34,8 +37,8 @@ pytestmark = pytest.mark.skipif(
 
 SEED = 20261004
 HEAD_DIMS = [64, 128, 256]
-# qhead_per_kvhead 4 / 4 / 8 / 8 (pack 2 + 2 / 2 / 4 / 4 sub-groups), 6 / 6 / 3 (pack 2 + 3
-# sub-groups, pack 2 + 3, no packing + 3) and 5 (no packing: head loop only)
+# qhead_per_kvhead 4 / 4 / 8 / 8 (pack 2 or 4 + sub-groups, full pack 4 / 8), 6 / 6 / 3 (pack
+# 2 + 3 sub-groups, no pack 4) and 5 (no packing: head loop only)
 HEADS = {
     "gqa8_2": (8, 2),
     "gqa16_4": (16, 4),
@@ -46,9 +49,19 @@ HEADS = {
     "gqa6_2": (6, 2),
     "gqa40_8": (40, 8),
 }
-# fold -> (pack_gqa, head_loop) overrides
-FOLDS = {"pack": (True, False), "pack_loop": (True, True), "loop": (False, True)}
-ENV_KEYS = ("FLASH_ATTENTION_BWD_PACK_GQA", "FLASH_ATTENTION_BWD_HEAD_LOOP")
+# fold -> (pack_gqa, head_loop, pack_factor) overrides
+FOLDS = {
+    "pack": (True, False, 2),  # pack 2; the other sub-groups through the dK / dV postprocess
+    "pack4": (True, False, 4),  # hdim 256 only (the other head dims take the full pack)
+    "pack_full": (True, False, None),  # other head dims: the one full pack
+    "pack_loop": (True, True, 2),  # pack 2 and the other sub-groups looped in the CTA
+    "loop": (False, True, None),  # unpacked, every query head a pass of the loop
+}
+ENV_KEYS = (
+    "FLASH_ATTENTION_BWD_PACK_GQA",
+    "FLASH_ATTENTION_BWD_HEAD_LOOP",
+    "FLASH_ATTENTION_BWD_PACK_FACTOR",
+)
 FEATURE_KWARGS = {
     "none": {},
     "local": {"window_size": (64, 32)},
@@ -79,9 +92,15 @@ def hd256_on_general_kernel():
     return getter is None or getter()
 
 
-def run_fwd_bwd_layout(layout, q, k, v, dout, q_lens, k_lens, causal, pack, head_loop, **kwargs):
+def run_fwd_bwd_layout(
+    layout, q, k, v, dout, q_lens, k_lens, causal, pack, head_loop, pack_factor=None, **kwargs
+):
     os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = "1" if pack else "0"
     os.environ["FLASH_ATTENTION_BWD_HEAD_LOOP"] = "1" if head_loop else "0"
+    if pack_factor is None:
+        os.environ.pop("FLASH_ATTENTION_BWD_PACK_FACTOR", None)
+    else:
+        os.environ["FLASH_ATTENTION_BWD_PACK_FACTOR"] = str(pack_factor)
     head_dim = q.shape[-1]
     if layout == "dense":
         b = len(q_lens)
@@ -123,14 +142,19 @@ def test_bwd_pack_gqa_matches_unpacked(
 ):
     if head_dim == 256 and not hd256_on_general_kernel():
         pytest.skip("hdim 256 backward runs on the dedicated kernels (no packing)")
-    pack, head_loop = FOLDS[fold]
+    pack, head_loop, pack_factor = FOLDS[fold]
     heads_q, heads_kv = HEADS[mha_type]
     qhead_per_kvhead = heads_q // heads_kv
+    full_pack = qhead_per_kvhead & -qhead_per_kvhead
     if head_loop and head_dim != 256:
         pytest.skip("the head loop is an hdim 256 (serial schedule) path")
-    if pack and qhead_per_kvhead % 2:
-        pytest.skip("odd qhead_per_kvhead: nothing to pack")
-    if head_loop and qhead_per_kvhead // (2 if pack else 1) == 1:
+    if fold == "pack4" and head_dim != 256:
+        pytest.skip("pack 4 is an hdim 256 fold; the other head dims take the full pack")
+    if fold == "pack_full" and (head_dim == 256 or full_pack <= 2):
+        pytest.skip("hdim 256 never takes the full pack; a full pack of 2 is the pack cell")
+    if pack and qhead_per_kvhead % (pack_factor or full_pack):
+        pytest.skip("qhead_per_kvhead does not divide into the packed heads")
+    if head_loop and qhead_per_kvhead // (pack_factor if pack else 1) == 1:
         pytest.skip("one sub-group: nothing to loop over")
     if layout == "varlen":
         # Ragged version of the same budget: tile edges, a short slot, an empty slot.
@@ -153,7 +177,7 @@ def test_bwd_pack_gqa_matches_unpacked(
     kwargs = FEATURE_KWARGS[feature]
     args = (layout, q, k, v, dout, q_lens, k_lens, causal)
     ref = run_fwd_bwd_layout(*args, False, False, **kwargs)
-    got = run_fwd_bwd_layout(*args, pack, head_loop, **kwargs)
+    got = run_fwd_bwd_layout(*args, pack, head_loop, pack_factor, **kwargs)
     assert torch.equal(got[0], ref[0]), (
         "forward does not depend on the backward packing"
     )
@@ -166,7 +190,7 @@ def test_bwd_pack_gqa_matches_unpacked(
             f"{name} differs from the unpacked path"
         )
     if feature == "deterministic":
-        again = run_fwd_bwd_layout(*args, pack, head_loop, **kwargs)
+        again = run_fwd_bwd_layout(*args, pack, head_loop, pack_factor, **kwargs)
         assert all(torch.equal(x, y) for x, y in zip(got, again)), (
             "deterministic run differs"
         )
@@ -326,3 +350,66 @@ def test_bwd_pack_gqa_heuristic():
         total_q=sum(lens),
         total_k=sum(lens) // 2,
     )
+
+
+def test_bwd_choose_fold():
+    """Fold choice on B200 (148 SMs, 74 clusters), hdim 256, 32k tokens per shape: the cells of
+    the chain probes (deterministic causal) and of the MQA probe (non-deterministic)."""
+    from flash_attn.cute.interface import _bwd_choose_fold
+
+    def decide(batch, heads, heads_kv, seqlen, causal, deterministic, head_loop_possible=True, **kw):
+        return _bwd_choose_fold(
+            num_sms=148,
+            cluster_size=2,
+            batch_size=batch,
+            num_head=heads,
+            num_head_kv=heads_kv,
+            seqlen_q=seqlen,
+            seqlen_k=seqlen,
+            total_q=batch * seqlen,
+            total_k=batch * seqlen,
+            m_block_size=128,
+            n_block_size=128,
+            causal=causal,
+            local=False,
+            varlen=False,
+            deterministic=deterministic,
+            fold_allowed=True,
+            head_loop_possible=head_loop_possible,
+            **kw,
+        )
+
+    # non-deterministic: pack 2 + loop whenever the heuristic takes the full fold; where it
+    # refuses (long causal MQA: critical path / waves) a smaller fold instead of none
+    assert decide(16, 16, 1, 2048, True, False) == (2, True)
+    assert decide(16, 40, 8, 2048, True, False) == (1, True)
+    assert decide(8, 16, 1, 4096, True, False) == (4, False)
+    assert decide(4, 16, 1, 8192, True, False)[0] > 1
+    # deterministic causal: MQA 16/1 1k b32 and 2k b16 pack 4 (+4% / +13% over pack 2 + loop),
+    # 4k b8 and 8k b4 pack 2 (+14%); GQA 32/2 2k b16 pack 4 (+9%), 8k b4 pack 2 (+13%);
+    # GQA 24/4 (qh 6) 2k b16 keeps the loop (+5%), 8k b4 pack 2 (+10%); GQA 40/8 (odd qh) loops
+    assert decide(32, 16, 1, 1024, True, True) == (4, False)
+    assert decide(16, 16, 1, 2048, True, True) == (4, False)
+    assert decide(8, 16, 1, 4096, True, True) == (2, False)
+    assert decide(4, 16, 1, 8192, True, True) == (2, False)
+    assert decide(16, 32, 2, 2048, True, True) == (4, False)
+    assert decide(4, 32, 2, 8192, True, True) == (2, False)
+    assert decide(16, 24, 4, 2048, True, True) == (2, True)
+    assert decide(4, 24, 4, 8192, True, True) == (2, False)
+    assert decide(16, 40, 8, 2048, True, True) == (1, True)
+    assert decide(16, 16, 8, 2048, True, True) == (2, False)
+    # deterministic non-causal: no pace difference, the default fold
+    assert decide(16, 16, 1, 2048, False, True) == (2, True)
+    # overrides
+    assert decide(16, 24, 4, 2048, True, False, pack_gqa_override=False) == (1, True)
+    assert decide(16, 24, 4, 2048, True, False, head_loop_override=False) == (2, False)
+    assert decide(1, 16, 1, 8192, True, False, pack_gqa_override=True) == (2, True)
+    assert decide(2, 16, 4, 256, True, True, pack_gqa_override=True, pack_factor_override=4) == (4, False)
+    assert decide(16, 16, 1, 2048, True, False, pack_factor_override=4) == (4, False)
+    assert decide(16, 16, 1, 2048, True, False, pack_factor_override=2, head_loop_override=True) == (2, True)
+    assert decide(16, 8, 1, 2048, True, False, head_loop_possible=False, pack_factor_override=2) == (2, False)
+    assert decide(16, 40, 8, 2048, True, False, pack_factor_override=2) == (1, False)
+    # without the loop (not hdim 256): the one full pack, as before
+    assert decide(16, 16, 1, 2048, True, False, head_loop_possible=False) == (16, False)
+    assert decide(16, 24, 4, 2048, True, False, head_loop_possible=False) == (2, False)
+    assert decide(8, 16, 1, 4096, True, False, head_loop_possible=False) == (1, False)
