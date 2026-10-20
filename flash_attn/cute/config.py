@@ -184,14 +184,10 @@ def loaded_seqlen_k(inputs: FwdHeuristicInputs, tile_m: int) -> int:
         return inputs.max_seqlen_k
     # Only None is unbounded; preserve 0, e.g. the right bound of a causal window.
     window_left = (
-        inputs.max_seqlen_k
-        if inputs.window_size_left is None
-        else inputs.window_size_left
+        inputs.max_seqlen_k if inputs.window_size_left is None else inputs.window_size_left
     )
     window_right = (
-        inputs.max_seqlen_k
-        if inputs.window_size_right is None
-        else inputs.window_size_right
+        inputs.max_seqlen_k if inputs.window_size_right is None else inputs.window_size_right
     )
     return max(0, min(inputs.max_seqlen_k, window_left + window_right + 1 + tile_m))
 
@@ -263,24 +259,79 @@ def fit_sm90_tile_to_block_sparsity(
 # The forward kernel reads the ex2 fields; select_sm100_registers reads the register fields and
 # gives the remaining budget to the other warp groups.
 SM100_TUNING = {
-    (True, False, 128, False): {"ex2_emu_freq": 10, "ex2_emu_start_frg": 1, "num_regs_softmax": 184, "num_regs_correction": 80},
-    (False, True, 128, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
-    (True, False, 192, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "num_regs_softmax": 184, "num_regs_correction": 80},
-    (False, True, 192, False): {"ex2_emu_freq": 32, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
-    (True, False, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 80},
-    (False, True, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
-    (True, False, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
-    (False, True, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 72},
-    (True, False, 256, False): {"ex2_emu_freq": 14, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
-    (True, True, 256, False): {"ex2_emu_freq": 14, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
+    (True, False, 128, False): {
+        "ex2_emu_freq": 10,
+        "ex2_emu_start_frg": 1,
+        "num_regs_softmax": 184,
+        "num_regs_correction": 80,
+    },
+    (False, True, 128, False): {
+        "ex2_emu_freq": 16,
+        "ex2_emu_start_frg": 1,
+        "num_regs_softmax": 192,
+        "num_regs_correction": 72,
+    },
+    (True, False, 192, False): {
+        "ex2_emu_freq": 16,
+        "ex2_emu_start_frg": 0,
+        "num_regs_softmax": 184,
+        "num_regs_correction": 80,
+    },
+    (False, True, 192, False): {
+        "ex2_emu_freq": 32,
+        "ex2_emu_start_frg": 1,
+        "num_regs_softmax": 192,
+        "num_regs_correction": 72,
+    },
+    (True, False, 128, True): {
+        "ex2_emu_freq": 0,
+        "ex2_emu_start_frg": 0,
+        "num_regs_softmax": 176,
+        "num_regs_correction": 80,
+    },
+    (False, True, 128, True): {
+        "ex2_emu_freq": 0,
+        "ex2_emu_start_frg": 0,
+        "num_regs_softmax": 176,
+        "num_regs_correction": 64,
+    },
+    (True, False, 192, True): {
+        "ex2_emu_freq": 0,
+        "ex2_emu_start_frg": 0,
+        "num_regs_softmax": 176,
+        "num_regs_correction": 64,
+    },
+    (False, True, 192, True): {
+        "ex2_emu_freq": 0,
+        "ex2_emu_start_frg": 0,
+        "num_regs_softmax": 176,
+        "num_regs_correction": 72,
+    },
+    (True, False, 256, False): {
+        "ex2_emu_freq": 14,
+        "ex2_emu_start_frg": 0,
+        "num_regs_softmax": 256,
+        "num_regs_correction": 160,
+    },
+    (True, True, 256, False): {
+        "ex2_emu_freq": 14,
+        "ex2_emu_start_frg": 0,
+        "num_regs_softmax": 256,
+        "num_regs_correction": 160,
+    },
 }
 SM100_FP8_TUNING = {
-    (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 160, 'num_regs_correction': 72},
+    (True, False, 128, False): {
+        "ex2_emu_freq": 10,
+        "ex2_emu_start_frg": 1,
+        "num_regs_softmax": 160,
+        "num_regs_correction": 72,
+    },
     # Causal hd128 FP8 previously inherited bf16's freq=16. FP8 fwd is MUFU/ex2-bound, so a more
     # aggressive emulation freq=8 offloads more exp from MUFU: +3.4%(4k)..+5.5%(16k) on B200,
     # MHA & GQA, accuracy-neutral (3-run validated, locked clocks). freq=8 would regress non-causal
     # (0.94x), hence keyed on is_causal=True only.
-    (False, True, 128, False): {'ex2_emu_freq': 8, 'ex2_emu_start_frg': 1},
+    (False, True, 128, False): {"ex2_emu_freq": 8, "ex2_emu_start_frg": 1},
 }
 # head_dim_padded < 96, keyed by paged non-TMA KV.
 SM100_SMALL_HDIM_REGISTERS = {
@@ -309,7 +360,12 @@ def select_sm100_registers(
 ) -> Sm100Registers:
     head_dim_padded = inputs.head_dim_padded
     paged_kv_non_tma = inputs.page_size not in (None, tile_n)
-    key = (use_2cta_instrs, inputs.causal, head_dim_padded, sm100_is_sm103_family(inputs.device_arch))
+    key = (
+        use_2cta_instrs,
+        inputs.causal,
+        head_dim_padded,
+        sm100_is_sm103_family(inputs.device_arch),
+    )
     is_fp8 = "float8" in inputs.dtype
     if head_dim_padded < 96:
         small = SM100_FP8_SMALL_HDIM_REGISTERS if is_fp8 else SM100_SMALL_HDIM_REGISTERS
@@ -397,7 +453,9 @@ def validate_registers(config: "FwdConfig") -> None:
     else:
         launch = SM100_LAUNCH_REGISTERS
         q_stage = config.q_stage
-        budget = q_stage * registers.softmax + registers.correction + (3 - q_stage) * registers.other
+        budget = (
+            q_stage * registers.softmax + registers.correction + (3 - q_stage) * registers.other
+        )
         if registers.softmax < launch or registers.other > launch:
             raise ValueError(
                 f"SM100 softmax registers must be >= {launch} and other <= {launch}, got {registers}"
@@ -420,10 +478,7 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
                 inputs.local,
                 inputs.sparse_q_block_size,
             )
-            if (
-                inputs.sparse_q_block_size is not None
-                and inputs.sparse_kv_block_size is not None
-            ):
+            if inputs.sparse_q_block_size is not None and inputs.sparse_kv_block_size is not None:
                 tile_m, tile_n = fit_sm90_tile_to_block_sparsity(
                     tile_m,
                     tile_n,
@@ -488,10 +543,7 @@ def can_use_tma_o(
     return (
         # hd256 SplitKV uses a chunked half-width epilogue without TMA.
         not (num_splits > 1 and inputs.head_dim_v == 256)
-        and not (
-            inputs.pack_gqa
-            and (tile_m % inputs.qhead_per_kvhead != 0 or num_splits > 1)
-        )
+        and not (inputs.pack_gqa and (tile_m % inputs.qhead_per_kvhead != 0 or num_splits > 1))
         and not inputs.is_varlen_q
     )
 
@@ -533,15 +585,11 @@ def is_2cta_eligible(
     # Single-M-block hd256 2CTA halves K/V loads per CTA; favor it when the grid fits one wave.
     num_q_tiles_per_batch = inputs.num_heads_kv if inputs.pack_gqa else inputs.num_heads
     hd256_decode_2cta = (
-        inputs.is_hdim256
-        and 2 * inputs.batch_size * num_q_tiles_per_batch <= inputs.num_sms
+        inputs.is_hdim256 and 2 * inputs.batch_size * num_q_tiles_per_batch <= inputs.num_sms
     )
     return (
         num_splits == 1
-        and (
-            not inputs.has_cu_seqlens_q
-            or (inputs.is_hdim256 and hd256_2cta_varlen_ok(inputs))
-        )
+        and (not inputs.has_cu_seqlens_q or (inputs.is_hdim256 and hd256_2cta_varlen_ok(inputs)))
         and not inputs.has_seqused_q
         and not inputs.use_block_sparsity
         and inputs.page_size in (None, 128)
@@ -582,17 +630,13 @@ def can_use_static_persistent(
         and (not inputs.has_cu_seqlens_q or inputs.has_max_seqlen_q_hint)
         # Dense causal/local LPT supports 2CTA clusters only without static persistence.
         and not (
-            use_2cta_instrs
-            and not inputs.has_cu_seqlens_q
-            and (inputs.causal or inputs.local)
+            use_2cta_instrs and not inputs.has_cu_seqlens_q and (inputs.causal or inputs.local)
         )
     )
     return dense_noncausal or single_m_block
 
 
-def can_use_clc(
-    inputs: FwdHeuristicInputs, *, tile_n: int, use_2cta_instrs: bool
-) -> bool:
+def can_use_clc(inputs: FwdHeuristicInputs, *, tile_n: int, use_2cta_instrs: bool) -> bool:
     """Whether the SM100 kernel honors CLC for this layout."""
     return (
         inputs.page_size in (None, tile_n)
@@ -614,18 +658,12 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     is_sm100_family = device_capacity in (10, 11)
     packed_seqlen_q = inputs.packed_max_seqlen_q
     # Two Q tiles exceed TMEM capacity at hdim_v 256.
-    q_stage = (
-        2
-        if is_sm100_family and packed_seqlen_q > tile_m and inputs.head_dim_v != 256
-        else 1
-    )
+    q_stage = 2 if is_sm100_family and packed_seqlen_q > tile_m and inputs.head_dim_v != 256 else 1
     seqlen_k_loaded = loaded_seqlen_k(inputs, tile_m)
 
     num_m_blocks = ceil_div(packed_seqlen_q, q_stage * tile_m)
     heads_per_m_block = 1 if inputs.pack_gqa else inputs.qhead_per_kvhead
-    total_mblocks = (
-        inputs.batch_size * inputs.num_heads_kv * heads_per_m_block * num_m_blocks
-    )
+    total_mblocks = inputs.batch_size * inputs.num_heads_kv * heads_per_m_block * num_m_blocks
     num_n_blocks = ceil_div(seqlen_k_loaded, tile_n)
     if inputs.requested_num_splits is not None:
         num_splits = max(1, inputs.requested_num_splits)
@@ -633,9 +671,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         # Only SM100/SM110 implement SplitKV.
         num_splits = 1
     else:
-        num_splits = num_splits_heuristic(
-            total_mblocks, inputs.num_sms, num_n_blocks, 128
-        )
+        num_splits = num_splits_heuristic(total_mblocks, inputs.num_sms, num_n_blocks, 128)
 
     # Diff-head SplitKV needs extra SMEM for fp32 partial O: use tile_n=64 for long KV,
     # no split for short KV or DV512. A requested split count may change here.
@@ -643,9 +679,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         if num_n_blocks >= 64 and inputs.head_dim_v != 512:
             tile_n = 64
             num_n_blocks = ceil_div(seqlen_k_loaded, tile_n)
-            num_splits = num_splits_heuristic(
-                total_mblocks, inputs.num_sms, num_n_blocks, 128
-            )
+            num_splits = num_splits_heuristic(total_mblocks, inputs.num_sms, num_n_blocks, 128)
         else:
             num_splits = 1
     if inputs.requested_num_splits is None and num_splits > 1:
@@ -655,9 +689,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     use_2cta_instrs = (
         is_sm100_family
         and not inputs.disable_2cta
-        and is_2cta_eligible(
-            inputs, tile_m=tile_m, q_stage=q_stage, num_splits=num_splits
-        )
+        and is_2cta_eligible(inputs, tile_m=tile_m, q_stage=q_stage, num_splits=num_splits)
     )
 
     # A CLC request alone skips varlen MHA (K/V traffic under imbalance) and dense
@@ -679,9 +711,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         use_2cta_instrs=use_2cta_instrs,
         use_clc_scheduler=use_clc_scheduler,
     )
-    use_tma_o = is_sm100_family and can_use_tma_o(
-        inputs, tile_m=tile_m, num_splits=num_splits
-    )
+    use_tma_o = is_sm100_family and can_use_tma_o(inputs, tile_m=tile_m, num_splits=num_splits)
     n_blocks_per_split = ceil_div(num_n_blocks, num_splits)
     use_s_ping_pong = (
         is_sm100_family
@@ -724,9 +754,7 @@ _SM100_SMEM_BYTES = 227 * 1024
 _SM100_SMEM_OVERHEAD_BYTES = 2048
 
 
-def sm100_hd192_uneven_kv_smem_bytes(
-    config: FwdConfig, inputs: FwdHeuristicInputs
-) -> int | None:
+def sm100_hd192_uneven_kv_smem_bytes(config: FwdConfig, inputs: FwdHeuristicInputs) -> int | None:
     """SM100 hd192/128 SMEM footprint when a two-stage budget becomes uneven [K, V, K].
 
     Return None outside this case; mirrors FlashAttentionForwardSm100.
@@ -750,17 +778,13 @@ def sm100_hd192_uneven_kv_smem_bytes(
 def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
     """Reject known unsupported or silently normalized config combinations."""
     if inputs.device_capacity not in (8, 9, 10, 11, 12):
-        raise ValueError(
-            f"Unsupported forward architecture family SM{inputs.device_capacity}"
-        )
+        raise ValueError(f"Unsupported forward architecture family SM{inputs.device_capacity}")
     if config.device_capacity != inputs.device_capacity:
         raise ValueError(
             f"Config targets SM{config.device_capacity}, but the problem targets SM{inputs.device_capacity}"
         )
     if config.tile_m <= 0 or config.tile_n <= 0:
-        raise ValueError(
-            f"Tile dimensions must be positive, got {(config.tile_m, config.tile_n)}"
-        )
+        raise ValueError(f"Tile dimensions must be positive, got {(config.tile_m, config.tile_n)}")
     if config.tile_m % 16 != 0 or config.tile_n % 16 != 0:
         raise ValueError(
             f"Tile dimensions must be multiples of 16, got {(config.tile_m, config.tile_n)}"
@@ -774,13 +798,8 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
             f"seqlen_k_per_split={inputs.seqlen_k_per_split} requires "
             f"num_splits >= {fixed_num_splits}, got {config.num_splits}"
         )
-    if (
-        inputs.seqlen_k_per_split is not None
-        and inputs.seqlen_k_per_split % config.tile_n != 0
-    ):
-        raise ValueError(
-            f"seqlen_k_per_split must be divisible by tile_n={config.tile_n}"
-        )
+    if inputs.seqlen_k_per_split is not None and inputs.seqlen_k_per_split % config.tile_n != 0:
+        raise ValueError(f"seqlen_k_per_split must be divisible by tile_n={config.tile_n}")
 
     is_sm90 = inputs.device_capacity == 9
     is_sm100_family = inputs.device_capacity in (10, 11)
@@ -789,18 +808,12 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
             case 8 if inputs.page_size is not None:
                 raise ValueError("SM80 forward does not support paged KV")
             case 12 if inputs.page_size is not None or inputs.use_block_sparsity:
-                raise ValueError(
-                    "SM120 forward does not support paged KV or block sparsity"
-                )
+                raise ValueError("SM120 forward does not support paged KV or block sparsity")
         if is_sm90:
             if config.tile_m not in (64, 128, 192):
-                raise ValueError(
-                    f"SM90 tile_m must be 64, 128, or 192, got {config.tile_m}"
-                )
+                raise ValueError(f"SM90 tile_m must be 64, 128, or 192, got {config.tile_m}")
         elif config.mma_pv_is_rs or config.intra_wg_overlap:
-            raise ValueError(
-                f"SM{inputs.device_capacity} does not expose SM90 MMA flags"
-            )
+            raise ValueError(f"SM{inputs.device_capacity} does not expose SM90 MMA flags")
         if config.q_stage != 1:
             raise ValueError(f"SM{inputs.device_capacity} requires q_stage=1")
         if config.num_splits != 1:
@@ -812,9 +825,7 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
             or config.use_tma_o
             or config.use_s_ping_pong
         ):
-            raise ValueError(
-                f"SM{inputs.device_capacity} does not support SM100 scheduler options"
-            )
+            raise ValueError(f"SM{inputs.device_capacity} does not support SM100 scheduler options")
         validate_registers(config)
         return
 
@@ -848,9 +859,7 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
     if config.use_clc_scheduler and not can_use_clc(
         inputs, tile_n=config.tile_n, use_2cta_instrs=config.use_2cta_instrs
     ):
-        raise ValueError(
-            "CLC is not supported for this forward problem"
-        )
+        raise ValueError("CLC is not supported for this forward problem")
     if config.is_static_persistent and not can_use_static_persistent(
         inputs,
         tile_m=config.tile_m,
@@ -859,16 +868,12 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         use_2cta_instrs=config.use_2cta_instrs,
         use_clc_scheduler=config.use_clc_scheduler,
     ):
-        raise ValueError(
-            "Static persistent scheduling is not supported for this forward problem"
-        )
+        raise ValueError("Static persistent scheduling is not supported for this forward problem")
 
     if config.use_tma_o and not can_use_tma_o(
         inputs, tile_m=config.tile_m, num_splits=config.num_splits
     ):
-        raise ValueError(
-            "TMA O is not supported for this GQA, SplitKV, or varlen layout"
-        )
+        raise ValueError("TMA O is not supported for this GQA, SplitKV, or varlen layout")
     if config.use_s_ping_pong and not can_use_s_ping_pong(
         inputs, tile_m=config.tile_m, tile_n=config.tile_n, q_stage=config.q_stage
     ):
