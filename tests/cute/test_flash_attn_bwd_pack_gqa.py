@@ -357,7 +357,7 @@ def test_bwd_choose_fold():
     the chain probes (deterministic causal) and of the MQA probe (non-deterministic)."""
     from flash_attn.cute.interface import _bwd_choose_fold
 
-    def decide(batch, heads, heads_kv, seqlen, causal, deterministic, head_loop_possible=True, **kw):
+    def decide(batch, heads, heads_kv, seqlen, causal, deterministic, head_loop_possible=True, varlen=False, **kw):
         return _bwd_choose_fold(
             num_sms=148,
             cluster_size=2,
@@ -372,7 +372,7 @@ def test_bwd_choose_fold():
             n_block_size=128,
             causal=causal,
             local=False,
-            varlen=False,
+            varlen=varlen,
             deterministic=deterministic,
             fold_allowed=True,
             head_loop_possible=head_loop_possible,
@@ -396,7 +396,17 @@ def test_bwd_choose_fold():
     assert decide(4, 32, 2, 8192, True, True) == (2, False)
     assert decide(16, 24, 4, 2048, True, True) == (2, True)
     assert decide(4, 24, 4, 8192, True, True) == (2, False)
-    assert decide(16, 40, 8, 2048, True, True) == (1, True)
+    assert decide(16, 40, 8, 2048, True, True) == (1, True)  # odd qh: no unlooped fold, the loop stays
+    # the loop stays while trips x m_blocks <= 48 (dense) / m_blocks <= 16 (varlen)
+    assert decide(32, 12, 2, 1024, True, True) == (2, True)
+    assert decide(16, 12, 2, 2048, True, True) == (2, True)
+    assert decide(8, 12, 2, 4096, True, True) == (2, False)
+    assert decide(32, 64, 8, 1024, True, True) == (2, True)
+    assert decide(16, 64, 8, 2048, True, True) == (4, False)
+    assert decide(16, 48, 4, 2048, True, True) == (4, False)
+    assert decide(16, 32, 2, 2048, True, True, varlen=True) == (2, True)
+    assert decide(8, 32, 2, 4096, True, True, varlen=True) == (4, False)
+    assert decide(32, 16, 1, 1024, True, True, varlen=True) == (2, True)
     assert decide(16, 16, 8, 2048, True, True) == (2, False)
     # deterministic non-causal: no pace difference, the default fold
     assert decide(16, 16, 1, 2048, False, True) == (2, True)

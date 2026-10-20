@@ -2398,7 +2398,13 @@ def _bwd_choose_fold(
     co-resident tiles per chain = clusters / chains and chains = batch * num_head / fold; the
     largest fold under 3% wins, else the smallest accepted fold (B200 hd256 vs the default: MQA
     16/1 2k b16 pack 4 +13%, 4k b8 pack 2 +14%, GQA 32/2 2k b16 pack 4 +9%, 24/4 8k b4 pack 2
-    +10%; with enough chains -- GQA 40/8 2k b16, MQA 1k b32 -- the loop stays).
+    +10%). The looped candidates are first dropped when the loop itself serializes too much:
+    a looped tile walks its sub-groups through the chains one after the other, so its cost
+    grows with trips * m_blocks while the per-sub-group alternative only pays K / V reloads
+    that shrink with seqlen -- measured crossover dense trips * m_blocks > 48, varlen
+    m_blocks > 16 (B200 1k-8k, qh 5-16: 12/2 1k-2k, 64/8 1k, varlen 32/2 / 48/4 / 64/8 /
+    MQA at <= 2k keep the loop and gain +5..+25% over the unlooped fold; 48/4 and 64/8 at
+    2k-4k, MQA dense drop it and gain +4..+14%).
 
     FLASH_ATTENTION_BWD_PACK_GQA / _HEAD_LOOP force or exclude candidates,
     FLASH_ATTENTION_BWD_PACK_FACTOR (tests) restricts them to that pack; forced candidates skip
@@ -2486,9 +2492,27 @@ def _bwd_choose_fold(
         chains = max(1, batch_size * num_head // fold(cand))
         return max(0.0, num_clusters / chains - 1.0) * 2 * m_block_size / max(seqlen_q, 1)
 
+    def loop_serialized(cand):
+        # A looped tile walks its qh // pack sub-groups through the dQ chains one after the
+        # other, so its deterministic cost grows with trips * m_blocks, while the alternative
+        # (one tile per sub-group + dK / dV postprocess) only pays K / V reloads that shrink
+        # with the sequence length. Measured crossover on B200 (dense / varlen 1k-8k, qh 5-16):
+        # dense trips * m_blocks > 48, varlen m_blocks > 16 (its LPT schedule tolerates more).
+        pack, loop = cand
+        if not loop:
+            return False
+        m_blocks = -(-seqlen_q // m_block_size)
+        return m_blocks > 16 if varlen else (qh // pack) * m_blocks > 48
+
     ok = [cand for cand in candidates if accepted(cand)]
+    if det_causal and any(not loop for _, loop in ok):
+        # only when an unlooped fold is available: without one (odd qhead_per_kvhead) the
+        # loop stays, one tile per query head with the dK / dV postprocess is far slower
+        ok = [cand for cand in ok if not loop_serialized(cand)]
     for cand in ok:
-        if not det_causal or chain_waste(cand) <= 0.03:
+        # looped candidates are already gated by loop_serialized; the chain waste orders the
+        # unlooped packs (MQA 16/1 4k b8: pack 4 refused, pack 2 taken)
+        if not det_causal or cand[1] or chain_waste(cand) <= 0.03:
             return cand
     if det_causal and ok:
         # every fold waits on the chains; the smallest accepted fold still beats none
