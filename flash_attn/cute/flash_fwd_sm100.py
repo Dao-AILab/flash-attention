@@ -36,6 +36,10 @@ from quack import copy_utils, layout_utils
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
+from flash_attn.cute.copy_utils import (
+    create_ragged_tensor_for_tma_load,
+    offset_ragged_tensor_for_tma_load,
+)
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
@@ -678,6 +682,13 @@ class FlashAttentionForwardSm100:
 
         tma_atom_K = None
         tma_atom_V = None
+        self.ragged_tma_V = (
+            self.use_tma_KV
+            and mPageTable is None
+            and (mCuSeqlensK is not None or mSeqUsedK is not None)
+            and not (isinstance(mV.stride[1], int) and mV.stride[1] == 0)
+        )
+        v_address_strides = None
         if const_expr(self.use_tma_KV):
             # TMA load for K
             tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
@@ -689,9 +700,20 @@ class FlashAttentionForwardSm100:
                 cta_layout_vmnk.shape,
             )
             # TMA load for V
+            # Bound V loads by the logical sequence length. Masking P alone cannot
+            # prevent unused NaN cache entries from entering the PV MMA (0 * NaN).
+            if const_expr(self.ragged_tma_V):
+                v_address_strides = (
+                    mV.stride[2],
+                    mV.stride[3] if const_expr(mCuSeqlensK is None) else Int64(0),
+                    mV.stride[1],
+                )
+                mV_tma = create_ragged_tensor_for_tma_load(mV)
+            else:
+                mV_tma = mV
             tma_atom_V, mV = cute.nvgpu.make_tiled_tma_atom_B(
                 tma_load_op,
-                mV,
+                mV_tma,
                 cute.select(sV_layout, mode=[0, 1, 2]),
                 self.mma_tiler_pv,
                 tiled_mma_pv,
@@ -844,6 +866,7 @@ class FlashAttentionForwardSm100:
             mQ,
             mK,
             mV,
+            v_address_strides,
             mO,
             mLSE,
             mCuSeqlensQ,
@@ -907,6 +930,7 @@ class FlashAttentionForwardSm100:
         mQ: cute.Tensor,  # (s_q, d, h, b) or (total_q, d, h) if there is cu_seqlens_q
         mK: cute.Tensor,  # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there is cu_seqlens_k or (page_size, d, h_k, num_pages) if there is page_table
         mV: cute.Tensor,  # (d, s_k, h_k, b_k) or (d, total_k, h_k) if there is cu_seqlens_k or (d, page_size, h_k, num_pages) if there is page_table
+        v_address_strides: Optional[tuple],
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
@@ -1318,6 +1342,7 @@ class FlashAttentionForwardSm100:
                 mQ,
                 mK,
                 mV,
+                v_address_strides,
                 sQ,
                 sK,
                 sV,
@@ -1491,6 +1516,7 @@ class FlashAttentionForwardSm100:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        v_address_strides: Optional[tuple],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -1537,12 +1563,24 @@ class FlashAttentionForwardSm100:
             )
             if const_expr(mPageTable is None):
                 if const_expr(not seqlen.has_cu_seqlens_k):
-                    mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
+                    mK_cur = mK[None, None, head_idx_kv, batch_idx]
                 else:
                     mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
+                if const_expr(self.ragged_tma_V):
+                    outer_offset = (
+                        Int64(head_idx_kv) * v_address_strides[0]
+                        + Int64(batch_idx) * v_address_strides[1]
+                    )
+                    mV_cur = None  # V's row bound and address are formed per tile.
+                elif const_expr(not seqlen.has_cu_seqlens_k):
+                    mV_cur = mV[None, None, head_idx_kv, batch_idx]
+                else:
                     mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, head_idx_kv])
                 gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
-                gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+                gV = (
+                    cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+                    if const_expr(mV_cur is not None) else None
+                )
             else:
                 # Need to keep batch coord None since we'll index into it with page idx
                 mK_cur, mV_cur = [t[None, None, head_idx_kv, None] for t in (mK, mV)]
@@ -1553,7 +1591,7 @@ class FlashAttentionForwardSm100:
                     mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None, None)
                 )
             tSgK = thr_mma_qk.partition_B(gK)
-            tOgV = thr_mma_pv.partition_B(gV)
+            tOgV = thr_mma_pv.partition_B(gV) if const_expr(gV is not None) else None
             if const_expr(self.use_tma_Q):
                 tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
                 gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
@@ -1587,13 +1625,16 @@ class FlashAttentionForwardSm100:
                     cute.group_modes(sK, 0, 3),
                     cute.group_modes(tSgK, 0, 3),
                 )
-                tVsV, tVgV = cpasync.tma_partition(
-                    tma_atom_V,
-                    0,  # no multicast
-                    cute.make_layout(1),
-                    cute.group_modes(sV, 0, 3),
-                    cute.group_modes(tOgV, 0, 3),
-                )
+                if const_expr(not self.ragged_tma_V):
+                    tVsV, tVgV = cpasync.tma_partition(
+                        tma_atom_V,
+                        0,  # no multicast
+                        cute.make_layout(1),
+                        cute.group_modes(sV, 0, 3),
+                        cute.group_modes(tOgV, 0, 3),
+                    )
+                else:
+                    tVsV, tVgV = None, None
                 paged_kv_manager = None
             else:
                 page_size = mK.shape[0]
@@ -1626,16 +1667,23 @@ class FlashAttentionForwardSm100:
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
             )
-            load_V = partial(
-                self.load_KV,
-                tma_atom_V,
-                tVgV,
-                tVsV,
-                paged_kv_manager,
-                sV,
-                pipeline_kv=pipeline_kv,
-                K_or_V="V",
-            )
+            if const_expr(self.ragged_tma_V):
+                load_V = partial(
+                    self.load_V_ragged, tma_atom_V, mV, sV, thr_mma_pv,
+                    outer_offset, v_address_strides[2], seqlen.offset_k, seqlen.seqlen_k,
+                    pipeline_kv=pipeline_kv,
+                )
+            else:
+                load_V = partial(
+                    self.load_KV,
+                    tma_atom_V,
+                    tVgV,
+                    tVsV,
+                    paged_kv_manager,
+                    sV,
+                    pipeline_kv=pipeline_kv,
+                    K_or_V="V",
+                )
 
             if const_expr(not self.use_block_sparsity):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
@@ -3472,6 +3520,37 @@ class FlashAttentionForwardSm100:
         pack_gqa.load_Q(mQ, sQ_pi, gmem_tiled_copy_Q, tidx, m_block * self.q_stage + block, seqlen_q)
         cute.arch.cp_async_commit_group()
         pipeline_q.sync_object_full.arrive_cp_async_mbarrier(stage)
+
+    @cute.jit
+    def load_V_ragged(
+        self,
+        tma_atom: cute.CopyAtom,
+        mV: cute.Tensor,
+        sV: cute.Tensor,
+        thr_mma: cute.ThrMma,
+        outer_offset: Int64,
+        row_stride: Int64,
+        offset: Int32,
+        length: Int32,
+        block: Int32,
+        pipeline_kv: pipeline.PipelineAsync,
+        producer_state: pipeline.PipelineState,
+        page_idx: Optional[Int32] = None,
+    ):
+        assert page_idx is None
+        view = offset_ragged_tensor_for_tma_load(
+            mV, outer_offset, row_stride, offset, length, block,
+            block_size=self.n_block_size, dtype=self.v_dtype,
+        )
+        gV = cute.local_tile(view, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+        tOgV = thr_mma.partition_B(gV)
+        tVsV, tVgV = cpasync.tma_partition(
+            tma_atom, 0, cute.make_layout(1),
+            cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3),
+        )
+        self.load_KV(
+            tma_atom, tVgV, tVsV, None, sV, 0, pipeline_kv, producer_state, "V"
+        )
 
     @cute.jit
     def load_KV(

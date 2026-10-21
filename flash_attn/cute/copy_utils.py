@@ -5,7 +5,7 @@ from typing import Optional, Type, Callable
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -286,6 +286,71 @@ def cpasync_reduce_bulk_add_f32(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@dsl_user_op
+def create_ragged_tensor_for_tma_load(tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    """Create a load-safe descriptor view of a tensor with modes (features, rows, ...).
+
+    Features must have unit stride, and row/outer offsets must be 16-byte aligned.
+    Outer modes are addressed by their element offsets using
+    ``offset_ragged_tensor_for_tma_load``; the allocation base stays unchanged.
+    """
+    # quack's create_ragged_tensor_for_tma(ptr_shift=True) is store-only: its
+    # shifted base can leave mapped memory. The load-safe wraparound form accepts
+    # rank <= 3, so it cannot represent dense (batch, sequence, head, feature) KV.
+    # Fold the outer modes into two address axes to support dense and packed KV
+    # with large offsets while retaining the real feature extent for zero-fill.
+    alignment = 128 // tensor.element_type.width
+    # TMA byte strides must be < 2**40. The row and wrap strides sum to
+    # wrap_stride, and ragged_rows * wrap_stride == 2**64.
+    wrap_stride = 2**40 // (tensor.element_type.width // 8)
+    ragged_rows = 2**64 // wrap_stride
+    # The low-address extent prevents coalescing the address axes into a
+    # single coordinate wider than Int32.
+    layout = cute.make_layout(
+        (tensor.shape[0], ragged_rows, 2**30 + 1, 2**31 - 1, ragged_rows + 1),
+        stride=(
+            1,
+            tensor.stride[1],
+            alignment,
+            Int64(alignment * 2**30),
+            wrap_stride - tensor.stride[1],
+        ),
+        loc=loc,
+        ip=ip,
+    )
+    return cute.make_tensor(tensor.iterator, layout, loc=loc, ip=ip)
+
+
+@cute.jit
+def offset_ragged_tensor_for_tma_load(
+    tensor: cute.Tensor,
+    outer_offset: Int64,
+    row_stride: Int64,
+    offset: Int32,
+    length: Int32,
+    block: Int32,
+    block_size: cutlass.Constexpr[int],
+    dtype: cutlass.Constexpr,
+) -> cute.Tensor:
+    """Select a (features, rows) tile view, zero-filling rows past its sequence.
+
+    ``tensor`` is the coordinate tensor returned by TMA atom construction from
+    ``create_ragged_tensor_for_tma_load``. Offsets and strides are in elements of
+    ``dtype``. A negative block selects an entirely zero-filled dummy tile.
+    """
+    ragged_rows = cute.size(tensor, mode=[1])
+    start = cutlass.max(block, 0) * block_size
+    valid = cutlass.min(cutlass.max(length - start, 0), block_size)
+    if block < 0:
+        valid = 0
+    # The row and wrap axes contribute (row - valid) * row_stride modulo 2**64.
+    # The two address axes supply the remaining offset without Int32 narrowing.
+    address = outer_offset + (Int64(offset) + start + valid) * row_stride
+    address = address // (128 // dtype.width)
+    view = tensor[None, None, Int32(address % 2**30), Int32(address // 2**30), ragged_rows]
+    return cute.domain_offset((0, ragged_rows - valid), view)
 
 
 def cpasync_bulk_get_copy_fn(
