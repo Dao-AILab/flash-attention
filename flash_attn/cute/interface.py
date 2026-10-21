@@ -2303,6 +2303,13 @@ def _bwd_choose_fold(
         and head_loop_override is None
         and pack_factor_override is None
     )
+    nondet_causal = (
+        causal
+        and not deterministic
+        and pack_gqa_override is None
+        and head_loop_override is None
+        and pack_factor_override is None
+    )
     num_clusters = max(1, num_sms // cluster_size)
 
     def chain_waste(cand):
@@ -2335,17 +2342,30 @@ def _bwd_choose_fold(
             return False
         return -(-seqlen_q // m_block_size) * head_dim > 4096
 
+    def wide_pack_slow(cand):
+        # Off the deterministic path the hdim 192 kernel prefers pack 2 to a partial pack 4
+        # from 4k on as well (B200, -lgc 1965, causal, pack 2 / pack 4 / unpacked): 4k b8 MQA
+        # 16/1 805 / 770 / 787 (varlen 811 / 777 / 789), GQA 64/8 825 / 803 / 781, 48/4 847 /
+        # 840 / 799; 8k b4 48/4 879 / 874 / 864, 64/8 876 / 850 / 850. The full pack keeps
+        # pack 4 (32/8 4k b8 818 / 835 / 788), and so does hdim 128 (4k b8 48/4 1048 / 1058,
+        # 32/8 1011 / 1063; 8k b4 48/4 1138 / 1167 both rounds).
+        pack, loop = cand
+        if loop or pack <= 2 or cluster_size == 1 or head_dim <= 128 or head_loop_possible:
+            return False
+        return qh > pack and -(-seqlen_q // m_block_size) >= 32
+
     ok = [cand for cand in candidates if accepted(cand)]
     if det_causal and any(not loop for _, loop in ok):
         # only when an unlooped fold is available: without one (odd qhead_per_kvhead) the
         # loop stays, one tile per query head with the dK / dV postprocess is far slower
         ok = [cand for cand in ok if not loop_serialized(cand)]
-    if det_causal and any(wide_pack_serialized(cand) for cand in ok):
+    wide = wide_pack_serialized if det_causal else wide_pack_slow if nondet_causal else None
+    if wide is not None and any(wide(cand) for cand in ok):
         # step down to pack 2 whether or not the heuristic took it for its own tile count (it
         # halves the gain of a 4+ way partial pack): the saving the wide pack was accepted
         # for is there at pack 2 too, without the chain hops. Measured at 8k b4 over the
         # unpacked kernel: hdim 192 GQA 48/4 +2%, 64/8 0%, hdim 128 +7 / +8%, hdim 256 +8 / +10%.
-        keep = {cand for cand in ok if not wide_pack_serialized(cand)} | {(2, False)}
+        keep = {cand for cand in ok if not wide(cand)} | {(2, False)}
         ok = [cand for cand in candidates if cand in keep]
     for cand in ok:
         # looped candidates are already gated by loop_serialized; the chain waste orders the

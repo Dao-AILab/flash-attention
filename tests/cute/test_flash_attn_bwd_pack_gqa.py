@@ -449,7 +449,29 @@ def test_bwd_choose_fold():
     assert decide(4, 48, 4, 8192, True, True) == (2, False)  # hdim 256: +8% over pack 4
     assert decide(8, 64, 8, 4096, True, True, head_loop_possible=False, cluster_size=1, head_dim=64) == (4, False)
     assert decide(4, 64, 8, 8192, True, True, head_loop_possible=False, cluster_size=1, head_dim=64) == (4, False)
-    assert decide(4, 48, 4, 8192, True, False, head_loop_possible=False, head_dim=192) == (4, False)  # non-det unchanged
+    # off the deterministic path the hdim 192 kernel also steps a partial pack 4 down to pack 2
+    # from 4k on (pack 2 / pack 4 / unpacked on B200: MQA 16/1 4k b8 805 / 770 / 787, GQA 64/8
+    # 825 / 803 / 781, 48/4 8k b4 879 / 874 / 864); the full pack 4 of GQA 32/8 stays (818 /
+    # 835 / 788), hdim 128 keeps pack 4 (48/4 8k b4 1167 vs 1138), and 2k is below the rule
+    for heads, heads_kv, seqlen, expect in (
+        (48, 4, 4096, (2, False)),
+        (48, 4, 8192, (2, False)),
+        (64, 8, 4096, (2, False)),
+        (64, 8, 8192, (2, False)),
+        (32, 2, 4096, (2, False)),
+        (16, 1, 4096, (2, False)),
+        (32, 8, 4096, (4, False)),
+        (48, 4, 2048, (4, False)),
+        (16, 1, 2048, (4, False)),
+    ):
+        for varlen in (False, True):
+            assert decide(
+                32768 // seqlen, heads, heads_kv, seqlen, True, False, head_loop_possible=False,
+                head_dim=192, varlen=varlen,
+            ) == expect, (heads, seqlen, varlen)
+    assert decide(4, 48, 4, 8192, True, False, head_loop_possible=False, head_dim=128) == (4, False)
+    assert decide(8, 64, 8, 4096, True, False, head_loop_possible=False, head_dim=128) == (4, False)
+    assert decide(8, 48, 4, 4096, False, False, head_loop_possible=False, head_dim=192) == (4, False)  # non-causal unchanged
     # deterministic non-causal: no pace difference, the default fold
     assert decide(16, 16, 1, 2048, False, True) == (2, True)
     # overrides
