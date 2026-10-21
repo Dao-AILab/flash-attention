@@ -2175,6 +2175,7 @@ def _bwd_choose_fold(
     total_k: int,
     m_block_size: int,
     n_block_size: int,
+    head_dim: int,
     causal: bool,
     local: bool,
     varlen: bool,
@@ -2201,7 +2202,14 @@ def _bwd_choose_fold(
     co-resident tiles per chain = clusters / chains and chains = batch * num_head / fold; the
     largest fold under 3% wins, else the smallest accepted fold (B200 hd256 vs the default: MQA
     16/1 2k b16 pack 4 +13%, 4k b8 pack 2 +14%, GQA 32/2 2k b16 pack 4 +9%, 24/4 8k b4 pack 2
-    +10%; hdim 192 GQA 32/8 4k b8 / 8k b4 pack 2 +3% / +7% over pack 4). The looped candidates are first dropped when the loop itself serializes too much:
+    +10%; hdim 192 GQA 32/8 4k b8 / 8k b4 pack 2 +3% / +7% over pack 4). On the 2-CTA kernel
+    pack 4 is dropped for pack 2 once m_blocks * head_dim > 4096 (hdim 128 past 4k, hdim 192 /
+    256 past 2k) whatever the chain waste says: a pack 4 tile walks twice the chain hops across
+    the CTA pair, each moving its dQaccum slab (m_block_size x head_dim fp32), for a K / V
+    saving over pack 2 that shrinks with the sequence (pack 2 over pack 4: hdim 192 GQA 32/2,
+    32/8, 48/4, 64/8 4k b8 +3..+8%, 48/4, 64/8 8k b4 +8..+9%, hdim 256 48/4, 64/8 8k b4 +8%,
+    hdim 128 64/8 8k b4 +3..+7%; pack 4 keeps +1..+21% at 1k-2k everywhere and +4% at hdim 128
+    32/8 4k b8). The looped candidates are first dropped when the loop itself serializes too much:
     a looped tile walks its sub-groups through the chains one after the other, so its cost
     grows with trips * m_blocks while the per-sub-group alternative only pays K / V reloads
     that shrink with seqlen -- measured crossover dense trips * m_blocks > 48, varlen
@@ -2313,11 +2321,32 @@ def _bwd_choose_fold(
         m_blocks = -(-seqlen_q // m_block_size)
         return m_blocks > 16 if varlen else (qh // pack) * m_blocks > 48
 
+    def wide_pack_serialized(cand):
+        # On the 2-CTA kernel a deterministic causal pack 4 tile loses to pack 2 as the
+        # sequence grows: it walks twice the chain hops (pack * m_blocks acquire / release
+        # pairs, each across the CTA pair and each moving the tile's dQaccum slab of
+        # m_block_size x head_dim fp32) for a K / V saving over pack 2 that shrinks with the
+        # sequence. Measured on B200 (-lgc 1965, pack 4 vs pack 2): 1k b32 +7..+21% and 2k b16
+        # +1..+9% everywhere; 4k b8 hdim 128 +4% (GQA 32/8) .. -1%, hdim 192 -3..-8%, hdim 256
+        # -2..+1%; 8k b4 hdim 128 -7..0%, hdim 192 -8..-9%, hdim 256 -8%: crossover m_blocks *
+        # head_dim > 4096. The 1-CTA hdim 64 kernel keeps pack 4 (4k b8 +5%, 8k b4 level).
+        pack, loop = cand
+        if loop or pack <= 2 or cluster_size == 1:
+            return False
+        return -(-seqlen_q // m_block_size) * head_dim > 4096
+
     ok = [cand for cand in candidates if accepted(cand)]
     if det_causal and any(not loop for _, loop in ok):
         # only when an unlooped fold is available: without one (odd qhead_per_kvhead) the
         # loop stays, one tile per query head with the dK / dV postprocess is far slower
         ok = [cand for cand in ok if not loop_serialized(cand)]
+    if det_causal and any(wide_pack_serialized(cand) for cand in ok):
+        # step down to pack 2 whether or not the heuristic took it for its own tile count (it
+        # halves the gain of a 4+ way partial pack): the saving the wide pack was accepted
+        # for is there at pack 2 too, without the chain hops. Measured at 8k b4 over the
+        # unpacked kernel: hdim 192 GQA 48/4 +2%, 64/8 0%, hdim 128 +7 / +8%, hdim 256 +8 / +10%.
+        keep = {cand for cand in ok if not wide_pack_serialized(cand)} | {(2, False)}
+        ok = [cand for cand in candidates if cand in keep]
     for cand in ok:
         # looped candidates are already gated by loop_serialized; the chain waste orders the
         # unlooped packs (MQA 16/1 4k b8: pack 4 refused, pack 2 taken)
@@ -2722,6 +2751,7 @@ def _flash_attn_bwd(
         total_k=total_k,
         m_block_size=m_block_size,
         n_block_size=n_block_size,
+        head_dim=head_dim,
         causal=causal,
         local=local,
         varlen=is_varlen_any,
