@@ -12,6 +12,23 @@ softmax max of training forwards is a separate change, see
 Kernels: `flash_fwd_mla_sm100.py` (residual store in the correction/epilogue warps),
 `flash_bwd_preprocess.py` (residual consumption), `interface.py` (`o_lo` plumbing).
 
+The dense SM100 forward emits the same residual when a `learnable_sink` requires grad
+(`flash_fwd_sm100.py` `correction_residual`; with split KV the combine kernel,
+`flash_fwd_combine.py`, writes it from its fp32 combined O). dsink = -sum_rows
+exp(sink - lse) * dpsum cancels heavily (sum of |terms| up to 1000x the result), which
+amplifies the bf16-O rounding in dpsum far beyond what dq sees (issue #2969). The pass runs
+in the correction warps after sO is handed to the TMA store and before the TMEM O buffer is
+released. The public dense and varlen entry points disable this residual when the caller
+is in `no_grad` or `inference_mode`, even if the sink parameter still requires grad.
+The residual removes output downcast error; probability rounding in the PV MMA remains.
+The `q=0` backward oracle in `tests/cute/test_flash_attn_sink_precision.py` isolates the
+downcast contribution and checks residual consumption without a randomized error allowance.
+Randomized tests use an empirical dtype-dependent RMS scale of the products before
+head-dimension and row cancellation, with the reference sink probability retained in fp32;
+this allowance is not a worst-case bound.
+The training pass costs ~2.5 us per 128-row tile on B200 when the tile's epilogue is exposed
+(causal hd128: +7% forward at 8K, +3% at 32K, +15% at 2K; non-causal within noise).
+
 ## Method
 
 `agent_space/dsa-accuracy/decomp.py` runs one sparse-MLA fwd+bwd (B=1, H=128,
