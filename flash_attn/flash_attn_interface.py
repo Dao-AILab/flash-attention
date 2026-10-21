@@ -4,21 +4,15 @@ from typing import Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
-import os
-import warnings
+
+from flash_attn._backend import select_amd_backend
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
-USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
-if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
-    try:
-        import flash_attn_2_cuda
-    except ImportError:
-        warnings.warn("flash_attn_2_cuda (which has ROCm/HIP kernels) not found, falling back to Triton implementation")
-        USE_TRITON_ROCM = True
+AMD_BACKEND = select_amd_backend(getattr(torch.version, 'hip', None) is not None)
 
-if USE_TRITON_ROCM:
-    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2 as flash_attn_gpu
+if AMD_BACKEND in ("aiter", "triton"):
+    from flash_attn.flash_attn_interface_aiter import flash_attn_2 as flash_attn_gpu
 else:
     import flash_attn_2_cuda as flash_attn_gpu
 
