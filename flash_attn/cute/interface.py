@@ -2310,13 +2310,19 @@ def _bwd_pack_gqa_heuristic(
     causal: bool,
     local: bool,
     varlen: bool,
+    kv_group: int = 1,
 ) -> bool:
     """Whether the SM100 backward should pack the query heads of a KV head into the Q tile.
 
     Packing divides the tile count by qhead_per_kvhead. Its per-tile saving (K/V loaded once per
     KV head, dK/dV kept in TMEM, no fp32 dK/dV accumulate + postprocess) shrinks with seqlen_q,
     while the wave-quantization loss of the smaller grid can grow; measured on B200: ~25% gross
-    gain at 2k, ~7% at 8k, and a 3.5-wave packed grid loses ~13%.
+    gain at 2k, ~7% at 8k, and a 3.5-wave packed grid loses ~13%. A partial pack of four or
+    more sub-groups (kv_group tiles per KV head, their dK / dV through the fp32 accumulate +
+    postprocess) keeps half of that saving: hdim 128 / 64 MQA 16/1 and GQA 32/2 pack 4
+    (kv_group 4 / 8) causal gain +7..+10% at 2k, +1..+5% at 4k and lose 2..3% at 8k, where the
+    full-pack model still packs; two sub-groups keep the saving (hdim 192 GQA 32/8 pack 2 +3%
+    at 8k causal, hdim 128 GQA 64/8 pack 4 within 2% of unpacked there).
 
     A packed tile also loops over qhead_per_kvhead times more Q rows, so the longest packed CTA
     runs qh * ceil(seqlen_q / tile_m) iterations (every KV tile, or the first one with causal).
@@ -2351,6 +2357,8 @@ def _bwd_pack_gqa_heuristic(
     ctas_unpacked = batch_size * num_head * n_blocks_kv * cluster_size
     ctas_packed = batch_size * num_head_kv * n_blocks_kv * cluster_size
     gain = 0.25 * 2048 / max(seqlen_q, 1)
+    if kv_group >= 4:
+        gain *= 0.5
     if causal or local:
         # causal / local tiles are uneven and the qh-times longer packed tiles balance
         # worse at the tail: smaller gain, and only pack with a margin
@@ -2384,12 +2392,11 @@ def _bwd_choose_fold(
     """How the SM100 backward folds the query heads of a KV head into tiles: (pack_factor,
     head_loop). Candidates with the head loop (hdim 256), largest fold first: pack 2 + loop
     over the other sub-groups (fold = qhead_per_kvhead, the default; qhead_per_kvhead 2 is the
-    one pack), loop only, pack 4, pack 2; without it one pack of the largest power of two
-    dividing qhead_per_kvhead (the other sub-groups go through the dK / dV postprocess). The
-    first one the
-    pack_gqa heuristic accepts for its own tile count wins (a smaller fold has a shorter
-    critical path and a bigger grid, so it can pass where the full fold does not: MQA 16/1 4k
-    b8 causal).
+    one pack), loop only, pack 4, pack 2; without it pack 4 and pack 2 when they divide
+    qhead_per_kvhead, largest first (the other sub-groups go through the dK / dV
+    postprocess). The first one the pack_gqa heuristic accepts for its own tile count wins (a
+    smaller fold has a shorter critical path and a bigger grid, so it can pass where the full
+    fold does not: MQA 16/1 4k b8 causal).
 
     Deterministic causal adds the dQ semaphore chains: they run over the n_blocks of a (batch,
     scratch head), and with causal tile n_block k has one more m_block per pass than tile
@@ -2398,7 +2405,7 @@ def _bwd_choose_fold(
     co-resident tiles per chain = clusters / chains and chains = batch * num_head / fold; the
     largest fold under 3% wins, else the smallest accepted fold (B200 hd256 vs the default: MQA
     16/1 2k b16 pack 4 +13%, 4k b8 pack 2 +14%, GQA 32/2 2k b16 pack 4 +9%, 24/4 8k b4 pack 2
-    +10%). The looped candidates are first dropped when the loop itself serializes too much:
+    +10%; hdim 192 GQA 32/8 4k b8 / 8k b4 pack 2 +3% / +7% over pack 4). The looped candidates are first dropped when the loop itself serializes too much:
     a looped tile walks its sub-groups through the chains one after the other, so its cost
     grows with trips * m_blocks while the per-sub-group alternative only pays K / V reloads
     that shrink with seqlen -- measured crossover dense trips * m_blocks > 48, varlen
@@ -2429,11 +2436,15 @@ def _bwd_choose_fold(
                 candidates.append((pack, False))
         candidates.append((1, True))
     else:
-        # no head loop (not hdim 256): one pack of the largest power of two dividing
-        # qhead_per_kvhead; the other sub-groups go through the dK / dV postprocess
-        pack = min(qh & -qh, m_block_size)
-        if pack > 1:
+        # no head loop (not hdim 256): pack 4 and pack 2 (when they divide qhead_per_kvhead),
+        # largest first; the other sub-groups go through the dK / dV postprocess. Wider packs
+        # lose on B200 as the sequence grows (hdim 128 / 64 MQA 16/1 and GQA 32/2 causal 2k-8k:
+        # pack 16 -5..-38%, pack 8 -2..-15%, pack 4 +1..+10%; non-causal 1k pack 16 is only
+        # 0..3% ahead of pack 4), the chain rules below then have pack 2 to step down to.
+        pack = min(qh & -qh, m_block_size, 4)
+        while pack > 1:
             candidates.append((pack, False))
+            pack //= 2
     if not fold_allowed:
         candidates = [c for c in candidates if c[1] and head_loop_override is True]
     if head_loop_override is False:
@@ -2464,6 +2475,8 @@ def _bwd_choose_fold(
     def accepted(cand):
         return forced(cand) or _bwd_pack_gqa_heuristic(
             num_sms=num_sms,
+            # off hdim 256 a pack below qhead_per_kvhead pays the dK / dV postprocess
+            kv_group=1 if head_loop_possible else qh // fold(cand),
             batch_size=batch_size,
             num_head=num_head,
             num_head_kv=num_head // fold(cand),
