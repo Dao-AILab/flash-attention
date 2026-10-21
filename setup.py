@@ -8,6 +8,7 @@ import os
 import re
 import ast
 import glob
+import hashlib
 import shutil
 import tempfile
 from pathlib import Path
@@ -64,6 +65,8 @@ BASE_WHEEL_URL = (
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 USE_SYSTEM_AITER = os.getenv("FLASH_ATTENTION_USE_SYSTEM_AITER", "FALSE") == "TRUE"
+# CK backend: run the backward with aiter's assembly kernels where they apply (gfx942/gfx950).
+CK_AITER_BWD = os.getenv("FLASH_ATTENTION_CK_AITER_BWD", "TRUE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
@@ -270,6 +273,99 @@ def get_ck_tile_bfloat16_supported_modes(ck_dir):
 cmdclass = {}
 ext_modules = []
 
+# gfx942 has fmha_v3_bwd kernels too, but they have not been validated against fmha_bwd.
+AITER_BWD_ARCHS = ("gfx950",)
+
+
+# aiter's hdim-128 causal backward kernels miss an s_barrier between a KV tile's last dK LDS read and
+# the next tile's LDS zero-fill, so a wave that runs ahead can zero another wave's staged dK (wrong dK
+# when the GPU is shared with other processes). The two FA launches on gfx950 are patched here: the
+# no-op `s_cbranch_scc1` (branch to the next instruction) after those reads becomes `s_barrier`.
+# Only these exact files are patched; for anything else aiter_bwd_v3.cpp keeps those cases on fmha_bwd.
+AITER_BWD_DK_FIX = {
+    "gfx950/fmha_v3_bwd/bwd_hd128_bf16_causal_br_a32_psskddv.co":
+        ("6d272c1b48014205680d1927180e72f3f2b3f3f9a84fa180ca49a409c93bc482", 0xB76C, "gfx950", "bf16"),
+    "gfx950/fmha_v3_bwd/bwd_hd128_fp16_causal_br_a32_psskddv.co":
+        ("98f9eb68da853427bf9c14f58371ce9c0f2cf596e2604e2476ba53e0519f91da", 0xB76C, "gfx950", "fp16"),
+}
+S_CBRANCH_SCC1_NEXT = bytes.fromhex("000085bf")
+S_BARRIER = bytes.fromhex("00008abf")
+
+
+def patch_aiter_bwd_code_object(path, arch):
+    """Return the file to embed for `path` and, if it got the dK fix, the (arch, dtype) it covers."""
+    rel = f"{arch}/fmha_v3_bwd/{path.name}"
+    if rel not in AITER_BWD_DK_FIX:
+        return path, None
+    sha, offset, fix_arch, dtype = AITER_BWD_DK_FIX[rel]
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != sha or data[offset:offset + 4] != S_CBRANCH_SCC1_NEXT:
+        warnings.warn(f"{rel} is not the version the dK fix was made for; masked hdim 65-128 {dtype} "
+                      "backward stays on fmha_bwd")
+        return path, None
+    out = Path("build") / "aiter_hsa_patched" / rel
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data[:offset] + S_BARRIER + data[offset + 4:])
+    return out.resolve(), (fix_arch, dtype)
+
+
+def generate_aiter_bwd_v3(kernel_targets):
+    """Generate what csrc/flash_attn_ck/aiter_bwd_v3.cpp needs from third_party/aiter: the fmha_v3_bwd
+    kernel table, and the code objects it launches embedded with .incbin so that nothing has to be
+    found at runtime. Returns False when no target has these kernels.
+    """
+    archs = [arch for arch in kernel_targets if arch in AITER_BWD_ARCHS]
+    hsa_dir = Path(this_dir) / "third_party" / "aiter" / "hsa"
+    if not archs or not (hsa_dir / "codegen.py").exists():
+        return False
+    try:
+        subprocess.run(
+            [sys.executable, str(hsa_dir / "codegen.py"), "-m", "fmha_v3_bwd", "--output_dir", "build"],
+            check=True,
+            env={**os.environ, "AITER_GPU_ARCHS": ";".join(archs)},
+        )
+    except subprocess.CalledProcessError:  # e.g. pandas, which the codegen needs, is missing
+        warnings.warn("aiter fmha_v3_bwd codegen failed; the CK backward will not use aiter's assembly kernels")
+        return False
+    # Included through the include path, not by relative path, so hipify rewrites its includes
+    # like those of the other sources and the TU sees one copy of the CK headers.
+    shutil.copy(Path(this_dir) / "third_party" / "aiter" / "csrc" / "cpp_itfs" / "mha_bwd.cu", "build/fa_aiter_mha_bwd.hpp")
+    code_objects = sorted(
+        path for arch in archs for path in (hsa_dir / arch / "fmha_v3_bwd").glob("*.co")
+    )
+    decls, entries, asm, fixed = [], [], [], []
+    for i, path in enumerate(code_objects):
+        sym = f"flash_aiter_hsa_{i}"
+        arch = path.parent.parent.name
+        key = f"hsa/{arch}/fmha_v3_bwd/{path.name}"
+        embed, fix = patch_aiter_bwd_code_object(path, arch)
+        if fix is not None:
+            fixed.append(fix)
+        decls.append(f"extern const char {sym}_begin[];\nextern const char {sym}_end[];")
+        entries.append(f'        {{"{key}", std::string_view({sym}_begin, {sym}_end - {sym}_begin)}},')
+        asm.append(
+            f'__asm__(".section .rodata\\n.balign 64\\n.global {sym}_begin\\n.hidden {sym}_begin\\n'
+            f'{sym}_begin:\\n.incbin \\"{embed}\\"\\n.global {sym}_end\\n.hidden {sym}_end\\n{sym}_end:\\n'
+            f'.byte 0\\n.previous");'
+        )
+    fixed_cond = " ||\n           ".join(f'(arch == "{a}" && dtype == "{t}")' for a, t in sorted(fixed)) or "false"
+    Path("build/fa_aiter_hsa_embed.hpp").write_text(
+        "#pragma once\n#include <string>\n#include <string_view>\n#include <unordered_map>\n\n"
+        'extern "C" {\n' + "\n".join(decls) + "\n}\n\n"
+        "inline const std::unordered_map<std::string, std::string_view>& flash_aiter_embedded_hsa_map()\n{\n"
+        "    static const std::unordered_map<std::string, std::string_view> map = {\n"
+        + "\n".join(entries) + "\n    };\n    return map;\n}\n\n"
+        "// Whether the embedded bottom-right-causal hdim-128 kernel for arch/dtype has the dK barrier fix.\n"
+        "inline bool flash_aiter_bwd_dk_fixed(const std::string& arch, const std::string& dtype)\n{\n"
+        f"    return {fixed_cond};\n}}\n"
+    )
+    # Host pass only: the device pass must not carry the code objects.
+    Path("build/fa_aiter_hsa_embed.inc").write_text(
+        "#if !defined(__HIP_DEVICE_COMPILE__)\n" + "\n".join(asm) + "\n#endif\n"
+    )
+    return True
+
+
 def check_system_aiter():
     """Check an installed aiter provides the Triton kernels, without importing it: find_spec() on a
     dotted name imports the parent, and importing aiter JIT-builds against a GPU the build has not got.
@@ -306,6 +402,8 @@ if IS_ROCM:
     elif ROCM_BACKEND == "ck":
         if os.path.isdir(".git"):
             subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
+            if CK_AITER_BWD:
+                subprocess.run(["git", "submodule", "update", "--init", "third_party/aiter"], check=True)
         else:
             assert os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py"), (
                 "csrc/composable_kernel is missing, please use source distribution or git clone"
@@ -560,6 +658,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         targets_arg = ",".join(kernel_targets)
         for direction in ["fwd", "fwd_appendkv", "fwd_splitkv", "bwd"]:
             subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", direction, "--output_dir", "build", "--receipt", "2", "--optdim", optdim, "--targets", targets_arg], check=True)
+        aiter_bwd = CK_AITER_BWD and generate_aiter_bwd_v3(kernel_targets)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -586,6 +685,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                 "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
             f"build/fmha_*wd*.cpp"
         )
+        if aiter_bwd:
+            sources.append("csrc/flash_attn_ck/aiter_bwd_v3.cpp")
 
         # Check if torch is using hipify v2. Until CK is updated with HIPIFY_V2 macro,
         # we must replace the incorrect APIs.
@@ -634,6 +735,9 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                         "csrc/flash_attn_ck/mha_fwd.cu",
                         "csrc/flash_attn_ck/mha_varlen_bwd.cu",
                         "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
+        if aiter_bwd:
+            renamed_sources.append("csrc/flash_attn_ck/aiter_bwd_v3.cu")
+            cc_flag += ["-DFLASHATTENTION_CK_AITER_BWD"]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()
@@ -659,6 +763,11 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             Path(this_dir) / "csrc" / "composable_kernel" / "library" / "include",
             Path(this_dir) / "csrc" / "composable_kernel" / "example" / "ck_tile" / "01_fmha",
         ]
+        if aiter_bwd:
+            include_dirs += [
+                Path(this_dir) / "third_party" / "aiter" / "csrc" / "include",
+                Path(this_dir) / "build",
+            ]
 
         ext_modules.append(
             CUDAExtension(
