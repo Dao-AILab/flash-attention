@@ -1013,6 +1013,10 @@ class FlashAttentionBackwardSm100:
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
             lpt=self.spt,
             head_swizzle=self.deterministic,
+            # the tile's Q / dO / dQaccum footprint covers its packed heads and, with the head
+            # loop, every sub-group of the KV head; it sizes the deterministic L2 section
+            qhead_fold=self.pack_factor * (self.kv_group if const_expr(self.head_loop) else 1),
+            qhead_pack=self.pack_factor,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
