@@ -150,7 +150,7 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
                                                    const at::Tensor q,
                                                    const at::Tensor k,
                                                    const at::Tensor v,
-                                                   const at::Tensor seqlens_k,
+                                                   std::optional<const at::Tensor> seqlens_k_,
                                                    std::optional<const at::Tensor> &cache_batch_idx_,
                                                    std::optional<at::Tensor> &block_table_,
                                                    std::optional<at::Tensor> &alibi_slopes_,
@@ -198,7 +198,8 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
 
     args.seqstart_q_ptr = nullptr;
     args.seqstart_k_ptr = nullptr;
-    args.seqlen_k_ptr = seqlens_k.data_ptr();
+    // Without seqlens_k the kernel attends to all seqlen_k keys of every batch.
+    args.seqlen_k_ptr = seqlens_k_.has_value() ? seqlens_k_.value().data_ptr() : nullptr;
 
     args.seqlen_q = seqlen_q;
     args.seqlen_k = seqlen_k;
