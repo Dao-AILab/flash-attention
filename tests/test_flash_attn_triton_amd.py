@@ -1,10 +1,16 @@
 import math
+import sys
+import types
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn.functional as F
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import get_arch, is_hip
 from einops import rearrange, repeat
+
 from flash_attn import (
+    amd_backend,
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
@@ -14,9 +20,10 @@ from flash_attn import (
     flash_attn_with_kvcache,
 )
 from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size_n
+from flash_attn import flash_attn_interface
+from flash_attn import flash_attn_interface_aiter as adapter
+from flash_attn.flash_attn_interface import AITER_IMPL, AMD_BACKEND, _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import USE_TRITON_ROCM, is_hip, get_arch
 
 
 def _get_block_size_n_triton(device, head_dim, is_dropout, is_causal):
@@ -918,7 +925,7 @@ def test_flash_attn_varlen_qkvpacked(
 def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
-    if USE_TRITON_ROCM:
+    if AITER_IMPL == "triton":
         if causal:
             if seqlen_q ==1024 and seqlen_k==1024 and d==160:
                 pytest.skip("This test with causal=True is flakey")
@@ -1191,7 +1198,7 @@ def test_flash_attn_output(
 def test_flash_attn_varlen_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
-    if USE_TRITON_ROCM:
+    if AITER_IMPL == "triton":
         if seqlen_q == 1 and seqlen_k == 147 and kvpacked == True and dropout_p != 0.0:
             pytest.skip("This config with dropout is flaky on AMD.")
     if (
@@ -1502,7 +1509,7 @@ def test_flash_attn_varlen_output(
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
-    if USE_TRITON_ROCM:
+    if AITER_IMPL == "triton":
         if get_arch().is_rdna:
             if seqlen_q == 1 and seqlen_k == 239 and d == 256:
                 pytest.skip("This config doesnot work on RDNA Devices.")
@@ -1792,7 +1799,7 @@ def test_flash_attn_varlen_causal(
 def test_flash_attn_splitkv(
     seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, alibi, deterministic, dtype
 ):
-    if USE_TRITON_ROCM:
+    if AITER_IMPL == "triton":
         if seqlen_q == 1 and seqlen_k == 339 and swap_sq_sk == True:
             pytest.skip("This config with is flaky on AMD.")
     if swap_sq_sk:
@@ -1952,6 +1959,8 @@ def test_flash_attn_kvcache(
     num_splits,
     dtype,
 ):
+    if AITER_IMPL == "general":
+        pytest.skip("KV-cache attention is not supported by the aiter general implementation")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -2559,3 +2568,170 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
+
+
+@pytest.fixture
+def aiter_calls(monkeypatch):
+    """Stand in for aiter's Triton and general MHA entry points and select the general
+    implementation; monkeypatch undoes both after the test."""
+    triton_fa2 = types.SimpleNamespace(
+        fwd=Mock(return_value=("to", "tl", "tp", "tr")),
+        bwd=Mock(return_value=("tq", "tk", "tv", "td")),
+        varlen_fwd=Mock(return_value=("tvo", "tvl", "tvp", "tvr")),
+        varlen_bwd=Mock(return_value=("tvq", "tvk", "tvv", "tvd")),
+        fwd_kvcache=Mock(return_value=("tco", "tcl")),
+    )
+    general = types.ModuleType("aiter.ops.mha")
+    general._flash_attn_forward = Mock(return_value=("o", "l", "p", "r"))
+    general._flash_attn_backward = Mock(return_value="softmax_d")
+    general._flash_attn_varlen_forward = Mock(return_value=("vo", "vl", "vp", "vr"))
+    general._flash_attn_varlen_backward = Mock(return_value="varlen_d")
+    ops = types.ModuleType("aiter.ops")
+    ops.mha = general
+    monkeypatch.setitem(sys.modules, "aiter.ops", ops)
+    monkeypatch.setitem(sys.modules, "aiter.ops.mha", general)
+    monkeypatch.setattr(adapter, "_triton_fa2", triton_fa2)
+    monkeypatch.setattr(adapter, "AITER_IMPL", "general")
+    return types.SimpleNamespace(triton=triton_fa2, general=general)
+
+
+def test_general_dense_forward_uses_aiter_dispatch(aiter_calls):
+    # aiter returns CK's random bytes; FA's record is >= 0 kept, < 0 dropped.
+    randval = torch.tensor([0, 18, 229, 230, 255], dtype=torch.uint8)
+    aiter_calls.general._flash_attn_forward.return_value = ("o", "l", randval, "r")
+    result = adapter.flash_attn_2.fwd(
+        "q", "k", "v", None, "alibi", 0.1, 0.5, True, 4, 2, 0.0, True
+    )
+    assert (result[0], result[1], result[3]) == ("o", "l", "r")
+    assert torch.equal(result[2], torch.tensor([229.0, 211.0, 0.0, -1.0, -26.0]))
+    args = aiter_calls.general._flash_attn_forward.call_args.args
+    assert args[:9] == ("q", "k", "v", 0.1, 0.5, True, 4, 2, 0)
+    assert args[10] == "alibi"
+    assert args[14] and args[15]
+    aiter_calls.triton.fwd.assert_not_called()
+
+
+def test_general_dense_backward_preserves_fa2_return(aiter_calls):
+    result = adapter.flash_attn_2.bwd(
+        "do", "q", "k", "v", "out", "lse", "dq", "dk", "dv",
+        None, 0.0, 0.5, True, -1, -1, 0.0, False, None, "rng",
+    )
+    assert result == ("dq", "dk", "dv", "softmax_d")
+    args = aiter_calls.general._flash_attn_backward.call_args.args
+    assert args[:9] == ("do", "q", "k", "v", "out", "lse", "dq", "dk", "dv")
+    assert args[18] == "rng"
+    aiter_calls.triton.bwd.assert_not_called()
+
+
+def test_general_varlen_forward_passes_block_table(aiter_calls):
+    result = adapter.flash_attn_2.varlen_fwd(
+        "q", "k", "v", None, "cq", "ck", None, None, "blocks",
+        None, 64, 128, 0.0, 0.5, False, True, -1, -1, 0.0, False,
+    )
+    assert result == ("vo", "vl", "vp", "vr")
+    call = aiter_calls.general._flash_attn_varlen_forward.call_args
+    assert call.args[:10] == ("q", "k", "v", "cq", "ck", None, None, 64, 128, 0)
+    assert call.kwargs["block_table"] == "blocks"
+    aiter_calls.triton.varlen_fwd.assert_not_called()
+
+
+def test_general_varlen_dropout_record_matches_fa2_layout(aiter_calls):
+    # aiter packs varlen as (heads, total_q, max_seqlen_k); FA returns
+    # (batch, heads, seqlen_q, seqlen_k), padded rows and columns kept.
+    randval = torch.tensor([[[0, 255], [211, 212], [100, 0]]], dtype=torch.uint8)
+    aiter_calls.general._flash_attn_varlen_forward.return_value = ("vo", "vl", randval, "vr")
+    result = adapter.flash_attn_2.varlen_fwd(
+        "q", "k", "v", None, torch.tensor([0, 1, 3]), "ck", None, None, None,
+        None, 2, 3, 0.17, 0.5, False, False, -1, -1, 0.0, True,
+    )
+    expected = torch.tensor([
+        [[[211.0, -44.0, 0.0], [0.0, 0.0, 0.0]]],
+        [[[0.0, -1.0, 0.0], [111.0, 211.0, 0.0]]],
+    ])
+    assert torch.equal(result[2], expected)
+
+
+def test_general_varlen_backward_preserves_fa2_return(aiter_calls):
+    result = adapter.flash_attn_2.varlen_bwd(
+        "do", "q", "k", "v", "out", "lse", "dq", "dk", "dv",
+        "cq", "ck", None, 64, 128, 0.0, 0.5, False, True,
+        -1, -1, 0.0, False, None, "rng",
+    )
+    assert result == ("dq", "dk", "dv", "varlen_d")
+    args = aiter_calls.general._flash_attn_varlen_backward.call_args.args
+    assert args[:11] == ("do", "q", "k", "v", "out", "lse", "dq", "dk", "dv", "cq", "ck")
+    assert args[20] == "rng"
+    aiter_calls.triton.varlen_bwd.assert_not_called()
+
+
+def test_general_cache_is_not_supported(aiter_calls):
+    with pytest.raises(NotImplementedError, match="KV-cache attention"):
+        adapter.flash_attn_2.fwd_kvcache(
+            "q", "kc", "vc", None, None, None, None, None, None, None,
+            None, None, None, 0.5, True, -1, -1, 0.0, True, 0,
+        )
+    aiter_calls.triton.fwd_kvcache.assert_not_called()
+
+
+def test_general_unsupported_args_fail_explicitly(aiter_calls):
+    with pytest.raises(NotImplementedError, match="softcap"):
+        adapter.flash_attn_2.fwd("q", "k", "v", None, None, 0.0, 0.5, False, -1, -1, 1.0, False)
+    with pytest.raises(NotImplementedError, match="leftpad_k"):
+        adapter.flash_attn_2.varlen_fwd(
+            "q", "k", "v", None, "cq", "ck", None, "leftpad", None,
+            None, 64, 64, 0.0, 0.5, False, False, -1, -1, 0.0, False,
+        )
+
+
+def test_triton_route_delegates_low_level_calls(aiter_calls, monkeypatch):
+    monkeypatch.setattr(adapter, "AITER_IMPL", "triton")
+    result = adapter.flash_attn_2.fwd("q", "k", "v", None, None, 0.0, 0.5, False, -1, -1, 0.0, False)
+    assert result == ("to", "tl", "tp", "tr")
+    aiter_calls.triton.fwd.assert_called_once()
+    aiter_calls.general._flash_attn_forward.assert_not_called()
+
+
+def test_interface_uses_the_adapter():
+    if AMD_BACKEND != "aiter":
+        pytest.skip("the adapter serves only the aiter backend")
+    assert flash_attn_interface.flash_attn_gpu is adapter.flash_attn_2
+
+
+@pytest.mark.parametrize(
+    "triton, aiter, expected",
+    [
+        ("FALSE", "FALSE", ("ck", None)),
+        ("TRUE", "FALSE", ("aiter", "triton")),
+        ("FALSE", "TRUE", ("aiter", "general")),
+    ],
+)
+def test_backend_flags_select_one_route(monkeypatch, triton, aiter, expected):
+    monkeypatch.setenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", triton)
+    monkeypatch.setenv("FLASH_ATTENTION_AITER_AMD_ENABLE", aiter)
+    assert amd_backend.select_amd_backend() == expected
+
+
+def test_backend_flags_refuse_both(monkeypatch):
+    monkeypatch.setenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "TRUE")
+    monkeypatch.setenv("FLASH_ATTENTION_AITER_AMD_ENABLE", "TRUE")
+    with pytest.raises(ValueError, match="Select only one"):
+        amd_backend.select_amd_backend()
+
+
+def test_runtime_backend_handles_missing_ck(monkeypatch):
+    monkeypatch.setenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE")
+    monkeypatch.setenv("FLASH_ATTENTION_AITER_AMD_ENABLE", "FALSE")
+    assert amd_backend.select_amd_backend(False) == ("ck", None)
+    monkeypatch.setitem(sys.modules, "flash_attn_2_cuda", types.ModuleType("flash_attn_2_cuda"))
+    assert amd_backend.select_amd_backend(True) == ("ck", None)
+    monkeypatch.setitem(sys.modules, "flash_attn_2_cuda", None)
+    with pytest.warns(UserWarning, match="falling back to Triton"):
+        assert amd_backend.select_amd_backend(True) == ("aiter", "triton")
+
+
+def test_aiter_flag_requires_rocm(monkeypatch):
+    monkeypatch.setenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE")
+    monkeypatch.setenv("FLASH_ATTENTION_AITER_AMD_ENABLE", "TRUE")
+    assert amd_backend.select_amd_backend(True) == ("aiter", "general")
+    with pytest.raises(RuntimeError, match="requires ROCm"):
+        amd_backend.select_amd_backend(False)

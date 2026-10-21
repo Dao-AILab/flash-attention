@@ -15,7 +15,7 @@ from flash_attn import (
     flash_attn_with_kvcache,
 )
 from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size_n, USE_TRITON_ROCM
+from flash_attn.flash_attn_interface import _get_block_size_n, AMD_BACKEND
 from flash_attn.layers.rotary import apply_rotary_emb
 
 MAX_HEADDIM_SM8x = 192
@@ -2527,6 +2527,7 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(AMD_BACKEND != "ck", reason="raw CUDA extension test")
 def test_flash_attn_varlen_paged_kv_num_splits(dtype):
     """Passing num_splits=0 explicitly should be bitwise identical to not passing it (default)."""
     from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
@@ -2787,7 +2788,7 @@ def test_flash_attn_cuda_graph_replay(mode):
             torch.testing.assert_close(got, want, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.skipif(USE_TRITON_ROCM, reason="compat-slot assert is only in the CUDA extension")
+@pytest.mark.skipif(AMD_BACKEND != "ck", reason="compat-slot assert is only in the CUDA extension")
 def test_flash_attn_generator_arg_must_be_none():
     """The optional RNG `generator` slot is retained only for backwards-compat arg
     positioning on all four raw C++ entry points (fwd/varlen_fwd/bwd/varlen_bwd):
