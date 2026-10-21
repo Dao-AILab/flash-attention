@@ -52,7 +52,7 @@ HEADS = {
 # fold -> (pack_gqa, head_loop, pack_factor) overrides
 FOLDS = {
     "pack": (True, False, 2),  # pack 2; the other sub-groups through the dK / dV postprocess
-    "pack4": (True, False, 4),  # hdim 256 only (the other head dims take the full pack)
+    "pack4": (True, False, 4),  # pack 4; the other sub-groups through the dK / dV postprocess
     "pack_full": (True, False, None),  # other head dims: the one full pack
     "pack_loop": (True, True, 2),  # pack 2 and the other sub-groups looped in the CTA
     "loop": (False, True, None),  # unpacked, every query head a pass of the loop
@@ -148,8 +148,6 @@ def test_bwd_pack_gqa_matches_unpacked(
     full_pack = qhead_per_kvhead & -qhead_per_kvhead
     if head_loop and head_dim != 256:
         pytest.skip("the head loop is an hdim 256 (serial schedule) path")
-    if fold == "pack4" and head_dim != 256:
-        pytest.skip("pack 4 is an hdim 256 fold; the other head dims take the full pack")
     if fold == "pack_full" and (head_dim == 256 or full_pack <= 2):
         pytest.skip("hdim 256 never takes the full pack; a full pack of 2 is the pack cell")
     if pack and qhead_per_kvhead % (pack_factor or full_pack):
@@ -357,10 +355,11 @@ def test_bwd_choose_fold():
     the chain probes (deterministic causal) and of the MQA probe (non-deterministic)."""
     from flash_attn.cute.interface import _bwd_choose_fold
 
-    def decide(batch, heads, heads_kv, seqlen, causal, deterministic, head_loop_possible=True, varlen=False, **kw):
+    def decide(batch, heads, heads_kv, seqlen, causal, deterministic, head_loop_possible=True, varlen=False,
+               cluster_size=2, m_block_size=128, n_block_size=128, **kw):
         return _bwd_choose_fold(
             num_sms=148,
-            cluster_size=2,
+            cluster_size=cluster_size,
             batch_size=batch,
             num_head=heads,
             num_head_kv=heads_kv,
@@ -368,8 +367,8 @@ def test_bwd_choose_fold():
             seqlen_k=seqlen,
             total_q=batch * seqlen,
             total_k=batch * seqlen,
-            m_block_size=128,
-            n_block_size=128,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
             causal=causal,
             local=False,
             varlen=varlen,
@@ -397,6 +396,23 @@ def test_bwd_choose_fold():
     assert decide(16, 24, 4, 2048, True, True) == (2, True)
     assert decide(4, 24, 4, 8192, True, True) == (2, False)
     assert decide(16, 40, 8, 2048, True, True) == (1, True)  # odd qh: no unlooped fold, the loop stays
+    # no head loop (hdim 192, 1 CTA, 64 x 96 tile), GQA 32/8: pack 4 while its chain waste is under
+    # 3% (2k b16), pack 2 at 4k b8 / 8k b4 (+3% / +7% over pack 4 on B200), the heuristic's pack 1
+    # at 16k; non-deterministic keeps the largest accepted pack
+    for seqlen, expect in (
+        (2048, (4, False)),
+        (4096, (2, False)),
+        (8192, (2, False)),
+        (16384, (1, False)),
+    ):
+        assert decide(
+            32768 // seqlen, 32, 8, seqlen, True, True, head_loop_possible=False,
+            cluster_size=1, m_block_size=64, n_block_size=96,
+        ) == expect, seqlen
+    assert decide(
+        4, 32, 8, 8192, True, False, head_loop_possible=False,
+        cluster_size=1, m_block_size=64, n_block_size=96,
+    ) == (4, False)
     # the loop stays while trips x m_blocks <= 48 (dense) / m_blocks <= 16 (varlen)
     assert decide(32, 12, 2, 1024, True, True) == (2, True)
     assert decide(16, 12, 2, 2048, True, True) == (2, True)
@@ -419,7 +435,18 @@ def test_bwd_choose_fold():
     assert decide(16, 16, 1, 2048, True, False, pack_factor_override=2, head_loop_override=True) == (2, True)
     assert decide(16, 8, 1, 2048, True, False, head_loop_possible=False, pack_factor_override=2) == (2, False)
     assert decide(16, 40, 8, 2048, True, False, pack_factor_override=2) == (1, False)
-    # without the loop (not hdim 256): the one full pack, as before
-    assert decide(16, 16, 1, 2048, True, False, head_loop_possible=False) == (16, False)
-    assert decide(16, 24, 4, 2048, True, False, head_loop_possible=False) == (2, False)
-    assert decide(8, 16, 1, 4096, True, False, head_loop_possible=False) == (1, False)
+    # without the loop (not hdim 256): pack 4 / pack 2, largest accepted first; the full pack
+    # 16 / 8 of hdim 128 MQA 16/1 loses 17% / 6% at 2k b16 causal where pack 4 gains 7%
+    assert decide(16, 16, 1, 2048, True, False, head_loop_possible=False, cluster_size=1) == (4, False)
+    assert decide(16, 16, 1, 2048, False, False, head_loop_possible=False, cluster_size=1) == (4, False)
+    assert decide(16, 24, 4, 2048, True, False, head_loop_possible=False, cluster_size=1) == (2, False)
+    assert decide(8, 16, 1, 4096, True, False, head_loop_possible=False, cluster_size=1) == (4, False)
+    # a partial pack of four or more sub-groups keeps half the packing gain: MQA 16/1 8k b4
+    # causal stays unpacked (pack 4 -2..-3%), 8k non-causal still packs (+3%); the full pack 4
+    # of GQA 32/8 is not partial; two sub-groups keep the gain (hdim 192 GQA 32/8 det causal
+    # 8k pack 2 above, GQA 64/8 pack 4)
+    assert decide(4, 16, 1, 8192, True, False, head_loop_possible=False, cluster_size=1) == (1, False)
+    assert decide(4, 16, 1, 8192, False, False, head_loop_possible=False, cluster_size=1) == (4, False)
+    assert decide(4, 32, 8, 8192, True, False, head_loop_possible=False, cluster_size=1) == (4, False)
+    assert decide(4, 64, 8, 8192, True, False, head_loop_possible=False, cluster_size=1) == (4, False)
+    assert decide(4, 16, 1, 8192, True, True, head_loop_possible=False, cluster_size=1) == (1, False)
