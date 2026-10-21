@@ -8,6 +8,7 @@
 #include "cutlass/arch/barrier.h"
 
 #include "named_barrier.hpp"
+#include "seqlen.h"
 #include "utils.h"
 
 namespace flash {
@@ -29,6 +30,10 @@ struct TileSchedulerArguments {
     int const* const varlen_batch_idx_ptr = nullptr;
     // int const* const num_n_blocks_ptr = nullptr;
     int const* const num_nheads_in_l2_ptr = nullptr;
+    // Number of blocks in the linearized padded layout,
+    // ceil_div(total_k + num_batch * kBlock, kBlock). Lets the bwd scheduler size
+    // its grid by actual work instead of max_seqlen * num_batch.
+    int const num_blocks_padded_linear = 0;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -378,6 +383,7 @@ public:
         cutlass::FastDivmod const l2_minor_divmod, l2_major_divmod;
         cutlass::FastDivmod const l2_minor_residual_divmod;
         int const num_hb_quotient;
+        int const num_batch;
         int const seqlen;
         int const* const cu_seqlens;
         int const* const seqused;
@@ -397,15 +403,24 @@ public:
         int const swizzle = size_l2 < size_one_head ? 1 : (1 << find_log2_floor(size_l2 / size_one_head));
         // If we're in the last section (called residual), we don't want to divide by
         // swizzle. Instead we want to divide by the remainder.
-        int const num_hb_remainder = (args.num_head * args.num_batch) % swizzle;
+        // With ragged sequences the batch dimension is folded into the block index:
+        // the grid covers the linearized padded layout instead of
+        // ceil_div(max_seqlen, kBlock) * num_batch, so it no longer grows with the
+        // longest sequence, and a sequence holding no work costs one block rather
+        // than a full column. The swizzle then runs over heads alone.
+        bool const linearize = Varlen && args.cu_seqlens != nullptr;
+        int const num_blocks_eff = linearize ? args.num_blocks_padded_linear : args.num_blocks;
+        int const num_hb = linearize ? args.num_head : args.num_head * args.num_batch;
+        int const num_hb_remainder = num_hb % swizzle;
         // printf("num_blocks = %d, num_head = %d, num_batch = %d, size_one_head = %d, ratio = %d, swizzle = %d, num_hb_remainder = %d\n", args.num_blocks, args.num_head, args.num_batch, size_one_head, size_l2 / size_one_head, swizzle, num_hb_remainder);
         assert(args.tile_count_semaphore != nullptr);
-        return {args.num_blocks * args.num_head * args.num_batch,
+        return {num_blocks_eff * num_hb,
                 cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head),
-                cutlass::FastDivmod(swizzle), cutlass::FastDivmod(swizzle * args.num_blocks),
+                cutlass::FastDivmod(swizzle), cutlass::FastDivmod(swizzle * num_blocks_eff),
                 // don't divide by 0
                 cutlass::FastDivmod(num_hb_remainder > 0 ? num_hb_remainder : 1),
-                (args.num_head * args.num_batch) / swizzle,
+                num_hb / swizzle,
+                args.num_batch,
                 args.seqlen, !Varlen ? nullptr : args.cu_seqlens, !Varlen ? nullptr : args.seqused};
     }
 
@@ -451,16 +466,29 @@ public:
         } else {
             block = params.l2_minor_residual_divmod.divmod(bidhb_residual, l2_mod);
         }
-        bidb = params.head_divmod.divmod(bidh, bidhb * params.l2_minor_divmod.divisor + bidhb_residual);
+        int const hb = bidhb * params.l2_minor_divmod.divisor + bidhb_residual;
         bool is_valid_tile = true;
         int num_blocks;
         if constexpr (Varlen) {
+            if (params.cu_seqlens != nullptr) {
+                // `block` indexes the linearized padded layout; recover the owning
+                // sequence and the block index within it. Sequences carry up to one
+                // block of alignment slack, which is_valid_tile drops below.
+                bidh = hb;
+                auto const seq_and_block =
+                    flash::padded_block_to_seq<kBlock>(block, params.num_batch, params.cu_seqlens);
+                bidb = cute::get<0>(seq_and_block);
+                block = cute::get<1>(seq_and_block);
+            } else {
+                bidb = params.head_divmod.divmod(bidh, hb);
+            }
             int seqlen = params.seqused
                 ? params.seqused[bidb]
                 : (params.cu_seqlens ? params.cu_seqlens[bidb + 1] - params.cu_seqlens[bidb] : params.seqlen);
             num_blocks = cute::ceil_div(seqlen, Int<kBlock>{});
             is_valid_tile = block < num_blocks;
         } else {
+            bidb = params.head_divmod.divmod(bidh, hb);
             num_blocks = params.block_divmod.divisor;
         }
         if constexpr (SPT) {
