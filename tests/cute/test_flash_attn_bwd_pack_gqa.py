@@ -356,7 +356,7 @@ def test_bwd_choose_fold():
     from flash_attn.cute.interface import _bwd_choose_fold
 
     def decide(batch, heads, heads_kv, seqlen, causal, deterministic, head_loop_possible=True, varlen=False,
-               cluster_size=2, m_block_size=128, n_block_size=128, **kw):
+               cluster_size=2, m_block_size=128, n_block_size=128, head_dim=256, **kw):
         return _bwd_choose_fold(
             num_sms=148,
             cluster_size=cluster_size,
@@ -369,6 +369,7 @@ def test_bwd_choose_fold():
             total_k=batch * seqlen,
             m_block_size=m_block_size,
             n_block_size=n_block_size,
+            head_dim=head_dim,
             causal=causal,
             local=False,
             varlen=varlen,
@@ -407,11 +408,11 @@ def test_bwd_choose_fold():
     ):
         assert decide(
             32768 // seqlen, 32, 8, seqlen, True, True, head_loop_possible=False,
-            cluster_size=1, m_block_size=64, n_block_size=96,
+            cluster_size=1, m_block_size=64, n_block_size=96, head_dim=192,
         ) == expect, seqlen
     assert decide(
         4, 32, 8, 8192, True, False, head_loop_possible=False,
-        cluster_size=1, m_block_size=64, n_block_size=96,
+        cluster_size=1, m_block_size=64, n_block_size=96, head_dim=192,
     ) == (4, False)
     # the loop stays while trips x m_blocks <= 48 (dense) / m_blocks <= 16 (varlen)
     assert decide(32, 12, 2, 1024, True, True) == (2, True)
@@ -421,9 +422,34 @@ def test_bwd_choose_fold():
     assert decide(16, 64, 8, 2048, True, True) == (4, False)
     assert decide(16, 48, 4, 2048, True, True) == (4, False)
     assert decide(16, 32, 2, 2048, True, True, varlen=True) == (2, True)
-    assert decide(8, 32, 2, 4096, True, True, varlen=True) == (4, False)
+    assert decide(8, 32, 2, 4096, True, True, varlen=True) == (2, False)
     assert decide(32, 16, 1, 1024, True, True, varlen=True) == (2, True)
     assert decide(16, 16, 8, 2048, True, True) == (2, False)
+    # 2-CTA kernels drop pack 4 for pack 2 under deterministic causal once m_blocks * head_dim
+    # > 4096 (hdim 192 past 2k, hdim 128 past 4k), also where the heuristic refused pack 2 for
+    # its halved partial-pack gain (hdim 192 GQA 48/4 and 64/8 8k b4: pack 4 is 6-9% below the
+    # unpacked kernel, pack 2 +0..+2%; hdim 128 pack 2 +7 / +8%); the 1-CTA hdim 64 kernel keeps
+    # pack 4 (GQA 64/8 4k b8 +5% over pack 2, 8k b4 level)
+    for head_dim, seqlen, expect in (
+        (192, 2048, (4, False)),
+        (192, 4096, (2, False)),
+        (192, 8192, (2, False)),
+        (192, 16384, (1, False)),
+        (128, 4096, (4, False)),
+        (128, 8192, (2, False)),
+    ):
+        for heads, heads_kv in ((48, 4), (64, 8)):
+            for varlen in (False, True):
+                assert decide(
+                    32768 // seqlen, heads, heads_kv, seqlen, True, True, head_loop_possible=False,
+                    head_dim=head_dim, varlen=varlen,
+                ) == expect, (head_dim, seqlen, heads, varlen)
+    assert decide(8, 32, 8, 4096, True, True, head_loop_possible=False, head_dim=192) == (2, False)
+    assert decide(8, 32, 8, 4096, True, True, head_loop_possible=False, head_dim=128) == (4, False)
+    assert decide(4, 48, 4, 8192, True, True) == (2, False)  # hdim 256: +8% over pack 4
+    assert decide(8, 64, 8, 4096, True, True, head_loop_possible=False, cluster_size=1, head_dim=64) == (4, False)
+    assert decide(4, 64, 8, 8192, True, True, head_loop_possible=False, cluster_size=1, head_dim=64) == (4, False)
+    assert decide(4, 48, 4, 8192, True, False, head_loop_possible=False, head_dim=192) == (4, False)  # non-det unchanged
     # deterministic non-causal: no pace difference, the default fold
     assert decide(16, 16, 1, 2048, False, True) == (2, True)
     # overrides
