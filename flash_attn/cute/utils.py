@@ -25,6 +25,17 @@ class AuxData(NamedTuple):
     scalars: tuple | None = None
 
 
+class DescaleTensors(NamedTuple):
+    q_descale: Optional[cute.Tensor] = None
+    k_descale: Optional[cute.Tensor] = None
+    v_descale: Optional[cute.Tensor] = None
+
+    def __new_from_mlir_values__(self, values):
+        # only the present members were extracted: put each value back in its own slot
+        values = iter(values)
+        return DescaleTensors(*(None if t is None else next(values) for t in self))
+
+
 # Obtained from sollya:
 # fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);
 POLY_EX2 = {
