@@ -1,7 +1,6 @@
 # Adapted from https://github.com/huggingface/transformers/blob/master/examples/pytorch/language-modeling/run_clm.py
 from itertools import chain
 from pathlib import Path
-import pickle
 from typing import Any, List, Union
 import subprocess
 import mmap
@@ -234,16 +233,13 @@ class LMDataModule(LightningDataModule):
         logger.info(f'Saving to cache at {str(cache_dir)}')
         for k, v in concat_ids.items():
             np.save(cache_dir / f'{k}.npy', v)
-        with open(cache_dir / 'tokenizer.pkl', 'wb') as f:
-            pickle.dump(tokenizer, f)
 
     def _load_from_cache(self, cache_dir):
         assert cache_dir.is_dir()
         logger.info(f'Load from cache at {str(cache_dir)}')
         concat_ids = {split: np.load(cache_dir / f'{split}.npy', mmap_mode='r')
                       for split in ['train', 'validation', 'test']}
-        with open(cache_dir / 'tokenizer.pkl', 'rb') as f:
-            tokenizer = pickle.load(f)
+        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, use_fast=True)
         return concat_ids, tokenizer
 
     @property
