@@ -2584,6 +2584,53 @@ def test_flash_attn_varlen_paged_kv_num_splits(dtype):
         _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_varlen_swapped_gqa_honors_out(dtype):
+    """`out` must be written in place on the decode-GQA (swapped) path.
+
+    mha_varlen_fwd swaps q to [batch * ngroups, num_heads_k, head_size] for the split-KV decode
+    optimization. The output is [batch, num_heads, head_size], so the kernels cannot write the
+    caller's buffer without being told its strides. A view that silently becomes a copy leaves
+    `out` untouched, and callers that pass a buffer and ignore the return value read stale data.
+    """
+    from flash_attn.flash_attn_interface import flash_attn_gpu
+
+    device = "cuda"
+    torch.manual_seed(0)
+    batch_size, num_heads, num_heads_k, head_size = 8, 8, 2, 256
+    seqlen_q, seqlen_k = 1, 2048
+    scale = head_size ** -0.5
+
+    q = torch.randn(batch_size * seqlen_q, num_heads, head_size, device=device, dtype=dtype)
+    k = torch.randn(batch_size * seqlen_k, num_heads_k, head_size, device=device, dtype=dtype)
+    v = torch.randn(batch_size * seqlen_k, num_heads_k, head_size, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=device
+    )
+    cu_seqlens_k = torch.arange(
+        0, (batch_size + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device=device
+    )
+
+    def varlen_fwd(out):
+        return flash_attn_gpu.varlen_fwd(
+            q, k, v, out, cu_seqlens_q, cu_seqlens_k,
+            None, None, None, None,
+            seqlen_q, seqlen_k,
+            0.0, scale, False, False,
+            -1, -1, 0.0, False, None, 0,
+        )[0]
+
+    ref = varlen_fwd(None)
+    assert ref.shape == (batch_size * seqlen_q, num_heads, head_size)
+
+    out = torch.full_like(ref, float("nan"))
+    returned = varlen_fwd(out)
+
+    assert not torch.isnan(out).any(), "`out` was not written; the output path made a copy"
+    assert torch.equal(out, ref)
+    assert torch.equal(returned, ref)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("paged_kv_block_size", [256])
 @pytest.mark.parametrize("append_knew", [False, True])
