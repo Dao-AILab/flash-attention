@@ -4373,15 +4373,42 @@ def test_flash_attn_sm90_fwd_unused_v_tail(dtype, d, causal, nheads_kv, varlen):
 
 _RAGGED_V_BOUNDARY_SCRIPT = """
 import sys, torch
+from cuda.bindings import driver as cu
 from flash_attn.cute.interface import flash_attn_varlen_func
-pack_gqa, seqlen_k = sys.argv[1] == "1", int(sys.argv[2])
+
+pack_gqa = sys.argv[1] == "1"
 torch.manual_seed(0)
-batch, seqlen_q, nheads, d, dv = 1, 511, 6, 128, 64
+batch, seqlen_q, seqlen_k, nheads, d, dv = 1, 511, 1, 6, 128, 64
 q = torch.randn(batch * seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(batch * seqlen_k, 1, d, device="cuda", dtype=q.dtype)
-# With the caching allocator disabled this is its own mapping: nothing is mapped after it.
-backing = torch.empty(1 << 29, dtype=q.dtype, device="cuda")
-v = backing[-batch * seqlen_k * dv :].view(batch * seqlen_k, 1, dv).normal_()
+
+# V is the tail of a VMM mapping that is followed by a reserved but unmapped guard range,
+# so any TMA access past the last V row faults no matter what the allocator placed elsewhere.
+def check(res):
+    assert res[0] == cu.CUresult.CUDA_SUCCESS, res[0]
+    return res[1] if len(res) == 2 else res[1:]
+
+dev = torch.cuda.current_device()
+prop = cu.CUmemAllocationProp()
+prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+prop.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+prop.location.id = dev
+gran = check(cu.cuMemGetAllocationGranularity(
+    prop, cu.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM))
+size, guard = gran, 4 * gran
+va = check(cu.cuMemAddressReserve(size + guard, 0, 0, 0))
+handle = check(cu.cuMemCreate(size, prop, 0))
+check(cu.cuMemMap(va, size, 0, handle, 0))
+access = cu.CUmemAccessDesc()
+access.location.type, access.location.id = prop.location.type, dev
+access.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+check(cu.cuMemSetAccess(va, size, [access], 1))
+storage = torch._C._construct_storage_from_data_pointer(int(va), torch.device("cuda", dev), size)
+mapped = torch.empty(0, dtype=q.dtype, device="cuda").set_(storage).view(size // 2)
+n = batch * seqlen_k * dv
+v = mapped[-n:].view(batch * seqlen_k, 1, dv).normal_()
+assert v.data_ptr() + n * 2 == int(va) + size
+
 cu_q = torch.arange(0, (batch + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32)
 cu_k = torch.arange(0, (batch + 1) * seqlen_k, seqlen_k, device="cuda", dtype=torch.int32)
 out = flash_attn_varlen_func(
@@ -4390,30 +4417,29 @@ out = flash_attn_varlen_func(
 )[0]
 torch.cuda.synchronize()
 assert out.isfinite().all()
-if seqlen_k == 1:
-    # One key per sequence: the output is that key's V row exactly.
-    ref = v.view(batch, 1, dv).expand(batch, seqlen_q, dv).reshape(batch * seqlen_q, 1, dv)
-    assert torch.equal(out, ref.expand(-1, nheads, -1))
+# One key per sequence: the output is that key's V row exactly.
+ref = v.view(batch, 1, dv).expand(batch, seqlen_q, dv).reshape(batch * seqlen_q, 1, dv)
+assert torch.equal(out, ref.expand(-1, nheads, -1))
 print("ok")
 """
 
 
 @pytest.mark.skipif(not (IS_SM90 or IS_SM100 or IS_SM110), reason="ragged K/V TMA loads")
 @pytest.mark.parametrize("pack_gqa", [False, True])
-@pytest.mark.parametrize("seqlen_k", [1])
-def test_flash_attn_ragged_v_tma_allocation_boundary(pack_gqa, seqlen_k):
-    """V ends exactly where a 1 GiB allocation ends, so any TMA access past the last
-    valid row (#3068: ~128 KB of prefetch with the wrap-around descriptor) faults. Runs in
-    a subprocess with the caching allocator disabled: with caching on, a block cached
-    after the allocation can keep the over-read mapped and hide the fault. A single
-    sequence keeps the over-read deterministic (main faults on every run)."""
+def test_flash_attn_ragged_v_tma_allocation_boundary(pack_gqa):
+    """V ends right before a reserved, unmapped guard range, so any TMA access past the
+    last valid row faults (#3068: ~128 KB of prefetch with the wrap-around descriptor;
+    main faults on every run). Runs in a subprocess so a fault cannot poison this one."""
     import subprocess
     import sys
 
-    env = dict(os.environ, PYTORCH_NO_CUDA_MEMORY_CACHING="1")
+    pytest.importorskip("cuda.bindings")
+    if not hasattr(torch._C, "_construct_storage_from_data_pointer"):
+        pytest.skip("needs torch._C._construct_storage_from_data_pointer")
+    env = dict(os.environ)
     env.pop("FLASH_ATTENTION_FAKE_TENSOR", None)
     proc = subprocess.run(
-        [sys.executable, "-c", _RAGGED_V_BOUNDARY_SCRIPT, "1" if pack_gqa else "0", str(seqlen_k)],
+        [sys.executable, "-c", _RAGGED_V_BOUNDARY_SCRIPT, "1" if pack_gqa else "0"],
         env=env, capture_output=True, text=True, timeout=1800,
     )
     assert proc.returncode == 0 and proc.stdout.strip().endswith("ok"), proc.stderr[-4000:]
@@ -4460,6 +4486,8 @@ def test_flash_attn_ragged_tensormap_workspace_padding(packed_kv, seqlen_q, num_
     """Dense Q + seqused_q with many short sequences: the varlen schedulers pad every
     batch by a cluster-sized tile, so the grid exceeds sum(ceil(seqlen_q / tile)) and the
     descriptor workspace must cover it (the kernel traps otherwise)."""
+    if (IS_SM90 or IS_SM120) and num_splits > 1:
+        pytest.skip("SplitKV not supported on SM90/SM120")
     torch.manual_seed(0)
     batch, seqlen_k, nheads, d = 49, 217, 6, 128
     q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
