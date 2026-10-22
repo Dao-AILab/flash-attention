@@ -230,27 +230,27 @@ class FlashAttentionForwardSm100:
         _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
         self.enable_ex2_emu = _default_enable_ex2_emu
         self.s0_s1_barrier = False
-        self.overlap_sO_sQ = (
-            (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-            # Reuse Q storage for O to leave room for more KV stages.
-            self.head_dim_padded == 256 or
-            (self.head_dim_v_padded >= 128 and self.is_split_kv)
-        )
 
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
         )
 
-        # ClC does not compose with these other features, so disable even if requested
-        self.use_clc_scheduler = (
-            use_clc_scheduler
-            and self.use_tma_KV
-            and not (has_tile_count_semaphore and is_varlen_q)
-        )
+        # validate_fwd_config rejects CLC without TMA KV or with a varlen-Q tile-count semaphore.
+        assert not use_clc_scheduler or (
+            self.use_tma_KV and not (has_tile_count_semaphore and is_varlen_q)
+        ), "CLC requires TMA KV and no varlen-Q tile-count semaphore"
+        self.use_clc_scheduler = use_clc_scheduler
         self.dynamic_persistent = (
             has_tile_count_semaphore and is_varlen_q
         ) or self.use_clc_scheduler
         self.is_persistent = self.dynamic_persistent or self.is_static_persistent
+        self.overlap_sO_sQ = (
+            (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
+            # Persistent hd256 2CTA separates Q/O to overlap the next Q load with O stores.
+            # 1CTA aliases Q/O to preserve KV pipeline depth.
+            (self.head_dim_padded == 256 and not (self.is_persistent and self.use_2cta_instrs)) or
+            (self.head_dim_v_padded >= 128 and self.is_split_kv)
+        )
         self.sched_stages = 1
         if self.use_clc_scheduler:
             assert self.cluster_shape_mn[1] == 1, f"CLC requires cluster N == 1: {self.cluster_shape_mn}"
@@ -335,6 +335,14 @@ class FlashAttentionForwardSm100:
                 "dynamic persistent scheduling requires an empty warp to serve as the scheduler warp"
             )
         self.scheduler_warp_id = self.empty_warp_ids[0] if self.dynamic_persistent else None
+        # Claim after the current tile's loads to avoid reserving work during long causal tiles.
+        self.clc_late_claim = (
+            self.use_clc_scheduler
+            and self.cta_group_size == 1
+            and self.TileScheduler is SingleTileLPTScheduler
+            and not self.is_split_kv
+            and len(self.load_warp_ids) == 1
+        )
 
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [
@@ -694,7 +702,11 @@ class FlashAttentionForwardSm100:
         else:
             eff_seqlen_q = max_seqlen_q if const_expr(not self.pack_gqa) else max_seqlen_q * self.qhead_per_kvhead
         TileScheduler = self.TileScheduler
-        _num_block_divisor = self.cta_tiler[0] * (self.cta_group_size if not self.is_persistent and self.cta_group_size > 1 else 1)
+        # Static persistence handles cluster division internally; other 2CTA paths count clusters.
+        use_cluster_idx = self.cta_group_size > 1 and (
+            not self.is_persistent or self.use_clc_scheduler
+        )
+        _num_block_divisor = self.cta_tiler[0] * (self.cta_group_size if use_cluster_idx else 1)
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(eff_seqlen_q, _num_block_divisor),
             cute.size(mQ.shape[2]),
@@ -719,7 +731,7 @@ class FlashAttentionForwardSm100:
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
             cluster_shape_mn=self.cluster_shape_mn,
-            use_cluster_idx=not self.is_persistent and self.cta_group_size > 1,
+            use_cluster_idx=use_cluster_idx,
             num_splits_dynamic_ptr=num_splits_dynamic_ptr,
             virtual_batch_idx_ptr=virtual_batch_idx_ptr,
             num_nheads_in_l2_ptr=num_nheads_in_l2_ptr,
@@ -1261,8 +1273,8 @@ class FlashAttentionForwardSm100:
         if const_expr(self.dynamic_persistent):
             if warp_idx == self.scheduler_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
-                # CLC: only leader CTA produces.
-                if is_leader_cta:
+                # CLC: only the leader produces; late claims belong to the load warp.
+                if is_leader_cta and not self.clc_late_claim:
                     self.scheduler_warp(tile_scheduler)
                 else:
                     self.empty_warp(tile_scheduler)
@@ -1722,7 +1734,8 @@ class FlashAttentionForwardSm100:
                     self.kv_subtile_factor,
                 )
 
-
+            if const_expr(self.clc_late_claim):
+                tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.advance_to_next_work()
             if const_expr(pipeline_load_epi is not None):
                 pipeline_load_epi.consumer_wait(load_epi_consumer_state)
@@ -1730,6 +1743,8 @@ class FlashAttentionForwardSm100:
                     pipeline_load_epi.consumer_release(load_epi_consumer_state)
                 load_epi_consumer_state.advance()
 
+        if const_expr(self.clc_late_claim):
+            tile_scheduler.producer_tail()
         if issue_kv_for_this_warp:
             pipeline_kv.producer_tail(kv_producer_state)
         # This is equivalent to pipeline_q.producer_tail for the TMA-Q producer warp.

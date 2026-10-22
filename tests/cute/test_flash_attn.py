@@ -22,7 +22,7 @@ except ImportError:
     apply_rotary_emb = None
 
 from flash_attn.cute.cache_utils import JITCache
-from flash_attn.cute.config import FwdConfig, Sm100Registers, select_fwd_config
+from flash_attn.cute.config import FwdConfig, Sm100Registers, select_fwd_config, select_registers
 from flash_attn.cute.testing import (
     check_dsink_vs_ref,
     check_tensor_vs_ref,
@@ -106,10 +106,53 @@ def capture_selected_fwd_config():
 
     def capture(inputs):
         selected["config"] = select_fwd_config(inputs)
+        selected["inputs"] = inputs
         return selected["config"]
 
     with mock.patch("flash_attn.cute.interface.select_fwd_config", side_effect=capture):
         yield selected
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 CLC with 2CTA")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_clc_2cta_matches_default():
+    """CLC must assign both CTAs of a cluster the same m block."""
+
+    def clc_config(selected):
+        """Force CLC onto the selected default 2CTA config."""
+        config, inputs = selected["config"], selected["inputs"]
+        assert config.use_2cta_instrs and not config.use_clc_scheduler
+        config = replace(config, use_clc_scheduler=True, is_static_persistent=False)
+        registers = select_registers(
+            inputs._replace(pack_gqa=config.pack_gqa), tile_m=config.tile_m,
+            tile_n=config.tile_n, q_stage=config.q_stage, num_splits=config.num_splits,
+            use_2cta_instrs=True, use_clc_scheduler=True,
+        )
+        return replace(config, registers=registers)
+
+    torch.manual_seed(0)
+    # Dense Q and K use the non-varlen scheduler.
+    q_dense = torch.randn(2, 512, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k_dense = torch.randn_like(q_dense)
+    v_dense = torch.randn_like(q_dense)
+    with capture_selected_fwd_config() as selected:
+        dense_ref = _flash_attn_fwd(q_dense, k_dense, v_dense)[0]
+    dense_out = _flash_attn_fwd(q_dense, k_dense, v_dense, config=clc_config(selected))[0]
+    # Varlen K allows CLC with dense hd128 Q. 900 rows give 15 packed tiles per KV head,
+    # leaving the last cluster half full.
+    lens_k = [1500, 2600]
+    q = torch.randn(2, 900, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(lens_k), 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    cu_seqlens_k = torch.tensor([0, lens_k[0], sum(lens_k)], device="cuda", dtype=torch.int32)
+    kwargs = dict(cu_seqlens_k=cu_seqlens_k, max_seqlen_k=max(lens_k), pack_gqa=True)
+    with capture_selected_fwd_config() as selected:
+        ref = _flash_attn_fwd(q, k, v, **kwargs)[0]
+    out = _flash_attn_fwd(q, k, v, config=clc_config(selected), **kwargs)[0]
+    if is_fake_mode():
+        return
+    assert torch.equal(dense_out, dense_ref)
+    assert torch.equal(out, ref)
 
 
 @pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
@@ -526,11 +569,8 @@ def test_flash_attn_explicit_config_scheduler_metadata(monkeypatch):
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 varlen scheduler metadata test")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_scheduler_metadata_semaphore_follows_selected_scheduler(monkeypatch):
-    """Varlen MHA metadata needs the tile semaphore even with FA_CLC=1."""
-    from flash_attn.cute import utils as cute_utils
-
-    monkeypatch.setattr(cute_utils, "_fa_clc_enabled", True)
+def test_scheduler_metadata_semaphore_follows_selected_scheduler():
+    """Varlen MHA selects the dynamic persistent scheduler, so its metadata has the semaphore."""
     cu_seqlens = torch.tensor([0, 300, 500], device="cuda", dtype=torch.int32)
     metadata = get_scheduler_metadata(
         nheads=4,
