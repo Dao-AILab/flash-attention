@@ -6,6 +6,10 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+try:
+    from cutlass.cute.nvgpu import OperandMajorMode
+except ImportError:  # CUTLASS DSL 4.6.x
+    from cutlass.cute.nvgpu.warpgroup import OperandMajorMode
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute import FastDivmodDivisorV2
@@ -265,8 +269,8 @@ class FlashAttentionBackwardSm90:
         tiled_mma_SdP = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            cute.nvgpu.OperandMajorMode.K,
-            cute.nvgpu.OperandMajorMode.K,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             Float32,
             atom_layout_mnk=maybe_swap_mn(atom_layout_SdP, self.SdP_swapAB),
             tiler_mn=(64, tiler_mn_SdP[1] if not self.SdP_swapAB else tiler_mn_SdP[0]),
@@ -279,10 +283,10 @@ class FlashAttentionBackwardSm90:
             sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
                 self.dtype,
-                cute.nvgpu.OperandMajorMode.MN
+                OperandMajorMode.MN
                 if not self.mma_dkv_is_rs
-                else cute.nvgpu.OperandMajorMode.K,
-                cute.nvgpu.OperandMajorMode.MN,
+                else OperandMajorMode.K,
+                OperandMajorMode.MN,
                 Float32,
                 atom_layout_mnk=maybe_swap_mn(atom_layout_dKV, self.dKV_swapAB),
                 tiler_mn=(64, tiler_mn_d[1] if not self.dKV_swapAB else tiler_mn_d[0]),
@@ -299,8 +303,8 @@ class FlashAttentionBackwardSm90:
         tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            cute.nvgpu.OperandMajorMode.K if not self.dQ_swapAB else cute.nvgpu.OperandMajorMode.MN,
-            cute.nvgpu.OperandMajorMode.MN if not self.dQ_swapAB else cute.nvgpu.OperandMajorMode.K,
+            OperandMajorMode.K if not self.dQ_swapAB else OperandMajorMode.MN,
+            OperandMajorMode.MN if not self.dQ_swapAB else OperandMajorMode.K,
             Float32,
             atom_layout_mnk=maybe_swap_mn(atom_layout_dQ, self.dQ_swapAB),
             tiler_mn=(64, tiler_mn_dQ[1] if not self.dQ_swapAB else tiler_mn_dQ[0]),

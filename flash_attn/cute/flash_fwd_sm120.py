@@ -7,7 +7,10 @@
 
 import cutlass
 import cutlass.utils as utils_basic
-from cutlass.base_dsl.enums import Arch
+try:
+    from cutlass.base_dsl.enums import Arch
+except ImportError:  # CUTLASS DSL 4.6.x
+    from cutlass.base_dsl.arch import Arch
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 
