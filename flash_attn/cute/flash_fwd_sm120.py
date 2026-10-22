@@ -7,7 +7,7 @@
 
 import cutlass
 import cutlass.utils as utils_basic
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 
