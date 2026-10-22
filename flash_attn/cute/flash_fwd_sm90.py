@@ -9,13 +9,22 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+
+try:
+    from cutlass.cute.nvgpu import OperandMajorMode
+except ImportError:  # CUTLASS DSL 4.6.x
+    from cutlass.cute.nvgpu.warpgroup import OperandMajorMode
 from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.base_dsl.arch import Arch
+
+try:
+    from cutlass.base_dsl.enums import Arch
+except ImportError:  # CUTLASS DSL 4.6.x
+    from cutlass.base_dsl.arch import Arch
 
 from quack import copy_utils
 from quack import layout_utils
@@ -101,8 +110,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.K,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             Float32,
             atom_layout_mnk=(self.tile_m // 64, 1, 1),
             tiler_mn=(64, self.tile_n),
@@ -110,8 +119,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.MN,
+            OperandMajorMode.K,
+            OperandMajorMode.MN,
             Float32,
             atom_layout_mnk=(self.tile_m // 64, 1, 1),  # Might need (1, 2, 1) for hdim 512
             tiler_mn=(64, self.tile_hdimv),

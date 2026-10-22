@@ -17,7 +17,10 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
-from cutlass.base_dsl.arch import Arch
+try:
+    from cutlass.base_dsl.enums import Arch
+except ImportError:  # CUTLASS DSL 4.6.x
+    from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils
