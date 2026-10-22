@@ -9,6 +9,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+
 try:
     from cutlass.cute.nvgpu import OperandMajorMode
 except ImportError:  # CUTLASS DSL 4.6.x
@@ -19,6 +20,7 @@ from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+
 try:
     from cutlass.base_dsl.enums import Arch
 except ImportError:  # CUTLASS DSL 4.6.x

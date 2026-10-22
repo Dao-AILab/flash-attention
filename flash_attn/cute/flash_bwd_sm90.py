@@ -6,6 +6,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+
 try:
     from cutlass.cute.nvgpu import OperandMajorMode
 except ImportError:  # CUTLASS DSL 4.6.x
@@ -283,9 +284,7 @@ class FlashAttentionBackwardSm90:
             sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
                 self.dtype,
-                OperandMajorMode.MN
-                if not self.mma_dkv_is_rs
-                else OperandMajorMode.K,
+                OperandMajorMode.MN if not self.mma_dkv_is_rs else OperandMajorMode.K,
                 OperandMajorMode.MN,
                 Float32,
                 atom_layout_mnk=maybe_swap_mn(atom_layout_dKV, self.dKV_swapAB),

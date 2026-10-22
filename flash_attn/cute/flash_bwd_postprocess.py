@@ -9,6 +9,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+
 try:
     from cutlass.cute.nvgpu import OperandMajorMode
 except ImportError:  # CUTLASS DSL 4.6.x
