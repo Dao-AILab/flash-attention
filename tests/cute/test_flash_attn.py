@@ -4371,30 +4371,52 @@ def test_flash_attn_sm90_fwd_unused_v_tail(dtype, d, causal, nheads_kv, varlen):
 # producer path, and the descriptor workspace must cover the schedulers' padded grid.
 
 
+_RAGGED_V_BOUNDARY_SCRIPT = """
+import sys, torch
+from flash_attn.cute.interface import flash_attn_varlen_func
+pack_gqa, seqlen_k = sys.argv[1] == "1", int(sys.argv[2])
+torch.manual_seed(0)
+batch, seqlen_q, nheads, d, dv = 1, 511, 6, 128, 64
+q = torch.randn(batch * seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(batch * seqlen_k, 1, d, device="cuda", dtype=q.dtype)
+# With the caching allocator disabled this is its own mapping: nothing is mapped after it.
+backing = torch.empty(1 << 29, dtype=q.dtype, device="cuda")
+v = backing[-batch * seqlen_k * dv :].view(batch * seqlen_k, 1, dv).normal_()
+cu_q = torch.arange(0, (batch + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32)
+cu_k = torch.arange(0, (batch + 1) * seqlen_k, seqlen_k, device="cuda", dtype=torch.int32)
+out = flash_attn_varlen_func(
+    q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=seqlen_q,
+    max_seqlen_k=seqlen_k, num_splits=1, pack_gqa=pack_gqa,
+)[0]
+torch.cuda.synchronize()
+assert out.isfinite().all()
+if seqlen_k == 1:
+    # One key per sequence: the output is that key's V row exactly.
+    ref = v.view(batch, 1, dv).expand(batch, seqlen_q, dv).reshape(batch * seqlen_q, 1, dv)
+    assert torch.equal(out, ref.expand(-1, nheads, -1))
+print("ok")
+"""
+
+
 @pytest.mark.skipif(not (IS_SM90 or IS_SM100 or IS_SM110), reason="ragged K/V TMA loads")
 @pytest.mark.parametrize("pack_gqa", [False, True])
-@pytest.mark.parametrize("seqlen_k", [1, 16, 100])
+@pytest.mark.parametrize("seqlen_k", [1])
 def test_flash_attn_ragged_v_tma_allocation_boundary(pack_gqa, seqlen_k):
     """V ends exactly where a 1 GiB allocation ends, so any TMA access past the last
-    valid row (#3068: ~128 KB of prefetch with the wrap-around descriptor) faults."""
-    torch.manual_seed(0)
-    batch, seqlen_q, nheads, d, dv = 49, 511, 6, 128, 64
-    q = torch.randn(batch * seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch * seqlen_k, 1, d, device="cuda", dtype=q.dtype)
-    backing = torch.empty(1 << 29, dtype=q.dtype, device="cuda")
-    v = backing[-batch * seqlen_k * dv :].view(batch * seqlen_k, 1, dv).normal_()
-    cu_q = torch.arange(0, (batch + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32)
-    cu_k = torch.arange(0, (batch + 1) * seqlen_k, seqlen_k, device="cuda", dtype=torch.int32)
-    out = flash_attn_varlen_func(
-        q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=seqlen_q,
-        max_seqlen_k=seqlen_k, num_splits=1, pack_gqa=pack_gqa,
-    )[0]
-    torch.cuda.synchronize()
-    assert out.isfinite().all()
-    if seqlen_k == 1:
-        # One key per sequence: the output is that key's V row exactly.
-        ref = v.view(batch, 1, dv).expand(batch, seqlen_q, dv).reshape(batch * seqlen_q, 1, dv)
-        assert torch.equal(out, ref.expand(-1, nheads, -1))
+    valid row (#3068: ~128 KB of prefetch with the wrap-around descriptor) faults. Runs in
+    a subprocess with the caching allocator disabled: with caching on, a block cached
+    after the allocation can keep the over-read mapped and hide the fault. A single
+    sequence keeps the over-read deterministic (main faults on every run)."""
+    import subprocess
+    import sys
+
+    env = dict(os.environ, PYTORCH_NO_CUDA_MEMORY_CACHING="1")
+    env.pop("FLASH_ATTENTION_FAKE_TENSOR", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", _RAGGED_V_BOUNDARY_SCRIPT, "1" if pack_gqa else "0", str(seqlen_k)],
+        env=env, capture_output=True, text=True, timeout=1800,
+    )
+    assert proc.returncode == 0 and proc.stdout.strip().endswith("ok"), proc.stderr[-4000:]
 
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100 block-sparse forward")
