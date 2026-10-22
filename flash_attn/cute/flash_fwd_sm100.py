@@ -124,6 +124,12 @@ _FP8_TUNING_CONFIG = {
     # (0.94x), hence keyed on is_causal=True only.
     (False, True, 128, False): {'ex2_emu_freq': 8, 'ex2_emu_start_frg': 1},
 }
+# BF16-only register overrides (keyed like _TUNING_CONFIG), applied once the dtype is known.
+_BF16_TUNING_CONFIG = {
+    # The shared 184/80 split is spill-free for both dtypes, but BF16 is faster on B200 with more
+    # softmax registers (192/64). FP16 keeps the shared 184/80 entry.
+    (True, False, 128, False): {"num_regs_softmax": 192, "num_regs_correction": 64},
+}
 _FP8_SMALL_HDIM_REGS = {
     False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
     True: {"num_regs_softmax": 152, "num_regs_correction": 96, "num_regs_other": 112},
@@ -550,6 +556,14 @@ class FlashAttentionForwardSm100:
                     self.num_regs_softmax = fp8_tune["num_regs_softmax"]
                     self.num_regs_correction = fp8_tune["num_regs_correction"]
                     self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
+        elif const_expr(self.q_dtype == cutlass.BFloat16 and self.use_tma_KV):
+            bf16_tune = _BF16_TUNING_CONFIG.get(
+                (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103), {}
+            )
+            if const_expr("num_regs_softmax" in bf16_tune):
+                self.num_regs_softmax = bf16_tune["num_regs_softmax"]
+                self.num_regs_correction = bf16_tune["num_regs_correction"]
+                self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
         self._setup_attributes()
         self.ex2_emu_freq = 0
         self.ex2_emu_start_frg = self._tune.get("ex2_emu_start_frg", 1)
