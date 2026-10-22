@@ -9,7 +9,7 @@ import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute import FastDivmodDivisorV2
-from cutlass import Float32, Int32, Boolean, const_expr
+from cutlass import Float32, Int32, Int64, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
 from quack import copy_utils
@@ -17,6 +17,10 @@ from quack import layout_utils
 from quack import sm90_utils
 from quack.sm90_utils import gemm_zero_init, gemm_w_idx
 
+from flash_attn.cute.copy_utils import (
+    create_ragged_tensor_for_tma_load,
+    offset_ragged_tensor_for_tma_load,
+)
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
@@ -472,15 +476,37 @@ class FlashAttentionBackwardSm90:
             cute.select(self.sQ_layout, mode=[0, 1]),
             (self.tile_m, self.tile_hdim),
         )
+        # Bound the K and V TMA loads by the logical seqlen_k (cu_seqlens_k and/or seqused_k) so
+        # rows in [seqlen_k, tile_n) arrive zero-filled instead of as whatever the buffer holds.
+        # The masked P / dS are exactly zero there, but 0 * NaN = NaN in dP = dO @ V.T and
+        # dQ = dS @ K. The descriptors use the load-safe form of flash_attn.cute.copy_utils
+        # (quack's ptr_shift form is store-only, and its wraparound form needs rank <= 3, i.e.
+        # only the packed layout); it covers the packed (t, d, h) and the dense (s, d, h, b)
+        # layout alike.
+        self.ragged_kv_tma = mCuSeqlensK is not None or mSeqUsedK is not None
+        mK_tma, mV_tma = mK, mV
+        k_address_strides = v_address_strides = None
+        if const_expr(self.ragged_kv_tma):
+            # (head, batch, row) element strides; the packed layout has no batch mode.
+            k_address_strides, v_address_strides = [
+                (
+                    t.stride[2],
+                    t.stride[3] if const_expr(mCuSeqlensK is None) else Int64(0),
+                    t.stride[0],
+                )
+                for t in (mK, mV)
+            ]
+            mK_tma = create_ragged_tensor_for_tma_load(mK, rows_dim=0)
+            mV_tma = create_ragged_tensor_for_tma_load(mV, rows_dim=0)
         tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
-            mK,
+            mK_tma,
             cute.select(self.sK_layout, mode=[0, 1]),
             (self.tile_n, self.tile_hdim),
         )
         tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
-            mV,
+            mV_tma,
             cute.select(self.sV_layout, mode=[0, 1]),
             (self.tile_n, self.tile_hdimv),
         )
@@ -579,6 +605,8 @@ class FlashAttentionBackwardSm90:
             tma_tensor_Q,
             tma_tensor_K,
             tma_tensor_V,
+            k_address_strides,
+            v_address_strides,
             tma_tensor_dO,
             tma_tensor_dK if const_expr(self.qhead_per_kvhead == 1) else mdK,
             tma_tensor_dV if const_expr(self.qhead_per_kvhead == 1) else mdV,
@@ -634,6 +662,8 @@ class FlashAttentionBackwardSm90:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        k_address_strides: Optional[tuple],
+        v_address_strides: Optional[tuple],
         mdO: cute.Tensor,
         mdK: cute.Tensor,
         mdV: cute.Tensor,
@@ -743,7 +773,9 @@ class FlashAttentionBackwardSm90:
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0],
-            seqlen_k_static=mK.shape[0],
+            # With ragged K/V TMA tensors mode 0 is a sentinel extent, but cu_seqlens_k or
+            # seqused_k is then always present and the static length is unused.
+            seqlen_k_static=mK.shape[0] if const_expr(not self.ragged_kv_tma) else Int32(0),
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
@@ -768,6 +800,8 @@ class FlashAttentionBackwardSm90:
                     mQ,
                     mK,
                     mV,
+                    k_address_strides,
+                    v_address_strides,
                     mdO,
                     mLSE,
                     mdPsum,
@@ -858,6 +892,8 @@ class FlashAttentionBackwardSm90:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        k_address_strides: Optional[tuple],
+        v_address_strides: Optional[tuple],
         mdO: cute.Tensor,
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
@@ -898,10 +934,31 @@ class FlashAttentionBackwardSm90:
                     if const_expr(self.qhead_per_kvhead == 1)
                     else head_idx // qhead_per_kvhead_divmod
                 )
-                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-                mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
-                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (n_block, 0))
+                if const_expr(not self.ragged_kv_tma):
+                    mK_cur, mV_cur = [
+                        seqlen.offset_batch_K(t, batch_idx, dim=3)[None, None, head_idx_kv]
+                        for t in (mK, mV)
+                    ]
+                else:
+                    # One descriptor view per K/V tile (tiled at block 0 below): rows at or past
+                    # seqlen_k are out of bounds for TMA and arrive zero-filled.
+                    mK_cur, mV_cur = [
+                        offset_ragged_tensor_for_tma_load(
+                            t,
+                            Int64(head_idx_kv) * strides[0] + Int64(batch_idx) * strides[1],
+                            strides[2],
+                            seqlen.offset_k,
+                            seqlen.seqlen_k,
+                            n_block,
+                            block_size=self.tile_n,
+                            dtype=self.dtype,
+                            rows_dim=0,
+                        )
+                        for t, strides in ((mK, k_address_strides), (mV, v_address_strides))
+                    ]
+                kv_block = n_block if const_expr(not self.ragged_kv_tma) else 0
+                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (kv_block, 0))
+                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (kv_block, 0))
 
                 mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
                 mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[
