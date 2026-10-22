@@ -155,6 +155,61 @@ def test_flash_attn_clc_2cta_matches_default():
     assert torch.equal(out, ref)
 
 
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 forward work tiles")
+@pytest.mark.parametrize("use_tma_o", [False, True], ids=["corr_epi", "tma_o"])
+@pytest.mark.parametrize("policy", ["grid", "static_persistent", "clc"])
+@pytest.mark.parametrize("q_stage", [1, 2])
+@pytest.mark.parametrize("use_2cta", [False, True], ids=["1cta", "2cta"])
+@pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_work_tiles_cover_q(causal, use_2cta, q_stage, policy, use_tma_o):
+    """Each scheduling policy writes every valid Q row once (NOTE [SM100 forward work coordinates])."""
+    if causal and (use_2cta or policy == "static_persistent"):
+        pytest.skip("hd128 causal supports neither 2CTA nor static persistence")
+    torch.manual_seed(0)
+    # 1000 rows leave a partial last work tile; 4 * 32 heads give several waves of work tiles.
+    batch, seqlen_q, seqlen_k, nheads, d = 4, 1000, 1024, 32, 128
+    q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seqlen_k, nheads, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    captured = {}
+
+    def capture(inputs):
+        captured["inputs"] = inputs
+        return select_fwd_config(inputs)
+
+    with mock.patch("flash_attn.cute.interface.select_fwd_config", side_effect=capture):
+        _flash_attn_fwd(q, k, v, causal=causal)
+    inputs = captured["inputs"]
+    use_clc = policy == "clc"
+    config = FwdConfig(
+        device_capacity=inputs.device_capacity, tile_m=128, tile_n=128,
+        mma_pv_is_rs=False, intra_wg_overlap=False, q_stage=q_stage, pack_gqa=False,
+        use_clc_scheduler=use_clc, is_static_persistent=policy == "static_persistent",
+        use_tma_o=use_tma_o, use_s_ping_pong=False, num_splits=1, use_2cta_instrs=use_2cta,
+        registers=select_registers(
+            inputs, tile_m=128, tile_n=128, q_stage=q_stage, num_splits=1,
+            use_2cta_instrs=use_2cta, use_clc_scheduler=use_clc,
+        ),
+    )
+    # NaN sentinels expose rows that no CTA writes.
+    out = torch.full_like(q, float("nan"))
+    lse = torch.full((batch, nheads, seqlen_q), float("nan"), device="cuda", dtype=torch.float32)
+    _flash_attn_fwd(q, k, v, causal=causal, out=out, lse=lse, return_lse=True, config=config)
+    if is_fake_mode():
+        return
+    out_ref, _ = attention_ref(q, k, v, causal=causal)
+    out_pt, _ = attention_ref(q, k, v, causal=causal, upcast=False, reorder_ops=True)
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert not out.isnan().any() and not lse.isnan().any()
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + fwd_atol
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float()) / math.sqrt(d)
+    if causal:
+        q_idx = torch.arange(seqlen_q, device="cuda")[:, None] + seqlen_k - seqlen_q
+        scores.masked_fill_(torch.arange(seqlen_k, device="cuda")[None, :] > q_idx, float("-inf"))
+    torch.testing.assert_close(lse, scores.logsumexp(dim=-1), atol=1e-3, rtol=1e-4)
+
+
 @pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
 @pytest.mark.parametrize("num_splits", [0, -1])
 def test_flash_attn_sm120_num_splits(num_splits):
