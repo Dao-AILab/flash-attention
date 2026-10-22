@@ -33,7 +33,7 @@ from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils, layout_utils
 
-from flash_attn.cute.paged_kv import PagedKVManager
+from flash_attn.cute.paged_kv import PagedKVManager, copy_kv_tma, resolve_paged_token
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.copy_utils import (
@@ -1697,7 +1697,9 @@ class FlashAttentionForwardSm100:
                 if self.process_work_tile(block_info, seqlen, n_block_min, n_block_max):
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                     page_idx = (
-                        mPageTable[batch_idx, n_block_first]
+                        resolve_paged_token(
+                            mPageTable[batch_idx, None], n_block_first * self.n_block_size, self.n_block_size
+                        )[0]
                         if const_expr(mPageTable is not None and self.use_tma_KV)
                         else None
                     )
@@ -1720,7 +1722,9 @@ class FlashAttentionForwardSm100:
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
                         page_idx = (
-                            mPageTable[batch_idx, n_block]
+                            resolve_paged_token(
+                                mPageTable[batch_idx, None], n_block * self.n_block_size, self.n_block_size
+                            )[0]
                             if const_expr(mPageTable is not None and self.use_tma_KV)
                             else None
                         )
@@ -1733,7 +1737,9 @@ class FlashAttentionForwardSm100:
                             if const_expr(self.use_s_ping_pong):
                                 # V lags K by one block to match the MMA order QK(i+1) -> PV(i)
                                 page_idx_v = (
-                                    mPageTable[batch_idx, n_block + 1]
+                                    resolve_paged_token(
+                                        mPageTable[batch_idx, None], (n_block + 1) * self.n_block_size, self.n_block_size
+                                    )[0]
                                     if const_expr(mPageTable is not None and self.use_tma_KV)
                                     else None
                                 )
@@ -1744,7 +1750,9 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.use_s_ping_pong):
                         if issue_kv_for_this_warp:
                             page_idx_v = (
-                                mPageTable[batch_idx, n_block_min]
+                                resolve_paged_token(
+                                    mPageTable[batch_idx, None], n_block_min * self.n_block_size, self.n_block_size
+                                )[0]
                                 if const_expr(mPageTable is not None and self.use_tma_KV)
                                 else None
                             )
@@ -3590,7 +3598,9 @@ class FlashAttentionForwardSm100:
                 tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
             # Currently we assume that page_size == n_block_size so we index into tXgX with block = 0
             tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
-            cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=pipeline_kv.producer_get_barrier(producer_state))
+            copy_kv_tma(
+                tXgX_cur, tXsX_cur, pipeline_kv.producer_get_barrier(producer_state), tma_atom=tma_atom
+            )
         else:
             assert paged_kv_manager is not None
             assert extra_tx_count is None

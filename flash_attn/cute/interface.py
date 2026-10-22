@@ -42,6 +42,8 @@ from flash_attn.cute.cute_dsl_utils import (
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
+from flash_attn.cute.swapab_dispatch import select_swapab_backend
+from flash_attn.cute.decode_config import get_decode_config
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -734,6 +736,8 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
+    original_request = locals().copy()
+    swapab_mode = os.environ.get("FLASH_ATTENTION_SM100_BACKEND", "auto")
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
@@ -932,6 +936,13 @@ def _flash_attn_fwd(
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
     requested_disable_s_ping_pong = utils._get_disable_s_ping_pong_default()
+    swapab = select_swapab_backend(
+        original_request, q=q, k=k, v=v, page_table=page_table, arch=arch,
+        requires_grad=requires_grad, mode=swapab_mode,
+        use_clc_scheduler=requested_use_clc_scheduler,
+        disable_s_ping_pong=requested_disable_s_ping_pong,
+        disable_2cta=requested_disable_2cta,
+    )
 
     # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
     if arch // 10 in [8, 12]:
@@ -1010,28 +1021,36 @@ def _flash_attn_fwd(
             # Prefer 2CTA over cp.async-Q PackGQA for hd256.
             pack_gqa = False
 
-    fwd_cfg = _get_fwd_config(
-        arch=arch,
-        head_dim=head_dim,
-        head_dim_v=head_dim_v,
-        causal=causal,
-        local=local,
-        window_size_left=window_size_left,
-        window_size_right=window_size_right,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        qhead_per_kvhead=qhead_per_kvhead,
-        pack_gqa=pack_gqa,
-        batch_size=batch_size,
-        num_head_kv=num_head_kv,
-        num_splits=num_splits if qv is None else 1,  # MLA: split by _mla_fwd_plan
-        device=device,
-        seqlen_q=seqlen_q,
-        tile_mn=tile_mn,
-        block_sparse_tensors=block_sparse_tensors,
-        mma_pv_is_rs=mma_pv_is_rs,
-        intra_wg_overlap=intra_wg_overlap,
-    )
+    if swapab.use_swapab:
+        decode_splits, tile_hq, _, _ = get_decode_config(
+            batch_size, num_head, num_head_kv, swapab.logical_kv_capacity, head_dim,
+        )
+        pack_gqa = True
+        fwd_cfg = FwdConfig(tile_hq, 256, False, False, 1,
+                            decode_splits if num_splits < 1 else num_splits)
+    else:
+        fwd_cfg = _get_fwd_config(
+            arch=arch,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            causal=causal,
+            local=local,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            qhead_per_kvhead=qhead_per_kvhead,
+            pack_gqa=pack_gqa,
+            batch_size=batch_size,
+            num_head_kv=num_head_kv,
+            num_splits=num_splits if qv is None else 1,  # MLA: split by _mla_fwd_plan
+            device=device,
+            seqlen_q=seqlen_q,
+            tile_mn=tile_mn,
+            block_sparse_tensors=block_sparse_tensors,
+            mma_pv_is_rs=mma_pv_is_rs,
+            intra_wg_overlap=intra_wg_overlap,
+        )
     mla_fwd_cls = None
     if qv is not None:
         mla_1cta, mla_fwd_cls, fwd_cfg = _mla_fwd_plan(
@@ -1079,7 +1098,8 @@ def _flash_attn_fwd(
         lse_partial_kernel = lse_partial if qv is None else lse_partial.transpose(-1, -2)
 
     use_2cta_instrs = (
-        arch // 10 in [10, 11]
+        not swapab.use_swapab
+        and arch // 10 in [10, 11]
         and not requested_disable_2cta
         and not is_split_kv
         and (cu_seqlens_q is None or (is_hdim256 and hd256_2cta_varlen_ok))
@@ -1379,6 +1399,9 @@ def _flash_attn_fwd(
         and not (use_2cta_instrs and cu_seqlens_q is None and (causal or local))
     )
 
+    if swapab.use_swapab:
+        is_static_persistent = False
+
     # CuTe keeps stride-zero modes static when marking layouts dynamic.
     tensor_broadcast_patterns = tuple(
         get_broadcast_dims(tensor) if tensor is not None else None
@@ -1450,6 +1473,7 @@ def _flash_attn_fwd(
     )
 
     compile_key = (
+        swapab.cache_token,
         mla_1cta,
         mla_1cta_kb64,
         mla_1cta_s_ahead if mla_1cta else None,
@@ -1723,7 +1747,11 @@ def _flash_attn_fwd(
                         rescale_threshold=mla_fwd_rescale_threshold,
                     )
             else:
-                fa_fwd = FlashAttentionForwardSm100(
+                fwd_cls = FlashAttentionForwardSm100
+                if swapab.use_swapab:
+                    from flash_attn.cute.flash_fwd_decode_sm100 import FlashAttentionForwardSm100SwapAB
+                    fwd_cls = FlashAttentionForwardSm100SwapAB
+                fa_fwd = fwd_cls(
                     head_dim,
                     head_dim_v,
                     qhead_per_kvhead=qhead_per_kvhead,
@@ -1738,7 +1766,7 @@ def _flash_attn_fwd(
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
-                    paged_kv_non_tma=page_size not in [None, tile_n],
+                    paged_kv_non_tma=not swapab.use_swapab and page_size not in [None, tile_n],
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
