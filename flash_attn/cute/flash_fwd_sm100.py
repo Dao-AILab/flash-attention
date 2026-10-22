@@ -78,16 +78,13 @@ from flash_attn.cute.tile_scheduler import (
 from flash_attn.cute.fa_logging import fa_log, fa_printf
 from flash_attn.cute.utils import smid
 from flash_attn.cute.utils import AuxData
-
-# === TUNING KNOBS (agent-editable) ===
-# Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
-# Values:
-#   ex2_emu_freq: int — how often to use emulated exp2 (0=all hardware exp2, higher=more emulation).
-#                        SM103 has fast native exp2, so set freq=0 there.
-#   ex2_emu_start_frg: int — fragment index to start emulation from
-#   num_regs_softmax: int — register count for softmax warps (multiple of 8)
-#   num_regs_correction: int — register count for correction warps (multiple of 8)
-#   num_regs_other: remaining register budget, shared by the non-softmax/correction WGs
+from flash_attn.cute.config import (
+    SM100_FP8_TUNING,
+    SM100_LAUNCH_REGISTERS,
+    SM100_THREADS_PER_CTA,
+    SM100_TUNING,
+    Sm100Registers,
+)
 
 # Note [Low Precision Scaling]
 # P is in (0, 1] and is cast to the input dtype before P @ V, so scaling it by 2^max_offset
@@ -104,31 +101,6 @@ _LOG2_DTYPE_MAX = {
     cutlass.BFloat16: math.log2(3.3895313892515355e38),
 }
 
-_TUNING_CONFIG = {
-    (True, False, 128, False): {"ex2_emu_freq": 10, "ex2_emu_start_frg": 1, "num_regs_softmax": 184, "num_regs_correction": 80},
-    (False, True, 128, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
-    (True, False, 192, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "num_regs_softmax": 184, "num_regs_correction": 80},
-    (False, True, 192, False): {"ex2_emu_freq": 32, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
-    (True, False, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 80},
-    (False, True, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
-    (True, False, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
-    (False, True, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 72},
-    (True, False, 256, False): {"ex2_emu_freq": 14, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
-    (True, True, 256, False): {"ex2_emu_freq": 14, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
-}
-_FP8_TUNING_CONFIG = {
-    (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 160, 'num_regs_correction': 72},
-    # Causal hd128 FP8 previously inherited bf16's freq=16. FP8 fwd is MUFU/ex2-bound, so a more
-    # aggressive emulation freq=8 offloads more exp from MUFU: +3.4%(4k)..+5.5%(16k) on B200,
-    # MHA & GQA, accuracy-neutral (3-run validated, locked clocks). freq=8 would regress non-causal
-    # (0.94x), hence keyed on is_causal=True only.
-    (False, True, 128, False): {'ex2_emu_freq': 8, 'ex2_emu_start_frg': 1},
-}
-_FP8_SMALL_HDIM_REGS = {
-    False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
-    True: {"num_regs_softmax": 152, "num_regs_correction": 96, "num_regs_other": 112},
-}
-# === END TUNING KNOBS ===
 
 
 class DescaleTensors(NamedTuple):
@@ -170,6 +142,9 @@ class FlashAttentionForwardSm100:
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
         use_s_ping_pong: cutlass.Constexpr[bool] = False,
+        *,
+        use_tma_o: bool,
+        registers: Sm100Registers,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -222,12 +197,8 @@ class FlashAttentionForwardSm100:
         # Half-width fp32 sO preserves two KV stages; unchanged column bounds require exact hd256.
         self.chunked_split_epi = self.is_split_kv and head_dim_v == 256
         self.epi_head_dim_v = 128 if self.chunked_split_epi else self.head_dim_v_padded
-        self.use_tma_O = (
-            not self.chunked_split_epi
-            and not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
-            and not (self.pack_gqa and self.is_split_kv)
-            and not is_varlen_q
-        )
+        assert not (use_tma_o and self.chunked_split_epi), "hd256 SplitKV uses a chunked epilogue"
+        self.use_tma_O = use_tma_o
         self.use_correction_warps_for_epi = not self.use_tma_O
         self.q_subtile_factor = q_subtile_factor
         self.kv_subtile_factor = kv_subtile_factor
@@ -333,6 +304,8 @@ class FlashAttentionForwardSm100:
                 *self.empty_warp_ids,
             )
         )
+        # config.select_sm100_registers and its validation assume this launch shape.
+        assert self.threads_per_cta == SM100_THREADS_PER_CTA
 
         self.use_tma_Q = not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
         self.use_s_ping_pong = use_s_ping_pong
@@ -378,32 +351,14 @@ class FlashAttentionForwardSm100:
         # vec buffer for row_max & row_sum
         self.tmem_vec_offset = self.tmem_s_offset
 
-        # Look up tuning config for register counts and ex2_emu params
+        # ex2 emulation tuning; FwdConfig.registers carries the register split.
         _tune_key = (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103)
-        self._tune = _TUNING_CONFIG.get(_tune_key, {})
+        self._tune = SM100_TUNING.get(_tune_key, {})
         if "ex2_emu_freq" in self._tune:
             self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
-        if self.head_dim_padded < 96:
-            self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
-            self.num_regs_correction = 64
-            self.num_regs_other = 48 if not paged_kv_non_tma else 80
-        else:
-            if not paged_kv_non_tma and "num_regs_softmax" in self._tune:
-                self.num_regs_softmax = self._tune["num_regs_softmax"]
-                self.num_regs_correction = self._tune["num_regs_correction"]
-            elif not paged_kv_non_tma:
-                self.num_regs_softmax = 192
-                self.num_regs_correction = 80
-            else:
-                self.num_regs_softmax = 184
-                self.num_regs_correction = 64
-            # Divide the remaining register budget among the other WGs. Their setmaxnreg.dec
-            # cannot exceed the launch register count.
-            self.num_regs_other = min(
-                (512 - self.num_regs_softmax * self.q_stage - self.num_regs_correction)
-                // (3 - self.q_stage) // 8 * 8,
-                65536 // self.threads_per_cta,
-            )
+        self.num_regs_softmax = registers.softmax
+        self.num_regs_correction = registers.correction
+        self.num_regs_other = registers.other
 
         self.buffer_align_bytes = 1024
 
@@ -533,23 +488,12 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         if const_expr(self.q_dtype.width == 8):
-            paged_kv_non_tma = not self.use_tma_KV
-            if const_expr(self.head_dim_padded < 96):
-                fp8_regs = _FP8_SMALL_HDIM_REGS[paged_kv_non_tma]
-                self.num_regs_softmax = fp8_regs["num_regs_softmax"]
-                self.num_regs_correction = fp8_regs["num_regs_correction"]
-                self.num_regs_other = fp8_regs["num_regs_other"]
-            else:
-                fp8_tune = _FP8_TUNING_CONFIG.get(
-                    (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103), {}
-                )
-                if const_expr("ex2_emu_freq" in fp8_tune):
-                    self._tune = {**self._tune, **fp8_tune}
-                    self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
-                if const_expr(not paged_kv_non_tma and "num_regs_softmax" in fp8_tune):
-                    self.num_regs_softmax = fp8_tune["num_regs_softmax"]
-                    self.num_regs_correction = fp8_tune["num_regs_correction"]
-                    self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
+            fp8_tune = SM100_FP8_TUNING.get(
+                (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103), {}
+            )
+            if const_expr("ex2_emu_freq" in fp8_tune):
+                self._tune = {**self._tune, **fp8_tune}
+                self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
         self._setup_attributes()
         self.ex2_emu_freq = 0
         self.ex2_emu_start_frg = self._tune.get("ex2_emu_start_frg", 1)
@@ -1471,7 +1415,7 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             # setmaxnreg.dec cannot exceed the launch register count.
-            if const_expr(self.num_regs_correction > 65536 // self.threads_per_cta):
+            if const_expr(self.num_regs_correction > SM100_LAUNCH_REGISTERS):
                 cute.arch.setmaxregister_increase(self.num_regs_correction)
             else:
                 cute.arch.setmaxregister_decrease(self.num_regs_correction)

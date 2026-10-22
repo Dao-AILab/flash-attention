@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Sweep _TUNING_CONFIG parameters for flash_fwd_sm100.
+"""Sweep SM100_TUNING parameters for the SM100 forward kernel.
 
-Edits the _TUNING_CONFIG dict in flash_fwd_sm100.py, runs benchmarks, and
+Edits the SM100_TUNING dict in config.py, runs benchmarks, and
 reports the best configuration. Restores the original file on exit.
 
 Usage:
     CUDA_VISIBLE_DEVICES=7 python benchmarks/tune_ex2_emu_v2.py [--headdim 128] [--seqlen 8192]
 
-Requires: the _TUNING_CONFIG dict in flash_attn/cute/flash_fwd_sm100.py.
+Requires: the SM100_TUNING dict in flash_attn/cute/config.py.
 """
 import argparse
 import atexit
@@ -18,7 +18,7 @@ import sys
 import os
 import torch
 
-KERNEL_FILE = "flash_attn/cute/flash_fwd_sm100.py"
+KERNEL_FILE = "flash_attn/cute/config.py"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -31,9 +31,9 @@ def write_file(content):
         f.write(content)
 
 def find_tuning_block(src):
-    """Return (start, end) indices of the _TUNING_CONFIG = { ... } block."""
-    m = re.search(r'^_TUNING_CONFIG\s*=\s*\{', src, re.MULTILINE)
-    assert m, "Could not find _TUNING_CONFIG in source"
+    """Return (start, end) indices of the SM100_TUNING = { ... } block."""
+    m = re.search(r'^SM100_TUNING\s*=\s*\{', src, re.MULTILINE)
+    assert m, "Could not find SM100_TUNING in source"
     start = m.start()
     # Find matching closing brace
     depth = 0
@@ -44,19 +44,19 @@ def find_tuning_block(src):
             depth -= 1
             if depth == 0:
                 return start, i + 1
-    raise RuntimeError("Unmatched brace in _TUNING_CONFIG")
+    raise RuntimeError("Unmatched brace in SM100_TUNING")
 
 def parse_tuning_config(src):
-    """Extract _TUNING_CONFIG as a Python dict."""
+    """Extract SM100_TUNING as a Python dict."""
     start, end = find_tuning_block(src)
     block = src[start:end]
     ns = {}
     exec(block, ns)
-    return ns["_TUNING_CONFIG"]
+    return ns["SM100_TUNING"]
 
 def serialize_tuning_config(config):
-    """Serialize _TUNING_CONFIG back to source."""
-    lines = ["_TUNING_CONFIG = {"]
+    """Serialize SM100_TUNING back to source."""
+    lines = ["SM100_TUNING = {"]
     for key, val in config.items():
         use_2cta, is_causal, hdim, is_sm103 = key
         label_parts = []
@@ -75,7 +75,7 @@ def serialize_tuning_config(config):
     return "\n".join(lines)
 
 def patch_config(original_src, new_config):
-    """Replace _TUNING_CONFIG block in source with new_config."""
+    """Replace SM100_TUNING block in source with new_config."""
     start, end = find_tuning_block(original_src)
     return original_src[:start] + serialize_tuning_config(new_config) + original_src[end:]
 
@@ -212,7 +212,7 @@ def parse_headdim(s):
     return hdim, hdim
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Tune _TUNING_CONFIG for flash_fwd_sm100")
+    p = argparse.ArgumentParser(description="Tune SM100_TUNING for flash_fwd_sm100")
     p.add_argument("--headdim", type=str, default="128",
                     help="Head dim spec: 128 or 192-128 (hdim-hdim_v)")
     p.add_argument("--seqlen", type=str, default="8192")
@@ -230,7 +230,7 @@ def main():
     config = parse_tuning_config(original_src)
 
     hdim, hdim_v = parse_headdim(args.headdim)
-    # _TUNING_CONFIG keys use head_dim_padded (rounded up to multiple of 16)
+    # SM100_TUNING keys use head_dim_padded (rounded up to multiple of 16)
     import math
     hdim_padded = int(math.ceil(hdim / 16) * 16)
     is_sm103 = detect_sm103()
@@ -238,7 +238,7 @@ def main():
     # Determine which keys to tune (matching hdim and detected arch)
     keys_to_tune = [k for k in config if k[2] == hdim_padded and k[3] == is_sm103]
     if not keys_to_tune:
-        print(f"No _TUNING_CONFIG entries for hdim_padded={hdim_padded}, is_sm103={is_sm103}")
+        print(f"No SM100_TUNING entries for hdim_padded={hdim_padded}, is_sm103={is_sm103}")
         print("Available keys:", [k for k in config])
         sys.exit(1)
 
@@ -387,7 +387,7 @@ def main():
         val_parts = ", ".join(f'"{k}": {json.dumps(v)}' for k, v in config[key].items())
         print(f"    {key!r}: {{{val_parts}}},")
 
-    print(f"\nTo apply, update _TUNING_CONFIG in {KERNEL_FILE}")
+    print(f"\nTo apply, update SM100_TUNING in {KERNEL_FILE}")
 
     write_file(original_src)
     print("Restored original file.")
