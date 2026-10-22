@@ -1,10 +1,11 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 
-"""Host-only forward config selection and validation.
+"""Host-only forward and backward config selection and validation.
 
-FwdConfig uses exact split counts: 1 disables SplitKV. Explicit configs are
-validated, not normalized. Selection must not read tensor contents, synchronize
-CUDA, or allocate device memory. MLA (qv) uses a separate policy in interface.py.
+FwdConfig and BwdConfig are fully resolved launch choices; FwdConfig uses exact
+split counts (1 disables SplitKV). Explicit configs are validated, not normalized.
+Selection must not read tensor contents, synchronize CUDA, or allocate device
+memory. MLA (qv) forward uses a separate policy in interface.py.
 """
 
 import math
@@ -962,3 +963,596 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
     ):
         raise ValueError("2CTA instructions are not supported for this forward problem")
     validate_registers(config)
+
+
+# === Backward ===
+# Backward selection mirrors the forward: host-only BwdHeuristicInputs, one fully resolved
+# BwdConfig, and validate_bwd_config rejecting (never normalizing) explicit configs. The
+# sparse MLA backward uses its own policy in interface.py.
+
+
+@dataclass(frozen=True)
+class Sm90BwdRegisters:
+    """Per-thread setmaxnreg targets for the SM90 backward warp-group roles.
+
+    MMA warp groups that compute dQ raise to ``mma``; with dQ_single_wg the other MMA warp
+    group raises to ``mma_no_dq``; the producer warp group lowers to ``producer``.
+    """
+
+    mma: int
+    mma_no_dq: int
+    producer: int
+
+
+@dataclass(frozen=True)
+class Sm100BwdRegisters:
+    """Per-thread setmaxnreg targets for the SM100/SM110 backward warp roles.
+
+    The dQ reduce warp group and the two compute warp groups raise; the load, MMA, and empty
+    warps lower. The relay warp lowers to ``mma`` with 2CTA and to ``empty`` otherwise.
+    """
+
+    reduce: int
+    compute: int
+    load: int
+    mma: int
+    empty: int
+
+
+# None for kernels that do not split registers by role (SM120, dedicated SM100 hdim 256).
+BwdRegisters = Sm90BwdRegisters | Sm100BwdRegisters | None
+
+
+@dataclass(frozen=True)
+class BwdConfig:
+    """Fully resolved backward launch configuration.
+
+    tile_m / tile_n are the main kernel's Q and KV tiles, which also size the preprocess,
+    postprocess, and accumulators. The dedicated SM100 hdim-256 kernels run fixed internal
+    tiles; its config records the 128x128 tiles the surrounding kernels use. SM90-only MMA
+    options (PdS stages, SdP_swapAB / AtomLayoutMSdP, dQ_single_wg) hold neutral values on
+    other architectures. cluster_size differs from use_2cta_instrs only for the dedicated
+    hdim-256 kernel, which always uses 2CTA instructions.
+    """
+
+    device_capacity: int
+    tile_m: int
+    tile_n: int
+    num_stages_Q: int
+    num_stages_dO: int
+    num_stages_PdS: int
+    SdP_swapAB: bool
+    dKV_swapAB: bool
+    dQ_swapAB: bool
+    AtomLayoutMSdP: int
+    AtomLayoutNdKV: int
+    AtomLayoutMdQ: int
+    num_threads: int
+    dQ_single_wg: bool
+    V_in_regs: bool
+    use_2cta_instrs: bool
+    cluster_size: int
+    spt: bool
+    use_dedicated_hd256_kernel: bool
+    registers: BwdRegisters
+
+    @property
+    def num_wg(self) -> int:
+        """SM90 MMA warp groups; the producer warp group is the remaining 128 threads."""
+        return self.num_threads // 128 - 1
+
+
+class BwdHeuristicInputs(NamedTuple):
+    """Host metadata for backward config selection and validation.
+
+    Holds only the facts the policy reads, so the selection cache key does not vary with
+    sequence lengths or batch size. sparse_block_size_q / sparse_block_size_kv are the
+    caller's block_size, None when unset.
+    """
+
+    device_arch: int
+    head_dim: int
+    head_dim_v: int
+    num_heads: int
+    num_heads_kv: int
+    causal: bool = False
+    local: bool = False
+    deterministic: bool = False
+    use_block_sparsity: bool = False
+    sparse_block_size_q: int | None = None
+    sparse_block_size_kv: int | None = None
+    sparse_spt: bool | None = None
+    requested_V_in_regs: bool = False
+    # FLASH_ATTENTION_BWD_TILE_N: 64 requests the SM100 2CTA 64-row KV tile.
+    requested_tile_n: int | None = None
+    disable_2cta: bool = False
+    # FLASH_ATTENTION_HD256_GENERIC_BWD: SM100 hdim 256 on FlashAttentionBackwardSm100.
+    hd256_generic: bool = False
+
+    @property
+    def device_capacity(self) -> int:
+        return self.device_arch // 10
+
+    @property
+    def qhead_per_kvhead(self) -> int:
+        return self.num_heads // self.num_heads_kv
+
+    @property
+    def is_hdim256(self) -> bool:
+        return self.head_dim == 256 and self.head_dim_v == 256
+
+
+def bwd_sparse_q_block_size(inputs: BwdHeuristicInputs) -> int | None:
+    """Sparse Q block size the backward tiles must divide; SM90 defaults to 128."""
+    if not inputs.use_block_sparsity:
+        return None
+    if inputs.sparse_block_size_q is not None:
+        return inputs.sparse_block_size_q
+    return 128 if inputs.device_capacity == 9 else None
+
+
+def bwd_q_subtile_factor(config: BwdConfig, inputs: BwdHeuristicInputs) -> int:
+    """Q tiles per sparse Q block; unset sizes keep the legacy factor of 2."""
+    sparse_q = bwd_sparse_q_block_size(inputs)
+    return sparse_q // config.tile_m if sparse_q is not None else 2
+
+
+def bwd_kv_subtile_factor(sparse_block_size_kv: int | None, tile_n: int) -> int:
+    """Physical KV tiles covered by one sparse KV block."""
+    if sparse_block_size_kv is None:
+        return 1
+    if sparse_block_size_kv % tile_n != 0:
+        raise ValueError(
+            "Block sparsity expects sparse_block_size[1] "
+            f"to be a multiple of tile_n={tile_n}; got {sparse_block_size_kv}."
+        )
+    return sparse_block_size_kv // tile_n
+
+
+def config_kv_subtile_factor(config: BwdConfig, inputs: BwdHeuristicInputs) -> int:
+    """KV tiles per sparse KV block; SM90 and SM120 map one sparse block per tile."""
+    if config.device_capacity not in (10, 11) or not inputs.use_block_sparsity:
+        return 1
+    return bwd_kv_subtile_factor(inputs.sparse_block_size_kv, config.tile_n)
+
+
+def bwd_spt(inputs: BwdHeuristicInputs) -> bool:
+    """SM90/SM100 deterministic shortest-processing-time dQ lock order.
+
+    SM100 block sparsity may name it; the SM90 kernel has no deterministic block-sparse path.
+    """
+    if inputs.device_capacity != 9 and inputs.use_block_sparsity and inputs.sparse_spt is not None:
+        return inputs.sparse_spt and inputs.deterministic
+    return (inputs.causal or inputs.local) and inputs.deterministic
+
+
+def bwd_tile_hdim(head_dim: int) -> int:
+    """SM100 backward head-dim tile: padded to a multiple of 32."""
+    return ceil_div(head_dim, 32) * 32
+
+
+def can_use_bwd_2cta(inputs: BwdHeuristicInputs, *, tile_n: int) -> bool:
+    """Whether the SM100 generic backward supports 2CTA instructions for this problem."""
+    # 2CTA tiles pair adjacent KV tiles, so a sparse KV block must cover an even count.
+    sparse_ok = (
+        not inputs.use_block_sparsity
+        or bwd_kv_subtile_factor(inputs.sparse_block_size_kv, tile_n) % 2 == 0
+    )
+    return inputs.head_dim >= 128 and sparse_ok
+
+
+def can_use_bwd_tile_n_64(inputs: BwdHeuristicInputs, *, use_2cta_instrs: bool) -> bool:
+    """Whether the SM100 generic backward supports a 64-row KV tile per CTA.
+
+    See NOTE [M=64 accumulator layout] in flash_bwd_sm100.py: only with 2CTA, for hdim 256
+    (serial schedule) or the pipelined schedule (hdim <= 128) without block sparsity, where
+    the dK / dV epilogue needs 32-padded head dims that are multiples of 64.
+    """
+    if not use_2cta_instrs:
+        return False
+    if inputs.is_hdim256:
+        return True
+    return (
+        inputs.head_dim <= 128
+        and inputs.head_dim_v <= 128
+        and all(bwd_tile_hdim(d) % 64 == 0 for d in (inputs.head_dim, inputs.head_dim_v))
+        and not inputs.use_block_sparsity
+    )
+
+
+def bwd_needs_2cta(inputs: BwdHeuristicInputs) -> str | None:
+    """Name the SM100 generic-backward problem that only the 2CTA serial schedule supports."""
+    if inputs.is_hdim256:
+        return "SM100 backward with head_dim=256"
+    if bwd_tile_hdim(inputs.head_dim) == 192:
+        if inputs.use_block_sparsity and inputs.head_dim == 192:
+            return "SM100 block-sparse backward with head_dim=192"
+        return f"SM100 backward with head_dim={inputs.head_dim}"
+    return None
+
+
+# fmt: off
+def select_sm90_bwd_tile(
+    head_dim: int,
+    head_dim_v: int,
+    causal: bool,
+    local: bool,
+    sparse_block_size_q: int | None,
+) -> dict:
+    """Return the SM90 backward tile and MMA fields of BwdConfig.
+
+    Configs based on C++ FA3 hopper/flash_bwd_launch_template.h, benchmarked on H100 SXM.
+    """
+    if head_dim <= 64:
+        # C++ FA3: 128, 128, 64, ..., 2, 2, true, false, false, 2, 1, 2, 2
+        return dict(
+            tile_m=128, tile_n=128,
+            num_stages_Q=2, num_stages_dO=2, num_stages_PdS=2,
+            SdP_swapAB=True, dKV_swapAB=False, dQ_swapAB=False,
+            AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=2,
+        )
+    elif head_dim <= 96:
+        # C++ FA3: 64, 128, 96, dQ_swapAB=False
+        return dict(
+            tile_m=64, tile_n=128,
+            num_stages_Q=2, num_stages_dO=2, num_stages_PdS=2,
+            SdP_swapAB=True, dKV_swapAB=False, dQ_swapAB=False,
+            AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
+            dQ_single_wg=True,
+        )
+    elif head_dim <= 128:
+        # C++ FA3: causal/local: 64, 128; non-causal: 80, 128 with dQ_swapAB
+        tile_m = 64 if causal or local else 80
+        if sparse_block_size_q is not None and sparse_block_size_q % tile_m != 0:
+            tile_m = 64
+        return dict(
+            tile_m=tile_m, tile_n=128,
+            num_stages_Q=2, num_stages_dO=2, num_stages_PdS=2,
+            SdP_swapAB=True, dKV_swapAB=False, dQ_swapAB=tile_m % 64 != 0,
+            AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
+        )
+    elif head_dim <= 192:
+        return dict(
+            tile_m=64, tile_n=96,
+            num_stages_Q=2, num_stages_dO=2 if head_dim_v <= 128 else 1, num_stages_PdS=1,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
+            AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
+        )
+    # hdim 256. The smem dQaccum staging buffer (64 KB) leaves no room for the C++ FA3
+    # tile (64x80, 2-stage Q); 64x48 is the largest tile_n that fits a 2-stage Q pipeline,
+    # and dKV_swapAB (hdim on WGMMA's M axis) is what allows tile_n=48. It also rounds
+    # tile_hdim to 64, which is what makes head_dim in (192, 256) compile.
+    if sparse_block_size_q is not None:
+        # Block sparsity derives its KV block size from tile_n; keep it at 64.
+        return dict(
+            tile_m=64, tile_n=64,
+            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
+            SdP_swapAB=False, dKV_swapAB=False, dQ_swapAB=False,
+            AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+        )
+    return dict(
+        tile_m=64, tile_n=48,
+        num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
+        SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
+        AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+    )
+# fmt: on
+
+
+def select_sm90_bwd_registers(*, num_wg: int, dQ_single_wg: bool) -> Sm90BwdRegisters:
+    if num_wg == 2:
+        if dQ_single_wg:
+            return Sm90BwdRegisters(mma=256, mma_no_dq=224, producer=24)
+        return Sm90BwdRegisters(mma=240, mma_no_dq=240, producer=24)
+    return Sm90BwdRegisters(mma=160, mma_no_dq=160, producer=32)
+
+
+def select_sm100_bwd_registers(
+    inputs: BwdHeuristicInputs, *, use_2cta_instrs: bool
+) -> Sm100BwdRegisters:
+    # Both 2CTA schedules use the same split.
+    if use_2cta_instrs:
+        return Sm100BwdRegisters(reduce=136, compute=136, load=104, mma=104, empty=24)
+    if (inputs.causal or inputs.local) and not inputs.deterministic:
+        return Sm100BwdRegisters(reduce=136, compute=144, load=88, mma=88, empty=24)
+    return Sm100BwdRegisters(reduce=152, compute=136, load=88, mma=88, empty=24)
+
+
+# Architecture-specific options at their neutral values, for architectures that do not
+# expose them: the SM90 MMA options, and the SM100 2CTA options. spt (SM90 and SM100) is
+# always bwd_spt(inputs) there and False on SM120.
+_SM90_ONLY_NEUTRAL_FIELDS = dict(
+    num_stages_PdS=1,
+    SdP_swapAB=False,
+    dKV_swapAB=False,
+    dQ_swapAB=False,
+    AtomLayoutMSdP=1,
+    AtomLayoutNdKV=1,
+    AtomLayoutMdQ=1,
+    dQ_single_wg=False,
+    V_in_regs=False,
+)
+_SM100_ONLY_NEUTRAL_FIELDS = dict(
+    use_2cta_instrs=False,
+    cluster_size=1,
+    use_dedicated_hd256_kernel=False,
+)
+# The SM100 kernel launches 16 warps: dQ reduce, 2x compute, MMA, load, relay, and empty.
+SM100_BWD_THREADS_PER_CTA = 512
+
+
+def sm120_bwd_fields(inputs: BwdHeuristicInputs) -> dict:
+    """The one SM120 backward configuration: SM80 MMA, 99 KB SMEM, 128 threads (4 warps)."""
+    stages = 2 if inputs.head_dim <= 64 else 1
+    return {
+        **_SM90_ONLY_NEUTRAL_FIELDS,
+        **_SM100_ONLY_NEUTRAL_FIELDS,
+        "tile_m": 64,
+        "tile_n": 64,
+        "num_stages_Q": stages,
+        "num_stages_dO": stages,
+        "AtomLayoutMSdP": 4,
+        "AtomLayoutNdKV": 4,
+        "AtomLayoutMdQ": 4,
+        "num_threads": 128,
+        "spt": False,
+    }
+
+
+@lru_cache(maxsize=1024)
+def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
+    """Select one fully resolved backward config from host-visible metadata."""
+    fields = {**_SM90_ONLY_NEUTRAL_FIELDS, **_SM100_ONLY_NEUTRAL_FIELDS}
+    match inputs.device_capacity:
+        case 9:
+            fields.update(
+                select_sm90_bwd_tile(
+                    inputs.head_dim,
+                    inputs.head_dim_v,
+                    inputs.causal,
+                    inputs.local,
+                    bwd_sparse_q_block_size(inputs),
+                ),
+                num_threads=3 * 128,
+                V_in_regs=inputs.requested_V_in_regs,
+                spt=bwd_spt(inputs),
+            )
+            registers = select_sm90_bwd_registers(
+                num_wg=fields["num_threads"] // 128 - 1, dQ_single_wg=fields["dQ_single_wg"]
+            )
+        case 10 | 11:
+            hd256_generic = inputs.is_hdim256 and inputs.hd256_generic
+            # hdim 256 on the generic kernel runs a 64-row KV tile per CTA (NOTE [M=64
+            # accumulator layout] in flash_bwd_sm100.py); the 2CTA decision sees that tile.
+            tile_n = 64 if hd256_generic else 128
+            use_2cta_instrs = not inputs.disable_2cta and can_use_bwd_2cta(inputs, tile_n=tile_n)
+            if (
+                inputs.requested_tile_n == 64
+                and not inputs.is_hdim256
+                and can_use_bwd_tile_n_64(inputs, use_2cta_instrs=use_2cta_instrs)
+            ):
+                tile_n = 64
+            dedicated = inputs.is_hdim256 and not inputs.hd256_generic
+            # The dedicated hdim-256 kernel always uses 2CTA instructions; its cluster follows
+            # the generic 2CTA decision.
+            any_2cta = use_2cta_instrs or dedicated
+            fields.update(
+                tile_m=128,
+                tile_n=tile_n,
+                num_stages_Q=1 if any_2cta else 2,
+                num_stages_dO=1,
+                num_threads=SM100_BWD_THREADS_PER_CTA,
+                use_2cta_instrs=any_2cta,
+                cluster_size=2 if use_2cta_instrs else 1,
+                spt=bwd_spt(inputs),
+                use_dedicated_hd256_kernel=dedicated,
+            )
+            registers = (
+                None
+                if dedicated
+                else select_sm100_bwd_registers(inputs, use_2cta_instrs=use_2cta_instrs)
+            )
+        case 12:
+            fields = sm120_bwd_fields(inputs)
+            registers = None
+        case _:
+            raise ValueError(f"Unsupported backward architecture family SM{inputs.device_capacity}")
+    config = BwdConfig(device_capacity=inputs.device_capacity, registers=registers, **fields)
+    validate_bwd_config(config, inputs)
+    return config
+
+
+def validate_bwd_registers(config: BwdConfig) -> None:
+    """Reject register splits the backward kernels cannot apply with setmaxnreg."""
+    registers = config.registers
+    if config.device_capacity == 9:
+        expected = Sm90BwdRegisters
+    elif config.device_capacity in (10, 11) and not config.use_dedicated_hd256_kernel:
+        expected = Sm100BwdRegisters
+    else:
+        expected = type(None)
+    if type(registers) is not expected:
+        raise ValueError(
+            f"This SM{config.device_capacity} backward needs registers of type "
+            f"{expected.__name__}, got {type(registers).__name__}"
+        )
+    if registers is None:
+        return
+    if any(v % 8 != 0 or not 24 <= v <= 256 for v in astuple(registers)):
+        raise ValueError(f"Register counts must be multiples of 8 in [24, 256], got {registers}")
+    if isinstance(registers, Sm90BwdRegisters):
+        num_wg = config.num_wg
+        num_wg_dq = 1 if config.dQ_single_wg else num_wg
+        if not config.dQ_single_wg and registers.mma_no_dq != registers.mma:
+            raise ValueError(
+                f"Without dQ_single_wg every MMA warp group uses mma registers, got {registers}"
+            )
+        launch = 65536 // config.num_threads
+        raised = (registers.mma, registers.mma_no_dq)
+        if registers.producer > launch or min(raised) < launch:
+            raise ValueError(
+                f"SM90 MMA registers must be >= {launch} and producer <= {launch}, got {registers}"
+            )
+        budget = num_wg_dq * registers.mma + (num_wg - num_wg_dq) * registers.mma_no_dq
+        budget += registers.producer
+        limit = 504 if num_wg == 2 else 512
+    else:
+        launch = 65536 // SM100_BWD_THREADS_PER_CTA
+        if (
+            min(registers.reduce, registers.compute) < launch
+            or max(registers.load, registers.mma, registers.empty) > launch
+        ):
+            raise ValueError(
+                f"SM100 reduce/compute registers must be >= {launch} and load/mma/empty "
+                f"<= {launch}, got {registers}"
+            )
+        # One warp group each for reduce and the lowered warps, two for compute.
+        budget = registers.reduce + 2 * registers.compute
+        budget += max(registers.load, registers.mma, registers.empty)
+        limit = 512
+    if budget > limit:
+        raise ValueError(f"Register split {registers} exceeds {limit} per thread (uses {budget})")
+
+
+def validate_sm90_bwd_mma(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
+    """Mirror FlashAttentionBackwardSm90's stage, warp-group, and WGMMA tiling requirements."""
+    if config.num_threads not in (384, 512):
+        raise ValueError(
+            f"SM90 backward needs 2 or 3 MMA warp groups (384 or 512 threads), "
+            f"got {config.num_threads}"
+        )
+    num_wg = config.num_wg
+    if num_wg != 2 and (config.dQ_single_wg or inputs.qhead_per_kvhead > 1):
+        raise ValueError("SM90 dQ_single_wg and GQA backward need 2 MMA warp groups")
+    if inputs.qhead_per_kvhead > 1 and inputs.head_dim != inputs.head_dim_v:
+        raise ValueError("SM90 GQA backward requires head_dim == head_dim_v")
+    Q_stage = config.num_stages_Q
+    if config.num_stages_dO not in (1, Q_stage) or config.num_stages_PdS not in (1, Q_stage):
+        raise ValueError(
+            f"SM90 backward needs dO and PdS stages of 1 or num_stages_Q={Q_stage}, got "
+            f"{(config.num_stages_dO, config.num_stages_PdS)}"
+        )
+    # Swapped dK/dV accumulators put head_dim on WGMMA's 64-row M axis.
+    hdim_multiple_of = 64 if config.dKV_swapAB else 16
+    tile_hdim = ceil_div(inputs.head_dim, hdim_multiple_of) * hdim_multiple_of
+    tile_hdimv = ceil_div(inputs.head_dim_v, hdim_multiple_of) * hdim_multiple_of
+    num_wg_dQ = 1 if config.dQ_single_wg else num_wg
+    # (GEMM, M, N, warp groups along M, warp groups, swapAB) as in _get_tiled_mma.
+    gemms = [
+        ("SdP", config.tile_m, config.tile_n, config.AtomLayoutMSdP, num_wg, config.SdP_swapAB),
+        ("dK", config.tile_n, tile_hdim, config.AtomLayoutNdKV, num_wg, config.dKV_swapAB),
+        ("dV", config.tile_n, tile_hdimv, config.AtomLayoutNdKV, num_wg, config.dKV_swapAB),
+        ("dQ", config.tile_m, tile_hdim, config.AtomLayoutMdQ, num_wg_dQ, config.dQ_swapAB),
+    ]
+    for name, m, n, atom_m, wgs, swap in gemms:
+        if atom_m < 1 or wgs % atom_m != 0:
+            raise ValueError(
+                f"SM90 {name} atom layout {atom_m} must divide its {wgs} MMA warp groups"
+            )
+        atom_n = wgs // atom_m
+        if swap:
+            m, n, atom_m, atom_n = n, m, atom_n, atom_m
+        # Each warp group issues 64-row WGMMAs with N a multiple of 8.
+        if m % (64 * atom_m) != 0 or n % atom_n != 0 or (n // atom_n) % 8 != 0:
+            raise ValueError(
+                f"SM90 {name} WGMMA (swapAB={swap}) cannot tile {m}x{n} over "
+                f"{atom_m}x{atom_n} warp groups of 64-row atoms"
+            )
+
+
+@lru_cache(maxsize=1024)
+def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
+    """Reject known unsupported or silently normalized backward config combinations."""
+    capacity = inputs.device_capacity
+    if capacity not in (9, 10, 11, 12):
+        raise ValueError(f"Unsupported backward architecture family SM{capacity}")
+    if config.device_capacity != capacity:
+        raise ValueError(
+            f"Config targets SM{config.device_capacity}, but the problem targets SM{capacity}"
+        )
+    if config.tile_m <= 0 or config.tile_n <= 0:
+        raise ValueError(f"Tile dimensions must be positive, got {(config.tile_m, config.tile_n)}")
+    if config.tile_m % 16 != 0 or config.tile_n % 16 != 0:
+        raise ValueError(
+            f"Tile dimensions must be multiples of 16, got {(config.tile_m, config.tile_n)}"
+        )
+    if config.num_stages_Q < 1 or config.num_stages_dO < 1 or config.num_stages_PdS < 1:
+        raise ValueError("Pipeline stage counts must be positive")
+    if capacity not in (10, 11) and any(
+        getattr(config, name) != value for name, value in _SM100_ONLY_NEUTRAL_FIELDS.items()
+    ):
+        raise ValueError(f"SM{capacity} backward does not support SM100 2CTA options")
+    if capacity != 12 and config.spt != bwd_spt(inputs):
+        raise ValueError(
+            f"SM{capacity} backward needs spt={bwd_spt(inputs)} (deterministic dQ lock order)"
+        )
+    if capacity == 9:
+        validate_sm90_bwd_mma(config, inputs)
+    elif capacity == 12:
+        mismatched = {
+            name: value
+            for name, value in sm120_bwd_fields(inputs).items()
+            if getattr(config, name) != value
+        }
+        if mismatched:
+            raise ValueError(f"SM120 backward supports one configuration; expected {mismatched}")
+    else:
+        neutral = _SM90_ONLY_NEUTRAL_FIELDS
+        if any(getattr(config, name) != value for name, value in neutral.items()):
+            raise ValueError(
+                "SM100 backward does not expose SM80/SM90 MMA options: "
+                + ", ".join(f"{name}={value}" for name, value in neutral.items())
+            )
+        if config.num_threads != SM100_BWD_THREADS_PER_CTA:
+            raise ValueError(f"SM100 backward launches {SM100_BWD_THREADS_PER_CTA} threads")
+        if config.num_stages_Q != (1 if config.use_2cta_instrs else 2) or config.num_stages_dO != 1:
+            raise ValueError("SM100 backward uses 2 Q stages (1 with 2CTA) and 1 dO stage")
+        if config.use_dedicated_hd256_kernel:
+            if not inputs.is_hdim256:
+                raise ValueError("The dedicated SM100 backward kernel requires head_dim=256")
+            if not config.use_2cta_instrs or config.cluster_size not in (1, 2):
+                raise ValueError(
+                    "The dedicated SM100 hdim-256 backward needs 2CTA instructions "
+                    "and cluster_size 1 or 2"
+                )
+            if (config.tile_m, config.tile_n) != (128, 128):
+                raise ValueError("The dedicated SM100 hdim-256 backward uses 128x128 tiles")
+            # The dedicated kernel checks the sparse KV size against tile_n like the generic one.
+            config_kv_subtile_factor(config, inputs)
+        else:
+            if config.cluster_size != (2 if config.use_2cta_instrs else 1):
+                raise ValueError("SM100 backward uses cluster_size=2 exactly with 2CTA")
+            if config.tile_m != 128 or config.tile_n not in (64, 128):
+                raise ValueError(
+                    f"SM100 backward requires tile_m=128 and tile_n in (64, 128), "
+                    f"got {(config.tile_m, config.tile_n)}"
+                )
+            config_kv_subtile_factor(config, inputs)
+            can_2cta = can_use_bwd_2cta(inputs, tile_n=config.tile_n)
+            needs_2cta = bwd_needs_2cta(inputs)
+            if needs_2cta is not None and not config.use_2cta_instrs:
+                reason = (
+                    "2CTA was disabled by request"
+                    if inputs.disable_2cta or can_2cta
+                    else (
+                        f"sparse_block_size[1] must cover an even number of "
+                        f"tile_n={config.tile_n} tiles; got factor "
+                        f"{config_kv_subtile_factor(config, inputs)}"
+                    )
+                )
+                raise ValueError(f"{needs_2cta} requires 2CTA; {reason}.")
+            if config.use_2cta_instrs and not can_2cta:
+                raise ValueError("2CTA instructions are not supported for this backward problem")
+            if config.tile_n == 64 and not can_use_bwd_tile_n_64(
+                inputs, use_2cta_instrs=config.use_2cta_instrs
+            ):
+                raise ValueError("tile_n=64 is not supported for this SM100 backward problem")
+            if inputs.is_hdim256 and config.tile_n != 64:
+                raise ValueError("SM100 generic backward with head_dim=256 needs tile_n=64")
+    sparse_q = bwd_sparse_q_block_size(inputs)
+    if sparse_q is not None and (sparse_q <= 0 or sparse_q % config.tile_m != 0):
+        raise ValueError(
+            "Block sparsity requires sparse_block_size[0] to be a multiple of "
+            f"tile_m={config.tile_m}; got {sparse_q}."
+        )
+    validate_bwd_registers(config)
