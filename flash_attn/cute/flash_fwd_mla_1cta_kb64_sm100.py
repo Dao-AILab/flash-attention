@@ -97,35 +97,6 @@ def pair_barrier_sync(barrier_id: Int32, num_threads: cutlass.Constexpr[int]) ->
 class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
     # No spills at the ptxas default; -O2 measured 7-8% slower (4k / 16k sparse training).
     ptxas_options = ""
-    # dense: one token per tile (heads padded to 64) x 64 keys, and at least 4 of those key
-    # blocks per split: each split pays a Q load, a 128 KB fp32 O partial and its share of the
-    # combine (one block per split measured 30% slower than 32 splits at s_k = 8K, b = 1)
-    TILE_MN = (64, 64)
-    MIN_BLOCKS_PER_SPLIT = 4
-
-    @staticmethod
-    def can_implement(*, is_topk_gather, is_fp8, nheads_per_kv, num_head_kv, seqlen_q_hint) -> bool:
-        """1CTA MLA calls this mainloop serves (the rest run the 128-key mainloop): 16-bit,
-        <= 64 heads; sparse at any such head count; dense at 64 heads, or with fewer on decode
-        only -- padding the one-token tile wins there (1.07-1.30x over the 128-key mainloop)
-        but wastes 64 / H of the MMA work on prefill, where the 128-key mainloop packs several
-        tokens per tile (kb64 0.34-0.81x)."""
-        if is_fp8 or nheads_per_kv > 64:
-            return False
-        return is_topk_gather or nheads_per_kv == 64 or (num_head_kv == 1 and seqlen_q_hint == 1)
-
-    @staticmethod
-    def use_clc(*, is_topk_gather, seqlen_q_hint, clc_default) -> bool:
-        """Sparse: always. Dense: CLC measured +2-10% on prefill (many tiles per KV stream) and
-        neutral on decode; varlen without a max_seqlen_q hint counts as decode."""
-        if is_topk_gather:
-            return True
-        return seqlen_q_hint is not None and seqlen_q_hint > 1
-
-    @staticmethod
-    def use_s_ahead(*, is_fp8, seqlen_q_hint, nheads) -> bool:
-        return False  # the 128-key mainloop's fp8 schedule; kb64 always issues S ahead of PV
-
     def __init__(
         self,
         is_causal: bool = False,
