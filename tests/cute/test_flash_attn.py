@@ -4364,3 +4364,107 @@ def test_flash_attn_sm90_fwd_unused_v_tail(dtype, d, causal, nheads_kv, varlen):
     out = flash_attn_varlen_func(q, k, v_nan, **kwargs)[0]
     assert out.isfinite().all(), "out has NaN/Inf"
     assert torch.equal(out, ref)
+
+
+# Regression tests for #3068: ragged K/V TMA loads must stay inside the tensor (the
+# per-CTA descriptor rewrite), the rewritten descriptor must be acquired on every
+# producer path, and the descriptor workspace must cover the schedulers' padded grid.
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100 or IS_SM110), reason="ragged K/V TMA loads")
+@pytest.mark.parametrize("pack_gqa", [False, True])
+@pytest.mark.parametrize("seqlen_k", [1, 16, 100])
+def test_flash_attn_ragged_v_tma_allocation_boundary(pack_gqa, seqlen_k):
+    """V ends exactly where a 1 GiB allocation ends, so any TMA access past the last
+    valid row (#3068: ~128 KB of prefetch with the wrap-around descriptor) faults."""
+    torch.manual_seed(0)
+    batch, seqlen_q, nheads, d, dv = 49, 511, 6, 128, 64
+    q = torch.randn(batch * seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch * seqlen_k, 1, d, device="cuda", dtype=q.dtype)
+    backing = torch.empty(1 << 29, dtype=q.dtype, device="cuda")
+    v = backing[-batch * seqlen_k * dv :].view(batch * seqlen_k, 1, dv).normal_()
+    cu_q = torch.arange(0, (batch + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32)
+    cu_k = torch.arange(0, (batch + 1) * seqlen_k, seqlen_k, device="cuda", dtype=torch.int32)
+    out = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k, num_splits=1, pack_gqa=pack_gqa,
+    )[0]
+    torch.cuda.synchronize()
+    assert out.isfinite().all()
+    if seqlen_k == 1:
+        # One key per sequence: the output is that key's V row exactly.
+        ref = v.view(batch, 1, dv).expand(batch, seqlen_q, dv).reshape(batch * seqlen_q, 1, dv)
+        assert torch.equal(out, ref.expand(-1, nheads, -1))
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100 block-sparse forward")
+def test_flash_attn_sm100_ragged_v_descriptor_reuse_block_sparse():
+    """Persistent CTAs rewrite the V descriptor per work tile; the block-sparse producer
+    must acquire it before its loads (a missing fence lets a CTA load V with the previous
+    sequence's extent, pulling NaN rows in)."""
+    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+    torch.manual_seed(0)
+    batch, seqlen_q, cache, nheads, d = 256, 128, 256, 4, 64
+    q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, cache, nheads, d, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    lengths = [1, 129] * (batch // 2)
+    seqused_k = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    for i, length in enumerate(lengths):
+        v[i, length:] = float("nan")
+    # Every KV block up to the sequence end is attended: same result as the dense call.
+    cnt = torch.tensor([(n + 127) // 128 for n in lengths], device="cuda", dtype=torch.int32)
+    cnt = cnt.view(batch, 1, 1).expand(batch, nheads, 1).contiguous()
+    idx = torch.arange(2, device="cuda", dtype=torch.int32)
+    idx = idx.view(1, 1, 1, 2).expand(batch, nheads, 1, 2).contiguous()
+    sparse = BlockSparseTensorsTorch(
+        cnt, idx, torch.zeros_like(cnt), torch.zeros_like(idx), block_size=(128, 128)
+    )
+    kwargs = dict(seqused_k=seqused_k, num_splits=1, pack_gqa=False)
+    ref = _flash_attn_fwd(q, k, v, **kwargs)[0]
+    assert ref.isfinite().all()
+    for _ in range(3):
+        out = _flash_attn_fwd(q, k, v, block_sparse_tensors=sparse, **kwargs)[0]
+        assert out.isfinite().all()
+        torch.testing.assert_close(out, ref, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100 or IS_SM110), reason="ragged K/V TMA loads")
+@pytest.mark.parametrize("packed_kv", [False, True])
+@pytest.mark.parametrize("seqlen_q", [128, 300])
+@pytest.mark.parametrize("num_splits", [1, 3])
+def test_flash_attn_ragged_tensormap_workspace_padding(packed_kv, seqlen_q, num_splits):
+    """Dense Q + seqused_q with many short sequences: the varlen schedulers pad every
+    batch by a cluster-sized tile, so the grid exceeds sum(ceil(seqlen_q / tile)) and the
+    descriptor workspace must cover it (the kernel traps otherwise)."""
+    torch.manual_seed(0)
+    batch, seqlen_k, nheads, d = 49, 217, 6, 128
+    q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seqlen_k, nheads, d, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    seqused_q = torch.tensor(([0, 1, 127, seqlen_q] * 13)[:batch], device="cuda", dtype=torch.int32)
+    seqused_k = torch.tensor(([0, 1, 129, seqlen_k] * 13)[:batch], device="cuda", dtype=torch.int32)
+    cu_k = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * seqlen_k
+    kk, vv = (k.reshape(-1, nheads, d), v.reshape(-1, nheads, d)) if packed_kv else (k, v)
+    for _ in range(2):
+        out = _flash_attn_fwd(
+            q, kk, vv, seqused_q=seqused_q, seqused_k=seqused_k,
+            cu_seqlens_k=cu_k if packed_kv else None, max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k, num_splits=num_splits, pack_gqa=False,
+        )[0]
+        torch.cuda.synchronize()
+        for i, (ql, kl) in enumerate(zip(seqused_q.tolist(), seqused_k.tolist())):
+            if ql == 0:
+                continue
+            if kl == 0:
+                ref = torch.zeros_like(out[i, :ql])
+            else:
+                ref = torch.nn.functional.scaled_dot_product_attention(
+                    q[i, :ql].float().transpose(0, 1),
+                    k[i, :kl].float().transpose(0, 1),
+                    v[i, :kl].float().transpose(0, 1),
+                ).transpose(0, 1).to(out.dtype)
+            torch.testing.assert_close(out[i, :ql], ref, atol=0.02, rtol=0.02)
+        # Change the sequence ends between calls: descriptors must be rebuilt per call.
+        seqused_k = torch.roll(seqused_k, 1)

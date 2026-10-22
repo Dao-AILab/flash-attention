@@ -1787,6 +1787,12 @@ class FlashAttentionForwardSm100:
             else:
                 # Match the dense path (get_n_block_min_max): the scheduler packs the
                 # per-batch dynamic num_splits into the top 16 bits of split_idx.
+                if const_expr(self.ragged_tma_V) and v_desc_acquire == 1:
+                    tensormap_manager.fence_tensormap_update(tensormap_V_gmem)
+                    cute.arch.inline_ptx(
+                        "prefetch.tensormap [{$r0}];", read_only_args=[tensormap_V_gmem.toint()]
+                    )
+                    v_desc_acquire = Int32(0)
                 num_splits_dyn = num_splits
                 if const_expr(self.is_split_kv and block_info.pack_split_idx):
                     num_splits_dyn = split_idx >> 16
