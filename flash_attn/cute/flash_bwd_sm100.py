@@ -823,10 +823,32 @@ class FlashAttentionBackwardSm100:
             )
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+        # Bound the K and V TMA loads by the logical seqlen_k (cu_seqlens_k and/or seqused_k) so
+        # rows in [seqlen_k, tile_n) arrive zero-filled instead of as whatever the buffer holds.
+        # The masked P / dS are exactly zero there, but 0 * NaN = NaN in dP = V @ dO.T and
+        # dQ = dS @ K. The descriptors use the load-safe form of flash_attn.cute.copy_utils
+        # (quack's ptr_shift form is store-only, and its wraparound form needs rank <= 3, i.e.
+        # only the packed layout); it covers the packed (t, d, h) and the dense (s, d, h, b)
+        # layout alike.
+        self.ragged_kv_tma = mCuSeqlensK is not None or mSeqUsedK is not None
+        mK_tma, mV_tma = mK, mV
+        k_address_strides = v_address_strides = None
+        if const_expr(self.ragged_kv_tma):
+            # (head, batch, row) element strides; the packed layout has no batch mode.
+            k_address_strides, v_address_strides = [
+                (
+                    t.stride[2],
+                    t.stride[3] if const_expr(mCuSeqlensK is None) else Int64(0),
+                    t.stride[0],
+                )
+                for t in (mK, mV)
+            ]
+            mK_tma = copy_utils.create_ragged_tensor_for_tma_load(mK, rows_dim=0)
+            mV_tma = copy_utils.create_ragged_tensor_for_tma_load(mV, rows_dim=0)
         # S.T = K @ Q.T
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
-            mK,
+            mK_tma,
             cute.select(self.sK_layout, mode=[0, 1, 2]),
             self.mma_tiler_kq,
             self.tiled_mma_S,
@@ -846,7 +868,7 @@ class FlashAttentionBackwardSm100:
         # dP.T = V @ dO.T
         tma_atom_V, tma_tensor_V = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
-            mV,
+            mV_tma,
             cute.select(self.sV_layout, mode=[0, 1, 2]),
             self.mma_tiler_vdo,
             self.tiled_mma_dP,
@@ -892,9 +914,13 @@ class FlashAttentionBackwardSm100:
             Kt_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
                 self.cluster_shape_mnk, self.tiled_mma_dQ.thr_id
             )
+            mKt_tma = layout_utils.select(mK, mode=transpose_sh_k)
+            if const_expr(self.ragged_kv_tma):
+                # (hdim, seqlen_k, ...): the rows are mode 1.
+                mKt_tma = copy_utils.create_ragged_tensor_for_tma_load(mKt_tma, rows_dim=1)
             tma_atom_Kt, tma_tensor_Kt = cute.nvgpu.make_tiled_tma_atom_B(
                 Kt_tma_op,
-                layout_utils.select(mK, mode=transpose_sh_k),
+                mKt_tma,
                 cute.select(self.sKt_layout, mode=[0, 1, 2]),
                 self.mma_tiler_dsk,
                 self.tiled_mma_dQ,
@@ -1185,6 +1211,8 @@ class FlashAttentionBackwardSm100:
             tma_tensor_K,
             tma_tensor_Kt,
             tma_tensor_V,
+            k_address_strides,
+            v_address_strides,
             mLSE,
             mdPsum,
             tma_tensor_dO,
@@ -1268,6 +1296,8 @@ class FlashAttentionBackwardSm100:
         mK: cute.Tensor,
         mKt: Optional[cute.Tensor],
         mV: cute.Tensor,
+        k_address_strides: Optional[tuple],
+        v_address_strides: Optional[tuple],
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
         mdO: cute.Tensor,
@@ -1677,7 +1707,9 @@ class FlashAttentionBackwardSm100:
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0],
-            seqlen_k_static=mK.shape[0],
+            # With ragged K/V TMA tensors mode 0 is a sentinel extent, but cu_seqlens_k or
+            # seqused_k is then always present and the static length is unused.
+            seqlen_k_static=mK.shape[0] if const_expr(not self.ragged_kv_tma) else Int32(0),
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
@@ -1725,6 +1757,8 @@ class FlashAttentionBackwardSm100:
                 mK,
                 mKt,
                 mV,
+                k_address_strides,
+                v_address_strides,
                 mdO,
                 mQt,
                 mdOt,
@@ -1964,6 +1998,8 @@ class FlashAttentionBackwardSm100:
         mK: cute.Tensor,
         mKt: Optional[cute.Tensor],
         mV: cute.Tensor,
+        k_address_strides: Optional[tuple],
+        v_address_strides: Optional[tuple],
         mdO: cute.Tensor,
         mQt: Optional[cute.Tensor],
         mdOt: Optional[cute.Tensor],
@@ -2047,8 +2083,32 @@ class FlashAttentionBackwardSm100:
 
             # GMEM tensors (varlen-aware)
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-            mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-            mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+            if const_expr(not self.ragged_kv_tma):
+                mK_cur, mV_cur = [
+                    seqlen.offset_batch_K(t, batch_idx, dim=3)[None, None, head_idx_kv]
+                    for t in (mK, mV)
+                ]
+            else:
+                # One descriptor view per K/V tile (tiled at block 0 below): rows at or past
+                # seqlen_k are out of bounds for TMA and arrive zero-filled.
+                mK_cur, mV_cur = [
+                    copy_utils.offset_ragged_tensor_for_tma_load(
+                        t,
+                        Int64(head_idx_kv) * strides[0] + Int64(batch_idx) * strides[1],
+                        strides[2],
+                        seqlen.offset_k,
+                        seqlen.seqlen_k,
+                        n_block_cta_group,
+                        block_size=tiler[0],
+                        dtype=dtype,
+                        rows_dim=0,
+                    )
+                    for t, strides, tiler, dtype in (
+                        (mK, k_address_strides, self.mma_tiler_kq, self.k_dtype),
+                        (mV, v_address_strides, self.mma_tiler_vdo, self.v_dtype),
+                    )
+                ]
+            kv_block = n_block_cta_group if const_expr(not self.ragged_kv_tma) else 0
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdO_cur = mdO[None, None, head_idx, batch_idx]
             else:
@@ -2067,17 +2127,30 @@ class FlashAttentionBackwardSm100:
                     mdOt_cur = cute.domain_offset((seqlen.offset_q, 0, 0), mdOt)[
                         None, None, head_idx
                     ]
-                if const_expr(not seqlen.has_cu_seqlens_k):
-                    mKt_cur = mKt[None, None, head_idx_kv, batch_idx]
+                if const_expr(not self.ragged_kv_tma):
+                    if const_expr(not seqlen.has_cu_seqlens_k):
+                        mKt_cur = mKt[None, None, head_idx_kv, batch_idx]
+                    else:
+                        mKt_cur = cute.domain_offset((0, seqlen.offset_k, 0), mKt)[
+                            None, None, head_idx_kv
+                        ]
                 else:
-                    mKt_cur = cute.domain_offset((0, seqlen.offset_k, 0), mKt)[
-                        None, None, head_idx_kv
-                    ]
+                    # Same K tile as mK_cur, through the (hdim, seqlen_k) descriptor.
+                    mKt_cur = copy_utils.offset_ragged_tensor_for_tma_load(
+                        mKt,
+                        Int64(head_idx_kv) * k_address_strides[0]
+                        + Int64(batch_idx) * k_address_strides[1],
+                        k_address_strides[2],
+                        seqlen.offset_k,
+                        seqlen.seqlen_k,
+                        n_block_cta_group,
+                        block_size=self.mma_tiler_dsk[2],
+                        dtype=self.k_dtype,
+                        rows_dim=1,
+                    )
 
             # (1) S.T = K @ Q.T
-            gK = cute.local_tile(
-                mK_cur, cute.select(self.mma_tiler_kq, mode=[0, 2]), (n_block_cta_group, 0)
-            )
+            gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_kq, mode=[0, 2]), (kv_block, 0))
             tSgK = thr_mma_S.partition_A(gK)
 
             gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_kq, mode=[1, 2]), (None, 0))
@@ -2110,7 +2183,7 @@ class FlashAttentionBackwardSm100:
 
             # (2) dP = V @ dO.T
             gV = cute.local_tile(
-                mV_cur, cute.select(self.mma_tiler_vdo, mode=[0, 2]), (n_block_cta_group, 0)
+                mV_cur, cute.select(self.mma_tiler_vdo, mode=[0, 2]), (kv_block, 0)
             )
             tdPgV = thr_mma_dP.partition_A(gV)
 
@@ -2173,7 +2246,7 @@ class FlashAttentionBackwardSm100:
             load_Kt = None
             if const_expr(self.use_2cta_instrs):
                 gKt = cute.local_tile(
-                    mKt_cur, cute.select(self.mma_tiler_dsk, mode=[1, 2]), (0, n_block_cta_group)
+                    mKt_cur, cute.select(self.mma_tiler_dsk, mode=[1, 2]), (0, kv_block)
                 )
                 tdQgK = thr_mma_dQ.partition_B(gKt)
 
