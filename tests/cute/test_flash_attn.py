@@ -4216,9 +4216,11 @@ def test_flash_attn_sm100_bwd_unused_kv_tail(
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("nheads_kv", [8, 2])
+@pytest.mark.parametrize("varlen", [True, False])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_sm90_varlen_bwd_unused_kv_tail(dtype, d, causal, nheads_kv):
-    """K/V rows past seqused_k inside a packed buffer must not reach dQ/dK/dV.
+def test_flash_attn_sm90_bwd_unused_kv_tail(dtype, d, causal, nheads_kv, varlen):
+    """K/V rows past seqused_k must not reach dQ/dK/dV, in the packed (cu_seqlens_k) and the
+    dense (batch, seqlen, heads, d) layout.
 
     The backward is KV-stationary: dP = dO @ V^T and dQ = dS @ K read whole K/V tiles, and the
     masked dS is exactly zero past the sequence end, but 0 * NaN = NaN unless the K/V TMA loads
@@ -4229,22 +4231,36 @@ def test_flash_attn_sm90_varlen_bwd_unused_kv_tail(dtype, d, causal, nheads_kv):
     nheads = 8
     lengths = [100, 256, 37, 200, 129]
     batch, capacity = len(lengths), 256
-    q = torch.randn(sum(lengths), nheads, d, device="cuda", dtype=dtype)
-    k = torch.randn(batch * capacity, nheads_kv, d, device="cuda", dtype=dtype)
-    v = torch.randn(batch * capacity, nheads_kv, d, device="cuda", dtype=dtype)
-    cu_seqlens_q = torch.tensor(
-        [0] + list(itertools.accumulate(lengths)), device="cuda", dtype=torch.int32
-    )
-    cu_seqlens_k = torch.arange(0, (batch + 1) * capacity, capacity, device="cuda", dtype=torch.int32)
     seqused_k = torch.tensor(lengths, device="cuda", dtype=torch.int32)
-    kwargs = {
-        "causal": causal,
-        "cu_seqlens_q": cu_seqlens_q,
-        "cu_seqlens_k": cu_seqlens_k,
-        "seqused_k": seqused_k,
-        "max_seqlen_q": max(lengths),
-        "max_seqlen_k": capacity,
-    }
+    if varlen:
+        q = torch.randn(sum(lengths), nheads, d, device="cuda", dtype=dtype)
+        k = torch.randn(batch * capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn(batch * capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        cu_seqlens_q = torch.tensor(
+            [0] + list(itertools.accumulate(lengths)), device="cuda", dtype=torch.int32
+        )
+        cu_seqlens_k = torch.arange(
+            0, (batch + 1) * capacity, capacity, device="cuda", dtype=torch.int32
+        )
+        kwargs = {
+            "causal": causal,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "seqused_k": seqused_k,
+            "max_seqlen_q": max(lengths),
+            "max_seqlen_k": capacity,
+        }
+    else:
+        seqlen_q = 128
+        q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=dtype)
+        k = torch.randn(batch, capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn(batch, capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        kwargs = {
+            "causal": causal,
+            "seqused_k": seqused_k,
+            "max_seqlen_q": seqlen_q,
+            "max_seqlen_k": capacity,
+        }
     out, lse = flash_attn_varlen_func(q, k, v, return_lse=True, **kwargs)
     dout = torch.randn_like(out)
 
@@ -4260,7 +4276,8 @@ def test_flash_attn_sm90_varlen_bwd_unused_kv_tail(dtype, d, causal, nheads_kv):
     valid = torch.zeros(batch, capacity, dtype=torch.bool, device="cuda")
     for b, length in enumerate(lengths):
         valid[b, :length] = True
-    valid = valid.flatten()
+    if varlen:
+        valid = valid.flatten()
     # dQ and the GQA dK/dV go through fp32 reduce-adds whose order is not fixed, so the clean
     # and poisoned runs can differ by an ulp; a NaN tail that leaks shows up as NaN, not as ulps.
     eps = torch.finfo(dtype).eps
