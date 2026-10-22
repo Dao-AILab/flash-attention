@@ -36,10 +36,7 @@ from quack import copy_utils, layout_utils
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
-from flash_attn.cute.copy_utils import (
-    create_ragged_tensor_for_tma_load,
-    offset_ragged_tensor_for_tma_load,
-)
+from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
@@ -479,6 +476,7 @@ class FlashAttentionForwardSm100:
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         mBlocksToBatchIdx: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
+        tensormap_workspace: Optional[cute.Tensor] = None,  # (num_ctas, 16) Int64, one TMA descriptor per CTA
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -682,13 +680,21 @@ class FlashAttentionForwardSm100:
 
         tma_atom_K = None
         tma_atom_V = None
+        # Bound V loads by the logical sequence length: the load warp rewrites its CTA's copy
+        # of the V TMA descriptor per work tile (tensormap.replace) so rows at or past the
+        # sequence end are out of bounds for TMA and arrive zero-filled. Masking P alone cannot
+        # prevent unused NaN cache entries from entering the PV MMA (0 * NaN). A descriptor
+        # trick with a per-launch extent is not an option: TMA prefetches past the tensor
+        # footprint it was given (#3068).
         self.ragged_tma_V = (
             self.use_tma_KV
             and mPageTable is None
             and (mCuSeqlensK is not None or mSeqUsedK is not None)
             and not (isinstance(mV.stride[1], int) and mV.stride[1] == 0)
         )
-        v_address_strides = None
+        if const_expr(self.ragged_tma_V):
+            assert tensormap_workspace is not None, "ragged V TMA loads need a tensormap workspace"
+        mV_gmem = mV if const_expr(self.ragged_tma_V) else None
         if const_expr(self.use_tma_KV):
             # TMA load for K
             tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
@@ -700,20 +706,9 @@ class FlashAttentionForwardSm100:
                 cta_layout_vmnk.shape,
             )
             # TMA load for V
-            # Bound V loads by the logical sequence length. Masking P alone cannot
-            # prevent unused NaN cache entries from entering the PV MMA (0 * NaN).
-            if const_expr(self.ragged_tma_V):
-                v_address_strides = (
-                    mV.stride[2],
-                    mV.stride[3] if const_expr(mCuSeqlensK is None) else Int64(0),
-                    mV.stride[1],
-                )
-                mV_tma = create_ragged_tensor_for_tma_load(mV)
-            else:
-                mV_tma = mV
             tma_atom_V, mV = cute.nvgpu.make_tiled_tma_atom_B(
                 tma_load_op,
-                mV_tma,
+                mV,
                 cute.select(sV_layout, mode=[0, 1, 2]),
                 self.mma_tiler_pv,
                 tiled_mma_pv,
@@ -866,7 +861,8 @@ class FlashAttentionForwardSm100:
             mQ,
             mK,
             mV,
-            v_address_strides,
+            mV_gmem,
+            tensormap_workspace if const_expr(self.ragged_tma_V) else None,
             mO,
             mLSE,
             mCuSeqlensQ,
@@ -930,7 +926,8 @@ class FlashAttentionForwardSm100:
         mQ: cute.Tensor,  # (s_q, d, h, b) or (total_q, d, h) if there is cu_seqlens_q
         mK: cute.Tensor,  # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there is cu_seqlens_k or (page_size, d, h_k, num_pages) if there is page_table
         mV: cute.Tensor,  # (d, s_k, h_k, b_k) or (d, total_k, h_k) if there is cu_seqlens_k or (d, page_size, h_k, num_pages) if there is page_table
-        v_address_strides: Optional[tuple],
+        mV_gmem: Optional[cute.Tensor],  # the gmem V tensor behind tma_atom_V (ragged V only)
+        tensormap_workspace: Optional[cute.Tensor],  # (num_ctas, 16) Int64 (ragged V only)
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
@@ -1342,7 +1339,8 @@ class FlashAttentionForwardSm100:
                 mQ,
                 mK,
                 mV,
-                v_address_strides,
+                mV_gmem,
+                tensormap_workspace,
                 sQ,
                 sK,
                 sV,
@@ -1516,7 +1514,8 @@ class FlashAttentionForwardSm100:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
-        v_address_strides: Optional[tuple],
+        mV_gmem: Optional[cute.Tensor],
+        tensormap_workspace: Optional[cute.Tensor],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -1552,11 +1551,54 @@ class FlashAttentionForwardSm100:
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.kv_stage
         )
+        tensormap_manager = None
+        tensormap_V_gmem = None
+        v_desc_ptr = None
+        if const_expr(self.ragged_tma_V):
+            tensormap_manager = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
+            bidx, bidy, bidz = cute.arch.block_idx()
+            gdx, gdy, _ = cute.arch.grid_dim()
+            cta_linear_idx = bidx + bidy * gdx + bidz * gdx * gdy
+            tensormap_V_gmem = tensormap_manager.get_tensormap_ptr(
+                tensormap_workspace[(cta_linear_idx, None)].iterator
+            )
+            v_desc_ptr = tensormap_manager.get_tensormap_ptr(
+                tensormap_V_gmem, cute.AddressSpace.generic
+            )
+            tensormap_manager.init_tensormap_from_atom(
+                tma_atom_V, tensormap_V_gmem, self.load_warp_ids[0]
+            )
+            tensormap_manager.fence_tensormap_initialization()
+        # The V extent depends on the batch only: rewrite the descriptor when it changes and
+        # acquire it right before the first V load so the K/Q issue overlaps the fence.
+        v_desc_batch_idx = Int32(-1)
+        v_desc_acquire = Int32(0)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+            if const_expr(self.ragged_tma_V) and batch_idx != v_desc_batch_idx:
+                # Shrink the rows extent of V to this sequence's end (packed: absolute row;
+                # dense: per-batch row). The TMA unit then zero-fills every row at or past
+                # the end and never touches memory beyond it. Extents must stay >= 1.
+                v_desc_batch_idx = batch_idx
+                v_desc_acquire = Int32(1)
+                v_rows_end = (
+                    seqlen.offset_k + seqlen.seqlen_k
+                    if const_expr(seqlen.has_cu_seqlens_k)
+                    else seqlen.seqlen_k
+                )
+                v_rows_end = cutlass.max(v_rows_end, 1)
+                v_shape = list(mV_gmem.shape)
+                v_shape[1] = v_rows_end
+                mV_bounded = cute.make_tensor(
+                    mV_gmem.iterator, cute.make_layout(tuple(v_shape), stride=mV_gmem.stride)
+                )
+                tensormap_manager.update_tensormap(
+                    (mV_bounded,), (tma_atom_V,), (tensormap_V_gmem,),
+                    self.load_warp_ids[0], (None,),
+                )
 
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
@@ -1566,21 +1608,12 @@ class FlashAttentionForwardSm100:
                     mK_cur = mK[None, None, head_idx_kv, batch_idx]
                 else:
                     mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
-                if const_expr(self.ragged_tma_V):
-                    outer_offset = (
-                        Int64(head_idx_kv) * v_address_strides[0]
-                        + Int64(batch_idx) * v_address_strides[1]
-                    )
-                    mV_cur = None  # V's row bound and address are formed per tile.
-                elif const_expr(not seqlen.has_cu_seqlens_k):
+                if const_expr(not seqlen.has_cu_seqlens_k):
                     mV_cur = mV[None, None, head_idx_kv, batch_idx]
                 else:
                     mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, head_idx_kv])
                 gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
-                gV = (
-                    cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
-                    if const_expr(mV_cur is not None) else None
-                )
+                gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
             else:
                 # Need to keep batch coord None since we'll index into it with page idx
                 mK_cur, mV_cur = [t[None, None, head_idx_kv, None] for t in (mK, mV)]
@@ -1625,16 +1658,13 @@ class FlashAttentionForwardSm100:
                     cute.group_modes(sK, 0, 3),
                     cute.group_modes(tSgK, 0, 3),
                 )
-                if const_expr(not self.ragged_tma_V):
-                    tVsV, tVgV = cpasync.tma_partition(
-                        tma_atom_V,
-                        0,  # no multicast
-                        cute.make_layout(1),
-                        cute.group_modes(sV, 0, 3),
-                        cute.group_modes(tOgV, 0, 3),
-                    )
-                else:
-                    tVsV, tVgV = None, None
+                tVsV, tVgV = cpasync.tma_partition(
+                    tma_atom_V,
+                    0,  # no multicast
+                    cute.make_layout(1),
+                    cute.group_modes(sV, 0, 3),
+                    cute.group_modes(tOgV, 0, 3),
+                )
                 paged_kv_manager = None
             else:
                 page_size = mK.shape[0]
@@ -1667,23 +1697,17 @@ class FlashAttentionForwardSm100:
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
             )
-            if const_expr(self.ragged_tma_V):
-                load_V = partial(
-                    self.load_V_ragged, tma_atom_V, mV, sV, thr_mma_pv,
-                    outer_offset, v_address_strides[2], seqlen.offset_k, seqlen.seqlen_k,
-                    pipeline_kv=pipeline_kv,
-                )
-            else:
-                load_V = partial(
-                    self.load_KV,
-                    tma_atom_V,
-                    tVgV,
-                    tVsV,
-                    paged_kv_manager,
-                    sV,
-                    pipeline_kv=pipeline_kv,
-                    K_or_V="V",
-                )
+            load_V = partial(
+                self.load_KV,
+                tma_atom_V,
+                tVgV,
+                tVsV,
+                paged_kv_manager,
+                sV,
+                pipeline_kv=pipeline_kv,
+                K_or_V="V",
+                tma_desc_ptr=v_desc_ptr,
+            )
 
             if const_expr(not self.use_block_sparsity):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
@@ -1712,6 +1736,12 @@ class FlashAttentionForwardSm100:
                         kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
                         load_Q(block=1, stage=1)
+                    if const_expr(self.ragged_tma_V) and v_desc_acquire == 1:
+                        tensormap_manager.fence_tensormap_update(tensormap_V_gmem)
+                        cute.arch.inline_ptx(
+                            "prefetch.tensormap [{$r0}];", read_only_args=[tensormap_V_gmem.toint()]
+                        )
+                        v_desc_acquire = Int32(0)
                     q_producer_phase ^= 1
                     if const_expr(not self.use_s_ping_pong):
                         if issue_kv_for_this_warp:
@@ -3522,37 +3552,6 @@ class FlashAttentionForwardSm100:
         pipeline_q.sync_object_full.arrive_cp_async_mbarrier(stage)
 
     @cute.jit
-    def load_V_ragged(
-        self,
-        tma_atom: cute.CopyAtom,
-        mV: cute.Tensor,
-        sV: cute.Tensor,
-        thr_mma: cute.ThrMma,
-        outer_offset: Int64,
-        row_stride: Int64,
-        offset: Int32,
-        length: Int32,
-        block: Int32,
-        pipeline_kv: pipeline.PipelineAsync,
-        producer_state: pipeline.PipelineState,
-        page_idx: Optional[Int32] = None,
-    ):
-        assert page_idx is None
-        view = offset_ragged_tensor_for_tma_load(
-            mV, outer_offset, row_stride, offset, length, block,
-            block_size=self.n_block_size, dtype=self.v_dtype,
-        )
-        gV = cute.local_tile(view, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
-        tOgV = thr_mma.partition_B(gV)
-        tVsV, tVgV = cpasync.tma_partition(
-            tma_atom, 0, cute.make_layout(1),
-            cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3),
-        )
-        self.load_KV(
-            tma_atom, tVgV, tVsV, None, sV, 0, pipeline_kv, producer_state, "V"
-        )
-
-    @cute.jit
     def load_KV(
         self,
         tma_atom: Optional[cute.CopyAtom],
@@ -3566,6 +3565,7 @@ class FlashAttentionForwardSm100:
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
         extra_tx_count: Optional[Int32] = None,
+        tma_desc_ptr: Optional[cute.Pointer] = None,
     ):
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase
@@ -3590,7 +3590,11 @@ class FlashAttentionForwardSm100:
                 tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
             # Currently we assume that page_size == n_block_size so we index into tXgX with block = 0
             tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
-            cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=pipeline_kv.producer_get_barrier(producer_state))
+            desc_kwargs = {"tma_desc_ptr": tma_desc_ptr} if const_expr(tma_desc_ptr is not None) else {}
+            cute.copy(
+                tma_atom, tXgX_cur, tXsX_cur,
+                tma_bar_ptr=pipeline_kv.producer_get_barrier(producer_state), **desc_kwargs,
+            )
         else:
             assert paged_kv_manager is not None
             assert extra_tx_count is None

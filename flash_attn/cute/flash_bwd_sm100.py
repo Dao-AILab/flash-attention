@@ -10,7 +10,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute import FastDivmodDivisorV2
 from cutlass import Float32, Int32, Int64, const_expr
-from cutlass.utils import LayoutEnum
+from cutlass.utils import LayoutEnum, TensorMapManager, TensorMapUpdateMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
@@ -682,6 +682,9 @@ class FlashAttentionBackwardSm100:
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        tensormap_workspace: Optional[
+            cute.Tensor
+        ] = None,  # (num_ctas, 3, 16) Int64: K, V, Kt descriptors per CTA
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -826,25 +829,18 @@ class FlashAttentionBackwardSm100:
         # Bound the K and V TMA loads by the logical seqlen_k (cu_seqlens_k and/or seqused_k) so
         # rows in [seqlen_k, tile_n) arrive zero-filled instead of as whatever the buffer holds.
         # The masked P / dS are exactly zero there, but 0 * NaN = NaN in dP = V @ dO.T and
-        # dQ = dS @ K. The descriptors use the load-safe form of flash_attn.cute.copy_utils
-        # (quack's ptr_shift form is store-only, and its wraparound form needs rank <= 3, i.e.
-        # only the packed layout); it covers the packed (t, d, h) and the dense (s, d, h, b)
-        # layout alike.
+        # dQ = dS @ K. The load warp rewrites its CTA's copies of the K, V (and Kt) descriptors
+        # per work tile with the sequence's row extent (tensormap.replace); TMA then zero-fills
+        # rows at or past the end and never touches memory beyond it. A descriptor with a
+        # per-launch extent cannot do this: TMA prefetches past the footprint it is given (#3068).
         self.ragged_kv_tma = mCuSeqlensK is not None or mSeqUsedK is not None
-        mK_tma, mV_tma = mK, mV
-        k_address_strides = v_address_strides = None
         if const_expr(self.ragged_kv_tma):
-            # (head, batch, row) element strides; the packed layout has no batch mode.
-            k_address_strides, v_address_strides = [
-                (
-                    t.stride[2],
-                    t.stride[3] if const_expr(mCuSeqlensK is None) else Int64(0),
-                    t.stride[0],
-                )
-                for t in (mK, mV)
-            ]
-            mK_tma = copy_utils.create_ragged_tensor_for_tma_load(mK, rows_dim=0)
-            mV_tma = copy_utils.create_ragged_tensor_for_tma_load(mV, rows_dim=0)
+            assert tensormap_workspace is not None, (
+                "ragged K/V TMA loads need a tensormap workspace"
+            )
+        mK_tma, mV_tma = mK, mV
+        mK_gmem, mV_gmem = (mK, mV) if const_expr(self.ragged_kv_tma) else (None, None)
+        mKt_gmem = None
         # S.T = K @ Q.T
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
@@ -916,8 +912,7 @@ class FlashAttentionBackwardSm100:
             )
             mKt_tma = layout_utils.select(mK, mode=transpose_sh_k)
             if const_expr(self.ragged_kv_tma):
-                # (hdim, seqlen_k, ...): the rows are mode 1.
-                mKt_tma = copy_utils.create_ragged_tensor_for_tma_load(mKt_tma, rows_dim=1)
+                mKt_gmem = mKt_tma  # (hdim, seqlen_k, ...): the rows are mode 1
             tma_atom_Kt, tma_tensor_Kt = cute.nvgpu.make_tiled_tma_atom_B(
                 Kt_tma_op,
                 mKt_tma,
@@ -1211,8 +1206,10 @@ class FlashAttentionBackwardSm100:
             tma_tensor_K,
             tma_tensor_Kt,
             tma_tensor_V,
-            k_address_strides,
-            v_address_strides,
+            mK_gmem,
+            mV_gmem,
+            mKt_gmem,
+            tensormap_workspace if const_expr(self.ragged_kv_tma) else None,
             mLSE,
             mdPsum,
             tma_tensor_dO,
@@ -1296,8 +1293,10 @@ class FlashAttentionBackwardSm100:
         mK: cute.Tensor,
         mKt: Optional[cute.Tensor],
         mV: cute.Tensor,
-        k_address_strides: Optional[tuple],
-        v_address_strides: Optional[tuple],
+        mK_gmem: Optional[cute.Tensor],  # gmem tensors behind tma_atom_K/V/Kt (ragged K/V only)
+        mV_gmem: Optional[cute.Tensor],
+        mKt_gmem: Optional[cute.Tensor],
+        tensormap_workspace: Optional[cute.Tensor],  # (num_ctas, 3, 16) Int64 (ragged K/V only)
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
         mdO: cute.Tensor,
@@ -1757,8 +1756,10 @@ class FlashAttentionBackwardSm100:
                 mK,
                 mKt,
                 mV,
-                k_address_strides,
-                v_address_strides,
+                mK_gmem,
+                mV_gmem,
+                mKt_gmem,
+                tensormap_workspace,
                 mdO,
                 mQt,
                 mdOt,
@@ -1998,8 +1999,10 @@ class FlashAttentionBackwardSm100:
         mK: cute.Tensor,
         mKt: Optional[cute.Tensor],
         mV: cute.Tensor,
-        k_address_strides: Optional[tuple],
-        v_address_strides: Optional[tuple],
+        mK_gmem: Optional[cute.Tensor],
+        mV_gmem: Optional[cute.Tensor],
+        mKt_gmem: Optional[cute.Tensor],
+        tensormap_workspace: Optional[cute.Tensor],
         mdO: cute.Tensor,
         mQt: Optional[cute.Tensor],
         mdOt: Optional[cute.Tensor],
@@ -2069,11 +2072,64 @@ class FlashAttentionBackwardSm100:
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
             )
 
+        tensormap_manager = None
+        tensormap_gmem = ()
+        desc_ptrs = (None, None, None)
+        atoms = ()
+        if const_expr(self.ragged_kv_tma):
+            tensormap_manager = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
+            bidx, bidy, bidz = cute.arch.block_idx()
+            gdx, gdy, _ = cute.arch.grid_dim()
+            cta_linear_idx = bidx + bidy * gdx + bidz * gdx * gdy
+            n_desc = 3 if const_expr(self.use_2cta_instrs) else 2
+            atoms = (tma_atom_K, tma_atom_V, tma_atom_Kt)[:n_desc]
+            tensormap_gmem = tuple(
+                tensormap_manager.get_tensormap_ptr(
+                    tensormap_workspace[(cta_linear_idx, i, None)].iterator
+                )
+                for i in range(n_desc)
+            )
+            desc_ptrs = tuple(
+                tensormap_manager.get_tensormap_ptr(p, cute.AddressSpace.generic)
+                for p in tensormap_gmem
+            ) + (None,) * (3 - n_desc)
+            for atom, gmem_ptr in zip(atoms, tensormap_gmem):
+                tensormap_manager.init_tensormap_from_atom(atom, gmem_ptr, self.load_warp_id)
+            tensormap_manager.fence_tensormap_initialization()
+        # The K/V extent depends on the batch only: rewrite the descriptors when it changes.
+        kv_desc_batch_idx = Int32(-1)
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            if const_expr(self.ragged_kv_tma) and batch_idx != kv_desc_batch_idx:
+                # Shrink the rows extent of K, V (mode 0) and Kt (mode 1) to this sequence's
+                # end: packed layouts count absolute rows, dense layouts per-batch rows.
+                # Extents must stay >= 1.
+                kv_desc_batch_idx = batch_idx
+                kv_rows_end = (
+                    seqlen.offset_k + seqlen.seqlen_k
+                    if const_expr(seqlen.has_cu_seqlens_k)
+                    else seqlen.seqlen_k
+                )
+                kv_rows_end = cutlass.max(kv_rows_end, 1)
+                bounded = []
+                for t, rows_mode in ((mK_gmem, 0), (mV_gmem, 0), (mKt_gmem, 1)):
+                    if const_expr(t is not None):
+                        shape = list(t.shape)
+                        shape[rows_mode] = kv_rows_end
+                        bounded.append(
+                            cute.make_tensor(
+                                t.iterator, cute.make_layout(tuple(shape), stride=t.stride)
+                            )
+                        )
+                tensormap_manager.update_tensormap(
+                    tuple(bounded), atoms, tensormap_gmem, self.load_warp_id, (None,) * len(atoms)
+                )
+                for p in tensormap_gmem:
+                    tensormap_manager.fence_tensormap_update(p)
+                    cute.arch.inline_ptx("prefetch.tensormap [{$r0}];", read_only_args=[p.toint()])
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
@@ -2083,32 +2139,11 @@ class FlashAttentionBackwardSm100:
 
             # GMEM tensors (varlen-aware)
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-            if const_expr(not self.ragged_kv_tma):
-                mK_cur, mV_cur = [
-                    seqlen.offset_batch_K(t, batch_idx, dim=3)[None, None, head_idx_kv]
-                    for t in (mK, mV)
-                ]
-            else:
-                # One descriptor view per K/V tile (tiled at block 0 below): rows at or past
-                # seqlen_k are out of bounds for TMA and arrive zero-filled.
-                mK_cur, mV_cur = [
-                    copy_utils.offset_ragged_tensor_for_tma_load(
-                        t,
-                        Int64(head_idx_kv) * strides[0] + Int64(batch_idx) * strides[1],
-                        strides[2],
-                        seqlen.offset_k,
-                        seqlen.seqlen_k,
-                        n_block_cta_group,
-                        block_size=tiler[0],
-                        dtype=dtype,
-                        rows_dim=0,
-                    )
-                    for t, strides, tiler, dtype in (
-                        (mK, k_address_strides, self.mma_tiler_kq, self.k_dtype),
-                        (mV, v_address_strides, self.mma_tiler_vdo, self.v_dtype),
-                    )
-                ]
-            kv_block = n_block_cta_group if const_expr(not self.ragged_kv_tma) else 0
+            mK_cur, mV_cur = [
+                seqlen.offset_batch_K(t, batch_idx, dim=3)[None, None, head_idx_kv]
+                for t in (mK, mV)
+            ]
+            kv_block = n_block_cta_group
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdO_cur = mdO[None, None, head_idx, batch_idx]
             else:
@@ -2127,27 +2162,12 @@ class FlashAttentionBackwardSm100:
                     mdOt_cur = cute.domain_offset((seqlen.offset_q, 0, 0), mdOt)[
                         None, None, head_idx
                     ]
-                if const_expr(not self.ragged_kv_tma):
-                    if const_expr(not seqlen.has_cu_seqlens_k):
-                        mKt_cur = mKt[None, None, head_idx_kv, batch_idx]
-                    else:
-                        mKt_cur = cute.domain_offset((0, seqlen.offset_k, 0), mKt)[
-                            None, None, head_idx_kv
-                        ]
+                if const_expr(not seqlen.has_cu_seqlens_k):
+                    mKt_cur = mKt[None, None, head_idx_kv, batch_idx]
                 else:
-                    # Same K tile as mK_cur, through the (hdim, seqlen_k) descriptor.
-                    mKt_cur = copy_utils.offset_ragged_tensor_for_tma_load(
-                        mKt,
-                        Int64(head_idx_kv) * k_address_strides[0]
-                        + Int64(batch_idx) * k_address_strides[1],
-                        k_address_strides[2],
-                        seqlen.offset_k,
-                        seqlen.seqlen_k,
-                        n_block_cta_group,
-                        block_size=self.mma_tiler_dsk[2],
-                        dtype=self.k_dtype,
-                        rows_dim=1,
-                    )
+                    mKt_cur = cute.domain_offset((0, seqlen.offset_k, 0), mKt)[
+                        None, None, head_idx_kv
+                    ]
 
             # (1) S.T = K @ Q.T
             gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_kq, mode=[0, 2]), (kv_block, 0))
@@ -2168,6 +2188,7 @@ class FlashAttentionBackwardSm100:
                 tSgK,
                 sK,
                 single_stage=True,
+                **({"tma_desc_ptr": desc_ptrs[0]} if const_expr(self.ragged_kv_tma) else {}),
             )
 
             b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
@@ -2194,6 +2215,7 @@ class FlashAttentionBackwardSm100:
                 tdPgV,
                 sV,
                 single_stage=True,
+                **({"tma_desc_ptr": desc_ptrs[1]} if const_expr(self.ragged_kv_tma) else {}),
             )
 
             load_dOt = None
@@ -2257,6 +2279,7 @@ class FlashAttentionBackwardSm100:
                     tdQgK,
                     sKt,
                     single_stage=True,
+                    **({"tma_desc_ptr": desc_ptrs[2]} if const_expr(self.ragged_kv_tma) else {}),
                 )
 
             copy_atom_stats = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)

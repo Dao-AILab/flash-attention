@@ -1449,6 +1449,27 @@ def _flash_attn_fwd(
         )
     )
 
+    # SM90 / SM100 bound the V TMA loads of varlen / seqused_k calls by rewriting a per-CTA copy
+    # of the V descriptor on device (see FlashAttentionForwardSm100 / Sm90). One 128-byte slot
+    # per CTA, sized by an upper bound on the grid.
+    tensormap_workspace = None
+    if (
+        arch // 10 in [9, 10, 11]
+        and qv is None
+        and page_table is None
+        and (cu_seqlens_k is not None or seqused_k is not None)
+    ):
+        q_mult = qhead_per_kvhead if pack_gqa and qhead_per_kvhead > 1 else 1
+        if cu_seqlens_q is not None:
+            n_batch, n_q_rows = cu_seqlens_q.shape[0] - 1, q.shape[0] * q_mult
+            m_blocks_bound = (n_q_rows + n_batch * (tile_m - 1)) // tile_m + 1
+        else:
+            n_batch = q.shape[0]
+            m_blocks_bound = ((q.shape[1] * q_mult + tile_m - 1) // tile_m) * n_batch
+        n_heads_sched = num_head_kv if q_mult > 1 else num_head
+        n_ctas = max(m_blocks_bound * n_heads_sched * max(int(num_splits), 1), 2 * num_sms) + 8
+        tensormap_workspace = torch.empty((n_ctas, 16), dtype=torch.int64, device=q.device)
+
     compile_key = (
         mla_1cta,
         mla_1cta_kb64,
@@ -1518,6 +1539,7 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
+        tensormap_workspace is not None,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1537,6 +1559,11 @@ def _flash_attn_fwd(
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
             if page_table is not None
+            else None
+        )
+        tensormap_workspace_tensor = (
+            to_cute_tensor(tensormap_workspace, assumed_align=128, leading_dim=1)
+            if tensormap_workspace is not None
             else None
         )
         q_tensor, k_tensor, v_tensor = [to_cute_tensor(t) for t in (q, k, v)]
@@ -1835,12 +1862,15 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks_tensor,
                     blocks_to_batch_idx_tensor,
                     max_seqlen_q,
+                    tensormap_workspace_tensor,
                 ])
             elif arch // 10 in [8, 9, 12]:
                 compile_args.extend([
                     cu_total_m_blocks_tensor,
                     cu_total_splits_m_blocks_tensor,
                 ])
+                if arch // 10 == 9:
+                    compile_args.append(tensormap_workspace_tensor)
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
@@ -1927,12 +1957,15 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks,
                     blocks_to_batch_idx,
                     max_seqlen_q,
+                    tensormap_workspace,
                 ])
             elif arch // 10 in [8, 9, 12]:
                 call_args.extend([
                     cu_total_m_blocks,
                     cu_total_splits_m_blocks,
                 ])
+                if arch // 10 == 9:
+                    call_args.append(tensormap_workspace)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         # Combine writes a seqlen-contiguous LSE. The MLA LSE is (..., s, h) contiguous, so
@@ -2874,6 +2907,25 @@ def _flash_attn_bwd(
             use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
         )
 
+    # SM90 / SM100 bound the K/V TMA loads of varlen / seqused_k calls by rewriting per-CTA
+    # copies of the K, V (and 2-CTA Kt) descriptors on device (see FlashAttentionBackwardSm100 /
+    # Sm90): one 128-byte slot per descriptor per CTA, sized by an upper bound on the grid.
+    bwd_tensormap_workspace = None
+    if (
+        arch // 10 in [9, 10, 11]
+        and not use_dedicated_hd256_kernel
+        and (cu_seqlens_k is not None or seqused_k is not None)
+    ):
+        if cu_seqlens_k is not None:
+            n_blocks_bound = (total_k + batch_size * (n_block_size - 1)) // n_block_size + 1
+        else:
+            n_blocks_bound = num_n_blocks * batch_size
+        n_ctas = (
+            max(n_blocks_bound * num_head * 2, 2 * get_num_sms_for_selection(device.index, arch)) + 8
+        )
+        n_desc = 3 if arch // 10 in [10, 11] else 2
+        bwd_tensormap_workspace = torch.empty((n_ctas, n_desc, 16), dtype=torch.int64, device=device)
+    compile_key = compile_key + (bwd_tensormap_workspace is not None,)
     if compile_key not in _flash_attn_bwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         cute_aux_tensors = (
@@ -3036,6 +3088,12 @@ def _flash_attn_bwd(
         ]
         if not use_dedicated_hd256_kernel:
             compile_args.append(cu_total_m_blocks_k_tensor)
+            if arch // 10 in [9, 10, 11]:
+                compile_args.append(
+                    to_cute_tensor(bwd_tensormap_workspace, assumed_align=128, leading_dim=2)
+                    if bwd_tensormap_workspace is not None
+                    else None
+                )
         else:
             compile_args.extend(
                 (
@@ -3091,6 +3149,8 @@ def _flash_attn_bwd(
         ]
         if not use_dedicated_hd256_kernel:
             call_args.append(cu_total_m_blocks_k)
+            if arch // 10 in [9, 10, 11]:
+                call_args.append(bwd_tensormap_workspace)
         else:
             call_args.extend(
                 (
