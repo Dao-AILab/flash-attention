@@ -3387,5 +3387,508 @@ def test_compute_block_sparsity_mask_mod_aux_scalars_runs():
     assert blocks.mask_block_idx.shape == (1, 1, 2, 1)
 
 
+@cute.jit
+def _cute_separate_qk_group_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors: list,
+) -> cute.TensorSSA:
+    q_groups = aux_tensors[0]
+    k_groups = aux_tensors[1]
+    qg = utils.scalar_to_ssa(q_groups[m_idx[0]], cutlass.Int32)
+    kg = utils.scalar_to_ssa(k_groups[n_idx[0]], cutlass.Int32)
+    return (kg <= qg) & (n_idx <= (m_idx + utils.scalar_to_ssa(128, cutlass.Int32)))
+
+
+@cute.jit
+def _cute_bhd_separate_qk_group_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors: list,
+) -> cute.TensorSSA:
+    q_groups = aux_tensors[0]
+    k_groups = aux_tensors[1]
+    qg = utils.scalar_to_ssa(q_groups[batch[0], head[0], m_idx[0]], cutlass.Int32)
+    kg = utils.scalar_to_ssa(k_groups[batch[0], head[0], n_idx[0]], cutlass.Int32)
+    return (kg <= qg) & (n_idx <= (m_idx + utils.scalar_to_ssa(128, cutlass.Int32)))
+
+
+def _make_separate_qk_groups(seqlen_q: int, seqlen_k: int, device: str = "cuda"):
+    q_idx = torch.arange(seqlen_q, device=device, dtype=torch.int32)
+    k_idx = torch.arange(seqlen_k, device=device, dtype=torch.int32)
+    q_groups = torch.where(q_idx < 64, 0, torch.where(q_idx < 128, 1, 2)).to(
+        torch.int32
+    )
+    k_groups = torch.where(k_idx < 64, 0, torch.where(k_idx < 192, 1, 2)).to(
+        torch.int32
+    )
+    return q_groups, k_groups
+
+
+def _make_manual_all_partial_block_sparse(
+    batch_size: int,
+    nheads: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    sparse_tile_m: int,
+    tile_n: int,
+    device: str = "cuda",
+) -> BlockSparseTensorsTorch:
+    q_blocks = (seqlen_q + sparse_tile_m - 1) // sparse_tile_m
+    k_blocks = (seqlen_k + tile_n - 1) // tile_n
+    mask_block_cnt = torch.full(
+        (batch_size, nheads, q_blocks), k_blocks, device=device, dtype=torch.int32
+    )
+    base_idx = torch.arange(k_blocks, device=device, dtype=torch.int32).view(
+        1, 1, 1, k_blocks
+    )
+    mask_block_idx = base_idx.expand(
+        batch_size, nheads, q_blocks, k_blocks
+    ).contiguous()
+    full_block_cnt = torch.zeros(
+        (batch_size, nheads, q_blocks), device=device, dtype=torch.int32
+    )
+    full_block_idx = torch.zeros(
+        (batch_size, nheads, q_blocks, k_blocks), device=device, dtype=torch.int32
+    )
+    return BlockSparseTensorsTorch(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (129, 256),  # Tail Q tile + exact K multiple + 2 partial K blocks
+        (129, 259),  # Both Q and K have tail padding across 3 partial K blocks
+        (128, 259),  # Full Q tile control
+        (129, 128),  # Single K block control
+    ],
+)
+@pytest.mark.parametrize("intra_wg_overlap", [True, False])
+@pytest.mark.parametrize("use_block_sparsity", [True, False])
+def test_mask_mod_tail_q_aux_bounds_fwd(
+    seqlen_q: int,
+    seqlen_k: int,
+    intra_wg_overlap: bool,
+    use_block_sparsity: bool,
+):
+    """Regression test for auxiliary tensor OOB reads on padded Q rows in tail Q tiles.
+
+    Uses separately allocated q_groups[seqlen_q] and k_groups[seqlen_k] and forces
+    multiple partial K blocks on the tail Q tile so subsequent K blocks execute with
+    mask_seqlen=False while still requiring Q boundary wrapping.
+    """
+    if COMPUTE_CAPABILITY == 10 and not intra_wg_overlap:
+        pytest.skip("intra_wg_overlap=False is an SM90 forward configuration")
+
+    torch.manual_seed(42)
+    batch_size = 1
+    nheads = 2
+    headdim = 128
+    tile_m = 128
+    tile_n = 128
+    dtype = torch.bfloat16
+    sparse_tile_m = 2 * tile_m if COMPUTE_CAPABILITY == 10 else tile_m
+
+    q_groups, k_groups = _make_separate_qk_groups(seqlen_q, seqlen_k)
+    assert q_groups.numel() == seqlen_q
+    assert k_groups.numel() == seqlen_k
+
+    def flex_mask(b, h, q_idx, kv_idx):
+        return (k_groups[kv_idx] <= q_groups[q_idx]) & (kv_idx <= q_idx + 128)
+
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads, headdim, headdim, dtype
+    )
+    block_sparse_fwd = (
+        _make_manual_all_partial_block_sparse(
+            batch_size, nheads, seqlen_q, seqlen_k, sparse_tile_m, tile_n
+        )
+        if use_block_sparsity
+        else None
+    )
+
+    out_cute, _, *_ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        tile_mn=(tile_m, tile_n),
+        pack_gqa=False,
+        intra_wg_overlap=intra_wg_overlap,
+        mask_mod=_cute_separate_qk_group_mask,
+        block_sparse_tensors=block_sparse_fwd,
+        return_lse=True,
+        aux_tensors=[q_groups, k_groups],
+    )
+
+    tensors_fp32 = {
+        k: v.float() if v.dtype in [torch.float16, torch.bfloat16] else v
+        for k, v in tensors.items()
+    }
+    out_ref_fp32 = compute_reference_flex_attn(
+        tensors_fp32, flex_mask, (tile_m, tile_n)
+    )
+    out_pt = compute_reference_flex_attn(tensors, flex_mask, (tile_m, tile_n))
+    assert_fwd_matches_reference(
+        out_cute,
+        out_ref_fp32,
+        out_pt,
+        f"tail_q_aux_bounds Q={seqlen_q} K={seqlen_k} overlap={intra_wg_overlap} sparse={use_block_sparsity}",
+    )
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(129, 256), (129, 259)])
+@pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
+def test_mask_mod_tail_q_aux_bounds_pack_gqa_and_bwd(
+    seqlen_q: int, seqlen_k: int, kv_mode: str
+):
+    """Verify tail-Q aux wrapping with PackGQA (fwd) and block-sparse backward."""
+    if kv_mode == "gqa" and COMPUTE_CAPABILITY < 9:
+        pytest.skip("pack_gqa requires SM90+")
+
+    torch.manual_seed(42)
+    batch_size = 1
+    nheads = 4
+    nheads_kv = 2 if kv_mode == "gqa" else nheads
+    pack_gqa = kv_mode == "gqa"
+    headdim = 128
+    tile_m = 128
+    tile_n = 128
+    dtype = torch.bfloat16
+    sparse_tile_m = 2 * tile_m if COMPUTE_CAPABILITY == 10 else tile_m
+
+    q_pos = torch.arange(seqlen_q, device="cuda", dtype=torch.int32).view(
+        1, 1, seqlen_q
+    )
+    k_pos = torch.arange(seqlen_k, device="cuda", dtype=torch.int32).view(
+        1, 1, seqlen_k
+    )
+    head_strides = torch.tensor(
+        [32, 48, 64, 80], device="cuda", dtype=torch.int32
+    ).view(1, nheads, 1)
+    q_groups = (q_pos // head_strides).expand(batch_size, nheads, seqlen_q).contiguous()
+    k_groups = (k_pos // head_strides).expand(batch_size, nheads, seqlen_k).contiguous()
+    q_groups.__leading_dim__ = 2
+    k_groups.__leading_dim__ = 2
+
+    def flex_mask(b, h, q_idx, kv_idx):
+        return (k_groups[b, h, kv_idx] <= q_groups[b, h, q_idx]) & (
+            kv_idx <= q_idx + 128
+        )
+
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim, dtype
+    )
+    bm_heads = 1 if pack_gqa else nheads
+    block_sparse_fwd = _make_manual_all_partial_block_sparse(
+        batch_size, bm_heads, seqlen_q, seqlen_k, sparse_tile_m, tile_n
+    )
+
+    out_cute, lse_cute, *_ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        tile_mn=(tile_m, tile_n),
+        pack_gqa=pack_gqa,
+        mask_mod=_cute_bhd_separate_qk_group_mask,
+        block_sparse_tensors=block_sparse_fwd,
+        return_lse=True,
+        aux_tensors=[q_groups, k_groups],
+    )
+
+    tensors_fp32 = {
+        k: v.float() if v.dtype in [torch.float16, torch.bfloat16] else v
+        for k, v in tensors.items()
+    }
+    out_ref_fp32 = compute_reference_flex_attn(
+        tensors_fp32, flex_mask, (tile_m, tile_n)
+    )
+    out_pt = compute_reference_flex_attn(tensors, flex_mask, (tile_m, tile_n))
+    assert_fwd_matches_reference(
+        out_cute,
+        out_ref_fp32,
+        out_pt,
+        f"tail_q_pack_gqa Q={seqlen_q} K={seqlen_k} mode={kv_mode}",
+    )
+
+    if not pack_gqa:
+        bm_bwd = create_block_mask(
+            flex_mask,
+            batch_size,
+            nheads,
+            seqlen_q,
+            seqlen_k,
+            device="cuda",
+            BLOCK_SIZE=(128 if COMPUTE_CAPABILITY == 9 else sparse_tile_m, tile_n),
+        )
+        (
+            _seq_q,
+            _seq_k,
+            _kv_mask_cnt,
+            _kv_mask_idx,
+            _full_kv_cnt,
+            _full_kv_idx,
+            q_mask_cnt,
+            q_mask_idx,
+            full_q_cnt,
+            full_q_idx,
+            *_,
+        ) = bm_bwd.as_tuple()
+        block_sparse_bwd = BlockSparseTensorsTorch(
+            mask_block_cnt=q_mask_cnt,
+            mask_block_idx=q_mask_idx,
+            full_block_cnt=full_q_cnt,
+            full_block_idx=full_q_idx,
+            block_size=(128 if COMPUTE_CAPABILITY == 9 else sparse_tile_m, tile_n),
+        )
+        grad_out = torch.randn_like(out_cute)
+        dq_cute, dk_cute, dv_cute = run_cute_mask_bwd(
+            tensors["q"],
+            tensors["k"],
+            tensors["v"],
+            out_cute,
+            lse_cute,
+            grad_out,
+            _cute_bhd_separate_qk_group_mask,
+            block_sparse_mask_bwd=block_sparse_bwd,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            aux_tensors=[q_groups, k_groups],
+        )
+        flex_bm_ref = create_block_mask(
+            flex_mask,
+            batch_size,
+            nheads,
+            seqlen_q,
+            seqlen_k,
+            device="cuda",
+            BLOCK_SIZE=(tile_m, tile_n),
+        )
+        _, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+            tensors["q"],
+            tensors["k"],
+            tensors["v"],
+            flex_bm_ref,
+            grad_out,
+            dtype=torch.float32,
+        )
+        _, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
+            tensors["q"], tensors["k"], tensors["v"], flex_bm_ref, grad_out
+        )
+        assert_bwd_matches_reference(
+            dq_cute,
+            dk_cute,
+            dv_cute,
+            dq_ref_fp32,
+            dk_ref_fp32,
+            dv_ref_fp32,
+            dq_pt,
+            dk_pt,
+            dv_pt,
+            dtype,
+            min(seqlen_q, seqlen_k),
+        )
+
+
+def test_mask_mod_tail_q_mixed_partial_full_and_empty_rows():
+    """Verify tail Q tile with mixed partial/full K blocks and an empty sparse Q tile."""
+    torch.manual_seed(42)
+    batch_size = 1
+    nheads = 2
+    seqlen_q = 129
+    seqlen_k = 384
+    headdim = 128
+    tile_m = 128
+    tile_n = 128
+    dtype = torch.bfloat16
+    sparse_tile_m = 2 * tile_m if COMPUTE_CAPABILITY == 10 else tile_m
+    if sparse_tile_m > 128:
+        pytest.skip("Requires 2 Q tiles at seqlen_q=129 (SM90 tile_m=128)")
+
+    q_groups = torch.zeros(seqlen_q, device="cuda", dtype=torch.int32)
+    k_groups = torch.tensor(
+        [0] * 128 + [0] * 64 + [1] * 64 + [0] * 64 + [1] * 64,
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    # Tile 0: empty sparse row (0 partial, 0 full)
+    # Tile 1 (tail Q tile, row 128 valid, rows 129..255 padded):
+    #   1 full K block (block 0) + 2 partial K blocks (blocks 1, 2)
+    mask_block_cnt = torch.tensor([[[0, 2], [0, 2]]], device="cuda", dtype=torch.int32)
+    mask_block_idx = torch.tensor(
+        [[[[0, 0, 0], [1, 2, 0]], [[0, 0, 0], [1, 2, 0]]]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    full_block_cnt = torch.tensor([[[0, 1], [0, 1]]], device="cuda", dtype=torch.int32)
+    full_block_idx = torch.tensor(
+        [[[[0, 0, 0], [0, 0, 0]], [[0, 0, 0], [0, 0, 0]]]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    block_sparse_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads, headdim, headdim, dtype
+    )
+    out_cute, lse_cute, *_ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        tile_mn=(tile_m, tile_n),
+        pack_gqa=False,
+        mask_mod=_cute_separate_qk_group_mask,
+        block_sparse_tensors=block_sparse_fwd,
+        return_lse=True,
+        aux_tensors=[q_groups, k_groups],
+    )
+
+    # Tile 0 is empty -> output rows 0..127 should be zero
+    assert torch.all(out_cute[:, :128] == 0)
+    assert torch.all(torch.isinf(lse_cute[:, :, :128]))
+
+    # Tile 1 row 128 attends to full block 0 (K[0:128]) plus partial blocks 1, 2
+    # where (k_groups[kv_idx] <= q_groups[128]) & (kv_idx <= 128 + 128) -> K[0:192] and K[256]
+    valid_k = torch.cat([torch.arange(0, 192), torch.tensor([256])]).to("cuda")
+    q_last = tensors["q"][:, 128:, :, :].float()
+    k_sel = tensors["k"][:, valid_k, :, :].float()
+    v_sel = tensors["v"][:, valid_k, :, :].float()
+    scores = torch.einsum("bthd,bshd->bhts", q_last, k_sel) / math.sqrt(headdim)
+    probs = torch.softmax(scores, dim=-1)
+    out_ref_last = torch.einsum("bhts,bshd->bthd", probs, v_sel).to(dtype)
+    torch.testing.assert_close(out_cute[:, 128:], out_ref_last, rtol=2e-2, atol=2e-2)
+
+
+@cute.jit
+def _cute_varlen_unclamped_global_qk_group_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors: list,
+) -> cute.TensorSSA:
+    q_groups = aux_tensors[0]
+    k_groups = aux_tensors[1]
+    m_global = m_idx + seqlen_info.offset_q
+    n_global = n_idx + seqlen_info.offset_k
+    qg = utils.scalar_to_ssa(q_groups[m_global[0]], cutlass.Int32)
+    kg = utils.scalar_to_ssa(k_groups[n_global[0]], cutlass.Int32)
+    return (kg <= qg) & (n_idx <= (m_idx + utils.scalar_to_ssa(128, cutlass.Int32)))
+
+
+@pytest.mark.parametrize("pack_gqa", [False, True])
+def test_mask_mod_tail_q_aux_bounds_varlen(pack_gqa: bool):
+    """Verify varlen dense mask_mod wraps local Q indices before offset_q indexing."""
+    if pack_gqa and COMPUTE_CAPABILITY < 9:
+        pytest.skip("pack_gqa requires SM90+")
+
+    torch.manual_seed(42)
+    seqlens_q = [129, 131]
+    seqlens_k = [256, 259]
+    nheads = 4
+    nheads_kv = 2 if pack_gqa else nheads
+    headdim = 128
+    dtype = torch.bfloat16
+
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+    q = torch.randn(total_q, nheads, headdim, device="cuda", dtype=dtype)
+    k = torch.randn(total_k, nheads_kv, headdim, device="cuda", dtype=dtype)
+    v = torch.randn(total_k, nheads_kv, headdim, device="cuda", dtype=dtype)
+    out = torch.empty_like(q)
+
+    cu_seqlens_q = torch.tensor([0, 129, 260], device="cuda", dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 256, 515], device="cuda", dtype=torch.int32)
+
+    q_groups_list = []
+    k_groups_list = []
+    for sq, sk in zip(seqlens_q, seqlens_k):
+        qg, kg = _make_separate_qk_groups(sq, sk)
+        q_groups_list.append(qg)
+        k_groups_list.append(kg)
+    q_groups = torch.cat(q_groups_list, dim=0).contiguous()
+    k_groups = torch.cat(k_groups_list, dim=0).contiguous()
+    assert q_groups.numel() == total_q
+    assert k_groups.numel() == total_k
+
+    out_cute, _, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        lse=None,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=None,
+        seqused_k=None,
+        page_table=None,
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        tile_mn=(128, 128),
+        pack_gqa=pack_gqa,
+        mask_mod=_cute_varlen_unclamped_global_qk_group_mask,
+        block_sparse_tensors=None,
+        return_lse=True,
+        aux_tensors=[q_groups, k_groups],
+    )
+
+    for seq_idx, (sq, sk) in enumerate(zip(seqlens_q, seqlens_k)):
+        q_off = cu_seqlens_q[seq_idx].item()
+        k_off = cu_seqlens_k[seq_idx].item()
+        qg_seq = q_groups[q_off : q_off + sq]
+        kg_seq = k_groups[k_off : k_off + sk]
+
+        def flex_mask(b, h, q_idx, kv_idx, qg=qg_seq, kg=kg_seq):
+            return (kg[kv_idx] <= qg[q_idx]) & (kv_idx <= q_idx + 128)
+
+        seq_tensors = {
+            "q": q[q_off : q_off + sq].unsqueeze(0),
+            "k": k[k_off : k_off + sk].unsqueeze(0),
+            "v": v[k_off : k_off + sk].unsqueeze(0),
+        }
+        seq_tensors_fp32 = {name: t.float() for name, t in seq_tensors.items()}
+        out_ref_fp32 = compute_reference_flex_attn(
+            seq_tensors_fp32, flex_mask, (128, 128)
+        )
+        out_pt = compute_reference_flex_attn(seq_tensors, flex_mask, (128, 128))
+        assert_fwd_matches_reference(
+            out_cute[q_off : q_off + sq].unsqueeze(0),
+            out_ref_fp32,
+            out_pt,
+            f"tail_q_varlen seq={seq_idx} pack_gqa={pack_gqa}",
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
