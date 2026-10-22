@@ -720,6 +720,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 bidx, bidy, bidz = cute.arch.block_idx()
                 gdx, gdy, _ = cute.arch.grid_dim()
                 cta_linear_idx = bidx + bidy * gdx + bidz * gdx * gdy
+                if cta_linear_idx >= cute.size(tensormap_workspace, mode=[0]):
+                    # An undersized workspace would silently corrupt memory: fail loudly instead.
+                    cute.arch.inline_ptx("trap;", read_only_args=[])
                 tensormap_V_gmem = tensormap_manager.get_tensormap_ptr(
                     tensormap_workspace[(cta_linear_idx, None)].iterator
                 )

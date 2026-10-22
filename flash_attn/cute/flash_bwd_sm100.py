@@ -2081,6 +2081,9 @@ class FlashAttentionBackwardSm100:
             bidx, bidy, bidz = cute.arch.block_idx()
             gdx, gdy, _ = cute.arch.grid_dim()
             cta_linear_idx = bidx + bidy * gdx + bidz * gdx * gdy
+            if cta_linear_idx >= cute.size(tensormap_workspace, mode=[0]):
+                # An undersized workspace would silently corrupt memory: fail loudly instead.
+                cute.arch.inline_ptx("trap;", read_only_args=[])
             n_desc = 3 if const_expr(self.use_2cta_instrs) else 2
             atoms = (tma_atom_K, tma_atom_V, tma_atom_Kt)[:n_desc]
             tensormap_gmem = tuple(

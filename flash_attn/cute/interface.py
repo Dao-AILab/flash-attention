@@ -1462,10 +1462,12 @@ def _flash_attn_fwd(
         q_mult = qhead_per_kvhead if pack_gqa and qhead_per_kvhead > 1 else 1
         if cu_seqlens_q is not None:
             n_batch, n_q_rows = cu_seqlens_q.shape[0] - 1, q.shape[0] * q_mult
-            m_blocks_bound = (n_q_rows + n_batch * (tile_m - 1)) // tile_m + 1
         else:
-            n_batch = q.shape[0]
-            m_blocks_bound = ((q.shape[1] * q_mult + tile_m - 1) // tile_m) * n_batch
+            n_batch, n_q_rows = q.shape[0], q.shape[0] * q.shape[1] * q_mult
+        # The varlen schedulers pad every batch by up to one (cluster, Q-stage) tile:
+        # grid_x = (rows + batch * (c * T - 1)) // T <= rows // tile_m + 2 * batch for c <= 2,
+        # T >= tile_m. Persistent grids are at most a cluster-rounded SM count.
+        m_blocks_bound = n_q_rows // tile_m + 2 * n_batch + 1
         n_heads_sched = num_head_kv if q_mult > 1 else num_head
         n_ctas = max(m_blocks_bound * n_heads_sched * max(int(num_splits), 1), 2 * num_sms) + 8
         tensormap_workspace = torch.empty((n_ctas, 16), dtype=torch.int64, device=q.device)
@@ -2916,10 +2918,10 @@ def _flash_attn_bwd(
         and not use_dedicated_hd256_kernel
         and (cu_seqlens_k is not None or seqused_k is not None)
     ):
-        if cu_seqlens_k is not None:
-            n_blocks_bound = (total_k + batch_size * (n_block_size - 1)) // n_block_size + 1
-        else:
-            n_blocks_bound = num_n_blocks * batch_size
+        # The schedulers pad every batch by up to one (cluster) tile: grid_x = (rows + batch *
+        # (c * tile_n - 1)) // tile_n <= rows // tile_n + 2 * batch for c <= 2; the 2-CTA kernels
+        # launch two CTAs per tile.
+        n_blocks_bound = total_k // n_block_size + 2 * batch_size + 1
         n_ctas = (
             max(n_blocks_bound * num_head * 2, 2 * get_num_sms_for_selection(device.index, arch)) + 8
         )
