@@ -9,7 +9,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
@@ -22,6 +22,10 @@ from quack import layout_utils
 from quack import sm90_utils
 
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute.copy_utils import (
+    create_ragged_tensor_for_tma_load,
+    offset_ragged_tensor_for_tma_load,
+)
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
@@ -286,22 +290,30 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         tma_atom_K, tma_tensor_K = None, None
         tma_atom_V, tma_tensor_V = None, None
-        # Packed varlen: bound the V TMA load by the logical seqlen_k so rows in
-        # [seqlen_k, tile_n) arrive zero-filled instead of as whatever the buffer holds. P is
+        # Bound the V TMA load by the logical seqlen_k (cu_seqlens_k and/or seqused_k) so rows
+        # in [seqlen_k, tile_n) arrive zero-filled instead of as whatever the buffer holds. P is
         # exactly zero there, but 0 * NaN = NaN in O = P @ V. K needs no bound: masked scores
-        # become -inf before exp. Loads must use the 2-extra-dim wraparound form (ptr_shift is
-        # store-only), which needs rank <= 3, i.e. the (t, d, h) layout. Paged KV is excluded
-        # (finite rows past seqused_k in a page are a caller contract), as are broadcast
-        # (seq-stride 0) V views.
+        # become -inf before exp. The descriptor is the load-safe form of
+        # flash_attn.cute.copy_utils (quack's ptr_shift form is store-only, and its wraparound
+        # form needs rank <= 3, i.e. only the packed (t, d, h) layout); it covers both the packed
+        # and the dense (s, d, h, b) layout. Paged KV is excluded (finite rows past seqused_k in
+        # a page are a caller contract), as are broadcast (seq-stride 0) V views.
         self.ragged_tma_V = (
             self.use_tma_KV
             and mPageTable is None
-            and mCuSeqlensK is not None
+            and (mCuSeqlensK is not None or mSeqUsedK is not None)
             and not (isinstance(mV.stride[0], int) and mV.stride[0] == 0)
         )
         mV_tma = mV
+        v_address_strides = None
         if const_expr(self.ragged_tma_V):
-            mV_tma = copy_utils.create_ragged_tensor_for_tma(mV, ragged_dim=0, ptr_shift=False)
+            # (head, batch, row) element strides; the packed layout has no batch mode.
+            v_address_strides = (
+                mV.stride[2],
+                mV.stride[3] if const_expr(mCuSeqlensK is None) else Int64(0),
+                mV.stride[0],
+            )
+            mV_tma = create_ragged_tensor_for_tma_load(mV, rows_dim=0)
         if const_expr(self.use_tma_KV):
             tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
@@ -379,6 +391,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tma_tensor_Q if const_expr(self.use_tma_Q) else mQ,
             tma_tensor_K if const_expr(self.use_tma_KV) else mK,
             tma_tensor_V if const_expr(self.use_tma_KV) else mV,
+            v_address_strides,
             tma_tensor_O if const_expr(self.use_tma_O) else mO,
             mLSE,
             mCuSeqlensQ,
@@ -425,6 +438,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        v_address_strides: Optional[tuple],
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
@@ -604,6 +618,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mQ,
                 mK,
                 mV,
+                v_address_strides,
                 sQ,
                 sK,
                 sV,
@@ -662,6 +677,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        v_address_strides: Optional[tuple],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -726,9 +742,25 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[
                             None, None, head_idx_kv
                         ]
-                        mV_cur = seqlen.offset_batch_K(
-                            mV, batch_idx, dim=3, ragged=self.ragged_tma_V, ptr_shift=False
-                        )[None, None, head_idx_kv]
+                        if const_expr(self.ragged_tma_V):
+                            # One descriptor view per (head, batch) sequence; rows at or past
+                            # seqlen_k are out of bounds for TMA and arrive zero-filled.
+                            mV_cur = offset_ragged_tensor_for_tma_load(
+                                mV,
+                                Int64(head_idx_kv) * v_address_strides[0]
+                                + Int64(batch_idx) * v_address_strides[1],
+                                v_address_strides[2],
+                                seqlen.offset_k,
+                                seqlen.seqlen_k,
+                                Int32(0),
+                                block_size=None,
+                                dtype=self.dtype,
+                                rows_dim=0,
+                            )
+                        else:
+                            mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[
+                                None, None, head_idx_kv
+                            ]
                         gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
                         gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
                     # TODO: mcast
