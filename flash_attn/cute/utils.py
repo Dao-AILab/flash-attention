@@ -102,6 +102,41 @@ def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
         return _fa_disable_2cta_enabled
 
 
+def _get_bwd_pack_gqa_override() -> Optional[bool]:
+    """FLASH_ATTENTION_BWD_PACK_GQA=0/1 forces the SM100 backward GQA head packing off / on
+    (NOTE [bwd pack_gqa] in pack_gqa.py); unset or "auto" leaves it to the heuristic."""
+    value = os.getenv("FLASH_ATTENTION_BWD_PACK_GQA")
+    if value is None or value == "" or value == "auto":
+        return None
+    assert value in ("0", "1"), f"FLASH_ATTENTION_BWD_PACK_GQA must be 0, 1 or auto, got {value}"
+    return value == "1"
+
+
+def _get_bwd_pack_factor_override() -> Optional[int]:
+    """FLASH_ATTENTION_BWD_PACK_FACTOR=2/4/... (tests): pack that many query heads per tile on
+    the SM100 backward, skipping the heuristic (with FLASH_ATTENTION_BWD_HEAD_LOOP=1 the other
+    sub-groups are looped); unset leaves the pack to _bwd_choose_fold."""
+    value = os.getenv("FLASH_ATTENTION_BWD_PACK_FACTOR")
+    if value is None or value == "" or value == "auto":
+        return None
+    factor = int(value)
+    assert factor >= 1 and factor & (factor - 1) == 0, (
+        "FLASH_ATTENTION_BWD_PACK_FACTOR must be a power of two"
+    )
+    return factor
+
+
+def _get_bwd_head_loop_override() -> Optional[bool]:
+    """FLASH_ATTENTION_BWD_HEAD_LOOP=0/1 forces the SM100 hdim 256 backward head loop (one tile
+    per KV head over its query-head groups) off / on; unset or "auto" leaves it to the fold
+    heuristic."""
+    value = os.getenv("FLASH_ATTENTION_BWD_HEAD_LOOP")
+    if value is None or value == "" or value == "auto":
+        return None
+    assert value in ("0", "1"), f"FLASH_ATTENTION_BWD_HEAD_LOOP must be 0, 1 or auto, got {value}"
+    return value == "1"
+
+
 def _get_hd256_generic_bwd() -> bool:
     """FLASH_ATTENTION_HD256_GENERIC_BWD=1 runs the SM100 hdim 256 backward on
     FlashAttentionBackwardSm100 (64-row KV tile, serial 2CTA schedule) instead of the dedicated

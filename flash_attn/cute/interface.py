@@ -43,7 +43,7 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
-from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess, PackGQA
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
@@ -2084,6 +2084,15 @@ def _compile_bwd_preprocess(
     mSequsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
     mdLSE = fake_tensor(Float32, mLSE.shape, divisibility=1) if has_dlse else None
     mLSElog2 = mLSElog2 if has_lse_log2 else None
+    if pack_gqa == PackGQA.PACKED_ROW_OUTPUTS:
+        # dPsum / LSElog2 are per KV head in packed row order: their own head and row symbols
+        batch_dims = (mO.shape[0],) if not has_cuseqlens_q else ()
+        mPdPsum = fake_tensor(Float32, (*batch_dims, cute.sym_int(), cute.sym_int()), divisibility=4)
+        if has_lse_log2:
+            mLSElog2 = fake_tensor(
+                Float32, (*batch_dims, cute.sym_int(), cute.sym_int()), divisibility=4
+            )
+        mdQaccum = fake_tensor(Float32, (*batch_dims, cute.sym_int(), cute.sym_int()), divisibility=4)
     mdQaccum = mdQaccum if has_dq_accum else None
     mRowMax = fake_tensor(Float32, mScaleP.shape, divisibility=1) if has_scaleP else None
     mScaleP = fake_tensor(Float32, mScaleP.shape, divisibility=1) if has_scaleP else None
@@ -2115,7 +2124,7 @@ def _bwd_preprocess(
     scale_p=None,
     use_padded_offsets=True,
     nheads_major=False,
-    pack_gqa=False,
+    pack_gqa=PackGQA.OFF,
     qhead_per_kvhead=1,  # only used with pack_gqa
     nheads_kv=1,         # only used with pack_gqa
     softmax_scale=1.0,   # only used with scale_p
@@ -2147,7 +2156,7 @@ def _bwd_preprocess(
             seqused=seqused_q,
             tile_size=m_block_size,
             qhead_per_kvhead=qhead_per_kvhead,
-            pack_gqa=pack_gqa,
+            pack_gqa=pack_gqa != PackGQA.OFF,
         )
     compile_key = (
         dtype, head_dim, head_dim_v, m_block_size,
@@ -2186,6 +2195,7 @@ def _compile_bwd_postprocess(
     learnable_sink_dtype,
     hdim_multiple_of,
     accum_order=None,
+    pack_factor=1,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -2196,6 +2206,15 @@ def _compile_bwd_postprocess(
     mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
     mSeqUsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
     mCuTotalMBlocks = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cu_total_m_blocks else None
+    if pack_factor > 1:
+        # dQaccum is per KV head (its own head symbol): (b, h_kv, rows*hd) dense, (h_kv, rows*hd)
+        # varlen; dQ keeps its own shape
+        accum_shape = (
+            (mdQ.shape[0], cute.sym_int(), cute.sym_int())
+            if not has_cuseqlens_q
+            else (cute.sym_int(), cute.sym_int())
+        )
+        mdQaccum = fake_tensor(Float32, accum_shape, divisibility=4)
     sink_tensors = (
         LearnableSinkBwdTensors(
             mPdPsum,
@@ -2212,6 +2231,7 @@ def _compile_bwd_postprocess(
         cluster_size=cluster_size,
         hdim_multiple_of=hdim_multiple_of,
         accum_order=accum_order,
+        pack_factor=pack_factor,
     )
     return cute.compile(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
@@ -2232,6 +2252,7 @@ def _bwd_postprocess_convert(
     sink_tensors=None,
     hdim_multiple_of=32,
     accum_order=None,
+    pack_factor=1,
     *,
     fake_mode,
 ):
@@ -2259,6 +2280,7 @@ def _bwd_postprocess_convert(
         ),
         hdim_multiple_of,
         accum_order,
+        pack_factor,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
@@ -2271,6 +2293,293 @@ def _bwd_postprocess_convert(
 
 
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
+
+
+def _bwd_pack_gqa_heuristic(
+    num_sms: int,
+    batch_size: int,
+    num_head: int,
+    num_head_kv: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    total_q: int,
+    total_k: int,
+    m_block_size: int,
+    n_block_size: int,
+    cluster_size: int,
+    causal: bool,
+    local: bool,
+    varlen: bool,
+    kv_group: int = 1,
+) -> bool:
+    """Whether the SM100 backward should pack the query heads of a KV head into the Q tile.
+
+    Packing divides the tile count by qhead_per_kvhead. Its per-tile saving (K/V loaded once per
+    KV head, dK/dV kept in TMEM, no fp32 dK/dV accumulate + postprocess) shrinks with seqlen_q,
+    while the wave-quantization loss of the smaller grid can grow; measured on B200: ~25% gross
+    gain at 2k, ~7% at 8k, and a 3.5-wave packed grid loses ~13%. A partial pack of four or
+    more sub-groups (kv_group tiles per KV head, their dK / dV through the fp32 accumulate +
+    postprocess) keeps half of that saving: hdim 128 / 64 MQA 16/1 and GQA 32/2 pack 4
+    (kv_group 4 / 8) causal gain +7..+10% at 2k, +1..+5% at 4k and lose 2..3% at 8k, where the
+    full-pack model still packs; two sub-groups keep the saving (hdim 192 GQA 32/8 pack 2 +3%
+    at 8k causal, hdim 128 GQA 64/8 pack 4 within 2% of unpacked there).
+
+    A packed tile also loops over qhead_per_kvhead times more Q rows, so the longest packed CTA
+    runs qh * ceil(seqlen_q / tile_m) iterations (every KV tile, or the first one with causal).
+    When that exceeds the work a cluster slot gets on average, the grid cannot hide it and the
+    long tiles serialize: MQA 16/1 on one 8k causal sequence runs 2x slower packed. Varlen only
+    knows the longest sequence and the totals, so the average is taken over mean sequence
+    lengths; ragged packs (one long sequence plus short ones) then stay unpacked.
+    """
+    qh = num_head // num_head_kv
+    kv_tile = n_block_size * cluster_size
+    n_blocks_kv = (seqlen_k + kv_tile - 1) // kv_tile
+    slots = max(1, num_sms // cluster_size)
+
+    # critical path of a packed tile vs the average cluster-slot work
+    packed_max_iters = qh * ((seqlen_q + m_block_size - 1) // m_block_size)
+    mean_q = total_q / max(batch_size, 1) if varlen else seqlen_q
+    mean_k = total_k / max(batch_size, 1) if varlen else seqlen_k
+    total_iters = (
+        batch_size
+        * num_head
+        * math.ceil(mean_k / kv_tile)
+        * math.ceil(mean_q / m_block_size)
+        * (0.5 if causal else 1.0)
+    )
+    if packed_max_iters > 1.25 * total_iters / slots:
+        return False
+
+    def wave_loss(num_ctas):
+        waves = num_ctas / num_sms
+        return (math.ceil(waves) - waves) / math.ceil(waves)
+
+    ctas_unpacked = batch_size * num_head * n_blocks_kv * cluster_size
+    ctas_packed = batch_size * num_head_kv * n_blocks_kv * cluster_size
+    gain = 0.25 * 2048 / max(seqlen_q, 1)
+    if kv_group >= 4:
+        gain *= 0.5
+    if causal or local:
+        # causal / local tiles are uneven and the qh-times longer packed tiles balance
+        # worse at the tail: smaller gain, and only pack with a margin
+        gain *= 0.6
+        gain -= 0.02
+    return gain > wave_loss(ctas_packed) - wave_loss(ctas_unpacked)
+
+
+def _bwd_choose_fold(
+    num_sms: int,
+    cluster_size: int,
+    batch_size: int,
+    num_head: int,
+    num_head_kv: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    total_q: int,
+    total_k: int,
+    m_block_size: int,
+    n_block_size: int,
+    head_dim: int,
+    causal: bool,
+    local: bool,
+    varlen: bool,
+    deterministic: bool,
+    fold_allowed: bool,
+    head_loop_possible: bool,
+    pack_gqa_override: Optional[bool] = None,
+    head_loop_override: Optional[bool] = None,
+    pack_factor_override: Optional[int] = None,
+) -> tuple[int, bool]:
+    """How the SM100 backward folds the query heads of a KV head into tiles: (pack_factor,
+    head_loop). Candidates with the head loop (hdim 256), largest fold first: pack 2 + loop
+    over the other sub-groups (fold = qhead_per_kvhead, the default; qhead_per_kvhead 2 is the
+    one pack), loop only, pack 4, pack 2; without it pack 4 and pack 2 when they divide
+    qhead_per_kvhead, largest first (the other sub-groups go through the dK / dV
+    postprocess). The first one the pack_gqa heuristic accepts for its own tile count wins (a
+    smaller fold has a shorter critical path and a bigger grid, so it can pass where the full
+    fold does not: MQA 16/1 4k b8 causal).
+
+    Deterministic causal adds the dQ semaphore chains: they run over the n_blocks of a (batch,
+    scratch head), and with causal tile n_block k has one more m_block per pass than tile
+    k + 1, so a co-resident later tile of the chain is held to the pace of the earlier one.
+    Estimated waste: (co-resident tiles per chain - 1) * 2 * m_block_size / seqlen_q with
+    co-resident tiles per chain = clusters / chains and chains = batch * num_head / fold; the
+    largest fold under 3% wins, else the smallest accepted fold (B200 hd256 vs the default: MQA
+    16/1 2k b16 pack 4 +13%, 4k b8 pack 2 +14%, GQA 32/2 2k b16 pack 4 +9%, 24/4 8k b4 pack 2
+    +10%; hdim 192 GQA 32/8 4k b8 / 8k b4 pack 2 +3% / +7% over pack 4). On the 2-CTA kernel
+    pack 4 is dropped for pack 2 once m_blocks * head_dim > 4096 (hdim 128 past 4k, hdim 192 /
+    256 past 2k) whatever the chain waste says: a pack 4 tile walks twice the chain hops across
+    the CTA pair, each moving its dQaccum slab (m_block_size x head_dim fp32), for a K / V
+    saving over pack 2 that shrinks with the sequence (pack 2 over pack 4: hdim 192 GQA 32/2,
+    32/8, 48/4, 64/8 4k b8 +3..+8%, 48/4, 64/8 8k b4 +8..+9%, hdim 256 48/4, 64/8 8k b4 +8%,
+    hdim 128 64/8 8k b4 +3..+7%; pack 4 keeps +1..+21% at 1k-2k everywhere and +4% at hdim 128
+    32/8 4k b8). The looped candidates are first dropped when the loop itself serializes too much:
+    a looped tile walks its sub-groups through the chains one after the other, so its cost
+    grows with trips * m_blocks while the per-sub-group alternative only pays K / V reloads
+    that shrink with seqlen -- measured crossover dense trips * m_blocks > 48, varlen
+    m_blocks > 16 (B200 1k-8k, qh 5-16: 12/2 1k-2k, 64/8 1k, varlen 32/2 / 48/4 / 64/8 /
+    MQA at <= 2k keep the loop and gain +5..+25% over the unlooped fold; 48/4 and 64/8 at
+    2k-4k, MQA dense drop it and gain +4..+14%).
+
+    FLASH_ATTENTION_BWD_PACK_GQA / _HEAD_LOOP force or exclude candidates,
+    FLASH_ATTENTION_BWD_PACK_FACTOR (tests) restricts them to that pack; forced candidates skip
+    the heuristic.
+    """
+    qh = num_head // num_head_kv
+    if qh <= 1:
+        return 1, False
+    candidates = []
+    if pack_factor_override is not None:
+        # tests: that pack; looped over the other sub-groups only when the loop is forced too
+        pack = pack_factor_override
+        if qh % pack == 0 and m_block_size % pack == 0:
+            if head_loop_possible and head_loop_override is True and qh // pack > 1:
+                candidates.append((pack, True))
+            candidates.append((pack, False))
+    elif head_loop_possible:
+        for pack in (2, 4):
+            if qh % pack == 0 and m_block_size % pack == 0:
+                if pack == 2 and qh // pack > 1:
+                    candidates.append((pack, True))
+                candidates.append((pack, False))
+        candidates.append((1, True))
+    else:
+        # no head loop (not hdim 256): pack 4 and pack 2 (when they divide qhead_per_kvhead),
+        # largest first; the other sub-groups go through the dK / dV postprocess. Wider packs
+        # lose on B200 as the sequence grows (hdim 128 / 64 MQA 16/1 and GQA 32/2 causal 2k-8k:
+        # pack 16 -5..-38%, pack 8 -2..-15%, pack 4 +1..+10%; non-causal 1k pack 16 is only
+        # 0..3% ahead of pack 4), the chain rules below then have pack 2 to step down to.
+        pack = min(qh & -qh, m_block_size, 4)
+        while pack > 1:
+            candidates.append((pack, False))
+            pack //= 2
+    if not fold_allowed:
+        candidates = [c for c in candidates if c[1] and head_loop_override is True]
+    if head_loop_override is False:
+        candidates = [c for c in candidates if not c[1]]
+    elif head_loop_override is True:
+        candidates = [c for c in candidates if c[1]]
+    if pack_gqa_override is False:
+        candidates = [c for c in candidates if c[0] == 1]
+    if not candidates:
+        return 1, False
+
+    def fold(cand):
+        pack, loop = cand
+        return pack * (qh // pack if loop else 1)
+
+    # largest fold first; for equal folds pack 2 (+ loop) before the unpacked loop before a
+    # wider pack
+    candidates.sort(key=lambda cand: (-fold(cand), cand[0] != 2, not cand[1]))
+
+    def forced(cand):
+        pack, loop = cand
+        return (
+            (loop and head_loop_override is True)
+            or (pack > 1 and pack_gqa_override is True)
+            or pack_factor_override is not None
+        )
+
+    def accepted(cand):
+        return forced(cand) or _bwd_pack_gqa_heuristic(
+            num_sms=num_sms,
+            # off hdim 256 a pack below qhead_per_kvhead pays the dK / dV postprocess
+            kv_group=1 if head_loop_possible else qh // fold(cand),
+            batch_size=batch_size,
+            num_head=num_head,
+            num_head_kv=num_head // fold(cand),
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            total_q=total_q,
+            total_k=total_k,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            cluster_size=cluster_size,
+            causal=causal,
+            local=local,
+            varlen=varlen,
+        )
+
+    det_causal = (
+        deterministic
+        and causal
+        and pack_gqa_override is None
+        and head_loop_override is None
+        and pack_factor_override is None
+    )
+    nondet_causal = (
+        causal
+        and not deterministic
+        and pack_gqa_override is None
+        and head_loop_override is None
+        and pack_factor_override is None
+    )
+    num_clusters = max(1, num_sms // cluster_size)
+
+    def chain_waste(cand):
+        chains = max(1, batch_size * num_head // fold(cand))
+        return max(0.0, num_clusters / chains - 1.0) * 2 * m_block_size / max(seqlen_q, 1)
+
+    def loop_serialized(cand):
+        # A looped tile walks its qh // pack sub-groups through the dQ chains one after the
+        # other, so its deterministic cost grows with trips * m_blocks, while the alternative
+        # (one tile per sub-group + dK / dV postprocess) only pays K / V reloads that shrink
+        # with the sequence length. Measured crossover on B200 (dense / varlen 1k-8k, qh 5-16):
+        # dense trips * m_blocks > 48, varlen m_blocks > 16 (its LPT schedule tolerates more).
+        pack, loop = cand
+        if not loop:
+            return False
+        m_blocks = -(-seqlen_q // m_block_size)
+        return m_blocks > 16 if varlen else (qh // pack) * m_blocks > 48
+
+    def wide_pack_serialized(cand):
+        # On the 2-CTA kernel a deterministic causal pack 4 tile loses to pack 2 as the
+        # sequence grows: it walks twice the chain hops (pack * m_blocks acquire / release
+        # pairs, each across the CTA pair and each moving the tile's dQaccum slab of
+        # m_block_size x head_dim fp32) for a K / V saving over pack 2 that shrinks with the
+        # sequence. Measured on B200 (-lgc 1965, pack 4 vs pack 2): 1k b32 +7..+21% and 2k b16
+        # +1..+9% everywhere; 4k b8 hdim 128 +4% (GQA 32/8) .. -1%, hdim 192 -3..-8%, hdim 256
+        # -2..+1%; 8k b4 hdim 128 -7..0%, hdim 192 -8..-9%, hdim 256 -8%: crossover m_blocks *
+        # head_dim > 4096. The 1-CTA hdim 64 kernel keeps pack 4 (4k b8 +5%, 8k b4 level).
+        pack, loop = cand
+        if loop or pack <= 2 or cluster_size == 1:
+            return False
+        return -(-seqlen_q // m_block_size) * head_dim > 4096
+
+    def wide_pack_slow(cand):
+        # Off the deterministic path the hdim 192 kernel prefers pack 2 to a partial pack 4
+        # from 4k on as well (B200, -lgc 1965, causal, pack 2 / pack 4 / unpacked): 4k b8 MQA
+        # 16/1 805 / 770 / 787 (varlen 811 / 777 / 789), GQA 64/8 825 / 803 / 781, 48/4 847 /
+        # 840 / 799; 8k b4 48/4 879 / 874 / 864, 64/8 876 / 850 / 850. The full pack keeps
+        # pack 4 (32/8 4k b8 818 / 835 / 788), and so does hdim 128 (4k b8 48/4 1048 / 1058,
+        # 32/8 1011 / 1063; 8k b4 48/4 1138 / 1167 both rounds).
+        pack, loop = cand
+        if loop or pack <= 2 or cluster_size == 1 or head_dim <= 128 or head_loop_possible:
+            return False
+        return qh > pack and -(-seqlen_q // m_block_size) >= 32
+
+    ok = [cand for cand in candidates if accepted(cand)]
+    if det_causal and any(not loop for _, loop in ok):
+        # only when an unlooped fold is available: without one (odd qhead_per_kvhead) the
+        # loop stays, one tile per query head with the dK / dV postprocess is far slower
+        ok = [cand for cand in ok if not loop_serialized(cand)]
+    wide = wide_pack_serialized if det_causal else wide_pack_slow if nondet_causal else None
+    if wide is not None and any(wide(cand) for cand in ok):
+        # step down to pack 2 whether or not the heuristic took it for its own tile count (it
+        # halves the gain of a 4+ way partial pack): the saving the wide pack was accepted
+        # for is there at pack 2 too, without the chain hops. Measured at 8k b4 over the
+        # unpacked kernel: hdim 192 GQA 48/4 +2%, 64/8 0%, hdim 128 +7 / +8%, hdim 256 +8 / +10%.
+        keep = {cand for cand in ok if not wide(cand)} | {(2, False)}
+        ok = [cand for cand in candidates if cand in keep]
+    for cand in ok:
+        # looped candidates are already gated by loop_serialized; the chain waste orders the
+        # unlooped packs (MQA 16/1 4k b8: pack 4 refused, pack 2 taken)
+        if not det_causal or cand[1] or chain_waste(cand) <= 0.03:
+            return cand
+    if det_causal and ok:
+        # every fold waits on the chains; the smallest accepted fold still beats none
+        return ok[-1]
+    return 1, False
 
 
 def _flash_attn_bwd(
@@ -2359,6 +2668,7 @@ def _flash_attn_bwd(
         causal, window_size_left, window_size_right
     )
 
+    bwd_pack_gqa_request = False
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
         m_block_size = 64
@@ -2447,6 +2757,8 @@ def _flash_attn_bwd(
         dQaccum_order, dKVaccum_order = FlashAttentionBackwardSm100.accum_tile_orders(
             use_2cta_instrs, n_block_size
         )
+        # pack_gqa (NOTE [bwd pack_gqa], pack_gqa.py) unless the tile_n test knob is set
+        bwd_pack_gqa_request = not utils._get_bwd_tile_n_override()
         # hdim 256 (64-row KV tile, serial schedule) and block-sparse hdim 192 need 2CTA.
         needs_2cta = (
             "SM100 backward with head_dim=256"
@@ -2610,6 +2922,71 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
+    # Fold of the query heads of a KV head into tiles (NOTE [bwd pack_gqa]): pack_factor
+    # query heads in the Q tile rows (at most 4; a packed tile covers only tile_m / pack_factor
+    # tokens, so with causal every diagonal KV tile meets pack_factor masked Q tiles -- pack 2
+    # is best or within 1% of best everywhere measured on B200 hd256, pack >= 8 loses 3-13% on
+    # causal MQA 16/1, GQA 32/2, 64/8), and / or head_loop (SM100 hdim 256, serial schedule):
+    # one tile per KV head that loops over its qhead_per_kvhead // pack_factor sub-groups in
+    # the CTA, so dK / dV are stored directly (no fp32 accumulate + postprocess) and K / V are
+    # loaded once. _bwd_choose_fold picks per shape.
+    fold_allowed = (
+        bwd_pack_gqa_request
+        and not use_dedicated_hd256_kernel
+        and qhead_per_kvhead > 1
+        and block_sparse_tensors is None
+        and score_mod is None
+        and mask_mod is None
+        and learnable_sink is None
+    )
+    head_loop_override = utils._get_bwd_head_loop_override()
+    head_loop_possible = (
+        arch // 10 in [10, 11]
+        and head_dim == 256
+        and head_dim_v == 256
+        and not use_dedicated_hd256_kernel
+        and block_sparse_tensors is None
+        and score_mod is None
+        and mask_mod is None
+        and learnable_sink is None
+    )
+    is_varlen_any = cu_seqlens_q is not None or cu_seqlens_k is not None
+    # The heuristics want the longest sequence; a varlen call without max_seqlen only knows
+    # the total, which as an upper bound refuses every causal fold. Use the mean.
+    heur_seqlen_q = (
+        max(1, math.ceil(total_q / max(batch_size, 1)))
+        if cu_seqlens_q is not None and max_seqlen_q is None
+        else seqlen_q
+    )
+    heur_seqlen_k = (
+        max(1, math.ceil(total_k / max(batch_size, 1)))
+        if cu_seqlens_k is not None and max_seqlen_k is None
+        else seqlen_k
+    )
+    bwd_pack_factor, bwd_head_loop = _bwd_choose_fold(
+        num_sms=get_num_sms_for_selection(q.device.index, arch),
+        cluster_size=cluster_size,
+        batch_size=batch_size,
+        num_head=num_head,
+        num_head_kv=num_head_kv,
+        seqlen_q=heur_seqlen_q,
+        seqlen_k=heur_seqlen_k,
+        total_q=total_q,
+        total_k=total_k,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        head_dim=head_dim,
+        causal=causal,
+        local=local,
+        varlen=is_varlen_any,
+        deterministic=deterministic,
+        fold_allowed=fold_allowed,
+        head_loop_possible=head_loop_possible,
+        pack_gqa_override=utils._get_bwd_pack_gqa_override(),
+        head_loop_override=head_loop_override,
+        pack_factor_override=utils._get_bwd_pack_factor_override(),
+    )
+    bwd_pack_gqa = bwd_pack_factor > 1
     
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
@@ -2644,43 +3021,40 @@ def _flash_attn_bwd(
     hdim_multiple_of = 64 if arch // 10 == 9 and dKV_swapAB else 32
     head_dim_rounded = (head_dim + hdim_multiple_of - 1) // hdim_multiple_of * hdim_multiple_of
 
+    # Per-head scratch (dq_accum, dpsum, lse_log2, dQ_semaphore): pack_gqa stores it per KV
+    # head with qhead_per_kvhead rows per token (NOTE [bwd pack_gqa]).
+    scratch_heads = num_head // bwd_pack_factor
+    rows_per_token = bwd_pack_factor
+    seqlen_q_rows_rounded = (
+        (seqlen_q * rows_per_token + m_block_size - 1) // m_block_size * m_block_size
+    )
     if cu_seqlens_q is None:
-        dq_accum = (
-            None
-            if use_dedicated_hd256_kernel
-            else torch.empty(
-                batch_size,
-                num_head,
-                seqlen_q_rounded * head_dim_rounded,
-                dtype=torch.float32,
-                device=device,
-            )
-        )
-        dpsum = torch.empty(
-            batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device
-        )
-        lse_log2 = torch.empty(
-            batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device
-        )
+        scratch_shape = (batch_size, scratch_heads, seqlen_q_rows_rounded)
     else:
-        total_q_rounded_padded = (
-            (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
+        # one tile of slack per sequence (padded per-sequence offsets)
+        total_q_rows_rounded_padded = (
+            (total_q * rows_per_token + cu_seqlens_q.shape[0] * m_block_size - 1)
+            // m_block_size * m_block_size
         )
-        dq_accum = (
-            None
-            if use_dedicated_hd256_kernel
-            else torch.empty(
-                num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device
-            )
+        scratch_shape = (scratch_heads, total_q_rows_rounded_padded)
+    dq_accum = (
+        None
+        if use_dedicated_hd256_kernel
+        else torch.empty(
+            *scratch_shape[:-1], scratch_shape[-1] * head_dim_rounded,
+            dtype=torch.float32, device=device,
         )
-        dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
-        lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
+    )
+    dpsum = torch.empty(*scratch_shape, dtype=torch.float32, device=device)
+    lse_log2 = torch.empty(*scratch_shape, dtype=torch.float32, device=device)
 
     # GQA (qhead_per_kvhead > 1) needs dK/dV accum+postprocess since multiple Q heads
     # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
     # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
     # hd=256 2CTA backward has its own internal postprocess for dK/dV.
-    dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
+    dKV_postprocess = (
+        qhead_per_kvhead // bwd_pack_factor > 1 and not use_dedicated_hd256_kernel and not bwd_head_loop
+    )
     if dKV_postprocess:
         # Same rounding as the kernel's tile_hdimv and the postprocess (64 with dKV_swapAB on
         # SM90): the GQA epilogue reduces tile_n * tile_hdimv fp32 values per block.
@@ -2724,11 +3098,15 @@ def _flash_attn_bwd(
 
     # The dedicated hd256 backward is deterministic without semaphores.
     if deterministic and not use_dedicated_hd256_kernel:
-        dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device=device)
+        # one slot per (scratch head, m block of scratch rows)
+        dQ_semaphore = torch.zeros(
+            batch_size, scratch_heads, seqlen_q_rows_rounded // m_block_size, cluster_size,
+            dtype=torch.int32, device=device,
+        )
     else:
         dQ_semaphore = None
 
-    if deterministic and qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel:
+    if deterministic and dKV_postprocess:
         dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
         dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
     else:
@@ -2744,6 +3122,8 @@ def _flash_attn_bwd(
             cu_seqlens=cu_seqlens_q,
             seqused=seqused_q,
             tile_size=m_block_size,
+            qhead_per_kvhead=bwd_pack_factor,
+            pack_gqa=bwd_pack_gqa,
         )
         cu_total_m_blocks_k, _ = _compute_tile_cumsum(
             cu_seqlens=cu_seqlens_k,
@@ -2760,6 +3140,11 @@ def _flash_attn_bwd(
         out, dout, dpsum, lse, lse_log2, dq_accum,
         cu_seqlens_q, seqused_q, dlse,
         dtype, head_dim, head_dim_v, m_block_size,
+        # NOTE [bwd pack_gqa]: packed views of the per-head O / dO / LSE; dPsum / LSElog2 /
+        # dQaccum are per KV head in packed row order
+        pack_gqa=PackGQA.PACKED_ROW_OUTPUTS if bwd_pack_gqa else PackGQA.OFF,
+        qhead_per_kvhead=bwd_pack_factor,
+        nheads_kv=num_head // bwd_pack_factor if bwd_pack_gqa else 1,
         cu_total_m_blocks=cu_total_m_blocks_q,
         fake_mode=fake_mode,
         hdim_multiple_of=hdim_multiple_of,
@@ -2872,6 +3257,9 @@ def _flash_attn_bwd(
             head_dim,
             head_dim_v,
             qhead_per_kvhead,
+            bwd_pack_gqa,
+            bwd_pack_factor,
+            bwd_head_loop,
             causal,
             window_size_left is not None,
             window_size_right is not None,
@@ -3056,6 +3444,9 @@ def _flash_attn_bwd(
                     has_aux_tensors=aux_tensors is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
+                    pack_gqa=bwd_pack_gqa,
+                    pack_factor=bwd_pack_factor,
+                    head_loop=bwd_head_loop,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -3191,6 +3582,7 @@ def _flash_attn_bwd(
             ),
             fake_mode=fake_mode,
             hdim_multiple_of=hdim_multiple_of,
+            pack_factor=bwd_pack_factor,
         )
 
         if dKV_postprocess:
@@ -3449,7 +3841,7 @@ def _flash_attn_bwd_sparse_mla(
         scale_p=scale_p[..., :nheads] if scale_p is not None else None,
         use_padded_offsets=False,
         nheads_major=True,
-        pack_gqa=True,
+        pack_gqa=PackGQA.PER_QHEAD_OUTPUTS,
         qhead_per_kvhead=1 if pad_qheads else qhead_per_kvhead,
         nheads_kv=nheads if pad_qheads else nheads_kv,
         softmax_scale=softmax_scale,
