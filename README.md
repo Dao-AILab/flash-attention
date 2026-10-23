@@ -147,7 +147,7 @@ FlashAttention-2 with CUDA currently supports:
 3. All head dimensions up to 256. ~~Head dim > 192 backward requires A100/A800 or H100/H800~~. Head dim 256 backward now works on consumer GPUs (if there's no dropout) as of flash-attn 2.5.5.
 
 ### AMD ROCm Support
-ROCm version has two backends. There is [composable_kernel](https://github.com/ROCm/composable_kernel) (ck) which is the default backend and a [Triton](https://github.com/triton-lang/triton) backend. They provide an implementation of FlashAttention-2.
+ROCm uses [composable_kernel](https://github.com/ROCm/composable_kernel) (ck) by default. Triton and aiter are opt-in routes for FlashAttention-2.
 
 **Requirements:**
 - ROCm 6.0 and above.
@@ -197,7 +197,7 @@ FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 
 To run the tests (note: full suite takes hours):
 ```sh
-FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_aiter.py
 ```
 
 The Triton backend uses a default kernel configuration optimized for determinism and reasonable performance across workloads. For peak throughput, enable `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE"` to search for optimal settings, which incurs a one-time warmup cost.
@@ -230,6 +230,18 @@ Build and run:
 docker build -t flash-attn-triton .
 docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri flash-attn-triton
 ```
+
+#### aiter Backend
+
+`FLASH_ATTENTION_AITER_AMD_ENABLE=TRUE` selects aiter's general MHA dispatcher, which may
+select FMHA v3 for supported inputs. Its KV-cache calls use aiter's Triton wrapper.
+To build against an installed aiter and run the tests:
+```sh
+FLASH_ATTENTION_AITER_AMD_ENABLE="TRUE" FLASH_ATTENTION_USE_SYSTEM_AITER="TRUE" pip install --no-build-isolation .
+FLASH_ATTENTION_AITER_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_aiter.py
+```
+
+Set only one of `FLASH_ATTENTION_AITER_AMD_ENABLE` and `FLASH_ATTENTION_TRITON_AMD_ENABLE`.
 
 ## How to use FlashAttention
 
