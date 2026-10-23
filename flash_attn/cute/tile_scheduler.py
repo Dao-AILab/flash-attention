@@ -139,8 +139,26 @@ class DynamicPersistentSchedulerState(SchedulerState):
         self._work_info[3] = split
 
 
+# NOTE [SM100 forward work coordinates]
+# With C = cta_group_size (2 for 2CTA, else 1), every CTA in a cluster receives the same
+# logical (work_m, head, batch, split) and validity; the CTA rank is not part of work_m.
+# Grids count physical CTAs: physical_x = C * cluster_slot + cta_rank. Persistence can run
+# many logical tiles on one physical cluster, so a work tile id is not a cluster id.
+#
+# The SM100 forward passes logical M work tiles in num_block with use_cluster_idx = (C > 1).
+# SingleTileLPTScheduler's CLC grid has grid_x = num_block * C; clc_work_to_coords divides
+# claimed_x by C and optionally reverses M for LPT. StaticPersistentTileScheduler takes
+# num_block as a cluster count, caps the grid at the SM count rounded down to whole clusters,
+# and strides over work by the launched cluster count. Varlen metadata units and the backward/MLA contracts are
+# separate. Row mapping: NOTE [SM100 forward coordinate spaces] in flash_fwd_sm100.py.
+
+
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
-    """Altered WorkTileInfo which includes four axes: (block, head, batch, split)"""
+    """Altered WorkTileInfo which includes four axes: (block, head, batch, split).
+
+    For the SM100 forward these are logical work coordinates, shared by every CTA of a
+    cluster; see NOTE [SM100 forward work coordinates].
+    """
 
     @override
     def __new_from_mlir_values__(self, values: list[ir.Value]) -> "WorkTileInfo":
@@ -157,6 +175,9 @@ class TileSchedulerProtocol(Protocol):
     Schedulers are responsible for:
     1. Coordinate mapping: linear tile index -> (m_block, head, batch, split)
     2. Work distribution: how to get the next tile (static grid-stride vs dynamic)
+
+    Grids are in physical CTAs, work tiles in logical coordinates; for the SM100 forward
+    see NOTE [SM100 forward work coordinates].
     """
 
     def initial_work_tile_info(self) -> WorkTileInfo:
@@ -189,6 +210,8 @@ class TileSchedulerProtocol(Protocol):
 
 @dataclass
 class TileSchedulerArguments(ParamsBase):
+    # num_block is in logical work tiles with use_cluster_idx, else in CTA tiles; see
+    # NOTE [SM100 forward work coordinates].
     num_block: Int32
     num_head: Int32
     num_batch: Int32
@@ -361,7 +384,12 @@ class StaticPersistentTileScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "StaticPersistentTileScheduler.Params":
-            num_block_cluster = cute.ceil_div(args.num_block, cute.size(args.cluster_shape_mn))
+            # use_cluster_idx: num_block already counts clusters (NOTE [SM100 forward work coordinates]).
+            num_block_cluster = (
+                args.num_block
+                if const_expr(args.use_cluster_idx)
+                else cute.ceil_div(args.num_block, cute.size(args.cluster_shape_mn))
+            )
             total_blocks_cluster = num_block_cluster * args.num_head * args.num_batch
             return StaticPersistentTileScheduler.Params(
                 FastDivmodDivisorV2(num_block_cluster),
@@ -620,26 +648,23 @@ class SingleTileLPTScheduler:
         """Convert CLC response (block, head, batch_split) to WorkTileInfo.
 
         CLC returns raw grid coordinates — no L2 swizzle (hardware decides order).
-        We only apply cluster division, optional LPT block reversal, and split_kv unpacking.
+        Clustered grids use one m block per cluster; num_block counts clusters. Both CTAs
+        of a cluster decode the same logical tile; see NOTE [SM100 forward work coordinates].
         """
+        assert self.params.cluster_shape_m == 1 or self.params.use_cluster_idx, (
+            "CLC with clusters requires use_cluster_idx"
+        )
         block_idx = work.tile_idx[0]
         if const_expr(self.params.cluster_shape_m > 1):
             block_idx = block_idx // self.params.cluster_shape_m
         if const_expr(self.params.lpt):
             # Longest-processing-time-first: reverse block order
-            if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
-                num_block = self.params.num_block // self.params.cluster_shape_m
-            else:
-                num_block = self.params.num_block
-            block_idx = num_block - 1 - block_idx
+            block_idx = self.params.num_block - 1 - block_idx
         split_idx = Int32(0)
         if const_expr(self.params.is_split_kv):
             batch_idx, split_idx = divmod(work.tile_idx[2], self.params.num_splits_divmod)
         else:
             batch_idx = work.tile_idx[2]
-        if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
-            bidx_in_cluster = cute.arch.block_in_cluster_idx()
-            block_idx = block_idx * self.params.cluster_shape_m + bidx_in_cluster[0]
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
         if const_expr(self.params.is_split_kv and self.params.num_splits_dynamic_ptr is not None):
             if work.is_valid_tile:
