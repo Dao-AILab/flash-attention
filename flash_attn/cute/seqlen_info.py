@@ -63,6 +63,28 @@ class SeqlenInfo:
             return cute.domain_offset(idx, mT)
 
 
+def sequence_row_offset(
+    token_offset: Int32,
+    batch_idx: Int32,
+    rows_per_token: cutlass.Constexpr[int],
+    tile_rows: cutlass.Constexpr[int],
+    padded: cutlass.Constexpr[bool] = True,
+) -> Int32:
+    """Offset of a varlen sequence, in storage rows, in a scratch buffer (LSE_log2, dPsum,
+    dQaccum) that holds ``rows_per_token`` rows per token: the SM100 backward's pack_gqa folds
+    the query heads of a KV head into the rows (NOTE [bwd pack_gqa] in pack_gqa.py).
+    ``token_offset`` is the sequence's cu_seqlens offset; it is scaled before the per-sequence
+    padding (``padded``: every sequence starts on a ``tile_rows`` boundary, as
+    ``SeqlenInfo.offset_padded``)."""
+    row_offset = token_offset if const_expr(rows_per_token == 1) else token_offset * rows_per_token
+    if const_expr(padded):
+        # Add divby so that the compiler knows the alignment when moving by the offset
+        row_offset = cute.assume(
+            (row_offset + batch_idx * tile_rows) // tile_rows * tile_rows, divby=tile_rows
+        )
+    return row_offset
+
+
 @dataclass(frozen=True)
 class SeqlenInfoQK:
     offset_q: Int32
