@@ -146,12 +146,19 @@ public:
         static constexpr int kBlockM = get<0>(TileShape_MK{});
 
         int const thread_idx = threadIdx.x;
-        int const m_block = blockIdx.x;
+        int m_block = blockIdx.x;
         int const bidh = blockIdx.y;
-        int const bidb = blockIdx.z;
+        int bidb = blockIdx.z;
+        bool const is_varlen = Varlen && params.cu_seqlens;
+        if (is_varlen) {
+            // The launch covers the batch's padded block space (varlen_num_blocks).
+            auto const coord = varlen_block_coord<kBlockM>(blockIdx.x, params.num_batch, params.cu_seqlens, params.seqused, size<0>(params.shape_O));
+            bidb = get<0>(coord);
+            m_block = get<1>(coord);
+            if (bidb < 0) { return; }
+        }
 
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info(bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused);
-        bool const is_varlen = Varlen && params.cu_seqlens;
         int const seqlen_o = seqlen_info.seqlen;
         if (is_varlen && m_block * kBlockM >= seqlen_o) { return; }
 
