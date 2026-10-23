@@ -22,6 +22,7 @@ from flash_attn.cute.testing import (
     maybe_fake_tensor_mode,
     unpad_input,
 )
+from flash_attn.cute.cache_utils import JITCache
 from flash_attn.cute.interface import (
     _flash_attn_bwd_sparse_mla,
     _flash_attn_fwd,
@@ -3586,3 +3587,40 @@ def test_flash_attn_mla_dispatch_heuristic_end_to_end(shape, monkeypatch):
     err = (out.float() - out_ref.float()).abs()[valid].max().item()
     err_pt = (out_pt.float() - out_ref.float()).abs()[valid].max().item()
     assert err <= 2 * err_pt + 1e-3, (err, err_pt)
+
+
+@pytest.mark.parametrize(
+    "head_counts",
+    [((64, 1), (128, 2)), ((128, 2), (64, 1))],
+    ids=["fewer_kv_heads_first", "more_kv_heads_first"],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_cache_separates_kv_head_counts(head_counts, monkeypatch):
+    """MLA kernels with equal GQA ratios but different KV head counts must not share code.
+
+    Reusing a kernel compiled for fewer KV heads launches too few tiles, so the extra
+    head is never written: that order fails deterministically without the cache key.
+    """
+    if not IS_SM100:
+        pytest.skip()
+    # A fresh in-memory cache: clear() would also purge the persistent cache.
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", JITCache())
+    torch.manual_seed(0)
+    cases = []
+    for q_heads, kv_heads in head_counts:
+        q = torch.randn(1, 2, q_heads, 64, device="cuda", dtype=torch.bfloat16)
+        qv = torch.randn(1, 2, q_heads, 512, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, 17, kv_heads, 64, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(1, 17, kv_heads, 512, device="cuda", dtype=torch.bfloat16)
+        cases.append((q, qv, k, v, _flash_attn_fwd(q, k, v, qv=qv)[0]))
+    if is_fake_mode():
+        return
+    for q, qv, k, v, out in cases:
+        group = q.shape[2] // k.shape[2]
+        k_expanded = k.float().repeat_interleave(group, dim=2)
+        v_expanded = v.float().repeat_interleave(group, dim=2)
+        scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k_expanded)
+        scores += torch.einsum("bqhd,bkhd->bhqk", qv.float(), v_expanded)
+        probabilities = torch.softmax(scores / math.sqrt(64 + 512), dim=-1)
+        reference = torch.einsum("bhqk,bkhd->bqhd", probabilities, v_expanded)
+        torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)

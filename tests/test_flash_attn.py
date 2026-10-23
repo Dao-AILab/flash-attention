@@ -1,4 +1,5 @@
 import math
+import itertools
 
 import pytest
 import torch
@@ -2644,6 +2645,146 @@ def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block
     )
     assert out.shape == (batch_size, 1, nheads, d)
     assert not out.isnan().any()
+
+
+@pytest.mark.parametrize("append_knew", [False, True])
+def test_flash_attn_kvcache_paged_cuda_graph(append_knew):
+    torch.manual_seed(0)
+    device, dtype = "cuda", torch.float16
+    batch_size, nheads, nheads_k, d = 2, 4, 1, 64
+    page_size = 256
+    k_cache = torch.randn(4, page_size, nheads_k, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    block_table = torch.tensor([[0, 2], [1, 3]], device=device, dtype=torch.int32)
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+    k_new = torch.randn(batch_size, 1, nheads_k, d, device=device, dtype=dtype) if append_knew else None
+    v_new = torch.randn_like(k_new) if append_knew else None
+    cache_seqlens = torch.tensor([127, 256], device=device, dtype=torch.int32)
+
+    def run():
+        return flash_attn_with_kvcache(
+            q, k_cache, v_cache, k=k_new, v=v_new, cache_seqlens=cache_seqlens,
+            block_table=block_table, causal=True,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+
+    # Replay with changed inputs, crossing a page boundary and reaching cache capacity.
+    for lengths in ([127, 256], [257, 512 - int(append_knew)]):
+        cache_seqlens.copy_(torch.tensor(lengths, device=device, dtype=torch.int32))
+        q.normal_()
+        graph.replay()
+        expected = run()
+        torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("mode", ["dense", "varlen", "kvcache"])
+def test_flash_attn_cuda_graph_replay(mode):
+    """Capture one call of each entry point in a CUDA graph and replay it with new inputs.
+
+    A captured call may not synchronize with the host (.item(), .tolist()), must launch on
+    the capturing stream, and must read every per-sequence length from device memory, so a
+    replay must match eager execution on the same inputs. The paged KV cache is covered by
+    test_flash_attn_kvcache_paged_cuda_graph; this covers dense and varlen forward+backward
+    and the non-paged cache with rotary, cache_batch_idx and appended keys.
+    """
+    torch.manual_seed(0)
+    device, dtype = "cuda", torch.float16
+    batch_size, nheads, nheads_k, d = 2, 4, 1, 64
+    replays = []  # (set_inputs, active_rows) per replay
+
+    def randomize(*tensors):
+        with torch.no_grad():
+            for t in tensors:
+                t.normal_()
+
+    if mode == "dense":
+        q = torch.randn(batch_size, 256, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        k = torch.randn(batch_size, 384, nheads_k, d, device=device, dtype=dtype, requires_grad=True)
+        v = torch.randn_like(k, requires_grad=True)
+        dout = torch.randn_like(q)
+
+        def run():
+            out = flash_attn_func(q, k, v, causal=True, deterministic=True)
+            return (out.detach(), *torch.autograd.grad(out, (q, k, v), dout))
+
+        replays = [(lambda: randomize(q, k, v, dout), None)] * 2
+    elif mode == "varlen":
+        capacity = 640
+        q = torch.randn(capacity, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        k = torch.randn(capacity, nheads_k, d, device=device, dtype=dtype, requires_grad=True)
+        v = torch.randn_like(k, requires_grad=True)
+        dout = torch.randn_like(q)
+        # Static cu_seqlens buffer; only its device values change between replays.
+        cu_seqlens = torch.tensor([0, 256, 384, 640], device=device, dtype=torch.int32)
+
+        def run():
+            out = flash_attn_varlen_func(
+                q, k, v, cu_seqlens, cu_seqlens, capacity, capacity, causal=True, deterministic=True
+            )
+            return (out.detach(), *torch.autograd.grad(out, (q, k, v), dout))
+
+        def set_lengths(lengths):
+            cu_seqlens.copy_(torch.tensor([0, *itertools.accumulate(lengths)], device=device))
+            randomize(q, k, v, dout)
+
+        # Ragged tiles, an empty middle slot, and a single short sequence.
+        for lengths in ([256, 128, 256], [129, 0, 257], [64, 0, 0]):
+            replays.append((lambda lengths=lengths: set_lengths(lengths), sum(lengths)))
+    else:
+        capacity = 512
+        q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+        k_cache = torch.randn(batch_size, capacity, nheads_k, d, device=device, dtype=dtype)
+        v_cache = torch.randn_like(k_cache)
+        k_new = torch.randn(batch_size, 1, nheads_k, d, device=device, dtype=dtype)
+        v_new = torch.randn_like(k_new)
+        angle = torch.rand(capacity, d // 2, device=device) * 2 * math.pi
+        rotary_cos, rotary_sin = angle.cos().to(dtype), angle.sin().to(dtype)
+        cache_batch_idx = torch.tensor([1, 0], device=device, dtype=torch.int32)
+        cache_seqlens = torch.tensor([127, 256], device=device, dtype=torch.int32)
+
+        def run():
+            return flash_attn_with_kvcache(
+                q, k_cache, v_cache, k=k_new, v=v_new, rotary_cos=rotary_cos, rotary_sin=rotary_sin,
+                cache_seqlens=cache_seqlens, cache_batch_idx=cache_batch_idx, causal=True,
+            )
+
+        def set_lengths(lengths):
+            cache_seqlens.copy_(torch.tensor(lengths, device=device, dtype=torch.int32))
+            randomize(q, k_new, v_new)
+
+        # Cross a tile boundary and append into the last slot of the cache.
+        for lengths in ([127, 256], [capacity - 1, 300]):
+            replays.append((lambda lengths=lengths: set_lengths(lengths), None))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static = run()
+    if not isinstance(static, tuple):
+        static = (static,)
+
+    for set_inputs, active_rows in replays:
+        set_inputs()
+        graph.replay()
+        expected = run()  # eager on the same inputs (re-appends the same keys to the same slots)
+        if not isinstance(expected, tuple):
+            expected = (expected,)
+        for got, want in zip(static, expected):
+            # Packed rows beyond cu_seqlens[-1] belong to no sequence and are undefined.
+            got, want = got[:active_rows], want[:active_rows]
+            torch.testing.assert_close(got, want, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.skipif(USE_TRITON_ROCM, reason="compat-slot assert is only in the CUDA extension")

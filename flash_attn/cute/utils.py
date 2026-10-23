@@ -102,6 +102,24 @@ def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
         return _fa_disable_2cta_enabled
 
 
+def _get_hd256_generic_bwd() -> bool:
+    """FLASH_ATTENTION_HD256_GENERIC_BWD=1 runs the SM100 hdim 256 backward on
+    FlashAttentionBackwardSm100 (64-row KV tile, serial 2CTA schedule) instead of the dedicated
+    kernels."""
+    return os.getenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "0") == "1"
+
+
+def _get_bwd_tile_n_override() -> Optional[int]:
+    """Test knob: FLASH_ATTENTION_BWD_TILE_N=64 selects the 64-row KV tile per CTA on the SM100
+    2CTA backward (the layout the hd256 backward needs). Unset or 128 keeps the default."""
+    value = os.getenv("FLASH_ATTENTION_BWD_TILE_N")
+    if value is None or value == "":
+        return None
+    tile_n = int(value)
+    assert tile_n in (64, 128), f"FLASH_ATTENTION_BWD_TILE_N must be 64 or 128, got {value}"
+    return tile_n
+
+
 def _compute_base_hash(func: Callable) -> str:
     """Compute a hash from callable code and captured compile-time values."""
     try:
