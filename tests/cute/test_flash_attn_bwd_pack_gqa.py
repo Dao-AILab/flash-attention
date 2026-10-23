@@ -7,6 +7,7 @@ rows of all its query heads, dK / dV stay in TMEM for the group (no fp32 accumul
 postprocess), dQaccum / LSE / dPsum are per KV head in packed row order.
 """
 
+import itertools
 import os
 
 import pytest
@@ -15,7 +16,11 @@ import torch
 from eager_reference import check_against_reference, make_cu_seqlens
 
 from flash_attn.cute import utils
-from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
+from flash_attn.cute.interface import (
+    _flash_attn_bwd,
+    flash_attn_func,
+    flash_attn_varlen_func,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -138,6 +143,103 @@ def test_bwd_pack_gqa_matches_unpacked(
         )
     if feature in ("none", "deterministic"):
         check_against_reference(got, q, k, v, dout, q_lens, k_lens, causal, dtype)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+@pytest.mark.parametrize("layout", ["dense", "varlen"])
+@pytest.mark.parametrize("mha_type", ["gqa8_2", "mqa8_1"])
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_bwd_pack_gqa_unused_kv_tail(head_dim, mha_type, layout, causal, pack_gqa_env):
+    """K/V rows past seqused_k must not reach dQ / dK / dV on the packed kernel either.
+
+    The packed kernel bounds its K/V TMA loads like the per-head one (per-CTA descriptor copies
+    rewritten to the sequence's row extent), but it runs one tile per KV head over qh times the
+    rows: the descriptor slots, the packed LSE / dPsum / dQaccum offsets and the seqused_k masking
+    are exercised with a different grid. Same layouts as test_flash_attn_sm100_bwd_unused_kv_tail:
+    packed K/V with cu_seqlens_k + seqused_k, and dense (batch, seqlen, heads, d) with seqused_k.
+    """
+    if head_dim == 256 and not hd256_on_general_kernel():
+        pytest.skip("hdim 256 backward runs on the dedicated kernels (no packing)")
+    torch.manual_seed(SEED)
+    heads_q, heads_kv = HEADS[mha_type]
+    dtype = torch.bfloat16
+    lengths = [100, 256, 37, 200, 129]
+    batch, capacity = len(lengths), 256
+    seqused_k = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    if layout == "varlen":
+        q = torch.randn(sum(lengths), heads_q, head_dim, device="cuda", dtype=dtype)
+        k = torch.randn(
+            batch * capacity, heads_kv, head_dim, device="cuda", dtype=dtype
+        )
+        v = torch.randn_like(k)
+        kwargs = dict(
+            causal=causal,
+            cu_seqlens_q=torch.tensor(
+                [0] + list(itertools.accumulate(lengths)),
+                device="cuda",
+                dtype=torch.int32,
+            ),
+            cu_seqlens_k=torch.arange(
+                0, (batch + 1) * capacity, capacity, device="cuda", dtype=torch.int32
+            ),
+            seqused_k=seqused_k,
+            max_seqlen_q=max(lengths),
+            max_seqlen_k=capacity,
+        )
+    else:
+        seqlen_q = 128
+        q = torch.randn(batch, seqlen_q, heads_q, head_dim, device="cuda", dtype=dtype)
+        k = torch.randn(batch, capacity, heads_kv, head_dim, device="cuda", dtype=dtype)
+        v = torch.randn_like(k)
+        kwargs = dict(
+            causal=causal,
+            seqused_k=seqused_k,
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=capacity,
+        )
+    out, lse = flash_attn_varlen_func(q, k, v, return_lse=True, **kwargs)
+    dout = torch.randn_like(out)
+
+    def backward(k_in, v_in, pack):
+        os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = "1" if pack else "0"
+        dq, dk, dv = _flash_attn_bwd(q, k_in, v_in, out, dout, lse, **kwargs)[:3]
+        torch.cuda.synchronize()
+        return dq, dk, dv
+
+    valid = torch.zeros(batch, capacity, dtype=torch.bool, device="cuda")
+    for b, length in enumerate(lengths):
+        valid[b, :length] = True
+    if layout == "varlen":
+        valid = valid.flatten()
+    eps = torch.finfo(dtype).eps
+    unpacked = backward(k, v, False)
+    ref = backward(k, v, True)
+    for name, a, b_ in zip(("dQ", "dK", "dV"), unpacked, ref):
+        if name != "dQ":
+            # dK / dV rows past seqused_k are never written; compare the valid rows only.
+            a, b_ = a[valid], b_[valid]
+        assert torch.isfinite(b_.float()).all(), f"{name} has non-finite values"
+        tol = 2 * eps * a.float().abs().max()
+        assert (a.float() - b_.float()).abs().max() <= tol, (
+            f"{name} differs from the unpacked path"
+        )
+    # Rows past seqused_k hold NaN: a K/V load that is not bounded by the sequence end leaks it
+    # through 0 * NaN in dP = dO @ V^T / dQ = dS @ K. The clean and poisoned runs may still
+    # differ by an ulp (fp32 reduce-add order).
+    for poison in ("k", "v", "kv"):
+        k_nan, v_nan = k.clone(), v.clone()
+        if "k" in poison:
+            k_nan[~valid] = float("nan")
+        if "v" in poison:
+            v_nan[~valid] = float("nan")
+        got = backward(k_nan, v_nan, True)
+        for name, a, b_ in zip(("dQ", "dK", "dV"), ref, got):
+            if name != "dQ":
+                a, b_ = a[valid], b_[valid]
+            assert torch.isfinite(b_.float()).all(), f"{poison}: {name} has NaN / Inf"
+            torch.testing.assert_close(
+                b_, a, atol=4 * eps * a.abs().max().item(), rtol=4 * eps
+            )
 
 
 def test_bwd_pack_gqa_heuristic():
