@@ -15,7 +15,6 @@ Examples:
 
 import argparse
 import time
-from dataclasses import replace
 from functools import lru_cache
 from itertools import product
 
@@ -63,19 +62,10 @@ def _select_with_clc(inputs, clc):
         use_2cta_instrs=config.use_2cta_instrs,
         use_clc_scheduler=False,
     )
-    config = replace(config, use_clc_scheduler=clc, is_static_persistent=is_static_persistent)
-    registers = fwd_config.select_registers(
-        resolved,
-        tile_m=config.tile_m,
-        tile_n=config.tile_n,
-        q_stage=config.q_stage,
-        num_splits=config.num_splits,
-        use_2cta_instrs=config.use_2cta_instrs,
-        use_clc_scheduler=clc,
+    # derive_fwd_config re-derives registers and the SMEM layout, and validates.
+    return fwd_config.derive_fwd_config(
+        config, inputs, use_clc_scheduler=clc, is_static_persistent=is_static_persistent
     )
-    config = replace(config, registers=registers)
-    fwd_config.validate_fwd_config(config, inputs)
-    return config
 
 
 def _select_clc(clc):

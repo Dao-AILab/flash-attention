@@ -7,7 +7,6 @@ not randomized fuzzing.
 """
 
 from contextlib import contextmanager
-from dataclasses import replace
 from unittest import mock
 
 import pytest
@@ -75,18 +74,9 @@ def select_with_clc(inputs):
             use_2cta_instrs=config.use_2cta_instrs,
         )
     ):
-        config = replace(config, use_clc_scheduler=True, is_static_persistent=False)
-        registers = fwd_config.select_registers(
-            resolved,
-            tile_m=config.tile_m,
-            tile_n=config.tile_n,
-            q_stage=config.q_stage,
-            num_splits=config.num_splits,
-            use_2cta_instrs=config.use_2cta_instrs,
-            use_clc_scheduler=True,
+        config = fwd_config.derive_fwd_config(
+            config, inputs, use_clc_scheduler=True, is_static_persistent=False
         )
-        config = replace(config, registers=registers)
-        fwd_config.validate_fwd_config(config, inputs)
     _selected_configs.append(config)
     return config
 
