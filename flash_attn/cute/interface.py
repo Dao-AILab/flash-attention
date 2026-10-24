@@ -934,23 +934,61 @@ def _flash_attn_fwd(
         # output columns. Other feature/layout combinations retain the general
         # two-slice implementation below.
         if (
-            not fake_mode and not is_fp8 and num_splits == 1
+            not fake_mode
             and not utils._get_disable_2cta_default(is_fwd=True)
-            and tile_mn is None and softcap in (None, 0.0)
-            and window_size_left is None
-            and window_size_right is None
-            and all(x is None for x in (
-                cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table,
+            and tile_mn is None
+            and (is_fp8 or all(x is None for x in (
                 q_descale, k_descale, v_descale,
-            ))
+            )))
             and all(
                 t.stride(-1) == 1 and t.data_ptr() % 16 == 0
-                and all(s % 8 == 0 for s in t.stride()[:-1])
+                and all(s % (16 if is_fp8 else 8) == 0 for s in t.stride()[:-1])
                 for t in (q, k, v, out)
             )
         ):
-            from flash_attn.cute.flash_fwd_sm100_hd512 import forward_sm100_d512
-            forward_sm100_d512(q, k, v, out, lse, softmax_scale, causal, arch=arch)
+            if is_fp8:
+                for descale, name in (
+                    (q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")
+                ):
+                    if descale is not None:
+                        _validate_tensor(descale, name, (batch_size, num_head_kv), torch.float32, device)
+            from flash_attn.cute.flash_fwd_sm100_hd512 import (
+                forward_sm100_d512, select_sm100_d512_config,
+            )
+            fused_causal, _, fused_window_left, fused_window_right = _resolve_causal_local_window(
+                causal, window_size_left, window_size_right, mask_mod
+            )
+            fused_q_hint = seqlen_q if cu_seqlens_q is None else (
+                max_seqlen_q if isinstance(max_seqlen_q, int) else None
+            )
+            fused_k_bound = page_table.shape[1] * page_size if page_table is not None else seqlen_k
+            if isinstance(max_seqlen_k, int):
+                fused_k_bound = min(fused_k_bound, max_seqlen_k)
+            fused_splits, fused_pack_gqa = select_sm100_d512_config(
+                num_splits=num_splits, pack_gqa=pack_gqa,
+                batch_size=batch_size, total_q=total_q,
+                num_head=num_head, num_head_kv=num_head_kv,
+                seqlen_q_hint=fused_q_hint, seqlen_k_hint=fused_k_bound,
+                window_size_left=fused_window_left, window_size_right=fused_window_right,
+                num_sms=get_num_sms_for_selection(device.index, arch) if num_splits < 1 else None,
+                is_fp8=is_fp8,
+                is_bf16=q.dtype == torch.bfloat16, is_causal=fused_causal,
+                is_plain_dense=(
+                    cu_seqlens_q is None and cu_seqlens_k is None
+                    and seqused_q is None and seqused_k is None
+                    and page_table is None and softcap in (None, 0.0)
+                ),
+            )
+            forward_sm100_d512(
+                q, k, v, out, lse, softmax_scale, fused_causal, arch=arch,
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q, seqused_k=seqused_k,
+                window_size_left=fused_window_left, window_size_right=fused_window_right,
+                softcap=softcap,
+                page_table=page_table,
+                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                num_splits=fused_splits, pack_gqa=fused_pack_gqa,
+            )
             return out, lse, None, None, None
         for start in range(0, 512, 256):
             _flash_attn_fwd(

@@ -598,9 +598,17 @@ def test_fp8(dtype, splits, mode, causal):
 @pytest.mark.parametrize("splits", [0, 2, 4, 8])
 def test_splitkv_training(dtype, splits, monkeypatch):
     from flash_attn.cute import interface
+    from flash_attn.cute import flash_fwd_sm100_hd512 as fused
 
     combine = interface._flash_attn_fwd_combine
     observed_splits = []
+    selected_splits = []
+    fused_forward = fused.forward_sm100_d512
+
+    @wraps(fused_forward)
+    def record_fused(*args, **kwargs):
+        selected_splits.append(kwargs["num_splits"])
+        return fused_forward(*args, **kwargs)
 
     @wraps(combine)
     def record_combine(out_partial, *args, **kwargs):
@@ -608,6 +616,7 @@ def test_splitkv_training(dtype, splits, monkeypatch):
         return combine(out_partial, *args, **kwargs)
 
     monkeypatch.setattr(interface, "_flash_attn_fwd_combine", record_combine)
+    monkeypatch.setattr(fused, "forward_sm100_d512", record_fused)
     torch.manual_seed(851)
     q = torch.randn(1, 65, 4, 512, device="cuda", dtype=dtype, requires_grad=True)
     k, v = [
@@ -616,8 +625,12 @@ def test_splitkv_training(dtype, splits, monkeypatch):
     ]
     qr, kr, vr = [x.detach().double().requires_grad_() for x in (q, k, v)]
     out, lse = flash_attn_func(q, k, v, causal=True, num_splits=splits, return_lse=True)
-    assert len(observed_splits) == 2
-    assert all(n == splits if splits > 0 else n > 1 for n in observed_splits)
+    # One fused QK/softmax covers all V512 columns. Automatic planning may
+    # choose one split when dividing a short KV sequence would add overhead.
+    assert len(selected_splits) == 1
+    chosen = selected_splits[0]
+    assert chosen == splits if splits > 0 else chosen >= 1
+    assert observed_splits == ([chosen] if chosen > 1 else [])
     ref, rlse = reference(qr, kr, vr, causal=True)
     check(out, ref, dtype)
     torch.testing.assert_close(lse.double(), rlse, atol=0.003, rtol=0.003)
