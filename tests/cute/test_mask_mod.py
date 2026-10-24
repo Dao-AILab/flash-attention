@@ -1964,6 +1964,33 @@ def test_sm90_block_sparse_explicit_192_block_size():
 def test_sm90_block_sparse_fwd_tile_fits_block_size(headdim, block_size, check_bwd):
     """flash_attn_func takes no tile sizes, so the SM90 forward must pick a tile that
     matches the block-sparse block size instead of rejecting it."""
+    _run_sm90_block_sparse_tile_fit(headdim, block_size, check_bwd)
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90-only test")
+@pytest.mark.parametrize(
+    "headdim,block_size",
+    [
+        (64, (64, 128)),  # sparse Q block smaller than the default tile_m=128
+        (64, (128, 64)),  # sparse KV block smaller than the default tile_n=128
+        (64, (128, 96)),
+        (96, (128, 112)),
+        (128, (128, 80)),
+        (128, (64, 48)),
+        (192, (128, 64)),  # default tile_n=96
+        (192, (64, 32)),
+        (256, (128, 48)),  # default block-sparse tile_n=64
+        (256, (64, 32)),
+    ],
+)
+@pytest.mark.parametrize("use_mask_mod", [False, True])
+def test_sm90_block_sparse_bwd_tile_fits_block_size(headdim, block_size, use_mask_mod):
+    """Same as the forward test: the SM90 backward must fit its tile to the block-sparse
+    block size instead of rejecting it."""
+    _run_sm90_block_sparse_tile_fit(headdim, block_size, True, use_mask_mod)
+
+
+def _run_sm90_block_sparse_tile_fit(headdim, block_size, check_bwd, use_mask_mod=False):
     torch.manual_seed(0)
     batch_size, nheads, seqlen = 1, 4, 512
     dtype = torch.bfloat16
@@ -1973,8 +2000,12 @@ def test_sm90_block_sparse_fwd_tile_fits_block_size(headdim, block_size, check_b
         # Block-aligned: every block is fully kept or fully dropped, so no mask_mod is needed.
         return (kv_idx // block_kv) * block_kv <= (q_idx // block_q) * block_q + block_q - 1
 
+    mask_mod_cute, mask_mod_flex = None, block_causal
+    if use_mask_mod:
+        # Partial diagonal blocks run mask_mod inside the kernel.
+        mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q=seqlen, seqlen_k=seqlen)
     bm = create_block_mask(
-        block_causal, batch_size, nheads, seqlen, seqlen, device="cuda", BLOCK_SIZE=block_size
+        mask_mod_flex, batch_size, nheads, seqlen, seqlen, device="cuda", BLOCK_SIZE=block_size
     )
     (
         _seq_q,
@@ -2013,6 +2044,7 @@ def test_sm90_block_sparse_fwd_tile_fits_block_size(headdim, block_size, check_b
         k,
         v,
         softmax_scale=1.0 / math.sqrt(headdim),
+        mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_fwd,
         block_sparse_tensors_bwd=block_sparse_bwd,
         return_lse=True,
