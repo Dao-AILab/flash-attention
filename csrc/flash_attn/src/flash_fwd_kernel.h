@@ -549,7 +549,13 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
         const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
             + m_block * kBlockM) * params.d_rounded;
-        const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+        index_t row_offset_lse_seq;
+        if (!Split && params.unpadded_lse) {  // softmax_lse, varlen: [h, total_q]
+            row_offset_lse_seq = bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb);
+        } else {  // softmax_lseaccum, or softmax_lse without varlen: [splits, b, h, seqlen_q]
+            row_offset_lse_seq = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q;
+        }
+        const index_t row_offset_lseaccum = row_offset_lse_seq + m_block * kBlockM;
         Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
                                       Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                      make_stride(Split ? kHeadDim : params.o_row_stride, _1{}));
