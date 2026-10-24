@@ -69,3 +69,22 @@ def arrive_inc(
     if thread_idx == 0:
         red_release(flag_ptr, val)
         # red_relaxed(flag_ptr, val)
+
+
+@cute.jit
+def arrive_inc_relaxed(
+    lock_ptr: cute.Pointer, thread_idx: int | Int32, flag_offset: int, val: cutlass.Constexpr[Int32]
+) -> None:
+    """Flag increment without the gpu-scope release fence.
+
+    For a producer whose published data was written by the async proxy (cp.reduce.async.bulk)
+    and already completed with cp.async.bulk.wait_group (not .read) by the issuing lane, with a
+    CTA barrier between that wait and this call: the adds are performed at L2 before the flag
+    is written, and a consumer that observes the flag (ld.acquire) issues
+    its own bulk adds only afterwards, so they are ordered behind the producer's at the point of
+    coherence. membar.gl in red.release would only order this thread's generic-proxy accesses,
+    which the flag does not depend on.
+    """
+    flag_ptr = lock_ptr + flag_offset
+    if thread_idx == 0:
+        red_relaxed(flag_ptr, val)
