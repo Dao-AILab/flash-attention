@@ -1125,9 +1125,9 @@ class NativeD512Dv(NativeD512DqDk):
         self.threads = 256
         self.head_group = head_group if mode != "dq" else 1
         self.head_major = head_major
-        # A smaller query tile reduces resource pressure for noncausal DV.
-        # Causal attention retains the wider tile to amortize traversal costs.
-        self.query_tile = 256 if causal else 128
+        # Causal and plain full attention use 256 query rows per DV traversal.
+        # Local and softcap noncausal attention retain the 128-row tile.
+        self.query_tile = 256 if causal or (softcap == 0.0 and window == (None, None)) else 128
 
     @cute.jit
     def __call__(
