@@ -31,7 +31,7 @@ from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.mask import AttentionMask
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
+from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, FlashAttentionForwardSm100
 from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
@@ -77,6 +77,7 @@ class FlashAttentionMLAForwardSm100:
         use_clc_scheduler: bool = True,
         has_qk: bool = True,
         rescale_threshold: float = 8.0,
+        num_splits: int = 1,
     ):
         self.is_causal = is_causal
         # Lazy online-softmax rescaling: the running row max (and hence the O/row_sum
@@ -86,6 +87,15 @@ class FlashAttentionMLAForwardSm100:
         # puts a coherent ~2^-9 relative error on the whole output row).
         self.rescale_threshold = float(rescale_threshold)
         self.is_local = False
+        # Specializations can provide local bounds and normalize empty ranges.
+        # Ordinary MLA keeps its existing unwindowed BlockInfo implementation.
+        self.window_size_left = None
+        self.window_size_right = None
+        self.block_info_type = BlockInfo
+        self.supports_fp8 = False
+        self.num_stages_sO = None
+        self.num_splits = num_splits
+        self.is_split_kv = num_splits > 1
         self.pack_gqa = pack_gqa
         assert 0 < qhead_per_kvhead <= 128
         # qhead_per_kvhead is the real head count. Sparse MLA (MQA) pads it to the tile:
@@ -409,7 +419,7 @@ class FlashAttentionMLAForwardSm100:
         stream: cuda.CUstream = None,
     ):
         # fmt: on
-        assert descale_tensors is None, "fp8 descales are not supported by 2CTA MLA"
+        assert descale_tensors is None or self.supports_fp8, "fp8 descales are not supported by 2CTA MLA"
         self.store_P = mP is not None
         self.store_row_max = mRowMax is not None
         self.store_O_residual = mOlo is not None
@@ -449,12 +459,17 @@ class FlashAttentionMLAForwardSm100:
         # (num_pages, page_size, h_k, d) -> (page_size, d, h_k, num_pages)
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
-        mQ, mQv, mO, mP, mOlo = [
+        mQ, mQv, mP, mOlo = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=QO_layout_transpose))
             if mX is not None
             else None
-            for mX in (mQ, mQv, mO, mP, mOlo)
+            for mX in (mQ, mQv, mP, mOlo)
         ]
+        O_layout_transpose = (
+            [mode + 1 for mode in QO_layout_transpose] + [0]
+            if const_expr(self.is_split_kv) else QO_layout_transpose
+        )
+        mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
         mK, mV = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=KV_layout_transpose))
             if mX is not None
@@ -476,6 +491,8 @@ class FlashAttentionMLAForwardSm100:
         )
         # (b, s_q, h) -> (s_q, h, b) or (total_q, h) -> (total_q, h)
         LSE_layout_transpose = [1, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 1]
+        if const_expr(self.is_split_kv):
+            LSE_layout_transpose = [mode + 1 for mode in LSE_layout_transpose] + [0]
         mLSE = (
             cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
             if mLSE is not None
@@ -653,7 +670,7 @@ class FlashAttentionMLAForwardSm100:
 
         self.overlap_sO_sV = True
         if const_expr(self.overlap_sO_sV):
-            num_stages_sO = self.num_stages_V
+            num_stages_sO = self.num_stages_V if self.num_stages_sO is None else self.num_stages_sO
         else:
             num_stages_sO = self.num_hdimv_splits
         sO_layout = sm100_utils.make_smem_layout_epi(
@@ -708,7 +725,7 @@ class FlashAttentionMLAForwardSm100:
             num_block=cute.ceil_div(cute.size(mQv.shape[0]), self.cluster_tile_m),
             num_head=cute.size(mQv.shape[2]),
             num_batch=batch_size_for_sched,
-            num_splits=1,  # todo: split_kv
+            num_splits=self.num_splits,
             seqlen_k=cute.size(mV.shape[0])
             if const_expr(mPageTable is None)
             else cute.size(mV.shape[0]) * cute.size(mPageTable.shape[1]),
@@ -725,7 +742,7 @@ class FlashAttentionMLAForwardSm100:
             is_persistent=self.is_persistent,
             # lpt=self.is_causal or self.is_local,
             lpt=False,
-            is_split_kv=False,
+            is_split_kv=self.is_split_kv,
             cluster_shape_mn=self.cluster_shape_mn,
             use_cluster_idx=True,
         )
@@ -781,6 +798,7 @@ class FlashAttentionMLAForwardSm100:
             mIndexTopk,
             mPageTable,
             learnable_sink,
+            descale_tensors,
             tma_atom_Q,
             tma_atom_Qv,
             tma_atom_K,
@@ -840,6 +858,7 @@ class FlashAttentionMLAForwardSm100:
         mIndexTopk: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
         learnable_sink: Optional[cute.Tensor],
+        descale_tensors: Optional[DescaleTensors],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_Qv: cute.CopyAtom,
         tma_atom_K: Optional[cute.CopyAtom],
@@ -1000,15 +1019,20 @@ class FlashAttentionMLAForwardSm100:
         if const_expr(self.is_topk_gather):
             sBitmask = storage.sBitmask.get_tensor(sBitmask_layout)
 
-        if const_expr(self.overlap_sO_sV):
+        if const_expr(not self.use_tma_O):
+            # The predicated R2G epilogue never reads sO. In particular, its
+            # FP32 SplitKV partials need no shared-memory output allocation.
+            sO = sV
+        elif const_expr(self.overlap_sO_sV):
             sO_iterator = sV.iterator
             assert cute.cosize(sO_layout) <= cute.cosize(sV_layout_staged)
         else:
             sO_iterator = sQv.iterator
             assert cute.cosize(sO_layout) <= cute.cosize(sQv_layout_staged)
-        sO = cute.make_tensor(
-            cute.recast_ptr(sO_iterator, sO_layout.inner, self.dtype_O), sO_layout.outer
-        )
+        if const_expr(self.use_tma_O):
+            sO = cute.make_tensor(
+                cute.recast_ptr(sO_iterator, sO_layout.inner, self.dtype_O), sO_layout.outer
+            )
 
         # ==== Get thread MMAs and accumulator fragments ====
         thr_mma_QK = tiled_mma_QK.get_slice(mma_tile_coord_v)
@@ -1022,10 +1046,15 @@ class FlashAttentionMLAForwardSm100:
         tOtO0_fake = thr_mma_PVt.make_fragment_C(acc_shape_Oi)
         tOtO1_fake = thr_mma_PVt.make_fragment_C(acc_shape_Oi)
 
-        block_info = BlockInfo(
+        block_info = self.block_info_type(
             self.cta_tile_m * self.cta_group_size,
             self.tile_n,
             is_causal=self.is_causal,
+            is_local=self.is_local,
+            is_split_kv=self.is_split_kv,
+            num_splits=self.num_splits,
+            window_size_left=self.window_size_left,
+            window_size_right=self.window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
@@ -1045,6 +1074,8 @@ class FlashAttentionMLAForwardSm100:
             AttentionMask,
             self.cta_tile_m * self.cta_group_size,
             self.tile_n,
+            window_size_left=self.window_size_left,
+            window_size_right=self.window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
 
@@ -1262,6 +1293,7 @@ class FlashAttentionMLAForwardSm100:
                 sP_out=sP_out,
                 mCuSeqlensQ=mCuSeqlensQ,
                 learnable_sink=learnable_sink,
+                descale_tensors=descale_tensors,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1298,6 +1330,7 @@ class FlashAttentionMLAForwardSm100:
                 mCuSeqlensQ=mCuSeqlensQ,
                 learnable_sink=learnable_sink,
                 mOlo=mOlo,
+                descale_tensors=descale_tensors,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2545,6 +2578,12 @@ class FlashAttentionMLAForwardSm100:
         return consumer_state
 
     @cute.jit
+    def _load_effective_descales(self, descale_tensors, batch_idx, kv_head_idx):
+        return FlashAttentionForwardSm100._load_effective_descales(
+            self, descale_tensors, batch_idx, kv_head_idx
+        )
+
+    @cute.jit
     def softmax_loop(
         self,
         softmax_scale: Float32,
@@ -2573,6 +2612,7 @@ class FlashAttentionMLAForwardSm100:
         sP_out: Optional[cute.Tensor] = None,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         learnable_sink: Optional[cute.Tensor] = None,
+        descale_tensors: Optional[DescaleTensors] = None,
     ):
         # ==== softmax warpgroup ====
         # Description: computes softmax on S and writes the result to P
@@ -2634,7 +2674,7 @@ class FlashAttentionMLAForwardSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            cluster_m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             if const_expr(self.use_packed_varlen_sched):
                 batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
                 cluster_m_block -= mCuSeqlensQ[batch_idx]
@@ -2648,6 +2688,7 @@ class FlashAttentionMLAForwardSm100:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
                     cluster_m_block,
+                    split_idx,
                 )
             num_n_blocks = n_block_max - n_block_min
             even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
@@ -2696,10 +2737,13 @@ class FlashAttentionMLAForwardSm100:
             )
             disable_mask = self.disable_bitmask and self.is_topk_gather
 
+            kv_head_idx = head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
+            qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
             softmax = SoftmaxSm100.create(
-                softmax_scale_log2,
+                softmax_scale_log2 * qk_descale,
                 rescale_threshold=self.rescale_threshold if const_expr(self.dtype_Q.width == 16) else 0.0,
-                softmax_scale=softmax_scale,
+                softmax_scale=softmax_scale * qk_descale,
+                max_offset=8 if const_expr(self.dtype_P.width == 8) else 0,
             )
             softmax.reset()
 
@@ -2752,7 +2796,7 @@ class FlashAttentionMLAForwardSm100:
                 n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
                     seqlen, cluster_m_block, n_block_min
                 )
-                num_masked_n_blocks = n_block_max - 1 - n_block_min_causal_local_mask
+                num_masked_n_blocks = max(0, n_block_max - 1 - n_block_min_causal_local_mask)
                 num_masked_n_block_groups = min(
                     num_n_block_groups - 1, cute.ceil_div(num_masked_n_blocks, self.num_stages_S)
                 )
@@ -2791,7 +2835,7 @@ class FlashAttentionMLAForwardSm100:
                         1 - stage,
                         n_block,
                         mask_fn=partial(mask_fn, mask_seqlen=False)
-                        if const_expr(self.is_topk_gather and not self.disable_bitmask)
+                        if const_expr(self.is_local or (self.is_topk_gather and not self.disable_bitmask))
                         else None,
                     )
                     n_block -= 1
@@ -2968,6 +3012,7 @@ class FlashAttentionMLAForwardSm100:
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         learnable_sink: Optional[cute.Tensor] = None,
         mOlo: Optional[cute.Tensor] = None,
+        descale_tensors: Optional[DescaleTensors] = None,
     ):
         ### ==== correction/epilogue warpgroup ====
         # Correction: copy scale smem -> rmem, copy O tmem -> rmem, rescale O, store O rmem -> tmem

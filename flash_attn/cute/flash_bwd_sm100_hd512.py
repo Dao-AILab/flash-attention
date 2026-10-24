@@ -41,6 +41,7 @@ class NativeD512DqDk:
         self.threads = 256
         self.head_group = head_group if mode != "dq" else 1
         self.head_major = head_major
+        self.compute_threads = 256 if softcap > 0 else 128
 
     @cute.jit
     def __call__(
@@ -162,6 +163,7 @@ class NativeD512DqDk:
             usedq,
             usedk,
             maxsq,
+            maxsk,
         ).launch(grid=grid, block=(self.threads, 1, 1), cluster=(2, 1, 1), stream=stream)
 
     @cute.jit
@@ -287,6 +289,36 @@ class NativeD512DqDk:
             tcgen05.commit(empty, mask=3, cta_group=tcgen05.CtaGroup.TWO)
 
     @cute.jit
+    def tile_bounds(self, qs: Int32, ks: Int32, sq: Int32, sk: Int32, iterations: Int32):
+        """Bound the traversal before entering the producer/consumer loop.
+
+        This is the same bottom-right-aligned interval calculation used by
+        BlockInfo.  Elementwise masks still handle the two boundary tiles.
+        Clamping before division also handles negative window bounds and
+        fully masked rows without relying on signed integer division.
+        """
+        first = Int32(0)
+        last = iterations
+        if const_expr(self.mode == "dq"):
+            if const_expr(self.causal):
+                last = min(last, max(0, qs + 127 + sk - sq + 128) // 128)
+            if const_expr(self.window[0] is not None):
+                first = max(first, max(0, qs + sk - sq - self.window[0]) // 128)
+            if const_expr(self.window[1] is not None):
+                last = min(last, max(0, qs + 127 + sk - sq + self.window[1] + 128) // 128)
+        else:
+            query_tile = self.query_tile if const_expr(self.mode == "dv") else 128
+            if const_expr(self.causal):
+                first = max(first, max(0, ks + sq - sk) // query_tile)
+            if const_expr(self.window[1] is not None):
+                first = max(first, max(0, ks + sq - sk - self.window[1]) // query_tile)
+            if const_expr(self.window[0] is not None):
+                last = min(
+                    last, max(0, ks + 127 + sq - sk + self.window[0] + query_tile) // query_tile
+                )
+        return first, last
+
+    @cute.jit
     def epilogue(
         self,
         tensor,
@@ -387,6 +419,7 @@ class NativeD512DqDk:
         usedq,
         usedk,
         maxsq: Int32,
+        maxsk: Int32,
     ):
         cute.arch.griddepcontrol_wait()
         tid, _, _ = cute.arch.thread_idx()
@@ -398,10 +431,10 @@ class NativeD512DqDk:
             if const_expr(self.causal):
                 tile = cute.ceil_div(maxsq, 128) - 1 - tile
         else:
-            # Head-major order reuses long dense Q/dO working sets across key tiles.
+            # Head-major order reuses long Q/dO working sets across key tiles.
             # Keep the original order for smaller grids that regress with head-major scheduling.
             if const_expr(self.head_major):
-                tiles = cute.ceil_div(k.shape[1], 128)
+                tiles = cute.ceil_div(maxsk, 128)
                 tile = (bx // 2) % tiles
                 by = (bx // 2) // tiles
             else:
@@ -601,11 +634,14 @@ class NativeD512DqDk:
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-            compute_sync = cutlass.pipeline.NamedBarrier(barrier_id=2, num_threads=128)
+            compute_sync = cutlass.pipeline.NamedBarrier(
+                barrier_id=2, num_threads=self.compute_threads
+            )
             cphase = Int32(0)
+            first_it, last_it = self.tile_bounds(qs, ks, sq, sk, iterations)
             for head_part in cutlass.range(self.head_group, unroll=1):
                 h = by * self.head_group + head_part
-                for it in cutlass.range(iterations):
+                for it in cutlass.range(first_it, last_it):
                     if const_expr(self.mode == "dq"):
                         ks = it * 128
                     else:
@@ -837,41 +873,68 @@ class NativeD512DqDk:
                                         mask=3,
                                         cta_group=tcgen05.CtaGroup.TWO,
                                     )
-                                cute.arch.mbarrier_wait(ds_ready, cphase)
-                                self.issue(mg, acc0, ds, bgp0, ready, bar, cphase, not initialized)
-                                self.issue(
-                                    mg,
-                                    acc1,
-                                    ds,
-                                    bgp1,
-                                    ready + 1,
-                                    bar + 1,
-                                    cphase,
-                                    not initialized,
-                                )
-                        if warp < 4:
+                                if const_expr(self.compute_threads == 128):
+                                    cute.arch.mbarrier_wait(ds_ready, cphase)
+                                    self.issue(
+                                        mg, acc0, ds, bgp0, ready, bar, cphase, not initialized
+                                    )
+                                    self.issue(
+                                        mg,
+                                        acc1,
+                                        ds,
+                                        bgp1,
+                                        ready + 1,
+                                        bar + 1,
+                                        cphase,
+                                        not initialized,
+                                    )
+                        compute_active = (
+                            warp < 4
+                            if const_expr(self.compute_threads == 128)
+                            else tid < self.compute_threads
+                        )
+                        if compute_active:
                             x = Float32(0)
                             y = Float32(0)
-                            if qs + tid < sq:
-                                x = lse[qb, h, qo + qs + tid]
-                                y = delta[qb, h, delta_offset + qs + tid]
-                            slse[tid] = x
-                            sdelta[tid] = y
+                            if const_expr(self.compute_threads == 128):
+                                if qs + tid < sq:
+                                    x = lse[qb, h, qo + qs + tid]
+                                    y = delta[qb, h, delta_offset + qs + tid]
+                                slse[tid] = x
+                                sdelta[tid] = y
+                            else:
+                                if tid < 128:
+                                    if qs + tid < sq:
+                                        x = lse[qb, h, qo + qs + tid]
+                                        y = delta[qb, h, delta_offset + qs + tid]
+                                    slse[tid] = x
+                                    sdelta[tid] = y
                             compute_sync.arrive_and_wait()
                             cute.arch.mbarrier_wait(score_ready, cphase)
-                            probabilities = cute.make_rmem_tensor((64,), Float32)
-                            if const_expr(self.softcap > 0):
-                                derivatives = cute.make_rmem_tensor((64,), Float32)
-                            for strip in cutlass.range_constexpr(4):
+                            probabilities = cute.make_rmem_tensor(
+                                (64 // (self.compute_threads // 128),), Float32
+                            )
+                            for strip in cutlass.range_constexpr(
+                                4 // (self.compute_threads // 128)
+                            ):
+                                physical_strip = (
+                                    strip
+                                    if const_expr(self.compute_threads == 128)
+                                    else strip + (tid // 128) * (4 // (self.compute_threads // 128))
+                                )
                                 physical = cute.make_layout((128, 16), stride=(65536, 1))
-                                ts = cute.make_tensor(scores.iterator + strip * 16, physical)
+                                ts = cute.make_tensor(
+                                    scores.iterator + physical_strip * 16, physical
+                                )
                                 cp = tcgen05.make_tmem_copy(
                                     cute.make_copy_atom(
                                         tcgen05.Ld32x32bOp(tcgen05.Repetition(16)), Float32
                                     ),
                                     ts,
                                 )
-                                th = cp.get_slice(tid)
+                                th = cp.get_slice(
+                                    tid if const_expr(self.compute_threads == 128) else tid % 128
+                                )
                                 coords = th.partition_D(cute.make_identity_tensor((128, 16)))
                                 rs = cute.make_rmem_tensor(coords.shape, Float32)
                                 cute.copy(cp, th.partition_S(ts), rs)
@@ -879,7 +942,7 @@ class NativeD512DqDk:
                                 for j in cutlass.range_constexpr(cute.size(rs)):
                                     row, col = coords[j]
                                     r = rank * 64 + row % 64
-                                    c = (row // 64) * 64 + strip * 16 + col
+                                    c = (row // 64) * 64 + physical_strip * 16 + col
                                     if const_expr(self.mode == "dq"):
                                         qi = qs + r
                                         ki = ks + c
@@ -899,32 +962,33 @@ class NativeD512DqDk:
                                     if valid:
                                         value = rs[j] * scale
                                         if const_expr(self.softcap > 0):
-                                            t = (
-                                                2
-                                                / (
-                                                    1
-                                                    + cute.math.exp(
-                                                        -2 * value / self.softcap,
-                                                        fastmath=True,
-                                                    )
-                                                )
-                                                - 1
-                                            )
+                                            t = cute.math.tanh(value / self.softcap, fastmath=True)
                                             value = self.softcap * t
                                             deriv = 1 - t * t
                                         prob = cute.math.exp(value - slse[qi - qs], fastmath=True)
-                                    probabilities[strip * 16 + j] = prob
                                     if const_expr(self.softcap > 0):
-                                        derivatives[strip * 16 + j] = deriv
+                                        # dS needs P * softcap'(S), not either
+                                        # factor separately. Fold them before
+                                        # waiting for dP to avoid keeping a
+                                        # second 64-element FP32 array live.
+                                        prob = prob * deriv
+                                    probabilities[strip * 16 + j] = prob
                             cute.arch.mbarrier_wait(compute_ready, cphase)
                             copy_smem = cute.make_copy_atom(
                                 cute.nvgpu.CopyUniversalOp(),
                                 self.dtype,
                                 num_bits_per_copy=128,
                             )
-                            for strip in cutlass.range_constexpr(4):
+                            for strip in cutlass.range_constexpr(
+                                4 // (self.compute_threads // 128)
+                            ):
+                                physical_strip = (
+                                    strip
+                                    if const_expr(self.compute_threads == 128)
+                                    else strip + (tid // 128) * (4 // (self.compute_threads // 128))
+                                )
                                 td = cute.make_tensor(
-                                    dprob.iterator + strip * 16,
+                                    dprob.iterator + physical_strip * 16,
                                     cute.make_layout((128, 16), stride=(65536, 1)),
                                 )
                                 cp = tcgen05.make_tmem_copy(
@@ -933,7 +997,9 @@ class NativeD512DqDk:
                                     ),
                                     td,
                                 )
-                                th = cp.get_slice(tid)
+                                th = cp.get_slice(
+                                    tid if const_expr(self.compute_threads == 128) else tid % 128
+                                )
                                 coords = th.partition_D(cute.make_identity_tensor((128, 16)))
                                 rd = cute.make_rmem_tensor(coords.shape, Float32)
                                 rds = cute.make_rmem_tensor(coords.shape, self.dtype)
@@ -942,7 +1008,7 @@ class NativeD512DqDk:
                                 for j in cutlass.range_constexpr(cute.size(rd)):
                                     row, col = coords[j]
                                     r = rank * 64 + row % 64
-                                    c = (row // 64) * 64 + strip * 16 + col
+                                    c = (row // 64) * 64 + physical_strip * 16 + col
                                     if const_expr(self.mode == "dq"):
                                         qi = qs + r
                                     else:
@@ -952,13 +1018,11 @@ class NativeD512DqDk:
                                         * (rd[j] - sdelta[qi - qs])
                                         * scale
                                     )
-                                    if const_expr(self.softcap > 0):
-                                        dd = dd * derivatives[strip * 16 + j]
                                     rds[j] = self.dtype(dd)
                                 for j in cutlass.range_constexpr(2):
                                     row, col = coords[j * 8]
                                     r = row % 64
-                                    c = (row // 64) * 64 + strip * 16 + col
+                                    c = (row // 64) * 64 + physical_strip * 16 + col
                                     offset = cute.assume(cute.crd2idx((r, c), ss.layout), divby=8)
                                     target = cute.make_tensor(
                                         ss.iterator + offset, cute.make_layout(8)
@@ -971,6 +1035,20 @@ class NativeD512DqDk:
                             compute_sync.arrive_and_wait()
                             if tid == 0:
                                 cute.arch.mbarrier_arrive(ds_ready, peer_cta_rank_in_cluster=0)
+                        if const_expr(self.compute_threads == 256):
+                            if warp == 4 and rank == 0:
+                                cute.arch.mbarrier_wait(ds_ready, cphase)
+                                self.issue(mg, acc0, ds, bgp0, ready, bar, cphase, not initialized)
+                                self.issue(
+                                    mg,
+                                    acc1,
+                                    ds,
+                                    bgp1,
+                                    ready + 1,
+                                    bar + 1,
+                                    cphase,
+                                    not initialized,
+                                )
                         initialized = True
                         cphase = cphase ^ 1
             cute.arch.barrier()
@@ -1169,6 +1247,7 @@ class NativeD512Dv(NativeD512DqDk):
             usedq,
             usedk,
             maxsq,
+            maxsk,
         ).launch(grid=grid, block=(self.threads, 1, 1), cluster=(2, 1, 1), stream=stream)
 
     @cute.jit
@@ -1239,15 +1318,16 @@ class NativeD512Dv(NativeD512DqDk):
         usedq,
         usedk,
         maxsq: Int32,
+        maxsk: Int32,
     ):
         cute.arch.griddepcontrol_wait()
         tid, _, _ = cute.arch.thread_idx()
         bx, by, batch = cute.arch.block_idx()
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        # Head-major order reuses long dense Q/dO working sets across key tiles.
+        # Head-major order reuses long Q/dO working sets across key tiles.
         # Keep the original order for smaller grids that regress with head-major scheduling.
         if const_expr(self.head_major):
-            tiles = cute.ceil_div(k.shape[1], 128)
+            tiles = cute.ceil_div(maxsk, 128)
             tile = (bx // 2) % tiles
             by = (bx // 2) // tiles
         else:
@@ -1417,9 +1497,10 @@ class NativeD512Dv(NativeD512DqDk):
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
             compute_sync = cutlass.pipeline.NamedBarrier(barrier_id=2, num_threads=128)
             cphase = Int32(0)
+            first_it, last_it = self.tile_bounds(qs, ks, sq, sk, iterations)
             for head_part in cutlass.range(self.head_group, unroll=1):
                 h = by * self.head_group + head_part
-                for it in cutlass.range(iterations):
+                for it in cutlass.range(first_it, last_it):
                     qs = it * self.query_tile
                     active = True
                     if const_expr(self.causal):
@@ -1562,17 +1643,7 @@ class NativeD512Dv(NativeD512DqDk):
                                     if valid:
                                         value = rs[j] * scale
                                         if const_expr(self.softcap > 0):
-                                            t = (
-                                                2
-                                                / (
-                                                    1
-                                                    + cute.math.exp(
-                                                        -2 * value / self.softcap,
-                                                        fastmath=True,
-                                                    )
-                                                )
-                                                - 1
-                                            )
+                                            t = cute.math.tanh(value / self.softcap, fastmath=True)
                                             value = self.softcap * t
                                         prob = cute.math.exp(value - slse[qi - qs], fastmath=True)
                                     rp[j] = self.dtype(prob)
@@ -1712,42 +1783,87 @@ class ReduceD512Gqa:
             )
 
 
-def _select_head_group(q, k, causal, cuq, cuk, usedq, usedk):
+def _select_head_group(
+    q,
+    k,
+    causal,
+    cuq,
+    cuk,
+    usedq,
+    usedk,
+    maxsq=None,
+    maxsk=None,
+    window_left=None,
+    window_right=None,
+    softcap=0.0,
+):
     import torch
 
-    if q.ndim != 4 or q.shape[1] != k.shape[1]:
-        return 1
-    if any(x is not None for x in (cuq, cuk, usedq, usedk)):
-        return 1
-    ratio = q.shape[2] // k.shape[2]
+    ratio = q.shape[-2] // k.shape[-2]
     if ratio % 2:
         return 1
+    # The grouped kernels already apply independent packed offsets and used
+    # lengths before traversing each query head.  A group must divide the GQA
+    # ratio, but its legality does not depend on dense versus packed storage.
+    # Never inspect device-valued lengths here: this policy also runs in a
+    # CUDA graph capture.  Packed token counts provide a conservative estimate
+    # of the active grid; maxsq bounds the serialized traversal per group.
+    q_length = maxsq if isinstance(maxsq, int) else q.shape[-3]
+    if window_left is not None and (window_right is not None or causal):
+        # A key output tile traverses only this local query interval.  Using
+        # the full physical length disabled grouping for long local attention.
+        right = 0 if causal else window_right
+        q_length = min(q_length, max(0, 128 + window_left + right))
+    key_tokens = k.shape[0] if cuk is not None else k.shape[0] * k.shape[1]
     sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    clusters = q.shape[0] * q.shape[2] * ((k.shape[1] + 127) // 128)
+    if cuk is None:
+        clusters = k.shape[0] * q.shape[-2] * ((k.shape[1] + 127) // 128)
+    else:
+        # sum(ceil(length / 128)) >= ceil(sum(length) / 128).  Do not
+        # multiply by maxsk: short/empty sequences would overstate occupancy.
+        clusters = q.shape[-2] * ((key_tokens + 127) // 128)
     if not causal:
         # Keep the serialized query traversal per grouped cluster at or below
         # 64 tiles.  Retain at least 3/4 of one two-CTA cluster wave; when the
         # ungrouped grid is very large, group=2 preserves useful parallelism.
-        # This narrow path is benchmarked for dense ratio-4 GQA only.
-        if ratio != 4:
-            return 1
-        q_tiles = (q.shape[1] + 127) // 128
+        q_tiles = (q_length + 127) // 128
         cluster_slots = sms // 2
         if q_tiles <= 16:
-            if clusters // 4 >= (3 * cluster_slots) // 4:
+            if ratio % 4 == 0 and clusters // 4 >= (3 * cluster_slots) // 4:
+                if q_tiles <= 12 and not softcap:
+                    return 4
                 return 2 if clusters // 4 > 3 * cluster_slots else 4
             if clusters // 2 >= (3 * cluster_slots) // 4:
                 return 2
         return 1
-    # Long traversals amortize grouping with more than one wave of clusters.
-    if ratio % 4 == 0 and q.shape[1] >= 4096 and clusters // 4 > sms // 2:
-        return 4
+    # Short causal traversals amortize grouping with 3/4 of a cluster wave.
+    # Medium-length GQA requires three waves to avoid an MQA tail.
+    if ratio % 4 == 0:
+        grouped_clusters = clusters // 4
+        if not softcap and q_length <= 512 and grouped_clusters >= (3 * (sms // 2)) // 4:
+            return 4
+        if not softcap and q_length <= 2048 and grouped_clusters > 3 * (sms // 2):
+            return 4
+        if q_length >= 4096 and grouped_clusters > sms // 2:
+            return 4
     if clusters // 2 > sms // 2:
         return 2
     # For short traversals, saving prologues/reduction offsets a partial wave.
-    if q.shape[1] <= 512 and (clusters // 2) * 8 >= 3 * sms:
+    if q_length <= 512 and (clusters // 2) * 8 >= 3 * sms:
         return 2
     return 1
+
+
+def _select_head_major(causal, window, maxsq, maxsk, scheduled_heads):
+    key_tiles = (maxsk + 127) // 128
+    return (
+        not causal
+        and window == (None, None)
+        and maxsq == maxsk
+        and key_tiles >= 32
+        and scheduled_heads >= 4
+        and key_tiles * scheduled_heads >= 256
+    )
 
 
 def backward_sm100_d512(
@@ -1789,7 +1905,20 @@ def backward_sm100_d512(
     # non-padded output would let one sequence's padding overwrite its neighbor.
     hq, hk = q.shape[-2], k.shape[-2]
     ratio = hq // hk
-    head_group = _select_head_group(q, k, causal, cuq, cuk, usedq, usedk)
+    head_group = _select_head_group(
+        q,
+        k,
+        causal,
+        cuq,
+        cuk,
+        usedq,
+        usedk,
+        maxsq,
+        maxsk,
+        window_left,
+        window_right,
+        softcap,
+    )
     if cuq is None:
         delta_shape = (q.shape[0], hq, ((q.shape[1] + 127) // 128) * 128)
     else:
@@ -1866,19 +1995,8 @@ def backward_sm100_d512(
     window = (window_left, window_right)
     # Evaluate scheduling policy in Python: long BoolOp chains expand heavily
     # in CuTeDSL preprocessing, even when their inputs are compile-time constants.
-    key_tiles = (tensors[1].shape[1] + 127) // 128
     scheduled_heads = hq // head_group
-    head_major = (
-        not causal
-        and all(x is None for x in metadata)
-        and tensors[0].shape[1] == tensors[1].shape[1]
-        and window[0] is None
-        and window[1] is None
-        and maxsk == tensors[1].shape[1]
-        and key_tiles >= 32
-        and scheduled_heads >= 4
-        and key_tiles * scheduled_heads >= 256
-    )
+    head_major = _select_head_major(causal, window, maxsq, maxsk, scheduled_heads)
     # Keep batch and token extents dynamic for compact dense and packed layouts.
     # Head dimensions and scheduling policies still select distinct kernels.
     token_modes = ((0, 1), (0, 1), (0, 1), (0, 1), (0, 2), (0, 2), (0, 1), (0, 1), (0, 1))

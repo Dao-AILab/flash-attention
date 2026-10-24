@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Colfax International.
 
 import math
+import torch
 from functools import partial
 from typing import Callable, Optional
 
@@ -10,6 +11,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute import FastDivmodDivisorV2
 
 from quack import copy_utils
 
@@ -20,6 +22,8 @@ from flash_attn.cute.cute_dsl_utils import (
     to_compact_dynamic_tensor,
 )
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.paged_kv import PagedKVManager
+from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerProtocol,
@@ -30,6 +34,23 @@ from flash_attn.cute.utils import get_batch_from_cu_tensor
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 
 
+class D512BlockInfo(BlockInfo):
+    @cute.jit
+    def get_n_block_min_max(self, seqlen_info, m_block, split_idx=0, num_splits=1):
+        n_min, n_max = BlockInfo.get_n_block_min_max(
+            self, seqlen_info, m_block, split_idx, num_splits
+        )
+        # Every pipeline role must execute the same single, fully masked
+        # iteration for an empty range. Load a valid physical tile, never a
+        # negative or beyond-sequence tile selected by a signed local bound.
+        if n_max <= n_min:
+            if const_expr(self.is_split_kv):
+                n_min, n_max = Int32(-1), Int32(0)
+            else:
+                n_min, n_max = Int32(0), Int32(1)
+        return n_min, n_max
+
+
 class FusedD512Forward(FlashAttentionMLAForwardSm100):
     """Reuse the large-Dv pipeline for ordinary Q512/K512/V512 attention.
 
@@ -38,19 +59,49 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
     stages whose storage is reused by the two final output stores.
     """
 
-    def __init__(self, causal=False, ratio=1, kvheads=1):
+    def __init__(
+        self, causal=False, ratio=1, kvheads=1, *, has_cu_seqlens_q=False,
+        has_seqused_q=False, window_size_left=None, window_size_right=None,
+        softcap=None, page_size=None, is_fp8=False, num_splits=1, pack_gqa=False,
+        has_cu_seqlens_k=False, has_seqused_k=False,
+    ):
         super().__init__(
             is_causal=causal,
             hdim=512,
             hdimv=512,
             is_topk_gather=False,
-            pack_gqa=False,
+            pack_gqa=pack_gqa,
             qhead_per_kvhead=ratio,
             nheads_kv=kvheads,
             use_clc_scheduler=False,
             has_qk=True,
+            has_cu_seqlens_q=has_cu_seqlens_q,
+            has_seqused_q=has_seqused_q,
+            use_cpasync_load_KV=page_size is not None and page_size != 128,
+            num_splits=num_splits,
         )
-        self.num_stages_V = 2
+        # Two FP32/BF16 output slices reuse V storage. FP8 halves each V
+        # stage's bytes, so four stages preserve enough epilogue storage and
+        # allow paired K loads without altering the 16-bit default pipeline.
+        self.num_stages_V = 4 if is_fp8 else 2
+        if is_fp8:
+            self.num_stages_K = 2
+        self.num_stages_sO = self.num_hdimv_splits
+        self.window_size_left = window_size_left
+        self.window_size_right = window_size_right
+        self.is_local = window_size_left is not None or window_size_right is not None
+        general_blocks = (
+            self.is_local or self.is_split_kv or self.is_varlen_q
+            or has_cu_seqlens_k or has_seqused_k or page_size is not None
+        )
+        self.block_info_type = D512BlockInfo if general_blocks else BlockInfo
+        self.softcap = softcap
+        self.supports_fp8 = is_fp8
+        self.is_paged = page_size is not None
+        # Ordinary packed varlen has no ragged TMA output descriptor. A full
+        # tail-tile store would overwrite the following sequence's output.
+        # Reuse the inherited predicated register-to-global epilogue instead.
+        self.use_tma_O = not self.is_varlen_q and not self.is_split_kv
 
     def _get_shared_storage_cls(self):
         self.buffer_align_bytes = 1024
@@ -148,6 +199,155 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
         return SharedStorage
 
     @cute.jit
+    def softcap_and_mask(self, scores, n_block, rBitmask, softmax_scale, mask_fn):
+        # Keep the inherited softmax/LSE scale contract by storing the capped
+        # score in its original (unscaled) units. Apply masks after tanh so
+        # that a masked -inf cannot turn into a finite saturated score.
+        if const_expr(self.softcap is not None):
+            inv_scale = cute.arch.rcp_approx(softmax_scale) if softmax_scale != 0.0 else 0.0
+            capped = self.softcap * cute.math.tanh(
+                scores.load() * (softmax_scale / self.softcap), fastmath=True
+            )
+            scores.store(capped * inv_scale)
+        if const_expr(mask_fn is not None):
+            mask_fn(scores, n_block=n_block, rBitmask=rBitmask)
+        if const_expr(self.is_split_kv):
+            if n_block < 0:
+                scores.fill(-Float32.inf)
+
+    @cute.jit
+    def softmax_step(
+        self, softmax, sRowMax, sScale, sBitmask, tStS_t2r_staged,
+        tSrS_t2r, sP_smem_view, tmem_load_thr, smem_store_thr,
+        pipeline_S, pipeline_P, pipeline_sm_stats, pipeline_bitmask,
+        tidx, warp_idx, consumer_state_S, producer_state_P,
+        producer_state_sm_stats, consumer_state_bitmask, stage: cutlass.Constexpr,
+        n_block, mask_fn=None, is_first=False, store_P=None, gRowMax=None,
+        packed_row0=0,
+    ):
+        if const_expr(self.softcap is not None or self.is_split_kv):
+            mask_fn = partial(
+                self.softcap_and_mask, softmax_scale=softmax.softmax_scale,
+                mask_fn=mask_fn,
+            )
+        return FlashAttentionMLAForwardSm100.softmax_step(
+            self, softmax, sRowMax, sScale, sBitmask, tStS_t2r_staged,
+            tSrS_t2r, sP_smem_view, tmem_load_thr, smem_store_thr,
+            pipeline_S, pipeline_P, pipeline_sm_stats, pipeline_bitmask,
+            tidx, warp_idx, consumer_state_S, producer_state_P,
+            producer_state_sm_stats, consumer_state_bitmask, stage, n_block,
+            mask_fn=mask_fn, is_first=is_first, store_P=store_P,
+            gRowMax=gRowMax, packed_row0=packed_row0,
+        )
+
+    @cute.jit
+    def _get_block_idx(self, n_block, mPageTable_cur):
+        # Empty SplitKV ranges execute one masked logical block -1 while
+        # all memory traffic targets physical block zero.
+        if const_expr(self.is_split_kv):
+            n_block = max(n_block, 0)
+        if const_expr(mPageTable_cur is not None):
+            if const_expr(cute.size(mPageTable_cur.shape) == 0):
+                return Int32(0)
+            return mPageTable_cur[n_block]
+        return n_block
+
+    @cute.jit
+    def relay(
+        self, pipeline_K, pipeline_V, pipeline_K_cpasync, pipeline_V_cpasync,
+        sO_empty_mbar_ptr, topk_length_dynamic, block_info, SeqlenInfoCls,
+        tile_scheduler, mCuSeqlensQ=None,
+    ):
+        """Paged loaders produce K and only the two transposed V slices."""
+        Producer, Consumer = pipeline.PipelineUserType.Producer, pipeline.PipelineUserType.Consumer
+        producer_K = pipeline.make_pipeline_state(Producer, stages=self.num_stages_K)
+        consumer_K = pipeline.make_pipeline_state(Consumer, stages=self.num_stages_K)
+        producer_V = pipeline.make_pipeline_state(Producer, stages=self.num_stages_V)
+        consumer_V = pipeline.make_pipeline_state(Consumer, stages=self.num_stages_V)
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            cluster_m_block, _, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                cluster_m_block -= mCuSeqlensQ[batch_idx]
+            seqlen = SeqlenInfoCls(batch_idx)
+            n_min, n_max = block_info.get_n_block_min_max(seqlen, cluster_m_block, split_idx)
+            for _ in cutlass.range(n_max - n_min, unroll=1):
+                consumer_K, producer_K = self.relay_inner(
+                    pipeline_K_cpasync, pipeline_K, consumer_K, producer_K
+                )
+                for _ in cutlass.range_constexpr(self.num_hdimv_splits):
+                    consumer_V, producer_V = self.relay_inner(
+                        pipeline_V_cpasync, pipeline_V, consumer_V, producer_V
+                    )
+            work_tile = tile_scheduler.advance_to_next_work()
+        pipeline_K.producer_tail(producer_K)
+        pipeline_V.producer_tail(producer_V)
+
+    @cute.jit
+    def load_cpasync(
+        self, mIndexTopk, mK, mV, mVt, sK, sV, sVt, sBitmask,
+        pipeline_K, pipeline_V, pipeline_K_cpasync, pipeline_V_cpasync,
+        pipeline_bitmask, sO_empty_mbar_ptr, topk_length_dynamic,
+        block_info, SeqlenInfoCls, tile_scheduler, mPageTable=None,
+        mCuSeqlensQ=None,
+    ):
+        """Direct paged K/V loads; no contiguous materialization or Qv reads."""
+        cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        tidx = cute.arch.thread_idx()[0] % self.num_cpasync_load_threads
+        Producer = pipeline.PipelineUserType.Producer
+        producer_K = pipeline.make_pipeline_state(Producer, stages=self.num_stages_K)
+        producer_V = pipeline.make_pipeline_state(Producer, stages=self.num_stages_V)
+        if const_expr(self.use_tma_O):
+            producer_phase_O = Int32(1)
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            cluster_m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                cluster_m_block -= mCuSeqlensQ[batch_idx]
+            seqlen = SeqlenInfoCls(batch_idx)
+            n_min, n_max = block_info.get_n_block_min_max(seqlen, cluster_m_block, split_idx)
+            head_kv = head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
+            page_divmod = FastDivmodDivisorV2(cute.size(mV.shape[0]))
+            split_per_cta = self.hdimv // self.num_hdimv_splits // self.cta_group_size
+            mVt_cta = cute.tiled_divide(mVt, (split_per_cta,))
+            mVt_cta = cute.logical_divide(mVt_cta, (1, self.cta_group_size, 1, 1, 1))
+            mVt_cta = mVt_cta[
+                (0, None), (cta_rank, None), (0, None), (0, None), (0, None)
+            ]
+            mVt_cta = cute.group_modes(mVt_cta, 0, 2)
+            manager_K = PagedKVManager.create(
+                mPageTable, mK, mK, page_divmod, batch_idx, head_kv, tidx,
+                seqlen.seqlen_k, 0, self.tile_n, self.hdim, self.hdim,
+                self.num_cpasync_load_threads, mK.element_type, arch=100,
+            )
+            manager_V = PagedKVManager.create(
+                mPageTable, mV, mVt_cta, page_divmod, batch_idx, head_kv, tidx,
+                seqlen.seqlen_k, 0, self.tile_n,
+                self.hdimv // self.num_hdimv_splits, split_per_cta,
+                self.num_cpasync_load_threads, mV.element_type, arch=100,
+            )
+            if const_expr(self.use_tma_O and self.overlap_sO_sV):
+                cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
+                producer_phase_O ^= 1
+            for step in cutlass.range(n_max - n_min, unroll=1):
+                n_block = max(0, n_max - 1 - step)
+                manager_K.load_page_table(n_block)
+                producer_K = self.cpasync_paged_load_KV(
+                    manager_K, pipeline_K, pipeline_K_cpasync, sK,
+                    False, "K", cta_rank, n_block, producer_K,
+                )
+                manager_V.load_page_table(n_block)
+                for split in cutlass.range_constexpr(self.num_hdimv_splits):
+                    producer_V = self.cpasync_paged_load_KV(
+                        manager_V, pipeline_V, pipeline_V_cpasync, sVt,
+                        True, "V", cta_rank, n_block, producer_V,
+                        d_offset=split * split_per_cta,
+                    )
+            work_tile = tile_scheduler.advance_to_next_work()
+
+    @cute.jit
     def load(
         self,
         mQ: Optional[cute.Tensor],
@@ -198,7 +398,7 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            cluster_m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             if const_expr(self.use_packed_varlen_sched):
                 batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
                 cluster_m_block -= mCuSeqlensQ[batch_idx]
@@ -215,6 +415,7 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
                     cluster_m_block,
+                    split_idx,
                 )
             num_n_blocks = n_block_max - n_block_min
             even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
@@ -375,9 +576,9 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
                 # ==== Epilogue ====
                 num_final_n_blocks = self.num_stages_S if even_n_blocks else self.num_stages_S - 1
                 for stage in cutlass.range(num_final_n_blocks, unroll_full=True):
-                    n_block = num_final_n_blocks - 1 - stage
+                    n_block = n_block_min + num_final_n_blocks - 1 - stage
                     block = self._get_block_idx(n_block, mPageTable_cur)
-                    if n_block > 0:
+                    if n_block > n_block_min:
                         block_next = self._get_block_idx(n_block - 1, mPageTable_cur)
                         if const_expr(self.has_qk):
                             # copy K gmem -> smem
@@ -513,7 +714,7 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
         work_tile = tile_scheduler.initial_work_tile_info()
         O_should_accumulate = False
         while work_tile.is_valid_tile:
-            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            cluster_m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             if const_expr(self.use_packed_varlen_sched):
                 batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
                 cluster_m_block -= mCuSeqlensQ[batch_idx]
@@ -527,6 +728,7 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
                     cluster_m_block,
+                    split_idx,
                 )
             num_n_blocks = n_block_max - n_block_min
             even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
@@ -649,6 +851,7 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         learnable_sink: Optional[cute.Tensor] = None,
         mOlo: Optional[cute.Tensor] = None,
+        descale_tensors=None,
     ):
         assert learnable_sink is None, "D512 does not support learnable sinks"
         assert mOlo is None, "D512 does not produce an output rounding residual"
@@ -716,11 +919,17 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            cluster_m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             if const_expr(self.use_packed_varlen_sched):
                 batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
                 cluster_m_block -= mCuSeqlensQ[batch_idx]
             cta_m_block = cluster_m_block * self.cta_group_size + cta_rank_in_cluster
+
+            kv_head_idx = head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
+            qk_descale, v_descale = self._load_effective_descales(
+                descale_tensors, batch_idx, kv_head_idx
+            )
+            softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
@@ -731,6 +940,7 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
                     cluster_m_block,
+                    split_idx,
                 )
             num_n_blocks = n_block_max - n_block_min
 
@@ -762,7 +972,10 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
                     consumer_states_O[split] = consumer_state_Oi
 
             # (seqlen_q, hdimv)
-            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=self.ragged_tma_O)[
+            mO_split = mO
+            if const_expr(self.is_split_kv):
+                mO_split = mO[(None,) * (cute.rank(mO) - 1) + (split_idx,)]
+            mO_cur = seqlen.offset_batch_Q(mO_split, batch_idx, dim=3, ragged=self.ragged_tma_O)[
                 None, None, head_idx
             ]
             # (cta_tile_m, hdimv//2, 2)
@@ -801,7 +1014,7 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
             row_sum1 = sRowSum[tidx % self.cta_tile_m, 1]
             row_sum = row_sum0 + row_sum1
             acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
-            scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+            scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0) * v_descale
 
             row_max = 0.0
             if const_expr(mLSE is not None):
@@ -818,18 +1031,22 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
 
             # compute and store lse to gmem
             if const_expr(mLSE is not None):
+                mLSE_split = mLSE
+                if const_expr(self.is_split_kv):
+                    mLSE_split = mLSE[(None,) * (cute.rank(mLSE) - 1) + (split_idx,)]
                 if const_expr(not seqlen.has_cu_seqlens_q):
-                    mLSE_cur = mLSE[None, head_idx, batch_idx]
+                    mLSE_cur = mLSE_split[None, head_idx, batch_idx]
                 else:
                     lse_offset = (
                         seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
                     )
-                    mLSE_cur = cute.domain_offset((lse_offset,), mLSE[None, head_idx])
+                    mLSE_cur = cute.domain_offset((lse_offset,), mLSE_split[None, head_idx])
                 gLSE = cute.local_tile(mLSE_cur, (self.cta_tile_m,), (cta_m_block,))
                 if tidx < self.cta_tile_m:
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True))
+                        (row_max * softmax_scale_log2_eff + cute.math.log2(row_sum, fastmath=True)
+                         - (8.0 if const_expr(self.dtype_P.width == 8) else 0.0))
                         * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
@@ -838,6 +1055,11 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
                         gLSE[tidx] = lse
 
             row_idx = cta_m_block * self.cta_tile_m + tOicOi[0][0]
+
+            if const_expr(self.supports_fp8 and self.use_tma_O):
+                # One BF16 output stage overlaps two FP8 V stages. Both
+                # final PV slices must finish before the first shared store.
+                pipeline_O1.consumer_wait(consumer_states_O[1])
 
             for split in cutlass.range_constexpr(self.num_hdimv_splits):
                 consumer_state_Oi = consumer_states_O[split]
@@ -848,6 +1070,9 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
                     tOtOs_t2r[split],
                     tOrOs_t2r[split],
                 )
+                if const_expr(self.is_split_kv or self.is_paged):
+                    if acc_O_mn_row_is_zero_or_nan:
+                        tOrOs_t2r[split].fill(0.0)
 
                 # scale and downcast Oi
                 tOrOs_r2g[split].store((tOrOs_r2g_f32[split].load() * scale).to(self.dtype_O))
@@ -895,31 +1120,164 @@ class FusedD512Forward(FlashAttentionMLAForwardSm100):
             work_tile = tile_scheduler.advance_to_next_work()
 
 
-def forward_sm100_d512(q, k, v, out, lse, scale, causal, *, arch: int):
-    """Dense FP16/BF16 attention with one QK/softmax and two resident O slices.
+def select_sm100_d512_config(
+    *, num_splits, pack_gqa, batch_size, total_q, num_head, num_head_kv,
+    seqlen_q_hint, seqlen_k_hint, window_size_left, window_size_right, num_sms=None,
+    is_fp8=False, is_bf16=False, is_causal=False, is_plain_dense=False,
+):
+    """Host-only plan using physical 128-row / two-CTA work and native SplitKV policy.
+
+    Lengths are static storage bounds or explicit host hints, never GPU scalar
+    reads. Packed batches also use their known total token count to bound the
+    sum of per-sequence partial tiles.
+    """
+    ratio = num_head // num_head_kv
+    can_pack = ratio > 1 and ratio <= 128 and 128 % ratio == 0
+    q_bound = total_q if seqlen_q_hint is None else min(seqlen_q_hint, total_q)
+    # Matched short-Q probes retain the unpacked single-split plan for small
+    # FP8 MQA groups where grouping regresses. Long prefill is also unchanged;
+    # explicit False wins, and missing packed hints use the conservative total.
+    implicit_pack = (
+        0 < q_bound <= 4 and ratio >= 8
+        and not (is_fp8 and num_head_kv == 1 and ratio < 64 and num_splits == 1)
+    )
+    # Matched BF16 causal decode controls favor independent heads for these
+    # two short-Q GQA groups at KV8192. This is empirical bucket tuning;
+    # unmeasured KV lengths, explicit packing, and automatic SplitKV keep
+    # their existing behavior.
+    if (
+        is_bf16 and is_causal and is_plain_dense
+        and num_splits == 1 and batch_size == 1 and num_head_kv == 2
+        and seqlen_k_hint == 8192
+        and (q_bound, ratio) in ((2, 32), (4, 16))
+        and window_size_left is None and window_size_right is None
+    ):
+        implicit_pack = False
+    packed = can_pack and (implicit_pack if pack_gqa is None else bool(pack_gqa))
+    if num_splits > 0:
+        return num_splits, packed
+    from flash_attn.cute.interface import num_splits_heuristic
+    if num_sms is None:
+        raise ValueError("Automatic D512 SplitKV planning requires the target SM count")
+    row_pack = ratio if packed else 1
+    ceil_div = lambda value, divisor: (value + divisor - 1) // divisor
+    partial_tiles = 0 if row_pack == 128 else max(0, batch_size - 1)
+    q_clusters = min(
+        batch_size * ceil_div(q_bound * row_pack, 128),
+        ceil_div(total_q * row_pack, 128) + partial_tiles,
+    )
+    work_heads = num_head_kv if packed else num_head
+    physical_ctas = 2 * max(1, q_clusters * work_heads)
+    kv_bound = max(0, seqlen_k_hint)
+    n_blocks = ceil_div(kv_bound, 128)
+    union_width = None
+    if window_size_left is not None:
+        union_width = (
+            window_size_left + q_bound if window_size_right is None else
+            window_size_left + window_size_right + 1 + min(q_bound, ceil_div(128, row_pack))
+        )
+    elif window_size_right is not None:
+        union_width = kv_bound + window_size_right
+    if union_width is not None:
+        union_width = max(0, union_width)
+        # A local interval can straddle both end tiles at an arbitrary offset.
+        local_blocks = ceil_div(union_width, 128) + (1 if union_width else 0)
+        n_blocks = min(n_blocks, local_blocks)
+    # MQA follows the native MLA four-tile minimum to bound FP32 partials.
+    # Multi-KV-head GQA keeps the native occupancy policy: the measured
+    # four-tile cap regresses that route, so do not extrapolate the MQA rule.
+    max_splits = min(128, max(1, n_blocks // 4)) if num_head_kv == 1 else 128
+    splits = num_splits_heuristic(physical_ctas, num_sms, n_blocks, max_splits)
+    return max(1, splits), packed
+
+
+def forward_sm100_d512(
+    q, k, v, out, lse, scale, causal, *, arch: int,
+    cu_seqlens_q=None, cu_seqlens_k=None, seqused_q=None, seqused_k=None,
+    window_size_left=None, window_size_right=None, softcap=None,
+    page_table=None, q_descale=None, k_descale=None, v_descale=None,
+    num_splits=1, pack_gqa=False,
+):
+    """FP16/BF16/FP8 attention with one QK/softmax and two resident O slices.
 
     Q is also passed as the inherited host's Qv shape descriptor. No Qv data
     is loaded and no Qv-V score term is computed by this specialization.
-    LSE uses a view of the public B,H,S buffer; no transpose copy is needed.
+    LSE uses a view of the public B,H,S / H,total buffer; no copy is needed.
+    Q and KV can be packed independently, with independent used lengths.
     """
-    lse_view = lse.transpose(1, 2) if lse is not None else None
-    tensors = (q, q, k, v, out, lse_view)
+    is_split_kv = num_splits > 1
+    kernel_out, kernel_lse = out, lse
+    if is_split_kv:
+        kernel_out = torch.empty((num_splits, *out.shape), dtype=torch.float32, device=out.device)
+        lse_shape = (
+            (q.shape[0], q.shape[-2], q.shape[1]) if cu_seqlens_q is None
+            else (q.shape[-2], q.shape[0])
+        )
+        kernel_lse = torch.empty((num_splits, *lse_shape), dtype=torch.float32, device=out.device)
+    lse_view = kernel_lse.transpose(-1, -2) if kernel_lse is not None else None
+    tensors = (q, q, k, v, kernel_out, lse_view)
+    metadata = (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table)
+    descales = (q_descale, k_descale, v_descale)
+    descale_modes = tuple(
+        (0,) if t is not None and is_compact_layout(t) else () for t in descales
+    )
+    descale_tensors = DescaleTensors(*descales) if any(t is not None for t in descales) else None
+    metadata_modes = tuple(
+        (0,) if t is not None and is_compact_layout(t) else () for t in metadata
+    )
     # Batch and sequence extents change from call to call, so mark them dynamic and keep them out
     # of the compile key; only the head shape the tiling depends on has to be baked in.
-    dynamic_modes = (0, 1) if all(is_compact_layout(t) for t in tensors if t is not None) else ()
-    signature = tuple(dynamic_shape_signature(t, dynamic_modes) for t in tensors)
-    key = (arch, signature, causal, q.device.index)
+    q_modes = (0, 1) if cu_seqlens_q is None else (0,)
+    k_modes = (0, 1) if cu_seqlens_k is None and page_table is None else (0,)
+    out_modes = tuple(mode + 1 for mode in q_modes) if is_split_kv else q_modes
+    tensor_modes = (q_modes, q_modes, k_modes, k_modes, out_modes, out_modes)
+    tensor_modes = tuple(
+        modes if t is not None and is_compact_layout(t) else ()
+        for t, modes in zip(tensors, tensor_modes)
+    )
+    signature = tuple(
+        dynamic_shape_signature(t, modes) for t, modes in zip(tensors, tensor_modes)
+    ) + tuple(dynamic_shape_signature(t, modes) for t, modes in zip(metadata, metadata_modes)) + tuple(
+        dynamic_shape_signature(t, modes) for t, modes in zip(descales, descale_modes)
+    )
+    key = (arch, signature, causal, window_size_left, window_size_right, softcap,
+           num_splits, pack_gqa, q.device.index)
     if key not in _forward_cache:
         args = [
-            to_compact_dynamic_tensor(t.detach(), 4 if i == 5 else 16, dynamic_modes)
+            to_compact_dynamic_tensor(t.detach(), 4 if i == 5 else 16, modes)
             if t is not None
             else None
-            for i, t in enumerate(tensors)
+            for i, (t, modes) in enumerate(zip(tensors, tensor_modes))
         ]
+        metadata_args = [
+            to_compact_dynamic_tensor(t.detach(), 4, modes) if t is not None else None
+            for t, modes in zip(metadata, metadata_modes)
+        ]
+        descale_args = DescaleTensors(*(
+            to_compact_dynamic_tensor(t.detach(), 4, modes) if t is not None else None
+            for t, modes in zip(descales, descale_modes)
+        )) if descale_tensors is not None else None
         _forward_cache[key] = cute.compile(
-            FusedD512Forward(causal, q.shape[2] // k.shape[2], k.shape[2]),
+            FusedD512Forward(
+                causal, q.shape[-2] // k.shape[-2], k.shape[-2],
+                has_cu_seqlens_q=cu_seqlens_q is not None,
+                has_seqused_q=seqused_q is not None,
+                has_cu_seqlens_k=cu_seqlens_k is not None,
+                has_seqused_k=seqused_k is not None,
+                window_size_left=window_size_left, window_size_right=window_size_right,
+                softcap=softcap,
+                page_size=k.shape[1] if page_table is not None else None,
+                is_fp8=q.element_size() == 1,
+                num_splits=num_splits, pack_gqa=pack_gqa,
+            ),
             *args,
             Float32(0),
+            None,  # mP
+            None,  # mRowMax
+            *metadata_args[:4],
+            None,  # mIndexTopk
+            metadata_args[4],
+            descale_args,
             stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
@@ -929,18 +1287,22 @@ def forward_sm100_d512(q, k, v, out, lse, scale, causal, *, arch: int):
         scale,
         None,  # mP
         None,  # mRowMax
-        None,  # mCuSeqlensQ
-        None,  # mCuSeqlensK
-        None,  # mSeqUsedQ
-        None,  # mSeqUsedK
+        *metadata[:4],
         None,  # mIndexTopk
-        None,  # mPageTable
-        None,  # descale_tensors
+        metadata[4],
+        descale_tensors,
         None,  # window_size_left
         None,  # window_size_right
         None,  # learnable_sink
         None,  # mOlo
     )
+    if is_split_kv:
+        from flash_attn.cute.interface import _flash_attn_fwd_combine
+        _flash_attn_fwd_combine(
+            kernel_out, kernel_lse.transpose(-1, -2), out,
+            lse.transpose(-1, -2) if lse is not None else None,
+            cu_seqlens_q, seqused_q, _arch=arch,
+        )
     return out, lse
 
 
