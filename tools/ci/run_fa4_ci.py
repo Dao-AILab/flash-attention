@@ -78,9 +78,10 @@ def read_dep_spec(pyproject_path: Path, name: str) -> str:
 def read_cuda_major() -> int:
     """Driver's max CUDA major from nvidia-smi header (picks the cutlass-dsl libs variant)."""
     out = subprocess.run(["nvidia-smi"], check=True, capture_output=True, text=True).stdout
-    m = re.search(r"CUDA Version:\s*(\d+)\.", out)
+    # drivers 595+ print "CUDA UMD Version: X.Y"; 617+ no longer print "CUDA Version: X.Y"
+    m = re.search(r"CUDA (?:UMD )?Version:\s*(\d+)\.", out)
     if not m:
-        raise SystemExit("Could not parse 'CUDA Version: X.Y' from nvidia-smi output")
+        raise SystemExit("Could not parse 'CUDA [UMD ]Version: X.Y' from nvidia-smi output")
     return int(m.group(1))
 
 
