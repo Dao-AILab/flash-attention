@@ -1009,6 +1009,20 @@ class FlashAttentionBackwardSm100:
             cute.size_in_bytes(self.dv_dtype, self.sdV_layout),
             cute.size_in_bytes(self.do_dtype, self.sdO_layout),
         )
+        if const_expr(not self.dKV_postprocess and not self.use_2cta_instrs):
+            # NOTE [sdO allocation with the direct dK / dV store]: allocate sdO at the size the
+            # fp32 dV staging of the dK / dV accumulate variant needs (dKV_postprocess), so that
+            # the direct-store variant (MHA, a full GQA pack) lays out the buffers behind it
+            # (sdS, sLSE, sdPsum, sdQaccum) the same way. With the smaller allocation the
+            # hdim 64 kernel runs 9-14% slower on B200 (dense / varlen / deterministic, causal
+            # both; 8k MHA 908 -> 1005 TFLOPS at 1965 MHz): its SASS is identical, but the LSE /
+            # dPsum smem loads stall (short scoreboard) and the shared-load bank-conflict
+            # counter is 11x higher. A trailing pad or other buffer orders do not recover it;
+            # this layout does. hdim 96 (both variants already larger) is unchanged.
+            sdV_accum_bytes = cute.size_in_bytes(
+                Float32, cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
+            )
+            sdO_alloc_bytes = max(sdO_alloc_bytes, sdV_accum_bytes)
 
         sdK_bytes = cute.size_in_bytes(self.dk_dtype, self.sdK_layout)
         sdV_bytes = cute.size_in_bytes(self.dv_dtype, self.sdV_layout)
