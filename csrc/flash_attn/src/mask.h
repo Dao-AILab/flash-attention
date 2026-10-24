@@ -140,7 +140,7 @@ struct Mask {
             // Reshape tensor_ from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
             Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
             // Do we need both row and column indices, or just column incides?
-            static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
+            static constexpr bool Col_idx_only = !Has_alibi && !Is_local && !Causal_mask;
             const int lane_id = threadIdx.x % 32;
             const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
             if constexpr (Col_idx_only) {
@@ -152,10 +152,7 @@ struct Mask {
                         const int col_idx = col_idx_base + j;
                         #pragma unroll
                         for (int mi = 0; mi < size<0>(tensor); ++mi) {
-                            // No causal, no local
-                            if constexpr (Has_alibi) {
-                                tensor(mi, make_coord(j, nj)) += alibi_slope * col_idx;
-                            }
+                            // No causal, no local, no alibi
                             if constexpr (!Is_even_MN) {
                                 if (col_idx >= max_seqlen_k) { tensor(mi, make_coord(j, nj)) = -INFINITY; }
                             }
@@ -178,12 +175,7 @@ struct Mask {
                             for (int j = 0; j < size<1, 0>(tensor); ++j) {
                                 const int col_idx = col_idx_base + j;
                                 if constexpr (Has_alibi) {
-                                    if constexpr (Is_causal) {
-                                        tensor(make_coord(i, mi), make_coord(j, nj)) += alibi_slope * col_idx;
-                                    } else {
-                                        tensor(make_coord(i, mi), make_coord(j, nj)) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
-
-                                    }
+                                    tensor(make_coord(i, mi), make_coord(j, nj)) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
                                 }
                                 if constexpr (Causal_mask) {
                                     if (col_idx >= col_idx_limit_right) {
