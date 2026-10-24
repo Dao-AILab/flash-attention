@@ -1822,12 +1822,25 @@ def _select_head_group(
         # sum(ceil(length / 128)) >= ceil(sum(length) / 128).  Do not
         # multiply by maxsk: short/empty sequences would overstate occupancy.
         clusters = q.shape[-2] * ((key_tokens + 127) // 128)
+    q_tiles = (q_length + 127) // 128
+    cluster_slots = sms // 2
+    if (
+        cuk is not None
+        and ratio % 4 == 0
+        and not softcap
+        and window_left is None
+        and window_right is None
+        and 12 < q_tiles <= 16
+        and clusters // 4 < (3 * cluster_slots) // 4
+    ):
+        # Medium packed traversals with too few clusters for group=4 also
+        # lose to group=1 when serialized in pairs.  Keep the measured short,
+        # local, softcap and legal group=4 paths on their existing policy.
+        return 1
     if not causal:
         # Keep the serialized query traversal per grouped cluster at or below
         # 64 tiles.  Retain at least 3/4 of one two-CTA cluster wave; when the
         # ungrouped grid is very large, group=2 preserves useful parallelism.
-        q_tiles = (q_length + 127) // 128
-        cluster_slots = sms // 2
         if q_tiles <= 16:
             if ratio % 4 == 0 and clusters // 4 >= (3 * cluster_slots) // 4:
                 if q_tiles <= 12 and not softcap:

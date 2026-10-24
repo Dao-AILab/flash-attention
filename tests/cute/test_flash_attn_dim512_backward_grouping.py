@@ -33,9 +33,7 @@ def test_metadata_head_group_policy(monkeypatch, layout, causal, ratio):
     k = SimpleNamespace(shape=(8192, 4, 512) if packed_k else (8, 1024, 4, 512))
     # Objects deliberately have no item()/tolist()/shape; touching values fails.
     cuq, cuk = object() if packed_q else None, object() if packed_k else None
-    group = native._select_head_group(
-        q, k, causal, cuq, cuk, object(), object(), 1024, 1024
-    )
+    group = native._select_head_group(q, k, causal, cuq, cuk, object(), object(), 1024, 1024)
     assert group in (2, 4)
     assert ratio % group == 0
 
@@ -44,10 +42,7 @@ def test_metadata_head_group_policy(monkeypatch, layout, causal, ratio):
 def test_metadata_head_group_keeps_indivisible_heads(ratio):
     q = SimpleNamespace(shape=(128, ratio * 2, 512))
     k = SimpleNamespace(shape=(128, 2, 512))
-    assert (
-        native._select_head_group(q, k, True, object(), object(), None, None, 128, 128)
-        == 1
-    )
+    assert native._select_head_group(q, k, True, object(), object(), None, None, 128, 128) == 1
 
 
 def test_local_head_group_uses_traversal_width(monkeypatch):
@@ -58,15 +53,8 @@ def test_local_head_group_uses_traversal_width(monkeypatch):
     )
     q = SimpleNamespace(shape=(1, 8192, 16, 512), device="cuda")
     k = SimpleNamespace(shape=(1, 8192, 4, 512))
-    assert (
-        native._select_head_group(q, k, False, None, None, None, None, 8192, 8192) == 1
-    )
-    assert (
-        native._select_head_group(
-            q, k, False, None, None, None, None, 8192, 8192, 128, 128
-        )
-        == 4
-    )
+    assert native._select_head_group(q, k, False, None, None, None, None, 8192, 8192) == 1
+    assert native._select_head_group(q, k, False, None, None, None, None, 8192, 8192, 128, 128) == 4
 
 
 def test_short_causal_group_retains_partial_wave(monkeypatch):
@@ -80,6 +68,68 @@ def test_short_causal_group_retains_partial_wave(monkeypatch):
     assert native._select_head_group(q, k, True, None, None, None, None, 128, 128) == 4
 
 
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("ratio", [2, 4, 8])
+def test_medium_packed_head_group_policy(monkeypatch, causal, ratio):
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=148),
+    )
+    q = SimpleNamespace(shape=(3065, 8, 512), device="cuda")
+    k = SimpleNamespace(shape=(3065, 8 // ratio, 512))
+    # Three possible members make these maxima compatible with the same
+    # physical token count.  Opaque metadata forbids host length readbacks.
+    for maxq, expected in ((1536, 2), (1537, 1), (2048, 1), (2049, 2 if causal else 1)):
+        if ratio == 2 and maxq <= 2048:
+            expected = 2
+        assert (
+            native._select_head_group(
+                q, k, causal, object(), object(), object(), object(), maxq, 2048
+            )
+            == expected
+        )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    ("layout", "tokens", "window", "softcap", "sms", "full_group", "causal_group"),
+    [
+        ("packed", 3456, (None, None), 0.0, 148, 1, 1),
+        ("packed", 3457, (None, None), 0.0, 148, 4, 2),
+        ("packed", 3065, (None, None), 5.0, 148, 2, 2),
+        ("packed", 3065, (None, 0), 0.0, 148, 2, 2),
+        ("packed_q", 3065, (None, None), 0.0, 148, 4, 2),
+        ("dense", 3065, (None, None), 0.0, 148, 4, 2),
+        ("packed", 3065, (None, None), 0.0, 120, 4, 2),
+    ],
+)
+def test_medium_packed_group_preserves_distinct_paths(
+    monkeypatch, causal, layout, tokens, window, softcap, sms, full_group, causal_group
+):
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=sms),
+    )
+    packed_q, packed_k = layout != "dense", layout == "packed"
+    q = SimpleNamespace(shape=(tokens, 8, 512) if packed_q else (2, 2048, 8, 512), device="cuda")
+    k = SimpleNamespace(shape=(tokens, 2, 512) if packed_k else (2, 2048, 2, 512))
+    assert native._select_head_group(
+        q,
+        k,
+        causal,
+        object() if packed_q else None,
+        object() if packed_k else None,
+        None,
+        None,
+        2048,
+        2048,
+        *window,
+        softcap,
+    ) == (causal_group if causal else full_group)
+
+
 @pytest.mark.parametrize(
     ("causal", "window", "maxq", "maxk", "heads", "expected"),
     [
@@ -90,9 +140,7 @@ def test_short_causal_group_retains_partial_wave(monkeypatch):
         (False, (None, None), 8192, 4096, 8, False),
     ],
 )
-def test_head_major_policy_uses_launch_maxima(
-    causal, window, maxq, maxk, heads, expected
-):
+def test_head_major_policy_uses_launch_maxima(causal, window, maxq, maxk, heads, expected):
     assert native._select_head_major(causal, window, maxq, maxk, heads) == expected
 
 
@@ -117,9 +165,7 @@ sm100 = pytest.mark.skipif(
         ("packed_both_major", 8, 4),
     ],
 )
-def test_grouped_metadata_backward(
-    monkeypatch, dtype, causal, layout, ratio, head_group
-):
+def test_grouped_metadata_backward(monkeypatch, dtype, causal, layout, ratio, head_group):
     """Independent offsets, empty rows, softcap, window, LSE and output views compose."""
     monkeypatch.setattr(native, "_select_head_group", lambda *args: head_group)
     if layout.endswith("_major"):
@@ -137,16 +183,8 @@ def test_grouped_metadata_backward(
     k_shape = (sum(ks),) if packed_k else (3, ks[0])
     q = torch.randn(*q_shape, ratio, 512, device="cuda", dtype=dtype)
     k, v = [torch.randn(*k_shape, 1, 512, device="cuda", dtype=dtype) for _ in range(2)]
-    cuq = (
-        torch.tensor([0, *accumulate(qs)], device="cuda", dtype=torch.int32)
-        if packed_q
-        else None
-    )
-    cuk = (
-        torch.tensor([0, *accumulate(ks)], device="cuda", dtype=torch.int32)
-        if packed_k
-        else None
-    )
+    cuq = torch.tensor([0, *accumulate(qs)], device="cuda", dtype=torch.int32) if packed_q else None
+    cuk = torch.tensor([0, *accumulate(ks)], device="cuda", dtype=torch.int32) if packed_k else None
     opts = dict(
         cu_seqlens_q=cuq,
         cu_seqlens_k=cuk,
@@ -188,12 +226,8 @@ def test_grouped_metadata_backward(
 
     exact_loss = sum(t.sum() * 0 for t in (qr, kr, vr))
     eager_loss = sum(t.float().sum() * 0 for t in (qe, ke, ve))
-    exact_rows = zip(
-        rows(qr, qs, packed_q), rows(kr, ks, packed_k), rows(vr, ks, packed_k)
-    )
-    eager_rows = list(
-        zip(rows(qe, qs, packed_q), rows(ke, ks, packed_k), rows(ve, ks, packed_k))
-    )
+    exact_rows = zip(rows(qr, qs, packed_q), rows(kr, ks, packed_k), rows(vr, ks, packed_k))
+    eager_rows = list(zip(rows(qe, qs, packed_q), rows(ke, ks, packed_k), rows(ve, ks, packed_k)))
     do_rows = rows(dout, qs, packed_q)
     dlse_rows = dlse.split(qs, -1) if packed_q else dlse.unbind(0)
     for i, (a, b, c) in enumerate(exact_rows):
