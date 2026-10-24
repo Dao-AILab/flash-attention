@@ -230,6 +230,7 @@ class PagedKVManager(ParamsBase):
         seqlenk_row_limit = (
             self.seqlen_k - n_block * self.n_block_size - tXcX[0][0] if n_block >= 0 else 0
         )
+        rows_per_pass = self.num_threads // self.gmem_threads_per_row
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
             row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
             should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
@@ -245,4 +246,11 @@ class PagedKVManager(ParamsBase):
             )
             mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
             mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
-            self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
+            if const_expr(tXc0X[0, m, 0][0] + rows_per_pass <= self.n_block_size):
+                self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
+            else:
+                # Last pass when n_block_size is not a multiple of rows_per_pass: rows past the
+                # tile alias other rows of sX (next head-dim block or stage), and a predicated-off
+                # cp.async still zero-fills its destination, so those threads must not copy.
+                if tXcX[0, m, 0][0] < self.n_block_size:
+                    self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
