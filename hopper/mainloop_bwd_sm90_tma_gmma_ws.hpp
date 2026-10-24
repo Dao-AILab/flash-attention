@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cuda/std/iterator>
 #include <cutlass/cutlass.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
@@ -22,6 +23,7 @@
 #include "softmax.h"
 #include "utils.h"
 #include "copy_sm90_bulk_reduce.hpp"
+#include "tile_m_scheduler.hpp"
 
 namespace flash {
 
@@ -31,7 +33,7 @@ template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class T
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
         int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-        bool Mma_dP_is_RS=false>
+        bool Mma_dP_is_RS=false, bool UseShiftScheduler=true>
 struct CollectiveMainloopBwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -49,6 +51,7 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
+    static constexpr bool UseShiftForFullMask = UseShiftScheduler && Deterministic && !Is_causal && !Is_local && !Varlen;
 
     static constexpr bool SdP_swapAB = SdP_swapAB_;
     static constexpr bool dKV_swapAB = dKV_swapAB_;
@@ -320,6 +323,7 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        int const num_sm;
     };
 
     // Device side kernel params
@@ -350,6 +354,7 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        int const num_sm;
     };
 
     static Params
@@ -406,7 +411,46 @@ struct CollectiveMainloopBwdSm90 {
                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
+                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
+                args.num_sm};
+    }
+
+    // calculate the kv tile status (for current head): how many kv tiles are active? how many done?
+    // return: (running_count, finished_count)
+    CUTLASS_DEVICE
+    static auto get_kv_status(int num_sms, int kv_id, int bidh, int bidb, int num_kv_tiles, int num_heads) {
+        int linear_id = kv_id + bidh * num_kv_tiles + bidb * num_kv_tiles * num_heads;
+        int wave_id = linear_id / num_sms;
+
+        // start and end indices for the current head
+        int start_idx_my_head = bidh * num_kv_tiles + bidb * num_kv_tiles * num_heads;
+        int end_idx_my_head = start_idx_my_head + num_kv_tiles - 1;
+
+        // start and end indices for the current wave
+        int start_idx_wave = wave_id * num_sms;
+        int end_idx_wave = start_idx_wave + num_sms - 1;
+
+        int intersection_start = cute::max(start_idx_my_head, start_idx_wave);
+        int intersection_end = cute::min(end_idx_my_head, end_idx_wave);
+        int running_count = cute::max(0, intersection_end - intersection_start + 1);
+
+        int finished_count = cute::max(0, start_idx_wave - start_idx_my_head);
+
+        return cute::make_tuple(running_count, finished_count);
+    }
+
+    CUTLASS_DEVICE
+    static auto get_shift_mblock_iter(int m_block_min, int m_block_max, cute::tuple<int32_t, int32_t, int32_t> block_coord, Params const& params) {
+        auto [n_block, bidh, bidb] = block_coord;
+        int nheads = get<2>(params.shape_Q);
+        int kv_len = get<0>(params.shape_K);
+        int n_blocks = (kv_len + kBlockN - 1) / kBlockN;
+        int num_sms = params.num_sm;
+        auto [running_count, finished_count] = get_kv_status(
+            num_sms, n_block, bidh, bidb, n_blocks, nheads
+        );
+        auto additional_vars = cute::make_tuple(running_count, finished_count);
+        return cute::make_tuple(ShiftScheduler(m_block_min, m_block_max, n_block - finished_count), additional_vars);
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -501,6 +545,63 @@ struct CollectiveMainloopBwdSm90 {
             for (int n = 0; n < size<1>(block_layout); ++n) {
                 mcast_mask_qdo |= (uint16_t(1) << block_layout(cluster_local_block_id.x, n, _0{}));
             }
+        }
+
+        if constexpr (UseShiftForFullMask) {
+            auto [m_block, addition_vars] = get_shift_mblock_iter(m_block_min, m_block_max, block_coord, params);
+            (void)addition_vars;
+            int lane_predicate = cute::elect_one_sync();
+            int m_block_cur = 0;
+
+            if (lane_predicate) {
+                pipeline_q.producer_acquire(smem_pipe_write);
+                copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                     tQgQ(_, *m_block), tQsQ(_, smem_pipe_write.index()));
+                copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
+                     gLSE(_, *m_block), sLSE(_, smem_pipe_write.index()));
+            }
+
+            if (lane_predicate) {
+                // Copy K tile and V tile from GMEM to SMEM.
+                shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
+                copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tKgK, tKsK);
+                copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
+
+                m_block_cur = *m_block;
+                ++m_block;
+                #pragma unroll (kHeadDim < 256 ? 2 : 1)
+                for (; m_block.valid(); ++m_block) {
+                    // If Q and dO have the same number of stages, we can use the same pipeline state variable
+                    // to reduce registers
+                    PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
+                    pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                    copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                         tdOgdO(_, m_block_cur), tdOsdO(_, smem_pipe_write_do_cur.index()));
+                    copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
+                         gdPsum(_, m_block_cur), sdPsum(_, smem_pipe_write_do_cur.index()));
+                    if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+                    ++smem_pipe_write;
+                    pipeline_q.producer_acquire(smem_pipe_write);
+                    copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                         tQgQ(_, *m_block), tQsQ(_, smem_pipe_write.index()));
+                    copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
+                         gLSE(_, *m_block), sLSE(_, smem_pipe_write.index()));
+                    m_block_cur = *m_block;
+                }
+            }
+            scheduler_prefetch();
+            if (lane_predicate) {
+                PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
+                pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                     tdOgdO(_, m_block_cur), tdOsdO(_, smem_pipe_write_do_cur.index()));
+                copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
+                     gdPsum(_, m_block_cur), sdPsum(_, smem_pipe_write_do_cur.index()));
+                if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+                ++smem_pipe_write;
+            }
+            if constexpr (Q_dO_same_stages) { smem_pipe_write_do = smem_pipe_write; }
+            return;
         }
 
         int m_block = m_block_min;
@@ -626,6 +727,36 @@ struct CollectiveMainloopBwdSm90 {
         int *lock_ptr = !Deterministic ? nullptr : params.dq_semaphore + bidb * num_head + bidh;
         using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
         bool const lane_predicate = cute::elect_one_sync();
+
+        if constexpr (UseShiftForFullMask) {
+            auto [m_block, addition_vars] = get_shift_mblock_iter(m_block_min, m_block_max, block_coord, params);
+            #pragma unroll 2
+            for (; m_block.valid(); ++m_block) {
+                if constexpr (Deterministic) {
+                    auto [running_count, finished_count] = addition_vars;
+                    int wait_num = shift_dependency(*m_block, n_block - finished_count, running_count, finished_count);
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, (*m_block) * num_batch * num_head, wait_num);
+                }
+                #pragma unroll
+                for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
+                    if (lane_predicate) {
+                        SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, *m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                        tma_store_arrive();
+                    }
+                }
+                // Note, the for_each() function is required here to ensure `warpgroup_idx` is of type Int<x>.
+                for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto warpgroup_idx) {
+                    if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
+                    cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
+                });
+                if constexpr (Deterministic) {
+                    Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, (*m_block) * num_batch * num_head);
+                }
+            }
+            return;
+        }
+
         int m_block = m_block_min;
         constexpr int kBlockM = get<0>(TileShape_MNK{});
         constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -813,8 +944,6 @@ struct CollectiveMainloopBwdSm90 {
             params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
 
-        int m_block = m_block_min;
-
         clear(tdKrdK);
         clear(tdVrdV);
         // tiled_mma_dKV.accumulate_ = GMMA::ScaleOut::Zero;
@@ -1000,36 +1129,51 @@ struct CollectiveMainloopBwdSm90 {
             if constexpr (!Q_dO_same_stages) { ++smem_pipe_read_do; }
         };
 
-        // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
-        // this helps quite a bit to not have to do causal masking for most of the iterations.
-        if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+        auto run_default_loops = [&]() {
+            int m_block = m_block_min;
+            // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
+            // this helps quite a bit to not have to do causal masking for most of the iterations.
+            if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
+                auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                static constexpr int kBlockM = get<0>(TileShape_MNK{});
+                int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block < std::min(m_block_max, m_block_masking_max); ++m_block) {
+                    bwd_step(m_block, mask_fn);
+                }
+            }
+
             static constexpr int kBlockM = get<0>(TileShape_MNK{});
-            int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
+            static constexpr int kBlockN = get<1>(TileShape_MNK{});
+            int const m_block_max_before_local_mask = !Is_local || !SeparateMaskingIterations
+                ? m_block_max
+                : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
+
+            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
             CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < std::min(m_block_max, m_block_masking_max); ++m_block) {
+            for (; m_block < m_block_max_before_local_mask; ++m_block) {
                 bwd_step(m_block, mask_fn);
             }
-        }
 
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        int const m_block_max_before_local_mask = !Is_local || !SeparateMaskingIterations
-            ? m_block_max
-            : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
-
-        auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
-        CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block < m_block_max_before_local_mask; ++m_block) {
-            bwd_step(m_block, mask_fn);
-        }
-
-        if constexpr (Is_local && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < m_block_max; ++m_block) {
-                bwd_step(m_block, mask_fn);
+            if constexpr (Is_local && SeparateMaskingIterations) {
+                auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block < m_block_max; ++m_block) {
+                    bwd_step(m_block, mask_fn);
+                }
             }
+        };
+
+        if constexpr (UseShiftForFullMask) {
+            auto [m_block, addition_vars] = get_shift_mblock_iter(m_block_min, m_block_max, block_coord, params);
+            (void)addition_vars;
+            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
+            CUTLASS_PRAGMA_NO_UNROLL
+            for (; m_block.valid(); ++m_block) {
+                bwd_step(*m_block, mask_fn);
+            }
+        } else {
+            run_default_loops();
         }
 
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print_tensor(tdVrdV); }
