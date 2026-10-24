@@ -245,6 +245,8 @@ def test_static_and_hd256_fallback(
     monkeypatch.setenv("FA_CLC", str(int(clc_enabled)))
     monkeypatch.setattr(cute_utils, "_fa_clc_enabled", clc_enabled)
     monkeypatch.setattr(cute_utils, "_fa_disable_2cta_enabled", False)
+    # The public API still disables CLC for hd256 2CTA, even though the kernel
+    # accepts shared logical work coordinates for 2CTA CLC scheduling.
     mode = (
         SchedulingMode.CLC if clc_enabled and headdim == 128 else SchedulingMode.STATIC
     )

@@ -1566,6 +1566,8 @@ def flash_attn_with_kvcache(
                  might come from any of the duplicate indices.
         cache_leftpad: (batch_size,), dtype torch.int32. The index that the KV cache starts. If None, assume 0.
         block_table [optional]: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
+            cache_seqlens plus any appended keys must fit within max_num_blocks_per_seq * page_block_size.
+            This bounds check is skipped during CUDA graph capture; callers must ensure it holds on every replay.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).

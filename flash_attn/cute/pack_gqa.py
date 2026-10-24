@@ -12,32 +12,39 @@ from quack import layout_utils
 import flash_attn.cute.utils as utils
 
 
-def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
-    """Reshape a tensor to fold qhead_per_kvhead into the seqlen dimension (mode 0).
+def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx, seqlen_idx=0):
+    """Reshape a tensor to fold qhead_per_kvhead into the seqlen dimension (mode ``seqlen_idx``,
+    0 by default).
 
-    The head dimension is at mode ``head_idx``.  Modes before it (1..head_idx-1)
-    are kept as-is (e.g. headdim for Q/O tensors), and modes after it are kept
-    as-is (e.g. batch).
+    The head dimension is at mode ``head_idx``. All other modes are kept as-is (e.g. headdim
+    for Q/O tensors, batch).
 
     For Q/O tensors (head_idx=2):
         (seqlen_q, headdim, nheads, batch, ...) -> ((qhead_per_kvhead, seqlen_q), headdim, nheads_kv, batch, ...)
     For LSE tensors (head_idx=1):
         (seqlen_q, nheads, batch, ...) -> ((qhead_per_kvhead, seqlen_q), nheads_kv, batch, ...)
+    For a (batch, seqlen_q, nheads, headdim) tensor (head_idx=2, seqlen_idx=1):
+        -> (batch, (qhead_per_kvhead, seqlen_q), nheads_kv, headdim)
     """
     head_stride = T.stride[head_idx]
-    shape_packed = (
-        (qhead_per_kvhead, T.shape[0]),
-        *[T.shape[i] for i in range(1, head_idx)],
-        nheads_kv,
-        *[T.shape[i] for i in range(head_idx + 1, len(T.shape))],
+    shape_packed, stride_packed = list(T.shape), list(T.stride)
+    shape_packed[seqlen_idx] = (qhead_per_kvhead, T.shape[seqlen_idx])
+    stride_packed[seqlen_idx] = (head_stride, T.stride[seqlen_idx])
+    shape_packed[head_idx] = nheads_kv
+    stride_packed[head_idx] = head_stride * qhead_per_kvhead
+    return cute.make_tensor(
+        T.iterator, cute.make_layout(tuple(shape_packed), stride=tuple(stride_packed))
     )
-    stride_packed = (
-        (head_stride, T.stride[0]),
-        *[T.stride[i] for i in range(1, head_idx)],
-        head_stride * qhead_per_kvhead,
-        *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
-    )
-    return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+
+
+# NOTE [bwd pack_gqa]: the SM100 backward packs GQA the way the forward does. The
+# qhead_per_kvhead query heads of a KV head are folded into the rows of the Q tile through
+# pack_gqa_layout (row r of the packed sequence = head r % qh at token r // qh); one tile
+# iterates over the packed rows per KV head, and dK / dV stay in TMEM across the group (no
+# fp32 accumulate, no dK / dV postprocess). Q / dO / LSE (and dQ in the postprocess) are packed
+# views of the per-head tensors. The per-KV-head scratch buffers (LSE_log2, dPsum, dQaccum,
+# dQ_semaphore) are allocated directly in packed row order, qhead_per_kvhead rows per token;
+# their varlen offsets come from seqlen_info.sequence_row_offset.
 
 
 def select_modes(T, order):

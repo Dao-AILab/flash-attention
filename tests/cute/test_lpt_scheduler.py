@@ -165,13 +165,12 @@ def compile_probe(mode, cluster_m, use_cluster_idx, lpt, split_kv, exhausted_onl
     )
 
 
-# STATIC 2CTA counts clusters. CLC also accepts the persistent CTA-count domain.
+# STATIC and CLC count logical M work tiles; both CTAs share each 2CTA tile.
 GEOMETRIES = [
     pytest.param(SchedulingMode.STATIC, 1, False, id="static-1cta"),
     pytest.param(SchedulingMode.STATIC, 2, True, id="static-2cta-clusters"),
     pytest.param(SchedulingMode.CLC, 1, False, id="clc-1cta"),
     pytest.param(SchedulingMode.CLC, 2, True, id="clc-2cta-clusters"),
-    pytest.param(SchedulingMode.CLC, 2, False, id="clc-2cta-ctas"),
 ]
 
 
@@ -199,10 +198,7 @@ def ordered_tiles(m_clusters, heads, batch, lpt):
 def test_coordinate_mapping(
     mode, cluster_m, use_cluster_idx, lpt, num_splits, heads, batch, num_block
 ):
-    m_clusters = num_block
-    if mode == SchedulingMode.CLC and not use_cluster_idx:
-        m_clusters = (num_block + cluster_m - 1) // cluster_m
-    tiles = ordered_tiles(m_clusters, heads, batch, lpt)
+    tiles = ordered_tiles(num_block, heads, batch, lpt)
     grid_x = len(tiles) * cluster_m
     out = torch.full((grid_x, num_splits, 3, 5), -999, device="cuda", dtype=torch.int32)
     counts = [1 + b % num_splits for b in range(batch)]
@@ -227,8 +223,6 @@ def test_coordinate_mapping(
                     tile = (tile + 1) % len(tiles)
                     selected_split = (split + 1) % num_splits
                 m, h, b = tiles[tile]
-                if mode == SchedulingMode.CLC and not use_cluster_idx:
-                    m = m * cluster_m + x % cluster_m
                 packed_split = (
                     selected_split | (counts[b] << 16) if metadata is not None else 0
                 )
@@ -238,12 +232,10 @@ def test_coordinate_mapping(
     assert (actual[:, :, 2, 3] < (1 << 16)).all(), (
         "Invalid work must not pack split metadata"
     )
-    first = actual[:, :, 0, :4].reshape(-1, 4)
-    if use_cluster_idx:
-        first = actual[::cluster_m, :, 0, :4].reshape(-1, 4)
+    first = actual[::cluster_m, :, 0, :4].reshape(-1, 4)
     assert len(torch.unique(first, dim=0)) == len(first), "Duplicate logical work"
     if cluster_m > 1:
-        torch.testing.assert_close(actual[::2, :, :2, 1:4], actual[1::2, :, :2, 1:4])
+        torch.testing.assert_close(actual[::2, :, :2], actual[1::2, :, :2])
 
 
 @pytest.mark.parametrize("mode,cluster_m,use_cluster_idx", GEOMETRIES)

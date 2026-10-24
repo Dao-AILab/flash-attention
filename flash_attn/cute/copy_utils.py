@@ -288,6 +288,7 @@ def cpasync_reduce_bulk_add_f32(
     )
 
 
+@dsl_user_op
 def cpasync_bulk_get_copy_fn(
     src_tensor: cute.Tensor,
     dst_tensor: cute.Tensor,

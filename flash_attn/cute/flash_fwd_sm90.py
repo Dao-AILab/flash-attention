@@ -22,6 +22,7 @@ from quack import layout_utils
 from quack import sm90_utils
 
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
@@ -175,6 +176,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         aux_data: AuxData = AuxData(),
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
+        tensormap_workspace: Optional[
+            cute.Tensor
+        ] = None,  # (num_ctas, 16) Int64, one V descriptor per CTA
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -249,6 +253,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mV.element_type, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_n)
             )
 
+        # Bound V loads by the logical sequence length (see below); decided here because the
+        # shared storage needs a descriptor slot for it.
+        self.ragged_tma_V = (
+            self.use_tma_KV
+            and mPageTable is None
+            and (mCuSeqlensK is not None or mSeqUsedK is not None)
+            and not (isinstance(mV.stride[0], int) and mV.stride[0] == 0)
+        )
+        if const_expr(self.ragged_tma_V):
+            assert tensormap_workspace is not None, "ragged V TMA loads need a tensormap workspace"
         SharedStorage = self._get_shared_storage_cls()
 
         mQ_og, mO_og = mQ, mO
@@ -286,6 +300,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         tma_atom_K, tma_tensor_K = None, None
         tma_atom_V, tma_tensor_V = None, None
+        # Bound the V TMA load by the logical seqlen_k (cu_seqlens_k and/or seqused_k) so rows
+        # in [seqlen_k, tile_n) arrive zero-filled instead of as whatever the buffer holds. P is
+        # exactly zero there, but 0 * NaN = NaN in O = P @ V. K needs no bound: masked scores
+        # become -inf before exp. The descriptor is the load-safe form of
+        # flash_attn.cute.copy_utils (quack's ptr_shift form is store-only, and its wraparound
+        # form needs rank <= 3, i.e. only the packed (t, d, h) layout); it covers both the packed
+        # and the dense (s, d, h, b) layout. Paged KV is excluded (finite rows past seqused_k in
+        # a page are a caller contract), as are broadcast (seq-stride 0) V views.
+        # The load warp rewrites its CTA's copy of the V descriptor per work tile with the
+        # sequence's row extent (tensormap.replace), so rows at or past seqlen_k are out of
+        # bounds for TMA and arrive zero-filled; a descriptor with a per-launch extent cannot
+        # do this (TMA prefetches past the footprint it is given, #3068).
+        mV_gmem = mV if const_expr(self.ragged_tma_V) else None
+        mV_tma = mV
         if const_expr(self.use_tma_KV):
             tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
@@ -296,7 +324,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
             tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
-                mV,
+                mV_tma,
                 cute.select(self.sV_layout, mode=[0, 1]),
                 (self.tile_n, self.tile_hdimv),
                 1,  # No mcast for now
@@ -363,6 +391,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tma_tensor_Q if const_expr(self.use_tma_Q) else mQ,
             tma_tensor_K if const_expr(self.use_tma_KV) else mK,
             tma_tensor_V if const_expr(self.use_tma_KV) else mV,
+            mV_gmem,
+            tensormap_workspace if const_expr(self.ragged_tma_V) else None,
             tma_tensor_O if const_expr(self.use_tma_O) else mO,
             mLSE,
             mCuSeqlensQ,
@@ -409,6 +439,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        mV_gmem: Optional[cute.Tensor],  # gmem V behind tma_atom_V (ragged V only)
+        tensormap_workspace: Optional[cute.Tensor],  # (num_ctas, 16) Int64 (ragged V only)
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
@@ -588,6 +620,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mQ,
                 mK,
                 mV,
+                mV_gmem,
+                tensormap_workspace,
                 sQ,
                 sK,
                 sV,
@@ -646,6 +680,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        mV_gmem: Optional[cute.Tensor],
+        tensormap_workspace: Optional[cute.Tensor],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -676,12 +712,55 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             kv_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_stages
             )
+            tensormap_manager = None
+            tensormap_V_gmem = None
+            v_desc_ptr = None
+            if const_expr(self.ragged_tma_V):
+                tensormap_manager = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
+                bidx, bidy, bidz = cute.arch.block_idx()
+                gdx, gdy, _ = cute.arch.grid_dim()
+                cta_linear_idx = bidx + bidy * gdx + bidz * gdx * gdy
+                if cta_linear_idx >= cute.size(tensormap_workspace, mode=[0]):
+                    # An undersized workspace would silently corrupt memory: fail loudly instead.
+                    cute.arch.inline_ptx("trap;", read_only_args=[])
+                tensormap_V_gmem = tensormap_manager.get_tensormap_ptr(
+                    tensormap_workspace[(cta_linear_idx, None)].iterator
+                )
+                v_desc_ptr = tensormap_manager.get_tensormap_ptr(
+                    tensormap_V_gmem, cute.AddressSpace.generic
+                )
+                tensormap_manager.init_tensormap_from_atom(tma_atom_V, tensormap_V_gmem, 0)
+                tensormap_manager.fence_tensormap_initialization()
+            # The V extent depends on the batch only: rewrite the descriptor when it changes.
+            v_desc_batch_idx = Int32(-1)
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 # if work_tile.is_valid_tile:
                 m_block, head_idx, batch_idx, _ = work_tile.tile_idx
                 seqlen = SeqlenInfoCls(batch_idx)
+                if const_expr(self.ragged_tma_V) and batch_idx != v_desc_batch_idx:
+                    # Shrink the rows extent (mode 0) of V to this sequence's end: packed
+                    # layouts count absolute rows, dense layouts per-batch rows. Extents >= 1.
+                    v_desc_batch_idx = batch_idx
+                    v_rows_end = (
+                        seqlen.offset_k + seqlen.seqlen_k
+                        if const_expr(seqlen.has_cu_seqlens_k)
+                        else seqlen.seqlen_k
+                    )
+                    v_rows_end = cutlass.max(v_rows_end, 1)
+                    v_shape = list(mV_gmem.shape)
+                    v_shape[0] = v_rows_end
+                    mV_bounded = cute.make_tensor(
+                        mV_gmem.iterator, cute.make_layout(tuple(v_shape), stride=mV_gmem.stride)
+                    )
+                    tensormap_manager.update_tensormap(
+                        (mV_bounded,), (tma_atom_V,), (tensormap_V_gmem,), 0, (None,)
+                    )
+                    tensormap_manager.fence_tensormap_update(tensormap_V_gmem)
+                    cute.arch.inline_ptx(
+                        "prefetch.tensormap [{$r0}];", read_only_args=[tensormap_V_gmem.toint()]
+                    )
                 mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
                 head_idx_kv = (
                     head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
@@ -721,7 +800,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     )
                     tma_load_K_fn = copy_utils.tma_producer_copy_fn(tma_load_K_fn, pipeline_k)
                     tma_load_V_fn, _, _ = copy_utils.tma_get_copy_fn(
-                        tma_atom_V, 0, cute.make_layout(1), gV, sV
+                        tma_atom_V,
+                        0,
+                        cute.make_layout(1),
+                        gV,
+                        sV,
+                        **({"tma_desc_ptr": v_desc_ptr} if const_expr(self.ragged_tma_V) else {}),
                     )
                     tma_load_V_fn = copy_utils.tma_producer_copy_fn(tma_load_V_fn, pipeline_v)
                 else:
