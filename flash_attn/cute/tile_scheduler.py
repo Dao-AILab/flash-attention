@@ -240,6 +240,8 @@ class TileSchedulerArguments(ParamsBase):
     blocks_to_batch_idx_ptr: Optional[cute.Tensor] = None
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistent_cta_multiplier: cutlass.Constexpr[int] = 1
+    # L2 bytes the LPT scheduler budgets for the K & V of one section of heads
+    l2_size_bytes: cutlass.Constexpr[int] = 50 * 1024 * 1024
 
 
 class SingleTileScheduler:
@@ -523,7 +525,7 @@ class SingleTileLPTScheduler:
                 cutlass.Int64(args.seqlen_k) * (args.headdim + args.headdim_v) * args.element_size
             )
             size_one_head = size_one_kv_head
-            size_l2 = 50 * 1024 * 1024  # 40 MB for K & V
+            size_l2 = args.l2_size_bytes
             # Swizzle is the size of each "section". Round swizzle to a power of 2
             # Need to be careful about the case where only one head will fit
             # swizzle is how many heads can fit in L2
