@@ -984,6 +984,8 @@ def _flash_attn_fwd(
     # The config is chosen; from here on the window only reaches the kernels, so use the clamped sides.
     window_size_left, window_size_right = kernel_window_left, kernel_window_right
     num_splits = config.num_splits
+    if arch // 10 == 12 and config.seqlen_k_per_split is not None:
+        seqlen_k_per_split = config.seqlen_k_per_split
     mla_kernel = config.kernel if isinstance(config, MlaFwdConfig) else None
     mla_1cta = mla_kernel in ("1cta", "1cta_kb64")
     mla_1cta_kb64 = mla_kernel == "1cta_kb64"

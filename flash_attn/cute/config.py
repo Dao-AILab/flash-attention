@@ -9,7 +9,7 @@ allocate device memory.
 """
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Literal, NamedTuple
 
@@ -94,6 +94,9 @@ class FwdConfig:
     use_swapab: bool = False
     use_dynamic_varlen: bool = False
     lpt_global: bool = False
+    # Host-resolved SM120 split grain; the launch cache already keys this value
+    # separately. Other architectures keep their caller-owned grain unchanged.
+    seqlen_k_per_split: int | None = field(default=None, compare=False)
 
 
 class FwdHeuristicInputs(NamedTuple):
@@ -670,21 +673,35 @@ def validate_registers(config: "FwdConfig") -> None:
 def sm120_tile_supported(inputs: FwdHeuristicInputs, tile_m: int, tile_n: int) -> bool:
     """Host-only mirror of the SM120 one-stage, 128-thread layout/SMEM contract."""
     if inputs.dtype == "torch.float8_e4m3fn":
-        if (min(inputs.head_dim, inputs.head_dim_v, tile_m, tile_n) <= 0
-                or inputs.head_dim % 16 or inputs.head_dim_v % 16
-                or max(inputs.head_dim, inputs.head_dim_v) > 256
-                or tile_m % 16 or tile_n % 32 or (tile_m * 2) % 128
-                or tile_n // 8 > 128 or 128 % (tile_n // 8)):
+        if (
+            min(inputs.head_dim, inputs.head_dim_v, tile_m, tile_n) <= 0
+            or inputs.head_dim % 16
+            or inputs.head_dim_v % 16
+            or max(inputs.head_dim, inputs.head_dim_v) > 256
+            or tile_m % 16
+            or tile_n % 32
+            or (tile_m * 2) % 128
+            or tile_n // 8 > 128
+            or 128 % (tile_n // 8)
+        ):
             return False
         d, dv = round_up(inputs.head_dim, 32), round_up(inputs.head_dim_v, 32)
-        live = sum(round_up(n, 1024) for n in (tile_m * d, tile_n * d, tile_n * dv, tile_m * tile_n))
+        live = sum(
+            round_up(n, 1024) for n in (tile_m * d, tile_n * d, tile_n * dv, tile_m * tile_n)
+        )
         return max(live, round_up(tile_m * dv * 2, 1024)) <= 99 * 1024
-    if (inputs.dtype not in ("torch.float16", "torch.bfloat16")
-            or inputs.head_dim % 8 or inputs.head_dim_v % 8
-            or tile_n % 16 or (tile_m * 2) % 128):
+    if (
+        inputs.dtype not in ("torch.float16", "torch.bfloat16")
+        or inputs.head_dim % 8
+        or inputs.head_dim_v % 8
+        or tile_n % 16
+        or (tile_m * 2) % 128
+    ):
         return False
     d, dv = inputs.head_dim_padded, inputs.head_dim_v_padded
-    live = sum(round_up(n, 1024) for n in (tile_m * max(d, dv) * 2, tile_n * d * 2, tile_n * dv * 2))
+    live = sum(
+        round_up(n, 1024) for n in (tile_m * max(d, dv) * 2, tile_n * d * 2, tile_n * dv * 2)
+    )
     return live <= 99 * 1024
 
 
@@ -727,8 +744,12 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
                 # reduce their register footprint across head dimensions.
                 tile_m, tile_n = 64, 64
 
-    if (inputs.device_capacity == 12 and inputs.dtype != "torch.float8_e4m3fn"
-            and inputs.requested_tile_m is None and inputs.requested_tile_n is None):
+    if (
+        inputs.device_capacity == 12
+        and inputs.dtype != "torch.float8_e4m3fn"
+        and inputs.requested_tile_m is None
+        and inputs.requested_tile_n is None
+    ):
         # Capacity fallback, independent of sequence lengths and benchmark shapes.
         while not sm120_tile_supported(inputs, tile_m, tile_n):
             if tile_m > 64:
@@ -1674,8 +1695,27 @@ def _select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     if device_capacity == 12 and inputs.page_size is not None:
         if max(inputs.head_dim, inputs.head_dim_v) > 64 and tile_n < 128:
             if inputs.requested_tile_m is not None or inputs.requested_tile_n is not None:
-                raise ValueError("SM120 paged KV requires tile_n >= num_threads for heads wider than 64")
+                raise ValueError(
+                    "SM120 paged KV requires tile_n >= num_threads for heads wider than 64"
+                )
             tile_n = 128
+
+    seqlen_k_per_split = inputs.seqlen_k_per_split if device_capacity == 12 else None
+    if (
+        device_capacity == 12
+        and inputs.dtype == "torch.float8_e4m3fn"
+        and inputs.requested_num_splits is None
+        and inputs.max_seqlen_k > 262144
+        and not inputs.local
+        and not inputs.has_caller_scheduler_metadata
+        and seqlen_k_per_split is None
+    ):
+        # Bound FP8's sequential FP32 softmax sum without losing the heuristic's
+        # decode parallelism. Fixed grain prevents dynamic prefill coalescing.
+        num_splits = max(num_splits, ceil_div(inputs.max_seqlen_k, 65536))
+        if num_splits > 256:
+            raise ValueError("SM120 automatic FP8 precision splitting exceeds 256 splits")
+        seqlen_k_per_split = round_up(ceil_div(inputs.max_seqlen_k, num_splits), tile_n)
 
     is_split_kv = num_splits > 1
     use_2cta_instrs = (
@@ -1762,6 +1802,7 @@ def _select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         use_tma_o=use_tma_o,
         use_s_ping_pong=use_s_ping_pong,
         num_splits=num_splits,
+        seqlen_k_per_split=seqlen_k_per_split,
         use_2cta_instrs=use_2cta_instrs,
         registers=select_registers(
             inputs,
@@ -1967,7 +2008,9 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         raise ValueError(f"num_splits must be in [1, 256], got {config.num_splits}")
     # Fixed KV extents constrain split counts only under SplitKV.
     fixed_num_splits = fixed_seqlen_k_num_splits(inputs)
-    if (config.num_splits > 1 or inputs.device_capacity == 12) and config.num_splits < fixed_num_splits:
+    if (
+        config.num_splits > 1 or inputs.device_capacity == 12
+    ) and config.num_splits < fixed_num_splits:
         raise ValueError(
             f"seqlen_k_per_split={inputs.seqlen_k_per_split} requires "
             f"num_splits >= {fixed_num_splits}, got {config.num_splits}"
@@ -1993,15 +2036,24 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
                     raise ValueError("SM120 forward does not support block sparsity")
                 if inputs.page_size is not None:
                     if inputs.dtype != "torch.float8_e4m3fn":
-                        raise NotImplementedError("SM120 paged KV supports FP8 E4M3 only; BF16/FP16 paged is unsupported")
+                        raise ValueError(
+                            "SM120 forward does not support BF16/FP16 paged KV; use FP8 E4M3"
+                        )
                     if not inputs.has_seqused_k or inputs.page_size <= 0:
                         raise ValueError("SM120 paged KV requires seqused_k and positive page size")
                     if max(inputs.head_dim, inputs.head_dim_v) > 64 and config.tile_n < 128:
-                        raise ValueError("SM120 paged KV requires tile_n >= num_threads for heads wider than 64")
+                        raise ValueError(
+                            "SM120 paged KV requires tile_n >= num_threads for heads wider than 64"
+                        )
         if capacity == 12 and not sm120_tile_supported(inputs, config.tile_m, config.tile_n):
-            raise ValueError("SM120 tile exceeds the supported MMA/layout or 99 KiB shared-memory limits")
-        neutral = {k: v for k, v in _FWD_SM100_ONLY_NEUTRAL_FIELDS.items()
-                   if capacity != 12 or k != "num_splits"}
+            raise ValueError(
+                "SM120 tile exceeds the supported MMA/layout or 99 KiB shared-memory limits"
+            )
+        neutral = {
+            k: v
+            for k, v in _FWD_SM100_ONLY_NEUTRAL_FIELDS.items()
+            if capacity != 12 or k != "num_splits"
+        }
         mismatched = [name for name, value in neutral.items() if getattr(config, name) != value]
         if mismatched:
             raise ValueError(
