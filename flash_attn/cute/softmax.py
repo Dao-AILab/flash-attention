@@ -288,11 +288,15 @@ class Softmax(ParamsBase):
             row_sum_cur = row_sum[r]
             LN2 = math.log(2.0)
             row_sum[r] = (
-                (row_max_scaled + (
-                    cute.math.log2(row_sum_cur, fastmath=True) - self.max_offset
-                    if cutlass.const_expr(self.max_offset != 0)
-                    else cute.math.log2(row_sum_cur, fastmath=True)
-                )) * LN2
+                (
+                    row_max_scaled
+                    + (
+                        cute.math.log2(row_sum_cur, fastmath=True) - self.max_offset
+                        if cutlass.const_expr(self.max_offset != 0)
+                        else cute.math.log2(row_sum_cur, fastmath=True)
+                    )
+                )
+                * LN2
                 if not acc_O_mn_row_is_zero_or_nan
                 else -Float32.inf
             )
