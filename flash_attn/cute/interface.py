@@ -1122,6 +1122,23 @@ def _flash_attn_fwd(
     if arch // 10 == 12 and page_table is not None:
         fwd_cfg = _sm120_paged_fwd_config(
             fwd_cfg, dtype, head_dim, head_dim_v, num_threads, causal, tile_mn)
+    # Bound FP8's sequential FP32 softmax sum for automatic long-context
+    # SM120 calls. Reuse fixed-grain SplitKV so dynamic scheduling cannot
+    # collapse a sufficiently occupied prefill back to one long reduction.
+    # Explicit split/grain/scheduler choices remain caller-owned.
+    if (arch // 10 == 12 and is_fp8 and requested_num_splits < 1
+            and max_seqlen_k > 262144 and not local
+            and scheduler_metadata is None and seqlen_k_per_split is None):
+        precision_splits = (max_seqlen_k + 65535) // 65536
+        precision_splits = max(fwd_cfg.num_splits, precision_splits)
+        if precision_splits > 256:
+            raise ValueError("SM120 automatic FP8 precision splitting exceeds 256 splits")
+        split_keys = (max_seqlen_k + precision_splits - 1) // precision_splits
+        seqlen_k_per_split = (
+            (split_keys + fwd_cfg.n_block_size - 1) // fwd_cfg.n_block_size
+        ) * fwd_cfg.n_block_size
+        fwd_cfg = replace(fwd_cfg, num_splits=precision_splits)
+
     mla_1cta_kb64 = mla_fwd_cls is FlashAttentionMLAForward1CtaKb64Sm100
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     if arch // 10 == 12:
