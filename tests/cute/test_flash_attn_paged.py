@@ -157,14 +157,19 @@ def test_paged_capacity(page_size, heads_kv, softcap):
         )
 
 
-def test_paged_partial_loader_tile():
-    """A 96-row KV tile uses a partial wave of 128 page-table loader threads."""
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("pack_gqa", [False, True])
+@pytest.mark.parametrize("d,dv", [(64, 64), (24, 40), (40, 24)])
+def test_paged_partial_loader_tile(dtype, pack_gqa, d, dv):
+    """Guard shared-memory rows beyond a partially populated copy wave."""
     torch.manual_seed(3)
-    q = torch.randn(2, 7, 3, 64, device="cuda", dtype=torch.float16)
-    k = torch.randn(5, 16, 1, 64, device="cuda", dtype=torch.float16)
-    v = torch.randn_like(k)
-    page_table = torch.tensor([[3, 1], [4, 2]], device="cuda", dtype=torch.int32)
-    lengths = torch.tensor([27, 31], device="cuda", dtype=torch.int32)
+    q = torch.randn(2, 7, 3, d, device="cuda", dtype=dtype)
+    k = torch.randn(21, 16, 1, d, device="cuda", dtype=dtype)
+    v = torch.randn(21, 16, 1, dv, device="cuda", dtype=dtype)
+    page_table = torch.randperm(21, device="cuda", dtype=torch.int32)[:20].reshape(
+        2, 10
+    )
+    lengths = torch.tensor([149, 159], device="cuda", dtype=torch.int32)
     out, lse, *_ = _flash_attn_fwd(
         q,
         k,
@@ -172,13 +177,36 @@ def test_paged_partial_loader_tile():
         page_table=page_table,
         seqused_k=lengths,
         tile_mn=(64, 96),
-        pack_gqa=True,
+        pack_gqa=pack_gqa,
         return_lse=True,
     )
-    for b, length in enumerate([27, 31]):
-        kb = k[page_table[b].long()].reshape(32, 1, 64)[:length].expand(-1, 3, -1)
-        vb = v[page_table[b].long()].reshape(32, 1, 64)[:length].expand(-1, 3, -1)
-        scores = torch.einsum("qhd,khd->hqk", q[b].float(), kb.float()) / 8
+    for b, length in enumerate([149, 159]):
+        kb = k[page_table[b].long()].reshape(160, 1, d)[:length].expand(-1, 3, -1)
+        vb = v[page_table[b].long()].reshape(160, 1, dv)[:length].expand(-1, 3, -1)
+        scores = torch.einsum("qhd,khd->hqk", q[b].float(), kb.float()) * d**-0.5
         ref = torch.einsum("hqk,khd->qhd", scores.softmax(-1), vb.float())
-        torch.testing.assert_close(out[b].float(), ref, atol=2e-3, rtol=2e-3)
+        torch.testing.assert_close(out[b].float(), ref, atol=6e-3, rtol=6e-3)
         torch.testing.assert_close(lse[b], scores.logsumexp(-1), atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("d,dv", [(24, 32), (32, 24)])
+@pytest.mark.parametrize("page_size", [16, 52])
+@pytest.mark.parametrize("pack_gqa", [False, True])
+def test_paged_distinct_logical_head_dims(d, dv, page_size, pack_gqa):
+    """Matching padded dimensions must not alias distinct logical K/V predicates."""
+    sk = 17
+    num_pages = (sk + page_size - 1) // page_size
+    q = torch.zeros(1, 1, 3, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(num_pages, page_size, 1, d, device="cuda", dtype=q.dtype)
+    v = torch.ones(num_pages, page_size, 1, dv, device="cuda", dtype=q.dtype)
+    page_table = torch.arange(num_pages, device="cuda", dtype=torch.int32)[None]
+    lengths = torch.tensor([sk], device="cuda", dtype=torch.int32)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        page_table=page_table,
+        seqused_k=lengths,
+        pack_gqa=pack_gqa,
+    )
+    torch.testing.assert_close(out, torch.ones_like(out), atol=0, rtol=0)

@@ -59,6 +59,7 @@ class PagedKVManager(ParamsBase):
         num_threads: cutlass.Constexpr[Int32],
         dtype: Type[cutlass.Numeric],
         arch: cutlass.Constexpr[int] = 100,
+        same_hdim_kv: cutlass.Constexpr[bool] = False,
     ):
         # SM100 transposes V in gmem to (dv, page_size, num_pages);
         # SM80/SM90/SM120 keep V as (page_size, dv, num_pages), same layout as K.
@@ -100,12 +101,12 @@ class PagedKVManager(ParamsBase):
         tKcK = gmem_thr_copy_KV.partition_S(cK)
         tKpK = utils.predicate_k(tKcK, limit=mK_paged.shape[1])
 
-        if const_expr(head_dim_padded == head_dim_v_padded):
+        if const_expr(same_hdim_kv and head_dim_padded == head_dim_v_padded):
             tVpV = tKpK
         else:
             cV = cute.make_identity_tensor((n_block_size, head_dim_v_padded))
             tVcV = gmem_thr_copy_KV.partition_S(cV)
-            # When V is transposed in gmem, dv is shape[0]; otherwise dv is shape[1] (same as K)
+            # Transposed V has dv in mode 0; otherwise it is in mode 1, as for K.
             V_limit = cute.size(mV_paged.shape[0 if v_gmem_transposed else 1])
             tVpV = utils.predicate_k(tVcV, limit=V_limit)
 
@@ -206,8 +207,7 @@ class PagedKVManager(ParamsBase):
                 # SM80 MMA accepts dimensions padded to 16, including logical
                 # head dimensions that are only multiples of 8.
                 predicate = cute.make_fragment_like(should_load)
-                for i in cutlass.range_constexpr(cute.size(should_load)):
-                    predicate[i] = should_load[i] and tXpX[i, m, k]
+                predicate.store(should_load.load() & tXpX[None, m, k].load())
             cute.copy(
                 self.gmem_tiled_copy_KV,
                 mX_paged_cur_copy_ki,
@@ -239,19 +239,20 @@ class PagedKVManager(ParamsBase):
             self.seqlen_k - n_block * self.n_block_size - tXcX[0][0] if n_block >= 0 else 0
         )
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
-            row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
-            should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
-            should_load.fill(row_valid)
+            if tXcX[0, m, 0][0] < self.n_block_size:
+                row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
+                should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
+                should_load.fill(row_valid)
 
-            x_ptr_i64 = utils.shuffle_sync(
-                tPrXPtr[m // self.gmem_threads_per_row],
-                m % self.gmem_threads_per_row,
-                width=self.gmem_threads_per_row,
-            )
-            x_gmem_ptr = cute.make_ptr(
-                self.mK_paged.element_type, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
-            )
-            mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
-            mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
-            tXpX = self.tKpK if const_expr(K_or_V == "K") else self.tVpV
-            self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load, tXpX)
+                x_ptr_i64 = utils.shuffle_sync(
+                    tPrXPtr[m // self.gmem_threads_per_row],
+                    m % self.gmem_threads_per_row,
+                    width=self.gmem_threads_per_row,
+                )
+                x_gmem_ptr = cute.make_ptr(
+                    self.mK_paged.element_type, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+                )
+                mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
+                mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
+                tXpX = self.tKpK if const_expr(K_or_V == "K") else self.tVpV
+                self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load, tXpX)

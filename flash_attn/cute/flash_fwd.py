@@ -838,6 +838,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     batch_size, num_head_kv, tidx, seqlen.seqlen_k, 0,
                     self.tile_n, self.tile_hdim, self.tile_hdimv,
                     self.num_threads, self.dtype, arch=80,
+                    same_hdim_kv=self.same_hdim_kv,
                 )
             elif const_expr(not seqlen.has_cu_seqlens_k):
                 mK_cur = mK[None, None, num_head_kv, batch_size]
