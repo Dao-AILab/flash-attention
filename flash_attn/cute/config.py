@@ -58,8 +58,11 @@ class FwdConfig:
     per-split KV range also depends on the M tile extent, q_stage * tile_m.
     ex2_emu_freq and ex2_emu_start_frg are the SM100/SM110 softmax exp2 emulation
     (freq 0 keeps hardware exp2 throughout); other architectures carry 0 and 0.
+    overlap_sO_sQ and kv_stage are the SM100 forward SMEM layout (see
+    sm100_fwd_smem_bytes); other architectures carry False and 0.
     use_swapab selects the SM100/SM103 SwapAB decode kernel (flash_fwd_decode_sm100.py), where
-    tile_m is the query-head tile and only num_splits is tunable; see SwapABPolicy.config.
+    tile_m is the query-head tile and only num_splits is tunable; see SwapABPolicy.config. The
+    SwapAB kernel sizes its own SMEM stages, so its configs carry the neutral layout.
     """
 
     device_capacity: int
@@ -78,6 +81,8 @@ class FwdConfig:
     registers: Registers
     ex2_emu_freq: int
     ex2_emu_start_frg: int
+    overlap_sO_sQ: bool
+    kv_stage: int
     use_swapab: bool = False
 
 
@@ -773,6 +778,141 @@ def causal_clc_policy(
     return family in row, row.get(family)
 
 
+# === SM100 forward SMEM layout ===
+# Host model of FlashAttentionForwardSm100's SharedStorage: barriers and row statistics, then
+# 1024-byte aligned sO, sQ, and the sK/sV buffer (K and V alias one buffer per stage).
+SM100_SMEM_BYTES = 227 * 1024
+# kv_stage selection budget for Q/O plus KV stages; the rest holds barriers and sScale.
+_SM100_KV_STAGE_BUDGET_BYTES = 224 * 1024
+# Small head dims would otherwise pick up to 52 stages and overflow the barrier region.
+SM100_MAX_KV_STAGE = 32
+_SM100_SMEM_ALIGN_BYTES = 1024
+
+
+def sm100_uneven_kv_smem(
+    head_dim_padded: int, head_dim_v_padded: int, kv_stage: int, use_2cta_instrs: bool
+) -> bool:
+    """Whether 1CTA hd192/128 stores three KV stages as [K, V, K] instead of three K-sized stages.
+
+    The stage stride is the mean of the K and V stage sizes, so stages 0 and 2 index directly
+    and stage 1 is offset by tile_n * (192 - 128) / 2 elements depending on the phase. The
+    offset assumes full K/V tiles; 2CTA halves them per CTA, so 2CTA always uses even stages.
+    """
+    return (
+        not use_2cta_instrs
+        and head_dim_padded == 192
+        and head_dim_v_padded == 128
+        and kv_stage == 3
+    )
+
+
+def sm100_fwd_buffer_bytes(
+    inputs: FwdHeuristicInputs,
+    *,
+    tile_m: int,
+    tile_n: int,
+    q_stage: int,
+    num_splits: int,
+    use_2cta_instrs: bool,
+) -> tuple[int, int, int, int]:
+    """Per-CTA (sQ, sO, K stage, V stage) bytes of the SM100 forward kernel."""
+    element_bytes = 1 if "float8" in inputs.dtype else 2
+    is_split_kv = num_splits > 1
+    # SplitKV stores fp32 partials; FP8 inputs produce bf16 output.
+    o_bytes = 4 if is_split_kv else 2
+    # hd256 SplitKV stages fp32 O in half-width chunks.
+    epi_head_dim_v = 128 if is_split_kv and inputs.head_dim_v == 256 else inputs.head_dim_v_padded
+    rows = q_stage * tile_m
+    q = rows * inputs.head_dim_padded * element_bytes
+    o = rows * epi_head_dim_v * o_bytes
+    # 2CTA splits each K/V tile across the cluster.
+    cta_group_size = 2 if use_2cta_instrs else 1
+    k = tile_n * inputs.head_dim_padded * element_bytes // cta_group_size
+    v = tile_n * inputs.head_dim_v_padded * element_bytes // cta_group_size
+    return q, o, k, v
+
+
+def select_sm100_smem_layout(
+    inputs: FwdHeuristicInputs,
+    *,
+    tile_m: int,
+    tile_n: int,
+    q_stage: int,
+    num_splits: int,
+    use_2cta_instrs: bool,
+    is_static_persistent: bool,
+    use_clc_scheduler: bool,
+) -> tuple[bool, int]:
+    """Return (overlap_sO_sQ, kv_stage): alias O with Q, then fill the budget with KV stages."""
+    head_dim_padded, head_dim_v_padded = inputs.head_dim_padded, inputs.head_dim_v_padded
+    # FlashAttentionForwardSm100.is_persistent: static, CLC, or varlen-semaphore dynamic.
+    is_persistent = is_static_persistent or use_clc_scheduler or inputs.has_varlen_q_semaphore
+    overlap_sO_sQ = (
+        (head_dim_padded == 192 and head_dim_v_padded >= 64)
+        # Persistent hd256 2CTA separates Q/O to overlap the next Q load with O stores.
+        # 1CTA aliases Q/O to preserve KV pipeline depth.
+        or (head_dim_padded == 256 and not (is_persistent and use_2cta_instrs))
+        or (head_dim_v_padded >= 128 and num_splits > 1)
+    )
+    q, o, k, v = sm100_fwd_buffer_bytes(
+        inputs,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        q_stage=q_stage,
+        num_splits=num_splits,
+        use_2cta_instrs=use_2cta_instrs,
+    )
+    q_o = max(q, o) if overlap_sO_sQ else q + o
+    kv_stage = min((_SM100_KV_STAGE_BUDGET_BYTES - q_o) // max(k, v), SM100_MAX_KV_STAGE)
+    # 1CTA hd192/128 fits a third stage with the uneven [K, V, K] layout.
+    if sm100_uneven_kv_smem(head_dim_padded, head_dim_v_padded, kv_stage + 1, use_2cta_instrs):
+        kv_stage = 3
+    return overlap_sO_sQ, kv_stage
+
+
+def sm100_fwd_smem_bytes(config: FwdConfig, inputs: FwdHeuristicInputs) -> int:
+    """Dynamic SMEM bytes of FlashAttentionForwardSm100's SharedStorage for config."""
+    q_stage, kv_stage = config.q_stage, config.kv_stage
+    s_p_o_stage = 2 if config.use_s_ping_pong else q_stage
+    dynamic_persistent = config.use_clc_scheduler or inputs.has_varlen_q_semaphore
+    # Int64 mbarriers: load Q and KV, four S/P/O pipelines, O epilogue, load epilogue,
+    # S0/S1 sequence, TMEM dealloc.
+    num_mbarriers = (
+        2 * q_stage
+        + 2 * kv_stage
+        + 4 * 2 * s_p_o_stage
+        + 2 * q_stage
+        + (2 if config.overlap_sO_sQ else 0)
+        + 2 * 2
+        + 1
+    )
+    header = 8 * num_mbarriers + 4  # Int32 TMEM holding buffer
+    header += 4 * s_p_o_stage * config.tile_m * 2  # Float32 sScale: row max and row sum
+    if dynamic_persistent:  # one scheduler stage: full/empty mbarriers and a 4 x Int32 response
+        header = round_up(header, 8) + 2 * 8 + 4 * 4
+    q, o, k, v = sm100_fwd_buffer_bytes(
+        inputs,
+        tile_m=config.tile_m,
+        tile_n=config.tile_n,
+        q_stage=q_stage,
+        num_splits=config.num_splits,
+        use_2cta_instrs=config.use_2cta_instrs,
+    )
+    if config.overlap_sO_sQ:
+        q, o = max(q, o), 0
+    if sm100_uneven_kv_smem(
+        inputs.head_dim_padded, inputs.head_dim_v_padded, kv_stage, config.use_2cta_instrs
+    ):
+        kv_bytes = 2 * k + v  # [K, V, K]
+    else:
+        kv_bytes = kv_stage * max(k, v)
+    align = _SM100_SMEM_ALIGN_BYTES
+    total = round_up(header, align)
+    for buffer in (o, q, kv_bytes):
+        total = round_up(total + buffer, align)
+    return total
+
+
 @dataclass(frozen=True)
 class SwapABPolicy:
     """Shapes, admission, and split policy of the SM100/SM103 SwapAB decode kernel
@@ -965,6 +1105,8 @@ class SwapABPolicy:
             registers=None,
             ex2_emu_freq=0,
             ex2_emu_start_frg=0,
+            overlap_sO_sQ=False,
+            kv_stage=0,
             use_swapab=True,
         )
 
@@ -1080,6 +1222,20 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         )
     )
     ex2_emu_freq, ex2_emu_start_frg = select_ex2_emu(inputs, use_2cta_instrs=use_2cta_instrs)
+    overlap_sO_sQ, kv_stage = (
+        select_sm100_smem_layout(
+            inputs,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            q_stage=q_stage,
+            num_splits=num_splits,
+            use_2cta_instrs=use_2cta_instrs,
+            is_static_persistent=is_static_persistent,
+            use_clc_scheduler=use_clc_scheduler,
+        )
+        if is_sm100_family
+        else (False, 0)
+    )
 
     config = FwdConfig(
         device_capacity=device_capacity,
@@ -1106,6 +1262,8 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         ),
         ex2_emu_freq=ex2_emu_freq,
         ex2_emu_start_frg=ex2_emu_start_frg,
+        overlap_sO_sQ=overlap_sO_sQ,
+        kv_stage=kv_stage,
     )
     validate_fwd_config(config, inputs)
     return config
@@ -1114,20 +1272,42 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
 def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) -> FwdConfig:
     """Apply changes to base and re-derive the fields the selector computes from them.
 
-    registers and the exp2 emulation are recomputed for the changed tile, stage, split, 2CTA,
-    PackGQA, and scheduler choices unless changes sets them. The result is validated.
+    registers, the exp2 emulation, and the SM100 SMEM layout (overlap_sO_sQ, kv_stage) are
+    recomputed for the changed tile, stage, split, 2CTA, PackGQA, and scheduler choices unless
+    changes sets them. The result is validated.
     """
     config = replace(base, **changes)
     resolved = inputs._replace(pack_gqa=config.pack_gqa)
     if config.use_swapab:
         # registers=None: the SwapAB kernel owns its fixed per-role budgets (64/120/208 at
-        # tile_hq=32); it keeps hardware exp2.
-        derived = dict(registers=None, ex2_emu_freq=0, ex2_emu_start_frg=0)
+        # tile_hq=32) and its SMEM stages; it keeps hardware exp2.
+        derived = dict(
+            registers=None, ex2_emu_freq=0, ex2_emu_start_frg=0, overlap_sO_sQ=False, kv_stage=0
+        )
     else:
         ex2_emu_freq, ex2_emu_start_frg = select_ex2_emu(
             resolved, use_2cta_instrs=config.use_2cta_instrs
         )
-        derived = dict(ex2_emu_freq=ex2_emu_freq, ex2_emu_start_frg=ex2_emu_start_frg)
+        overlap_sO_sQ, kv_stage = (
+            select_sm100_smem_layout(
+                resolved,
+                tile_m=config.tile_m,
+                tile_n=config.tile_n,
+                q_stage=config.q_stage,
+                num_splits=config.num_splits,
+                use_2cta_instrs=config.use_2cta_instrs,
+                is_static_persistent=config.is_static_persistent,
+                use_clc_scheduler=config.use_clc_scheduler,
+            )
+            if config.device_capacity in (10, 11)
+            else (False, 0)
+        )
+        derived = dict(
+            ex2_emu_freq=ex2_emu_freq,
+            ex2_emu_start_frg=ex2_emu_start_frg,
+            overlap_sO_sQ=overlap_sO_sQ,
+            kv_stage=kv_stage,
+        )
     # The register tables cover only supported tiles and stages; validation rejects the rest.
     if "registers" not in changes and not config.use_swapab:
         derived["registers"] = select_registers(
@@ -1145,7 +1325,8 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
 
 
 # Architecture-specific fields at their neutral values, for architectures that do not expose
-# them: the SM90 MMA flags, and the SM100/SM110 stage, split, scheduler, and exp2 options.
+# them: the SM90 MMA flags, and the SM100/SM110 stage, split, scheduler, exp2, and SMEM
+# layout options.
 _FWD_SM90_ONLY_NEUTRAL_FIELDS = dict(mma_pv_is_rs=False, intra_wg_overlap=False)
 _FWD_SM100_ONLY_NEUTRAL_FIELDS = dict(
     q_stage=1,
@@ -1157,31 +1338,9 @@ _FWD_SM100_ONLY_NEUTRAL_FIELDS = dict(
     use_s_ping_pong=False,
     ex2_emu_freq=0,
     ex2_emu_start_frg=0,
+    overlap_sO_sQ=False,
+    kv_stage=0,
 )
-
-_SM100_SMEM_BYTES = 227 * 1024
-# Barrier/scheduler overhead calibrated to hd192/128, tile_n=192: 247808 bytes at launch.
-_SM100_SMEM_OVERHEAD_BYTES = 2048
-
-
-def sm100_hd192_uneven_kv_smem_bytes(config: FwdConfig, inputs: FwdHeuristicInputs) -> int | None:
-    """SM100 hd192/128 SMEM footprint when a two-stage budget becomes uneven [K, V, K].
-
-    Return None outside this case; mirrors FlashAttentionForwardSm100.
-    """
-    if inputs.head_dim_padded != 192 or inputs.head_dim_v_padded != 128:
-        return None
-    element_bytes = 1 if "float8" in inputs.dtype else 2
-    o_bytes = 4 if config.num_splits > 1 else 2  # SplitKV stores fp32 partials
-    rows = config.q_stage * config.tile_m
-    # sO overlaps sQ for head-dim 192.
-    q_o_bytes = max(rows * 192 * element_bytes, rows * 128 * o_bytes)
-    cta_group_size = 2 if config.use_2cta_instrs else 1
-    k_stage_bytes = config.tile_n * 192 * element_bytes // cta_group_size
-    v_stage_bytes = config.tile_n * 128 * element_bytes // cta_group_size
-    if (224 * 1024 - q_o_bytes) // k_stage_bytes != 2:
-        return None
-    return q_o_bytes + 2 * k_stage_bytes + v_stage_bytes + _SM100_SMEM_OVERHEAD_BYTES
 
 
 @lru_cache(maxsize=1024)
@@ -1271,12 +1430,6 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         raise ValueError(f"SM100 q_stage must be 1 or 2, got {config.q_stage}")
     if 2 * config.tile_n + config.q_stage * inputs.head_dim_v_padded > 512:
         raise ValueError("S and O accumulators exceed the 512 TMEM columns")
-    hd192_smem_bytes = sm100_hd192_uneven_kv_smem_bytes(config, inputs)
-    if hd192_smem_bytes is not None and hd192_smem_bytes > _SM100_SMEM_BYTES:
-        raise ValueError(
-            f"Head-dim 192/128 with tile_n={config.tile_n} needs {hd192_smem_bytes} bytes "
-            f"of shared memory; SM100 provides {_SM100_SMEM_BYTES}"
-        )
 
     if config.num_splits > 1:
         if inputs.head_dim_v_padded >= 192 and inputs.head_dim_v != 256:
@@ -1321,7 +1474,38 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         num_splits=config.num_splits,
     ):
         raise ValueError("2CTA instructions are not supported for this forward problem")
+    validate_sm100_smem_layout(config, inputs)
     validate_registers(config)
+
+
+def validate_sm100_smem_layout(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
+    """Reject SM100 forward SMEM layouts the kernel cannot pipeline or launch."""
+    # K and V share the stage pipeline: with two Q stages the MMA warp waits for K_{i+1}
+    # before releasing V_i, and one stage would serialize every load behind its MMA.
+    if not 2 <= config.kv_stage <= SM100_MAX_KV_STAGE:
+        raise ValueError(
+            f"SM100 kv_stage must be in [2, {SM100_MAX_KV_STAGE}], got {config.kv_stage}"
+        )
+    # The uneven stage-1 offset, tile_n * 32 elements, must keep 1024-element swizzle alignment.
+    if (
+        sm100_uneven_kv_smem(
+            inputs.head_dim_padded,
+            inputs.head_dim_v_padded,
+            config.kv_stage,
+            config.use_2cta_instrs,
+        )
+        and config.tile_n % 32 != 0
+    ):
+        raise ValueError(
+            f"1CTA head-dim 192/128 with kv_stage=3 needs tile_n divisible by 32, got {config.tile_n}"
+        )
+    smem_bytes = sm100_fwd_smem_bytes(config, inputs)
+    if smem_bytes > SM100_SMEM_BYTES:
+        raise ValueError(
+            f"SM100 forward layout (tile_n={config.tile_n}, q_stage={config.q_stage}, "
+            f"overlap_sO_sQ={config.overlap_sO_sQ}, kv_stage={config.kv_stage}) needs "
+            f"{smem_bytes} bytes of shared memory; SM100 provides {SM100_SMEM_BYTES}"
+        )
 
 
 # === MLA (qv) forward ===
