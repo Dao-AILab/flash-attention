@@ -616,6 +616,11 @@ def select_untuned(inputs: FwdHeuristicInputs) -> FwdConfig:
 
 _TUNED_RULES = {
     # rule -> (matching inputs, required field changes)
+    "b200_d64_direct_o": (
+        make_inputs(num_heads=32, num_heads_kv=32, batch_size=1, total_q=257, total_k=2048,
+                    max_seqlen_q=257, max_seqlen_k=2048),
+        {"use_tma_o"},
+    ),
     "sm103_d64_nonpersistent": (
         make_inputs(device_arch=103, max_seqlen_k=8192),
         {"is_static_persistent"},
@@ -653,6 +658,13 @@ _NOT_PLAIN_BF16 = [
         *[(rule, {}, True) for rule in _TUNED_RULES],
         # One plain-BF16 gate precedes every rule.
         *[("sm103_d64_nonpersistent", changes, False) for changes in _NOT_PLAIN_BF16],
+        ("b200_d64_direct_o", {"max_seqlen_q": 256}, False),
+        ("b200_d64_direct_o", {"max_seqlen_k": 2047}, False),
+        ("b200_d64_direct_o", {"num_heads": 31, "num_heads_kv": 31}, False),
+        ("b200_d64_direct_o", {"causal": True}, False),
+        ("b200_d64_direct_o", {"num_heads": 64, "num_heads_kv": 16, "pack_gqa": True}, True),
+        ("b200_d64_direct_o", {"num_heads": 64, "num_heads_kv": 32, "pack_gqa": True}, False),
+        ("b200_d64_direct_o", {"num_heads_kv": 8, "pack_gqa": False}, False),
         ("sm103_d64_nonpersistent", {"max_seqlen_k": 4096}, True),
         ("sm103_d64_nonpersistent", {"max_seqlen_k": 3072}, False),
         ("sm103_d64_nonpersistent", {"head_dim": 96, "head_dim_v": 96}, False),
