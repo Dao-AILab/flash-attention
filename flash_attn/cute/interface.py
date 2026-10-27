@@ -2163,6 +2163,24 @@ def _bwd_pack_gqa_heuristic(
     return gain > wave_loss(ctas_packed) - wave_loss(ctas_unpacked)
 
 
+# Fold rules of _bwd_choose_fold, measured on B200 (the cells are in PR #3059).
+_BWD_MAX_PACK = 4  # wider packs lose from 2k on (causal MQA 16/1, GQA 32/2, 64/8: -3..-38%)
+_BWD_CHAIN_WASTE_MAX = 0.03  # deterministic causal: largest fold whose dQ-chain waste stays under
+_BWD_LOOP_DENSE_TRIPS_X_MBLOCKS = 48  # deterministic causal: the head loop serializes past this
+_BWD_LOOP_VARLEN_MBLOCKS = 16  # (the varlen LPT schedule tolerates more trips)
+_BWD_WIDE_PACK_MBLOCKS_X_HDIM = 4096  # 2-CTA deterministic causal: pack 4 steps down to pack 2
+_BWD_WIDE_PACK_SLOW_MBLOCKS = 32  # hdim 192 causal: a partial pack 4 steps down to pack 2
+
+
+class BwdFold(NamedTuple):
+    """How the SM100 backward folds the query heads of a KV head into tiles: pack_factor query
+    heads in the Q tile rows and, with head_loop (hdim 256), one tile per KV head that loops
+    over its qhead_per_kvhead // pack_factor sub-groups in the CTA (NOTE [bwd pack_gqa])."""
+
+    pack_factor: int
+    head_loop: bool
+
+
 def _bwd_choose_fold(
     num_sms: int,
     cluster_size: int,
@@ -2182,98 +2200,78 @@ def _bwd_choose_fold(
     deterministic: bool,
     fold_allowed: bool,
     head_loop_possible: bool,
-    pack_gqa_override: Optional[bool] = None,
+    pack_gqa_override: Optional[int] = None,
     head_loop_override: Optional[bool] = None,
-    pack_factor_override: Optional[int] = None,
-) -> tuple[int, bool]:
-    """How the SM100 backward folds the query heads of a KV head into tiles: (pack_factor,
-    head_loop). Candidates with the head loop (hdim 256), largest fold first: pack 2 + loop
-    over the other sub-groups (fold = qhead_per_kvhead, the default; qhead_per_kvhead 2 is the
-    one pack), loop only, pack 4, pack 2; without it pack 4 and pack 2 when they divide
-    qhead_per_kvhead, largest first (the other sub-groups go through the dK / dV
-    postprocess). The first one the pack_gqa heuristic accepts for its own tile count wins (a
-    smaller fold has a shorter critical path and a bigger grid, so it can pass where the full
-    fold does not: MQA 16/1 4k b8 causal).
+) -> BwdFold:
+    """Candidates, largest fold first. With the head loop (hdim 256): pack 2 + loop over the
+    other sub-groups (fold = qhead_per_kvhead, the default), loop only, pack 4, pack 2. Without
+    it: pack 4 and pack 2 when they divide qhead_per_kvhead (the other sub-groups go through
+    the dK / dV postprocess). The first one _bwd_pack_gqa_heuristic accepts for its own tile
+    count wins: a smaller fold has a shorter critical path and a bigger grid.
 
-    Deterministic causal adds the dQ semaphore chains: they run over the n_blocks of a (batch,
-    scratch head), and with causal tile n_block k has one more m_block per pass than tile
-    k + 1, so a co-resident later tile of the chain is held to the pace of the earlier one.
-    Estimated waste: (co-resident tiles per chain - 1) * 2 * m_block_size / seqlen_q with
-    co-resident tiles per chain = clusters / chains and chains = batch * num_head / fold; the
-    largest fold under 3% wins, else the smallest accepted fold (B200 hd256 vs the default: MQA
-    16/1 2k b16 pack 4 +13%, 4k b8 pack 2 +14%, GQA 32/2 2k b16 pack 4 +9%, 24/4 8k b4 pack 2
-    +10%; hdim 192 GQA 32/8 4k b8 / 8k b4 pack 2 +3% / +7% over pack 4). On the 2-CTA kernel
-    pack 4 is dropped for pack 2 once m_blocks * head_dim > 4096 (hdim 128 past 4k, hdim 192 /
-    256 past 2k) whatever the chain waste says: a pack 4 tile walks twice the chain hops across
-    the CTA pair, each moving its dQaccum slab (m_block_size x head_dim fp32), for a K / V
-    saving over pack 2 that shrinks with the sequence (pack 2 over pack 4: hdim 192 GQA 32/2,
-    32/8, 48/4, 64/8 4k b8 +3..+8%, 48/4, 64/8 8k b4 +8..+9%, hdim 256 48/4, 64/8 8k b4 +8%,
-    hdim 128 64/8 8k b4 +3..+7%; pack 4 keeps +1..+21% at 1k-2k everywhere and +4% at hdim 128
-    32/8 4k b8). The looped candidates are first dropped when the loop itself serializes too much:
-    a looped tile walks its sub-groups through the chains one after the other, so its cost
-    grows with trips * m_blocks while the per-sub-group alternative only pays K / V reloads
-    that shrink with seqlen -- measured crossover dense trips * m_blocks > 48, varlen
-    m_blocks > 16 (B200 1k-8k, qh 5-16: 12/2 1k-2k, 64/8 1k, varlen 32/2 / 48/4 / 64/8 /
-    MQA at <= 2k keep the loop and gain +5..+25% over the unlooped fold; 48/4 and 64/8 at
-    2k-4k, MQA dense drop it and gain +4..+14%).
+    Deterministic causal adds the dQ semaphore chains over the n_blocks of a (batch, scratch
+    head): a co-resident later tile of a chain is held to the pace of the earlier one, so the
+    looped candidates are dropped once the loop walks too many sub-groups through the chains
+    (_BWD_LOOP_*), a 2-CTA pack 4 steps down to pack 2 once its chain hops cost more than its
+    K / V saving (_BWD_WIDE_PACK_MBLOCKS_X_HDIM), and the largest fold whose chain waste
+    (co-resident tiles per chain - 1) * 2 * m_block_size / seqlen_q stays under
+    _BWD_CHAIN_WASTE_MAX wins, else the smallest accepted fold. Off the deterministic path the
+    hdim 192 kernel steps a partial pack 4 down to pack 2 as well (_BWD_WIDE_PACK_SLOW_MBLOCKS).
 
-    FLASH_ATTENTION_BWD_PACK_GQA / _HEAD_LOOP force or exclude candidates,
-    FLASH_ATTENTION_BWD_PACK_FACTOR (tests) restricts them to that pack; forced candidates skip
-    the heuristic.
+    pack_gqa_override (FLASH_ATTENTION_BWD_PACK_GQA: 0 off, 1 on, 2 / 4 that pack) and
+    head_loop_override (FLASH_ATTENTION_BWD_HEAD_LOOP) force or exclude candidates; forced
+    candidates skip the heuristic and the deterministic rules.
     """
     qh = num_head // num_head_kv
+    none = BwdFold(1, False)
     if qh <= 1:
-        return 1, False
+        return none
+    m_blocks = -(-seqlen_q // m_block_size)
+
+    def fits(pack):
+        return qh % pack == 0 and m_block_size % pack == 0
+
     candidates = []
-    if pack_factor_override is not None:
-        # tests: that pack; looped over the other sub-groups only when the loop is forced too
-        pack = pack_factor_override
-        if qh % pack == 0 and m_block_size % pack == 0:
+    if pack_gqa_override is not None and pack_gqa_override > 1:
+        pack = pack_gqa_override
+        if fits(pack):
             if head_loop_possible and head_loop_override is True and qh // pack > 1:
-                candidates.append((pack, True))
-            candidates.append((pack, False))
+                candidates.append(BwdFold(pack, True))
+            candidates.append(BwdFold(pack, False))
     elif head_loop_possible:
         for pack in (2, 4):
-            if qh % pack == 0 and m_block_size % pack == 0:
+            if fits(pack):
                 if pack == 2 and qh // pack > 1:
-                    candidates.append((pack, True))
-                candidates.append((pack, False))
-        candidates.append((1, True))
+                    candidates.append(BwdFold(pack, True))
+                candidates.append(BwdFold(pack, False))
+        candidates.append(BwdFold(1, True))
     else:
-        # no head loop (not hdim 256): pack 4 and pack 2 (when they divide qhead_per_kvhead),
-        # largest first; the other sub-groups go through the dK / dV postprocess. Wider packs
-        # lose on B200 as the sequence grows (hdim 128 / 64 MQA 16/1 and GQA 32/2 causal 2k-8k:
-        # pack 16 -5..-38%, pack 8 -2..-15%, pack 4 +1..+10%; non-causal 1k pack 16 is only
-        # 0..3% ahead of pack 4), the chain rules below then have pack 2 to step down to.
-        pack = min(qh & -qh, m_block_size, 4)
+        pack = min(qh & -qh, m_block_size, _BWD_MAX_PACK)
         while pack > 1:
-            candidates.append((pack, False))
+            candidates.append(BwdFold(pack, False))
             pack //= 2
-    if not fold_allowed:
-        candidates = [c for c in candidates if c[1] and head_loop_override is True]
-    if head_loop_override is False:
-        candidates = [c for c in candidates if not c[1]]
-    elif head_loop_override is True:
-        candidates = [c for c in candidates if c[1]]
-    if pack_gqa_override is False:
-        candidates = [c for c in candidates if c[0] == 1]
+
+    def allowed(cand):
+        if not fold_allowed and not (cand.head_loop and head_loop_override is True):
+            return False
+        if head_loop_override is not None and cand.head_loop != head_loop_override:
+            return False
+        return pack_gqa_override != 0 or cand.pack_factor == 1
+
+    candidates = [cand for cand in candidates if allowed(cand)]
     if not candidates:
-        return 1, False
+        return none
 
     def fold(cand):
-        pack, loop = cand
-        return pack * (qh // pack if loop else 1)
+        return cand.pack_factor * (qh // cand.pack_factor if cand.head_loop else 1)
 
     # largest fold first; for equal folds pack 2 (+ loop) before the unpacked loop before a
     # wider pack
-    candidates.sort(key=lambda cand: (-fold(cand), cand[0] != 2, not cand[1]))
+    candidates.sort(key=lambda cand: (-fold(cand), cand.pack_factor != 2, not cand.head_loop))
 
     def forced(cand):
-        pack, loop = cand
-        return (
-            (loop and head_loop_override is True)
-            or (pack > 1 and pack_gqa_override is True)
-            or pack_factor_override is not None
+        return (cand.head_loop and head_loop_override is True) or (
+            cand.pack_factor > 1 and pack_gqa_override is not None and pack_gqa_override >= 1
         )
 
     def accepted(cand):
@@ -2296,20 +2294,9 @@ def _bwd_choose_fold(
             varlen=varlen,
         )
 
-    det_causal = (
-        deterministic
-        and causal
-        and pack_gqa_override is None
-        and head_loop_override is None
-        and pack_factor_override is None
-    )
-    nondet_causal = (
-        causal
-        and not deterministic
-        and pack_gqa_override is None
-        and head_loop_override is None
-        and pack_factor_override is None
-    )
+    no_override = pack_gqa_override is None and head_loop_override is None
+    det_causal = causal and deterministic and no_override
+    nondet_causal = causal and not deterministic and no_override
     num_clusters = max(1, num_sms // cluster_size)
 
     def chain_waste(cand):
@@ -2317,65 +2304,41 @@ def _bwd_choose_fold(
         return max(0.0, num_clusters / chains - 1.0) * 2 * m_block_size / max(seqlen_q, 1)
 
     def loop_serialized(cand):
-        # A looped tile walks its qh // pack sub-groups through the dQ chains one after the
-        # other, so its deterministic cost grows with trips * m_blocks, while the alternative
-        # (one tile per sub-group + dK / dV postprocess) only pays K / V reloads that shrink
-        # with the sequence length. Measured crossover on B200 (dense / varlen 1k-8k, qh 5-16):
-        # dense trips * m_blocks > 48, varlen m_blocks > 16 (its LPT schedule tolerates more).
-        pack, loop = cand
-        if not loop:
+        if not cand.head_loop:
             return False
-        m_blocks = -(-seqlen_q // m_block_size)
-        return m_blocks > 16 if varlen else (qh // pack) * m_blocks > 48
+        if varlen:
+            return m_blocks > _BWD_LOOP_VARLEN_MBLOCKS
+        return (qh // cand.pack_factor) * m_blocks > _BWD_LOOP_DENSE_TRIPS_X_MBLOCKS
 
-    def wide_pack_serialized(cand):
-        # On the 2-CTA kernel a deterministic causal pack 4 tile loses to pack 2 as the
-        # sequence grows: it walks twice the chain hops (pack * m_blocks acquire / release
-        # pairs, each across the CTA pair and each moving the tile's dQaccum slab of
-        # m_block_size x head_dim fp32) for a K / V saving over pack 2 that shrinks with the
-        # sequence. Measured on B200 (-lgc 1965, pack 4 vs pack 2): 1k b32 +7..+21% and 2k b16
-        # +1..+9% everywhere; 4k b8 hdim 128 +4% (GQA 32/8) .. -1%, hdim 192 -3..-8%, hdim 256
-        # -2..+1%; 8k b4 hdim 128 -7..0%, hdim 192 -8..-9%, hdim 256 -8%: crossover m_blocks *
-        # head_dim > 4096. The 1-CTA hdim 64 kernel keeps pack 4 (4k b8 +5%, 8k b4 level).
-        pack, loop = cand
-        if loop or pack <= 2 or cluster_size == 1:
+    def wide_pack_steps_down(cand):
+        if cand.head_loop or cand.pack_factor <= 2 or cluster_size == 1:
             return False
-        return -(-seqlen_q // m_block_size) * head_dim > 4096
-
-    def wide_pack_slow(cand):
-        # Off the deterministic path the hdim 192 kernel prefers pack 2 to a partial pack 4
-        # from 4k on as well (B200, -lgc 1965, causal, pack 2 / pack 4 / unpacked): 4k b8 MQA
-        # 16/1 805 / 770 / 787 (varlen 811 / 777 / 789), GQA 64/8 825 / 803 / 781, 48/4 847 /
-        # 840 / 799; 8k b4 48/4 879 / 874 / 864, 64/8 876 / 850 / 850. The full pack keeps
-        # pack 4 (32/8 4k b8 818 / 835 / 788), and so does hdim 128 (4k b8 48/4 1048 / 1058,
-        # 32/8 1011 / 1063; 8k b4 48/4 1138 / 1167 both rounds).
-        pack, loop = cand
-        if loop or pack <= 2 or cluster_size == 1 or head_dim <= 128 or head_loop_possible:
-            return False
-        return qh > pack and -(-seqlen_q // m_block_size) >= 32
+        if det_causal:
+            return m_blocks * head_dim > _BWD_WIDE_PACK_MBLOCKS_X_HDIM
+        return (
+            nondet_causal
+            and head_dim > 128
+            and not head_loop_possible
+            and qh > cand.pack_factor
+            and m_blocks >= _BWD_WIDE_PACK_SLOW_MBLOCKS
+        )
 
     ok = [cand for cand in candidates if accepted(cand)]
-    if det_causal and any(not loop for _, loop in ok):
+    if det_causal and any(not cand.head_loop for cand in ok):
         # only when an unlooped fold is available: without one (odd qhead_per_kvhead) the
         # loop stays, one tile per query head with the dK / dV postprocess is far slower
         ok = [cand for cand in ok if not loop_serialized(cand)]
-    wide = wide_pack_serialized if det_causal else wide_pack_slow if nondet_causal else None
-    if wide is not None and any(wide(cand) for cand in ok):
-        # step down to pack 2 whether or not the heuristic took it for its own tile count (it
-        # halves the gain of a 4+ way partial pack): the saving the wide pack was accepted
-        # for is there at pack 2 too, without the chain hops. Measured at 8k b4 over the
-        # unpacked kernel: hdim 192 GQA 48/4 +2%, 64/8 0%, hdim 128 +7 / +8%, hdim 256 +8 / +10%.
-        keep = {cand for cand in ok if not wide(cand)} | {(2, False)}
+    if any(wide_pack_steps_down(cand) for cand in ok):
+        # pack 2 whether or not the heuristic took it for its own tile count (it halves the
+        # gain of a 4+ way partial pack): the saving is there at pack 2 too
+        keep = {cand for cand in ok if not wide_pack_steps_down(cand)} | {BwdFold(2, False)}
         ok = [cand for cand in candidates if cand in keep]
     for cand in ok:
-        # looped candidates are already gated by loop_serialized; the chain waste orders the
-        # unlooped packs (MQA 16/1 4k b8: pack 4 refused, pack 2 taken)
-        if not det_causal or cand[1] or chain_waste(cand) <= 0.03:
+        if not det_causal or cand.head_loop or chain_waste(cand) <= _BWD_CHAIN_WASTE_MAX:
             return cand
-    if det_causal and ok:
-        # every fold waits on the chains; the smallest accepted fold still beats none
-        return ok[-1]
-    return 1, False
+    # deterministic causal: every fold waits on the chains; the smallest accepted fold still
+    # beats none
+    return ok[-1] if det_causal and ok else none
 
 
 def _flash_attn_bwd(
@@ -2718,33 +2681,19 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
-    # Fold of the query heads of a KV head into tiles (NOTE [bwd pack_gqa]): pack_factor
-    # query heads in the Q tile rows (at most 4; a packed tile covers only tile_m / pack_factor
-    # tokens, so with causal every diagonal KV tile meets pack_factor masked Q tiles -- pack 2
-    # is best or within 1% of best everywhere measured on B200 hd256, pack >= 8 loses 3-13% on
-    # causal MQA 16/1, GQA 32/2, 64/8), and / or head_loop (SM100 hdim 256, serial schedule):
-    # one tile per KV head that loops over its qhead_per_kvhead // pack_factor sub-groups in
-    # the CTA, so dK / dV are stored directly (no fp32 accumulate + postprocess) and K / V are
-    # loaded once. _bwd_choose_fold picks per shape.
-    fold_allowed = (
-        bwd_pack_gqa_request
-        and not use_dedicated_hd256_kernel
-        and qhead_per_kvhead > 1
+    # Fold of the query heads of a KV head into tiles (NOTE [bwd pack_gqa]): pack_factor query
+    # heads in the Q tile rows and / or, on hdim 256, the head loop over the KV head's
+    # sub-groups; _bwd_choose_fold picks per shape.
+    fold_features_ok = (
+        not use_dedicated_hd256_kernel
         and block_sparse_tensors is None
         and score_mod is None
         and mask_mod is None
         and learnable_sink is None
     )
-    head_loop_override = utils._get_bwd_head_loop_override()
+    fold_allowed = bwd_pack_gqa_request and qhead_per_kvhead > 1 and fold_features_ok
     head_loop_possible = (
-        arch // 10 in [10, 11]
-        and head_dim == 256
-        and head_dim_v == 256
-        and not use_dedicated_hd256_kernel
-        and block_sparse_tensors is None
-        and score_mod is None
-        and mask_mod is None
-        and learnable_sink is None
+        arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256 and fold_features_ok
     )
     is_varlen_any = cu_seqlens_q is not None or cu_seqlens_k is not None
     # The heuristics want the longest sequence; a varlen call without max_seqlen only knows
@@ -2779,8 +2728,7 @@ def _flash_attn_bwd(
         fold_allowed=fold_allowed,
         head_loop_possible=head_loop_possible,
         pack_gqa_override=utils._get_bwd_pack_gqa_override(),
-        head_loop_override=head_loop_override,
-        pack_factor_override=utils._get_bwd_pack_factor_override(),
+        head_loop_override=utils._get_bwd_head_loop_override(),
     )
     bwd_pack_gqa = bwd_pack_factor > 1
     
@@ -3053,7 +3001,6 @@ def _flash_attn_bwd(
             head_dim,
             head_dim_v,
             qhead_per_kvhead,
-            bwd_pack_gqa,
             bwd_pack_factor,
             bwd_head_loop,
             causal,
@@ -3240,7 +3187,6 @@ def _flash_attn_bwd(
                     has_aux_tensors=aux_tensors is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
-                    pack_gqa=bwd_pack_gqa,
                     pack_factor=bwd_pack_factor,
                     head_loop=bwd_head_loop,
                 )

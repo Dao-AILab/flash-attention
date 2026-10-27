@@ -2,12 +2,12 @@
 per-head path (FLASH_ATTENTION_BWD_PACK_GQA=0, FLASH_ATTENTION_BWD_HEAD_LOOP=0) and against
 FP64 eager. The fold modes:
 
-- pack: FLASH_ATTENTION_BWD_PACK_FACTOR=2 packs 2 query heads into the Q tile rows (NOTE
+- pack: FLASH_ATTENTION_BWD_PACK_GQA=2 packs 2 query heads into the Q tile rows (NOTE
   [bwd pack_gqa] in pack_gqa.py); the remaining qhead_per_kvhead // 2 sub-groups of a KV
   head are separate tiles whose dK / dV accumulate in fp32 (+ postprocess). pack4: the same
   with 4 (hdim 256: what the deterministic causal fold picks when the dQ chains are few).
   pack_full: the one full pack (largest power of two dividing qhead_per_kvhead) that the
-  other head dims take.
+  other head dims take (FLASH_ATTENTION_BWD_PACK_GQA=1, the chooser's pick).
 - pack_loop: pack 2, and the sub-groups looped inside one tile per KV head
   (FLASH_ATTENTION_BWD_HEAD_LOOP=1, hdim 256): K / V loaded once, dK / dV stay in TMEM and are
   stored directly.
@@ -49,19 +49,24 @@ HEADS = {
     "gqa6_2": (6, 2),
     "gqa40_8": (40, 8),
 }
-# fold -> (pack_gqa, head_loop, pack_factor) overrides
+# fold -> (pack_gqa, head_loop, pack_factor) overrides; FLASH_ATTENTION_BWD_PACK_GQA takes
+# 0 (off), 1 (on, the chooser picks the pack) or 2 / 4 (that pack)
 FOLDS = {
-    "pack": (True, False, 2),  # pack 2; the other sub-groups through the dK / dV postprocess
-    "pack4": (True, False, 4),  # pack 4; the other sub-groups through the dK / dV postprocess
+    "pack": (
+        True,
+        False,
+        2,
+    ),  # pack 2; the other sub-groups through the dK / dV postprocess
+    "pack4": (
+        True,
+        False,
+        4,
+    ),  # pack 4; the other sub-groups through the dK / dV postprocess
     "pack_full": (True, False, None),  # other head dims: the one full pack
     "pack_loop": (True, True, 2),  # pack 2 and the other sub-groups looped in the CTA
     "loop": (False, True, None),  # unpacked, every query head a pass of the loop
 }
-ENV_KEYS = (
-    "FLASH_ATTENTION_BWD_PACK_GQA",
-    "FLASH_ATTENTION_BWD_HEAD_LOOP",
-    "FLASH_ATTENTION_BWD_PACK_FACTOR",
-)
+ENV_KEYS = ("FLASH_ATTENTION_BWD_PACK_GQA", "FLASH_ATTENTION_BWD_HEAD_LOOP")
 FEATURE_KWARGS = {
     "none": {},
     "local": {"window_size": (64, 32)},
@@ -93,14 +98,24 @@ def hd256_on_general_kernel():
 
 
 def run_fwd_bwd_layout(
-    layout, q, k, v, dout, q_lens, k_lens, causal, pack, head_loop, pack_factor=None, **kwargs
+    layout,
+    q,
+    k,
+    v,
+    dout,
+    q_lens,
+    k_lens,
+    causal,
+    pack,
+    head_loop,
+    pack_factor=None,
+    **kwargs,
 ):
-    os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = "1" if pack else "0"
-    os.environ["FLASH_ATTENTION_BWD_HEAD_LOOP"] = "1" if head_loop else "0"
-    if pack_factor is None:
-        os.environ.pop("FLASH_ATTENTION_BWD_PACK_FACTOR", None)
+    if pack and pack_factor is not None:
+        os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = str(pack_factor)
     else:
-        os.environ["FLASH_ATTENTION_BWD_PACK_FACTOR"] = str(pack_factor)
+        os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = "1" if pack else "0"
+    os.environ["FLASH_ATTENTION_BWD_HEAD_LOOP"] = "1" if head_loop else "0"
     head_dim = q.shape[-1]
     if layout == "dense":
         b = len(q_lens)
@@ -149,7 +164,9 @@ def test_bwd_pack_gqa_matches_unpacked(
     if head_loop and head_dim != 256:
         pytest.skip("the head loop is an hdim 256 (serial schedule) path")
     if fold == "pack_full" and (head_dim == 256 or full_pack <= 2):
-        pytest.skip("hdim 256 never takes the full pack; a full pack of 2 is the pack cell")
+        pytest.skip(
+            "hdim 256 never takes the full pack; a full pack of 2 is the pack cell"
+        )
     if pack and qhead_per_kvhead % (pack_factor or full_pack):
         pytest.skip("qhead_per_kvhead does not divide into the packed heads")
     if head_loop and qhead_per_kvhead // (pack_factor if pack else 1) == 1:
@@ -350,151 +367,297 @@ def test_bwd_pack_gqa_heuristic():
     )
 
 
-def test_bwd_choose_fold():
-    """Fold choice on B200 (148 SMs, 74 clusters), hdim 256, 32k tokens per shape: the cells of
-    the chain probes (deterministic causal) and of the MQA probe (non-deterministic)."""
+def choose_fold(
+    batch,
+    heads,
+    heads_kv,
+    seqlen,
+    causal,
+    deterministic,
+    head_loop_possible=True,
+    varlen=False,
+    cluster_size=2,
+    m_block_size=128,
+    n_block_size=128,
+    head_dim=256,
+    **kw,
+):
+    """_bwd_choose_fold on B200 (148 SMs, 74 clusters) for a dense shape of batch x
+    seqlen tokens; hdim 256 with the head loop unless given."""
     from flash_attn.cute.interface import _bwd_choose_fold
 
-    def decide(batch, heads, heads_kv, seqlen, causal, deterministic, head_loop_possible=True, varlen=False,
-               cluster_size=2, m_block_size=128, n_block_size=128, head_dim=256, **kw):
-        return _bwd_choose_fold(
-            num_sms=148,
-            cluster_size=cluster_size,
-            batch_size=batch,
-            num_head=heads,
-            num_head_kv=heads_kv,
-            seqlen_q=seqlen,
-            seqlen_k=seqlen,
-            total_q=batch * seqlen,
-            total_k=batch * seqlen,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
-            head_dim=head_dim,
-            causal=causal,
-            local=False,
-            varlen=varlen,
-            deterministic=deterministic,
-            fold_allowed=True,
-            head_loop_possible=head_loop_possible,
-            **kw,
-        )
+    return _bwd_choose_fold(
+        num_sms=148,
+        cluster_size=cluster_size,
+        batch_size=batch,
+        num_head=heads,
+        num_head_kv=heads_kv,
+        seqlen_q=seqlen,
+        seqlen_k=seqlen,
+        total_q=batch * seqlen,
+        total_k=batch * seqlen,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        head_dim=head_dim,
+        causal=causal,
+        local=False,
+        varlen=varlen,
+        deterministic=deterministic,
+        fold_allowed=True,
+        head_loop_possible=head_loop_possible,
+        **kw,
+    )
 
-    # non-deterministic: pack 2 + loop whenever the heuristic takes the full fold; where it
-    # refuses (long causal MQA: critical path / waves) a smaller fold instead of none
-    assert decide(16, 16, 1, 2048, True, False) == (2, True)
-    assert decide(16, 40, 8, 2048, True, False) == (1, True)
-    assert decide(8, 16, 1, 4096, True, False) == (4, False)
-    assert decide(4, 16, 1, 8192, True, False)[0] > 1
-    # deterministic causal: MQA 16/1 1k b32 and 2k b16 pack 4 (+4% / +13% over pack 2 + loop),
-    # 4k b8 and 8k b4 pack 2 (+14%); GQA 32/2 2k b16 pack 4 (+9%), 8k b4 pack 2 (+13%);
-    # GQA 24/4 (qh 6) 2k b16 keeps the loop (+5%), 8k b4 pack 2 (+10%); GQA 40/8 (odd qh) loops
-    assert decide(32, 16, 1, 1024, True, True) == (4, False)
-    assert decide(16, 16, 1, 2048, True, True) == (4, False)
-    assert decide(8, 16, 1, 4096, True, True) == (2, False)
-    assert decide(4, 16, 1, 8192, True, True) == (2, False)
-    assert decide(16, 32, 2, 2048, True, True) == (4, False)
-    assert decide(4, 32, 2, 8192, True, True) == (2, False)
-    assert decide(16, 24, 4, 2048, True, True) == (2, True)
-    assert decide(4, 24, 4, 8192, True, True) == (2, False)
-    assert decide(16, 40, 8, 2048, True, True) == (1, True)  # odd qh: no unlooped fold, the loop stays
-    # no head loop (hdim 192, 1 CTA, 64 x 96 tile), GQA 32/8: pack 4 while its chain waste is under
-    # 3% (2k b16), pack 2 at 4k b8 / 8k b4 (+3% / +7% over pack 4 on B200), the heuristic's pack 1
-    # at 16k; non-deterministic keeps the largest accepted pack
-    for seqlen, expect in (
-        (2048, (4, False)),
-        (4096, (2, False)),
-        (8192, (2, False)),
-        (16384, (1, False)),
-    ):
-        assert decide(
-            32768 // seqlen, 32, 8, seqlen, True, True, head_loop_possible=False,
-            cluster_size=1, m_block_size=64, n_block_size=96, head_dim=192,
-        ) == expect, seqlen
-    assert decide(
-        4, 32, 8, 8192, True, False, head_loop_possible=False,
-        cluster_size=1, m_block_size=64, n_block_size=96, head_dim=192,
-    ) == (4, False)
+
+def fold_case(expect, batch, heads, heads_kv, seqlen, *, causal, deterministic, **kw):
+    """One row of CHOOSE_FOLD_CASES: the choose_fold() inputs and the expected
+    (pack_factor, head_loop), with an id like det-causal-mqa16/1-2k-b16-hd192-noloop."""
+    inputs = dict(
+        batch=batch,
+        heads=heads,
+        heads_kv=heads_kv,
+        seqlen=seqlen,
+        causal=causal,
+        deterministic=deterministic,
+        **kw,
+    )
+    parts = [
+        "det" if deterministic else "nondet",
+        "causal" if causal else "noncausal",
+        f"{'mqa' if heads_kv == 1 else 'gqa'}{heads}/{heads_kv}",
+        f"{seqlen // 1024}k" if seqlen >= 1024 else str(seqlen),
+        f"b{batch}",
+    ]
+    if "head_dim" in kw:
+        parts.append(f"hd{kw['head_dim']}")
+    if not kw.get("head_loop_possible", True):
+        parts.append("noloop")
+    if "cluster_size" in kw:
+        parts.append(f"cs{kw['cluster_size']}")
+    if "m_block_size" in kw or "n_block_size" in kw:
+        parts.append(f"{kw.get('m_block_size', 128)}x{kw.get('n_block_size', 128)}")
+    if kw.get("varlen"):
+        parts.append("varlen")
+    if "pack_gqa_override" in kw:
+        parts.append(f"pack{kw['pack_gqa_override']}")
+    if "head_loop_override" in kw:
+        parts.append(f"loop{int(kw['head_loop_override'])}")
+    return pytest.param(inputs, expect, id="-".join(parts))
+
+
+# Fold choice on B200 (148 SMs, 74 clusters), 32k tokens per shape: the cells of the
+# chain probes (deterministic causal) and of the MQA probe (non-deterministic). Expected
+# = (pack_factor, head_loop); the measurements behind each rule are in the PR body.
+# fmt: off
+CHOOSE_FOLD_CASES = [
+    # non-deterministic: pack 2 + loop whenever the heuristic takes the full fold; where
+    # it refuses (long causal MQA: critical path / waves) a smaller fold instead of none
+    fold_case((2, True), 16, 16, 1, 2048, causal=True, deterministic=False),
+    fold_case((1, True), 16, 40, 8, 2048, causal=True, deterministic=False),
+    fold_case((4, False), 8, 16, 1, 4096, causal=True, deterministic=False),
+    # deterministic causal, hdim 256: the dQ chains pace the looped tiles, so few chains
+    # take an unlooped pack 4 (1k / 2k) and pack 2 from 4k; GQA 24/4 (qh 6) keeps the
+    # loop at 2k; GQA 40/8 (odd qh) has no unlooped fold, the loop stays
+    fold_case((4, False), 32, 16, 1, 1024, causal=True, deterministic=True),
+    fold_case((4, False), 16, 16, 1, 2048, causal=True, deterministic=True),
+    fold_case((2, False), 8, 16, 1, 4096, causal=True, deterministic=True),
+    fold_case((2, False), 4, 16, 1, 8192, causal=True, deterministic=True),
+    fold_case((4, False), 16, 32, 2, 2048, causal=True, deterministic=True),
+    fold_case((2, False), 4, 32, 2, 8192, causal=True, deterministic=True),
+    fold_case((2, True), 16, 24, 4, 2048, causal=True, deterministic=True),
+    fold_case((2, False), 4, 24, 4, 8192, causal=True, deterministic=True),
+    fold_case((1, True), 16, 40, 8, 2048, causal=True, deterministic=True),
+    # no head loop (hdim 192, 1 CTA, 64 x 96 tile), GQA 32/8: pack 4 while its chain
+    # waste is small (2k), pack 2 at 4k / 8k, the heuristic's pack 1 at 16k;
+    # non-deterministic keeps the largest accepted pack
+    fold_case((4, False), 16, 32, 8, 2048, causal=True, deterministic=True,
+              head_loop_possible=False, cluster_size=1, m_block_size=64,
+              n_block_size=96, head_dim=192),
+    fold_case((2, False), 8, 32, 8, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, cluster_size=1, m_block_size=64,
+              n_block_size=96, head_dim=192),
+    fold_case((2, False), 4, 32, 8, 8192, causal=True, deterministic=True,
+              head_loop_possible=False, cluster_size=1, m_block_size=64,
+              n_block_size=96, head_dim=192),
+    fold_case((1, False), 2, 32, 8, 16384, causal=True, deterministic=True,
+              head_loop_possible=False, cluster_size=1, m_block_size=64,
+              n_block_size=96, head_dim=192),
+    fold_case((4, False), 4, 32, 8, 8192, causal=True, deterministic=False,
+              head_loop_possible=False, cluster_size=1, m_block_size=64,
+              n_block_size=96, head_dim=192),
     # the loop stays while trips x m_blocks <= 48 (dense) / m_blocks <= 16 (varlen)
-    assert decide(32, 12, 2, 1024, True, True) == (2, True)
-    assert decide(16, 12, 2, 2048, True, True) == (2, True)
-    assert decide(8, 12, 2, 4096, True, True) == (2, False)
-    assert decide(32, 64, 8, 1024, True, True) == (2, True)
-    assert decide(16, 64, 8, 2048, True, True) == (4, False)
-    assert decide(16, 48, 4, 2048, True, True) == (4, False)
-    assert decide(16, 32, 2, 2048, True, True, varlen=True) == (2, True)
-    assert decide(8, 32, 2, 4096, True, True, varlen=True) == (2, False)
-    assert decide(32, 16, 1, 1024, True, True, varlen=True) == (2, True)
-    assert decide(16, 16, 8, 2048, True, True) == (2, False)
-    # 2-CTA kernels drop pack 4 for pack 2 under deterministic causal once m_blocks * head_dim
-    # > 4096 (hdim 192 past 2k, hdim 128 past 4k), also where the heuristic refused pack 2 for
-    # its halved partial-pack gain (hdim 192 GQA 48/4 and 64/8 8k b4: pack 4 is 6-9% below the
-    # unpacked kernel, pack 2 +0..+2%; hdim 128 pack 2 +7 / +8%); the 1-CTA hdim 64 kernel keeps
-    # pack 4 (GQA 64/8 4k b8 +5% over pack 2, 8k b4 level)
-    for head_dim, seqlen, expect in (
-        (192, 2048, (4, False)),
-        (192, 4096, (2, False)),
-        (192, 8192, (2, False)),
-        (192, 16384, (1, False)),
-        (128, 4096, (4, False)),
-        (128, 8192, (2, False)),
-    ):
-        for heads, heads_kv in ((48, 4), (64, 8)):
-            for varlen in (False, True):
-                assert decide(
-                    32768 // seqlen, heads, heads_kv, seqlen, True, True, head_loop_possible=False,
-                    head_dim=head_dim, varlen=varlen,
-                ) == expect, (head_dim, seqlen, heads, varlen)
-    assert decide(8, 32, 8, 4096, True, True, head_loop_possible=False, head_dim=192) == (2, False)
-    assert decide(8, 32, 8, 4096, True, True, head_loop_possible=False, head_dim=128) == (4, False)
-    assert decide(4, 48, 4, 8192, True, True) == (2, False)  # hdim 256: +8% over pack 4
-    assert decide(8, 64, 8, 4096, True, True, head_loop_possible=False, cluster_size=1, head_dim=64) == (4, False)
-    assert decide(4, 64, 8, 8192, True, True, head_loop_possible=False, cluster_size=1, head_dim=64) == (4, False)
-    # off the deterministic path the hdim 192 kernel also steps a partial pack 4 down to pack 2
-    # from 4k on (pack 2 / pack 4 / unpacked on B200: MQA 16/1 4k b8 805 / 770 / 787, GQA 64/8
-    # 825 / 803 / 781, 48/4 8k b4 879 / 874 / 864); the full pack 4 of GQA 32/8 stays (818 /
-    # 835 / 788), hdim 128 keeps pack 4 (48/4 8k b4 1167 vs 1138), and 2k is below the rule
-    for heads, heads_kv, seqlen, expect in (
-        (48, 4, 4096, (2, False)),
-        (48, 4, 8192, (2, False)),
-        (64, 8, 4096, (2, False)),
-        (64, 8, 8192, (2, False)),
-        (32, 2, 4096, (2, False)),
-        (16, 1, 4096, (2, False)),
-        (32, 8, 4096, (4, False)),
-        (48, 4, 2048, (4, False)),
-        (16, 1, 2048, (4, False)),
-    ):
-        for varlen in (False, True):
-            assert decide(
-                32768 // seqlen, heads, heads_kv, seqlen, True, False, head_loop_possible=False,
-                head_dim=192, varlen=varlen,
-            ) == expect, (heads, seqlen, varlen)
-    assert decide(4, 48, 4, 8192, True, False, head_loop_possible=False, head_dim=128) == (4, False)
-    assert decide(8, 64, 8, 4096, True, False, head_loop_possible=False, head_dim=128) == (4, False)
-    assert decide(8, 48, 4, 4096, False, False, head_loop_possible=False, head_dim=192) == (4, False)  # non-causal unchanged
+    fold_case((2, True), 32, 12, 2, 1024, causal=True, deterministic=True),
+    fold_case((2, True), 16, 12, 2, 2048, causal=True, deterministic=True),
+    fold_case((2, False), 8, 12, 2, 4096, causal=True, deterministic=True),
+    fold_case((2, True), 32, 64, 8, 1024, causal=True, deterministic=True),
+    fold_case((4, False), 16, 64, 8, 2048, causal=True, deterministic=True),
+    fold_case((4, False), 16, 48, 4, 2048, causal=True, deterministic=True),
+    fold_case((2, True), 16, 32, 2, 2048, causal=True, deterministic=True,
+              varlen=True),
+    fold_case((2, False), 8, 32, 2, 4096, causal=True, deterministic=True,
+              varlen=True),
+    fold_case((2, True), 32, 16, 1, 1024, causal=True, deterministic=True,
+              varlen=True),
+    fold_case((2, False), 16, 16, 8, 2048, causal=True, deterministic=True),
+    # 2-CTA kernels drop pack 4 for pack 2 under deterministic causal once m_blocks *
+    # head_dim > 4096 (hdim 192 past 2k, hdim 128 past 4k), also where the heuristic
+    # refused pack 2 for its halved partial-pack gain; hdim 256 (GQA 48/4 8k) likewise;
+    # the 1-CTA hdim 64 kernel keeps pack 4
+    fold_case((4, False), 16, 48, 4, 2048, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192),
+    fold_case((4, False), 16, 48, 4, 2048, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((4, False), 16, 64, 8, 2048, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192),
+    fold_case((4, False), 16, 64, 8, 2048, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((2, False), 8, 48, 4, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192),
+    fold_case((2, False), 8, 48, 4, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((2, False), 8, 64, 8, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192),
+    fold_case((2, False), 8, 64, 8, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((2, False), 4, 48, 4, 8192, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192),
+    fold_case((2, False), 4, 48, 4, 8192, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((2, False), 4, 64, 8, 8192, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192),
+    fold_case((2, False), 4, 64, 8, 8192, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((1, False), 2, 48, 4, 16384, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192),
+    fold_case((1, False), 2, 48, 4, 16384, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((1, False), 2, 64, 8, 16384, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192),
+    fold_case((1, False), 2, 64, 8, 16384, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((4, False), 8, 48, 4, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=128),
+    fold_case((4, False), 8, 48, 4, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=128, varlen=True),
+    fold_case((4, False), 8, 64, 8, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=128),
+    fold_case((4, False), 8, 64, 8, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=128, varlen=True),
+    fold_case((2, False), 4, 48, 4, 8192, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=128),
+    fold_case((2, False), 4, 48, 4, 8192, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=128, varlen=True),
+    fold_case((2, False), 4, 64, 8, 8192, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=128),
+    fold_case((2, False), 4, 64, 8, 8192, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=128, varlen=True),
+    fold_case((2, False), 8, 32, 8, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=192),
+    fold_case((4, False), 8, 32, 8, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, head_dim=128),
+    fold_case((2, False), 4, 48, 4, 8192, causal=True, deterministic=True),
+    fold_case((4, False), 8, 64, 8, 4096, causal=True, deterministic=True,
+              head_loop_possible=False, cluster_size=1, head_dim=64),
+    fold_case((4, False), 4, 64, 8, 8192, causal=True, deterministic=True,
+              head_loop_possible=False, cluster_size=1, head_dim=64),
+    # off the deterministic path the hdim 192 kernel also steps a partial pack 4 down to
+    # pack 2 from 4k on; the full pack 4 of GQA 32/8 stays, hdim 128 keeps pack 4, 2k is
+    # below the rule, and non-causal is unchanged
+    fold_case((2, False), 8, 48, 4, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192),
+    fold_case((2, False), 8, 48, 4, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((2, False), 4, 48, 4, 8192, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192),
+    fold_case((2, False), 4, 48, 4, 8192, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((2, False), 8, 64, 8, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192),
+    fold_case((2, False), 8, 64, 8, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((2, False), 4, 64, 8, 8192, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192),
+    fold_case((2, False), 4, 64, 8, 8192, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((2, False), 8, 32, 2, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192),
+    fold_case((2, False), 8, 32, 2, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((2, False), 8, 16, 1, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192),
+    fold_case((2, False), 8, 16, 1, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((4, False), 8, 32, 8, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192),
+    fold_case((4, False), 8, 32, 8, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((4, False), 16, 48, 4, 2048, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192),
+    fold_case((4, False), 16, 48, 4, 2048, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((4, False), 16, 16, 1, 2048, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192),
+    fold_case((4, False), 16, 16, 1, 2048, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=192, varlen=True),
+    fold_case((4, False), 4, 48, 4, 8192, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=128),
+    fold_case((4, False), 8, 64, 8, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, head_dim=128),
+    fold_case((4, False), 8, 48, 4, 4096, causal=False, deterministic=False,
+              head_loop_possible=False, head_dim=192),
     # deterministic non-causal: no pace difference, the default fold
-    assert decide(16, 16, 1, 2048, False, True) == (2, True)
-    # overrides
-    assert decide(16, 24, 4, 2048, True, False, pack_gqa_override=False) == (1, True)
-    assert decide(16, 24, 4, 2048, True, False, head_loop_override=False) == (2, False)
-    assert decide(1, 16, 1, 8192, True, False, pack_gqa_override=True) == (2, True)
-    assert decide(2, 16, 4, 256, True, True, pack_gqa_override=True, pack_factor_override=4) == (4, False)
-    assert decide(16, 16, 1, 2048, True, False, pack_factor_override=4) == (4, False)
-    assert decide(16, 16, 1, 2048, True, False, pack_factor_override=2, head_loop_override=True) == (2, True)
-    assert decide(16, 8, 1, 2048, True, False, head_loop_possible=False, pack_factor_override=2) == (2, False)
-    assert decide(16, 40, 8, 2048, True, False, pack_factor_override=2) == (1, False)
-    # without the loop (not hdim 256): pack 4 / pack 2, largest accepted first; the full pack
-    # 16 / 8 of hdim 128 MQA 16/1 loses 17% / 6% at 2k b16 causal where pack 4 gains 7%
-    assert decide(16, 16, 1, 2048, True, False, head_loop_possible=False, cluster_size=1) == (4, False)
-    assert decide(16, 16, 1, 2048, False, False, head_loop_possible=False, cluster_size=1) == (4, False)
-    assert decide(16, 24, 4, 2048, True, False, head_loop_possible=False, cluster_size=1) == (2, False)
-    assert decide(8, 16, 1, 4096, True, False, head_loop_possible=False, cluster_size=1) == (4, False)
-    # a partial pack of four or more sub-groups keeps half the packing gain: MQA 16/1 8k b4
-    # causal stays unpacked (pack 4 -2..-3%), 8k non-causal still packs (+3%); the full pack 4
-    # of GQA 32/8 is not partial; two sub-groups keep the gain (hdim 192 GQA 32/8 det causal
-    # 8k pack 2 above, GQA 64/8 pack 4)
-    assert decide(4, 16, 1, 8192, True, False, head_loop_possible=False, cluster_size=1) == (1, False)
-    assert decide(4, 16, 1, 8192, False, False, head_loop_possible=False, cluster_size=1) == (4, False)
-    assert decide(4, 32, 8, 8192, True, False, head_loop_possible=False, cluster_size=1) == (4, False)
-    assert decide(4, 64, 8, 8192, True, False, head_loop_possible=False, cluster_size=1) == (4, False)
-    assert decide(4, 16, 1, 8192, True, True, head_loop_possible=False, cluster_size=1) == (1, False)
+    fold_case((2, True), 16, 16, 1, 2048, causal=False, deterministic=True),
+    # overrides: pack_gqa_override 0 off / 1 on / 2, 4 that pack; head_loop_override
+    # forces or excludes the loop
+    fold_case((1, True), 16, 24, 4, 2048, causal=True, deterministic=False,
+              pack_gqa_override=0),
+    fold_case((2, False), 16, 24, 4, 2048, causal=True, deterministic=False,
+              head_loop_override=False),
+    fold_case((2, True), 1, 16, 1, 8192, causal=True, deterministic=False,
+              pack_gqa_override=1),
+    fold_case((4, False), 2, 16, 4, 256, causal=True, deterministic=True,
+              pack_gqa_override=4),
+    fold_case((4, False), 16, 16, 1, 2048, causal=True, deterministic=False,
+              pack_gqa_override=4),
+    fold_case((2, True), 16, 16, 1, 2048, causal=True, deterministic=False,
+              pack_gqa_override=2, head_loop_override=True),
+    fold_case((2, False), 16, 8, 1, 2048, causal=True, deterministic=False,
+              head_loop_possible=False, pack_gqa_override=2),
+    fold_case((1, False), 16, 40, 8, 2048, causal=True, deterministic=False,
+              pack_gqa_override=2),
+    # without the loop (not hdim 256): pack 4 / pack 2, largest accepted first; the full
+    # pack 16 / 8 of MQA 16/1 loses to pack 4
+    fold_case((4, False), 16, 16, 1, 2048, causal=True, deterministic=False,
+              head_loop_possible=False, cluster_size=1),
+    fold_case((4, False), 16, 16, 1, 2048, causal=False, deterministic=False,
+              head_loop_possible=False, cluster_size=1),
+    fold_case((2, False), 16, 24, 4, 2048, causal=True, deterministic=False,
+              head_loop_possible=False, cluster_size=1),
+    fold_case((4, False), 8, 16, 1, 4096, causal=True, deterministic=False,
+              head_loop_possible=False, cluster_size=1),
+    # a partial pack of four or more sub-groups keeps half the packing gain: MQA 16/1 8k
+    # b4 causal stays unpacked, non-causal still packs; the full pack 4 of GQA 32/8 is
+    # not partial; two sub-groups (GQA 64/8) keep the gain
+    fold_case((1, False), 4, 16, 1, 8192, causal=True, deterministic=False,
+              head_loop_possible=False, cluster_size=1),
+    fold_case((4, False), 4, 16, 1, 8192, causal=False, deterministic=False,
+              head_loop_possible=False, cluster_size=1),
+    fold_case((4, False), 4, 32, 8, 8192, causal=True, deterministic=False,
+              head_loop_possible=False, cluster_size=1),
+    fold_case((4, False), 4, 64, 8, 8192, causal=True, deterministic=False,
+              head_loop_possible=False, cluster_size=1),
+    fold_case((1, False), 4, 16, 1, 8192, causal=True, deterministic=True,
+              head_loop_possible=False, cluster_size=1),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize("inputs,expected", CHOOSE_FOLD_CASES)
+def test_bwd_choose_fold(inputs, expected):
+    assert choose_fold(**inputs) == expected
+
+
+def test_bwd_choose_fold_long_causal_mqa_partial_fold():
+    """Where the heuristic refuses the full fold of a long causal MQA batch the chooser
+    still takes a smaller fold instead of none."""
+    assert choose_fold(4, 16, 1, 8192, causal=True, deterministic=False)[0] > 1

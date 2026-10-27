@@ -113,39 +113,29 @@ def _get_sm100_backend_override() -> Optional[bool]:
     return overrides[value]
 
 
-def _get_bwd_pack_gqa_override() -> Optional[bool]:
-    """FLASH_ATTENTION_BWD_PACK_GQA=0/1 forces the SM100 backward GQA head packing off / on
-    (NOTE [bwd pack_gqa] in pack_gqa.py); unset or "auto" leaves it to the heuristic."""
-    value = os.getenv("FLASH_ATTENTION_BWD_PACK_GQA")
+def _env_choice(name: str, choices: tuple[int, ...]) -> Optional[int]:
+    """Integer choice of an environment variable; unset, "" or "auto" is None."""
+    value = os.getenv(name)
     if value is None or value == "" or value == "auto":
         return None
-    assert value in ("0", "1"), f"FLASH_ATTENTION_BWD_PACK_GQA must be 0, 1 or auto, got {value}"
-    return value == "1"
-
-
-def _get_bwd_pack_factor_override() -> Optional[int]:
-    """FLASH_ATTENTION_BWD_PACK_FACTOR=2/4/... (tests): pack that many query heads per tile on
-    the SM100 backward, skipping the heuristic (with FLASH_ATTENTION_BWD_HEAD_LOOP=1 the other
-    sub-groups are looped); unset leaves the pack to _bwd_choose_fold."""
-    value = os.getenv("FLASH_ATTENTION_BWD_PACK_FACTOR")
-    if value is None or value == "" or value == "auto":
-        return None
-    factor = int(value)
-    assert factor >= 1 and factor & (factor - 1) == 0, (
-        "FLASH_ATTENTION_BWD_PACK_FACTOR must be a power of two"
+    assert value.isdigit() and int(value) in choices, (
+        f"{name} must be one of {', '.join(map(str, choices))} or auto, got {value}"
     )
-    return factor
+    return int(value)
+
+
+def _get_bwd_pack_gqa_override() -> Optional[int]:
+    """FLASH_ATTENTION_BWD_PACK_GQA: 0 forces the SM100 backward query-head fold off, 1 on (the
+    fold chooser picks the pack), 2 / 4 force that many query heads per tile; unset or "auto"
+    leaves it to the chooser (NOTE [bwd pack_gqa] in pack_gqa.py)."""
+    return _env_choice("FLASH_ATTENTION_BWD_PACK_GQA", (0, 1, 2, 4))
 
 
 def _get_bwd_head_loop_override() -> Optional[bool]:
     """FLASH_ATTENTION_BWD_HEAD_LOOP=0/1 forces the SM100 hdim 256 backward head loop (one tile
-    per KV head over its query-head groups) off / on; unset or "auto" leaves it to the fold
-    heuristic."""
-    value = os.getenv("FLASH_ATTENTION_BWD_HEAD_LOOP")
-    if value is None or value == "" or value == "auto":
-        return None
-    assert value in ("0", "1"), f"FLASH_ATTENTION_BWD_HEAD_LOOP must be 0, 1 or auto, got {value}"
-    return value == "1"
+    per KV head over its query-head groups) off / on; unset or "auto" leaves it to the chooser."""
+    value = _env_choice("FLASH_ATTENTION_BWD_HEAD_LOOP", (0, 1))
+    return None if value is None else value == 1
 
 
 def _get_hd256_generic_bwd() -> bool:

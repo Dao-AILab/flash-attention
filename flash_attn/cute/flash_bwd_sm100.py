@@ -98,8 +98,7 @@ class FlashAttentionBackwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         q_subtile_factor: cutlass.Constexpr[int] = 1,
         kv_subtile_factor: cutlass.Constexpr[int] = 1,
-        pack_gqa: bool = False,
-        pack_factor: Optional[int] = None,
+        pack_factor: int = 1,
         head_loop: bool = False,
     ):
         # Pad head_dim to a multiple of 32 (k_block_size). Must stay a multiple of 32 so
@@ -199,25 +198,20 @@ class FlashAttentionBackwardSm100:
         self.is_causal = is_causal
         self.is_local = is_local
         self.qhead_per_kvhead = qhead_per_kvhead
-        # pack_gqa: one tile per KV head over the packed rows of its query heads, see
-        # NOTE [bwd pack_gqa] (pack_gqa.py)
-        self.pack_gqa = pack_gqa
-        # pack_factor query heads per tile (all qhead_per_kvhead of a KV head by default); with a
-        # sub-group (pack_factor < qhead_per_kvhead) a KV head gets kv_group tiles whose dK / dV
-        # go through the fp32 accumulate + postprocess like unpacked GQA.
-        if pack_factor is None:
-            pack_factor = qhead_per_kvhead
-        self.pack_factor = pack_factor if pack_gqa else 1
-        assert not pack_gqa or (
-            1 < self.pack_factor
-            and tile_m % self.pack_factor == 0
-            and qhead_per_kvhead % self.pack_factor == 0
-        ), "pack_gqa needs 1 < pack_factor | tile_m and pack_factor | qhead_per_kvhead"
-        self.kv_group = qhead_per_kvhead // self.pack_factor
-        # head_loop: one tile per KV head that loops over its kv_group query-head (sub-)groups
-        # inside the CTA -- K / V loaded once, dK / dV stay in TMEM and are stored directly --
-        # instead of kv_group tiles with fp32 dK / dV accumulation + postprocess.
-        self.head_loop = head_loop and self.kv_group > 1
+        # pack_factor query heads per tile (NOTE [bwd pack_gqa] in pack_gqa.py); with a sub-group
+        # (pack_factor < qhead_per_kvhead) a KV head gets kv_group tiles whose dK / dV go through
+        # the fp32 accumulate + postprocess like unpacked GQA, unless head_loop: one tile per KV
+        # head that loops over its kv_group sub-groups inside the CTA (K / V loaded once, dK / dV
+        # stay in TMEM and are stored directly).
+        assert tile_m % pack_factor == 0 and qhead_per_kvhead % pack_factor == 0, (
+            "pack_factor must divide tile_m and qhead_per_kvhead"
+        )
+        self.pack_factor = pack_factor
+        self.pack_gqa = pack_factor > 1
+        self.kv_group = qhead_per_kvhead // pack_factor
+        assert not head_loop or self.kv_group > 1, "head_loop needs more than one sub-group"
+        self.head_loop = head_loop
+        self.groups_per_tile = self.kv_group if head_loop else 1
         self.deterministic = deterministic
         # Deterministic dQ: tiles with fewer m_blocks (short varlen sequences, local windows)
         # release each one immediately instead of one m_block behind, see dQacc_reduce.
@@ -991,10 +985,7 @@ class FlashAttentionBackwardSm100:
             self.spt = self.spt_override and self.deterministic
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.cta_tiler[0]),  # num_blocks
-            cute.size(mQ.shape[2])
-            // (
-                self.kv_group if const_expr(self.head_loop) else 1
-            ),  # query heads, or KV heads with head_loop
+            cute.size(mQ.shape[2]) // self.groups_per_tile,  # query heads, or KV heads (head_loop)
             cute.size(mK.shape[3])
             if const_expr(mCuSeqlensK is None)
             else cute.size(mCuSeqlensK.shape[0] - 1),  # num_batches
@@ -1018,7 +1009,7 @@ class FlashAttentionBackwardSm100:
             head_swizzle=self.deterministic,
             # the tile's Q / dO / dQaccum footprint covers its packed heads and, with the head
             # loop, every sub-group of the KV head; it sizes the deterministic L2 section
-            qhead_fold=self.pack_factor * (self.kv_group if const_expr(self.head_loop) else 1),
+            qhead_fold=self.pack_factor * self.groups_per_tile,
             qhead_pack=self.pack_factor,
         )
 
@@ -2371,7 +2362,7 @@ class FlashAttentionBackwardSm100:
             # One loader set per query-head (sub-)group of the tile (a single set without
             # head_loop). Built here, outside the staged regions: they hold Python callables,
             # which the DSL cannot carry through a run-time if / for.
-            n_groups = self.kv_group if const_expr(self.head_loop) else 1
+            n_groups = self.groups_per_tile
             loaders_g = [
                 self._q_side_loaders(
                     head_idx * n_groups + g,
@@ -2483,106 +2474,62 @@ class FlashAttentionBackwardSm100:
                         producer_state_O_Ot.advance()
 
                         #### Mainloop ####
-                        # 2CTA: [lse | Q | dOt | dPsum | Qt | dO]
-                        for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
-                            # LSE
-                            pipeline_LSE.producer_acquire(producer_state_LSE)
-                            with cute.arch.elect_one():
-                                copy_stats(
-                                    gLSE[None, m_block],
-                                    sLSE[None, producer_state_LSE.index],
-                                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
-                                )
-                            producer_state_LSE.advance()
+                        # 2CTA: [lse | Q | dOt | dPsum | Qt | dO]; with head_loop the other
+                        # query-head (sub-)groups of this KV head follow, reusing the resident
+                        # K / V / Kt: only their Q side is loaded
+                        for g in cutlass.range_constexpr(n_groups):
+                            load_Q_g, load_dO_g, load_dOt_g, load_Qt_g, gLSE_g, gdPsum_g = (
+                                loaders_g[g]
+                            )
+                            m_block_first = m_block_min + 1 if g == 0 else m_block_min
+                            for m_block in cutlass.range(m_block_first, m_block_max, unroll=1):
+                                # LSE
+                                pipeline_LSE.producer_acquire(producer_state_LSE)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gLSE_g[None, m_block],
+                                        sLSE[None, producer_state_LSE.index],
+                                        mbar_ptr=pipeline_LSE.producer_get_barrier(
+                                            producer_state_LSE
+                                        ),
+                                    )
+                                producer_state_LSE.advance()
 
-                            # Q
-                            pipeline_Q.producer_acquire(producer_state_Q_Qt)
-                            load_Q(m_block, producer_state=producer_state_Q_Qt)
-                            pipeline_Q.producer_commit(producer_state_Q_Qt)
-                            producer_state_Q_Qt.advance()
+                                # Q
+                                pipeline_Q.producer_acquire(producer_state_Q_Qt)
+                                load_Q_g(m_block, producer_state=producer_state_Q_Qt)
+                                pipeline_Q.producer_commit(producer_state_Q_Qt)
+                                producer_state_Q_Qt.advance()
 
-                            # dPsum
-                            pipeline_dPsum.producer_acquire(producer_state_dPsum)
-                            with cute.arch.elect_one():
-                                copy_stats(
-                                    gdPsum[None, m_block],
-                                    sdPsum[None, producer_state_dPsum.index],
-                                    mbar_ptr=pipeline_dPsum.producer_get_barrier(
-                                        producer_state_dPsum
-                                    ),
-                                )
-                            producer_state_dPsum.advance()
+                                # dPsum
+                                pipeline_dPsum.producer_acquire(producer_state_dPsum)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gdPsum_g[None, m_block],
+                                        sdPsum[None, producer_state_dPsum.index],
+                                        mbar_ptr=pipeline_dPsum.producer_get_barrier(
+                                            producer_state_dPsum
+                                        ),
+                                    )
+                                producer_state_dPsum.advance()
 
-                            # dOt, for dP.T = V @ dO.T
-                            pipeline_dO.producer_acquire(producer_state_O_Ot)
-                            load_dOt(m_block, producer_state=producer_state_O_Ot)
-                            pipeline_dO.producer_commit(producer_state_O_Ot)
-                            producer_state_O_Ot.advance()
+                                # dOt, for dP.T = V @ dO.T
+                                pipeline_dO.producer_acquire(producer_state_O_Ot)
+                                load_dOt_g(m_block, producer_state=producer_state_O_Ot)
+                                pipeline_dO.producer_commit(producer_state_O_Ot)
+                                producer_state_O_Ot.advance()
 
-                            # Qt, for dK = dS.T @ Q
-                            pipeline_Qt.producer_acquire(producer_state_Q_Qt)
-                            load_Qt(m_block, producer_state=producer_state_Q_Qt)
-                            pipeline_Qt.producer_commit(producer_state_Q_Qt)
-                            producer_state_Q_Qt.advance()
+                                # Qt, for dK = dS.T @ Q
+                                pipeline_Qt.producer_acquire(producer_state_Q_Qt)
+                                load_Qt_g(m_block, producer_state=producer_state_Q_Qt)
+                                pipeline_Qt.producer_commit(producer_state_Q_Qt)
+                                producer_state_Q_Qt.advance()
 
-                            # dO, for dV = P.T @ dO
-                            pipeline_dO.producer_acquire(producer_state_O_Ot)
-                            load_dO(m_block, producer_state=producer_state_O_Ot)
-                            pipeline_dO.producer_commit(producer_state_O_Ot)
-                            producer_state_O_Ot.advance()
-
-                        if const_expr(self.head_loop):
-                            # head_loop: the other query-head (sub-)groups of this KV head reuse
-                            # the resident K / V / Kt, only the Q side is loaded
-                            for g in cutlass.range_constexpr(self.kv_group - 1):
-                                for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
-                                    # LSE
-                                    pipeline_LSE.producer_acquire(producer_state_LSE)
-                                    with cute.arch.elect_one():
-                                        copy_stats(
-                                            loaders_g[g + 1][4][None, m_block],
-                                            sLSE[None, producer_state_LSE.index],
-                                            mbar_ptr=pipeline_LSE.producer_get_barrier(
-                                                producer_state_LSE
-                                            ),
-                                        )
-                                    producer_state_LSE.advance()
-
-                                    # Q
-                                    pipeline_Q.producer_acquire(producer_state_Q_Qt)
-                                    loaders_g[g + 1][0](m_block, producer_state=producer_state_Q_Qt)
-                                    pipeline_Q.producer_commit(producer_state_Q_Qt)
-                                    producer_state_Q_Qt.advance()
-
-                                    # dPsum
-                                    pipeline_dPsum.producer_acquire(producer_state_dPsum)
-                                    with cute.arch.elect_one():
-                                        copy_stats(
-                                            loaders_g[g + 1][5][None, m_block],
-                                            sdPsum[None, producer_state_dPsum.index],
-                                            mbar_ptr=pipeline_dPsum.producer_get_barrier(
-                                                producer_state_dPsum
-                                            ),
-                                        )
-                                    producer_state_dPsum.advance()
-
-                                    # dOt, for dP.T = V @ dO.T
-                                    pipeline_dO.producer_acquire(producer_state_O_Ot)
-                                    loaders_g[g + 1][2](m_block, producer_state=producer_state_O_Ot)
-                                    pipeline_dO.producer_commit(producer_state_O_Ot)
-                                    producer_state_O_Ot.advance()
-
-                                    # Qt, for dK = dS.T @ Q
-                                    pipeline_Qt.producer_acquire(producer_state_Q_Qt)
-                                    loaders_g[g + 1][3](m_block, producer_state=producer_state_Q_Qt)
-                                    pipeline_Qt.producer_commit(producer_state_Q_Qt)
-                                    producer_state_Q_Qt.advance()
-
-                                    # dO, for dV = P.T @ dO
-                                    pipeline_dO.producer_acquire(producer_state_O_Ot)
-                                    loaders_g[g + 1][1](m_block, producer_state=producer_state_O_Ot)
-                                    pipeline_dO.producer_commit(producer_state_O_Ot)
-                                    producer_state_O_Ot.advance()
+                                # dO, for dV = P.T @ dO
+                                pipeline_dO.producer_acquire(producer_state_O_Ot)
+                                load_dO_g(m_block, producer_state=producer_state_O_Ot)
+                                pipeline_dO.producer_commit(producer_state_O_Ot)
+                                producer_state_O_Ot.advance()
 
                         pipeline_Q.producer_tail(producer_state_Q_Qt)
                         pipeline_LSE.producer_tail(producer_state_LSE)
@@ -4483,7 +4430,7 @@ class FlashAttentionBackwardSm100:
 
             # head_loop: the sub-groups of the KV head, in order, each with its own dQaccum /
             # semaphore slice (scratch head head_idx * kv_group + g)
-            for g in cutlass.range_constexpr(self.kv_group if const_expr(self.head_loop) else 1):
+            for g in cutlass.range_constexpr(self.groups_per_tile):
                 head_q = head_idx * self.kv_group + g if const_expr(self.head_loop) else head_idx
                 if const_expr(not seqlen.has_cu_seqlens_q):
                     mdQaccum_cur = mdQaccum[None, head_q, batch_idx]
