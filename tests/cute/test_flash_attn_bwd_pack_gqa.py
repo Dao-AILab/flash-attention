@@ -53,6 +53,13 @@ def pack_gqa_env():
         os.environ.pop("FLASH_ATTENTION_BWD_PACK_GQA", None)
     else:
         os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = saved
+    utils._get_bwd_pack_gqa_override.cache_clear()
+
+
+def set_pack_gqa_env(pack):
+    """The backward reads FLASH_ATTENTION_BWD_PACK_GQA once per process; clear it to re-read."""
+    os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = "1" if pack else "0"
+    utils._get_bwd_pack_gqa_override.cache_clear()
 
 
 def hd256_on_general_kernel():
@@ -61,7 +68,7 @@ def hd256_on_general_kernel():
 
 
 def run_fwd_bwd_layout(layout, q, k, v, dout, q_lens, k_lens, causal, pack, **kwargs):
-    os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = "1" if pack else "0"
+    set_pack_gqa_env(pack)
     head_dim = q.shape[-1]
     if layout == "dense":
         b = len(q_lens)
@@ -201,7 +208,7 @@ def test_bwd_pack_gqa_unused_kv_tail(head_dim, mha_type, layout, causal, pack_gq
     dout = torch.randn_like(out)
 
     def backward(k_in, v_in, pack):
-        os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = "1" if pack else "0"
+        set_pack_gqa_env(pack)
         dq, dk, dv = _flash_attn_bwd(q, k_in, v_in, out, dout, lse, **kwargs)[:3]
         torch.cuda.synchronize()
         return dq, dk, dv
@@ -246,7 +253,7 @@ def test_bwd_pack_gqa_heuristic():
     """Pack when the grid still hides the qh-times longer packed tiles; keep ragged / long causal
     MQA unpacked (measured on B200: MQA 16/1 hd256, one 8k causal sequence plus 16 x 256 in a
     varlen pack: packed 3946 us, unpacked 2297 us)."""
-    from flash_attn.cute.interface import _bwd_pack_gqa_heuristic
+    from flash_attn.cute.config import BwdHeuristicInputs, bwd_pack_gqa_heuristic
 
     def decide(
         batch,
@@ -259,22 +266,22 @@ def test_bwd_pack_gqa_heuristic():
         total_q=None,
         total_k=None,
     ):
-        return _bwd_pack_gqa_heuristic(
+        inputs = BwdHeuristicInputs(
+            device_arch=100,
+            head_dim=128,
+            head_dim_v=128,
+            num_heads=heads,
+            num_heads_kv=heads_kv,
             num_sms=148,
             batch_size=batch,
-            num_head=heads,
-            num_head_kv=heads_kv,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k,
             total_q=total_q if total_q is not None else batch * seqlen_q,
             total_k=total_k if total_k is not None else batch * seqlen_k,
-            m_block_size=128,
-            n_block_size=128,
-            cluster_size=2,
+            has_cu_seqlens=varlen,
             causal=causal,
-            local=False,
-            varlen=varlen,
         )
+        return bwd_pack_gqa_heuristic(inputs, tile_m=128, tile_n=128, cluster_size=2)
 
     # dense 2k / 4k GQA and MQA batches: enough packed tiles, pack
     assert decide(8, 16, 4, 2048, 2048, False)

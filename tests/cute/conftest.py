@@ -148,6 +148,15 @@ def _install_compile_instrumentation(config):
 
         recording_contains._fa_recorded = True
         cache_utils.JITCache.__contains__ = recording_contains
+        original_get = cache_utils.JITCache.get
+
+        def recording_get(self, key):
+            out.write(f"{names.get(id(self), type(self).__name__)}\t{key!r}\n")
+            out.flush()
+            fn = original_get(self, key)
+            return (lambda *args, **kwargs: None) if fn is None and keys_only else fn
+
+        cache_utils.JITCache.get = recording_get
         if keys_only:
             original_getitem = cache_utils.JITCache.__getitem__
 

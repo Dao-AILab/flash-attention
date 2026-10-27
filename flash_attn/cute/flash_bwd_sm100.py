@@ -21,6 +21,7 @@ from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
 from flash_attn.cute import pipeline
 from flash_attn.cute.bwd_accum_tile import AccumTileOrder, accum_tile_layout
+from flash_attn.cute.config import Sm100BwdRegisters
 from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.pack_gqa import pack_gqa_layout
@@ -89,7 +90,6 @@ class FlashAttentionBackwardSm100:
         tile_n: int = 128,
         is_persistent: bool = False,
         deterministic: bool = False,
-        spt: Optional[bool] = None,
         cluster_size: int = 1,
         use_2cta_instrs: bool = False,
         score_mod: cutlass.Constexpr | None = None,
@@ -99,6 +99,11 @@ class FlashAttentionBackwardSm100:
         q_subtile_factor: cutlass.Constexpr[int] = 1,
         kv_subtile_factor: cutlass.Constexpr[int] = 1,
         pack_gqa: bool = False,
+        *,
+        spt: bool,
+        registers: Sm100BwdRegisters,
+        Q_stage: int,
+        dO_stage: int,
     ):
         # Pad head_dim to a multiple of 32 (k_block_size). Must stay a multiple of 32 so
         # that the dQ accumulator reduce (dQ_reduce_ncol up to 32) tiles evenly and matches
@@ -208,7 +213,7 @@ class FlashAttentionBackwardSm100:
         # Deterministic dQ: tiles with fewer m_blocks (short varlen sequences, local windows)
         # release each one immediately instead of one m_block behind, see dQacc_reduce.
         self.delay_release_min_m_blocks = 16
-        self.spt_override = spt
+        self.spt = spt
 
         # Score mod and mask mod support
         self.score_mod = score_mod
@@ -329,30 +334,14 @@ class FlashAttentionBackwardSm100:
             f"TMEM map needs {tmem_end} > {self.tmem_alloc_cols} columns"
         )
 
-        if (not is_causal and not is_local) or deterministic:
-            self.num_regs_reduce = 136 if self.use_2cta_instrs else 152
-            self.num_regs_compute = 136
-            self.num_regs_load = 104 if self.use_2cta_instrs else 96 - 8
-            self.num_regs_mma = 104 if self.use_2cta_instrs else self.num_regs_load
-        else:
-            self.num_regs_reduce = 136 if self.use_2cta_instrs else 136
-            self.num_regs_compute = 136 if self.use_2cta_instrs else 144
-            self.num_regs_load = 104 if self.use_2cta_instrs else 96 - 8
-            self.num_regs_mma = 104 if self.use_2cta_instrs else self.num_regs_load
-        self.num_regs_empty = 24
-
-        if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
-            self.num_regs_reduce = 128 + 8
-            self.num_regs_compute = 128 + 8
-            self.num_regs_load = 128 - 24
-            self.num_regs_mma = self.num_regs_load
-
-        assert (
-            self.num_regs_reduce
-            + self.num_regs_compute * 2
-            + max(self.num_regs_load, self.num_regs_mma)
-            <= 512
-        )
+        # BwdConfig.registers carries the split; config.validate_bwd_registers checks it.
+        self.num_regs_reduce = registers.reduce
+        self.num_regs_compute = registers.compute
+        self.num_regs_load = registers.load
+        self.num_regs_mma = registers.mma
+        self.num_regs_empty = registers.empty
+        self.Q_stage = Q_stage
+        self.dO_stage = dO_stage
         self.buffer_align_bytes = 1024
 
     @staticmethod
@@ -437,8 +426,6 @@ class FlashAttentionBackwardSm100:
                                 )
 
     def _setup_attributes(self):
-        self.Q_stage = 1 if self.use_2cta_instrs else 2
-        self.dO_stage = 1
         self.single_stage = 1
         self.P_stage = 1 if self.split_P_dS else 0  # dedicated P pipeline, else P aliases S
         # LSE_stage = Q_stage and dPsum_stage = dO_stage
@@ -967,11 +954,6 @@ class FlashAttentionBackwardSm100:
             TileScheduler = SingleTileLPTBwdScheduler
         else:
             TileScheduler = SingleTileScheduler
-        if const_expr(self.spt_override is None):
-            self.spt = (self.is_causal or self.is_local) and self.deterministic
-        else:
-            assert self.spt_override is not None
-            self.spt = self.spt_override and self.deterministic
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.cta_tiler[0]),  # num_blocks
             cute.size(mQ.shape[2]),  # num_heads = num_query_heads
