@@ -46,6 +46,9 @@ def decode(**changes) -> FwdHeuristicInputs:
         {"device_arch": 103},
         # Dense causal bf16 hd128 is a default causal CLC cell; SwapAB is chosen first.
         {"causal": True},
+        # A GB300 tuned CLC cell (select_tuned_sm100_overrides) of the standard kernel.
+        {"device_arch": 103, "causal": True, "num_heads": 32, "num_heads_kv": 8,
+         "batch_size": 32, "total_q": 32, "max_seqlen_k": 1024},
         {"causal": True, "local": True, "window_size_left": 31, "window_size_right": 0,
          "has_score_mod": True, "has_mask_mod": True, "pack_gqa": True, "disable_2cta": True},
     ],

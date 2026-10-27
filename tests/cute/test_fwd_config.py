@@ -1,14 +1,18 @@
 import itertools
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import asdict, replace
+from unittest import mock
 
 import pytest
 
+from flash_attn.cute import config as config_module
 from flash_attn.cute.config import (
     SM100_SMEM_BYTES,
+    FwdConfig,
     FwdHeuristicInputs,
     Sm90Registers,
     Sm100Registers,
+    TunedSm100Overrides,
     derive_fwd_config,
     select_ex2_emu,
     select_fwd_config,
@@ -601,3 +605,90 @@ def test_selected_configs_carry_the_legacy_policy(case):
     )
     assert (config.ex2_emu_freq, config.ex2_emu_start_frg) == expected_ex2, config
 
+
+def select_untuned(inputs: FwdHeuristicInputs) -> FwdConfig:
+    """Select without measured overrides or cached results."""
+    with mock.patch.object(
+        config_module, "select_tuned_sm100_overrides", return_value=TunedSm100Overrides()
+    ):
+        return select_fwd_config.__wrapped__(inputs)
+
+
+_TUNED_RULES = {
+    # rule -> (matching inputs, required field changes)
+    "sm103_d64_nonpersistent": (
+        make_inputs(device_arch=103, max_seqlen_k=8192),
+        {"is_static_persistent"},
+    ),
+    "sm103_balanced_varlen_mha_clc": (
+        make_inputs(device_arch=103, batch_size=4, total_q=10240, max_seqlen_q=6400,
+                    has_cu_seqlens_q=True, has_cu_seqlens_k=True),
+        {"use_clc_scheduler"},
+    ),
+    "sm103_high_head_varlen_clc": (
+        make_inputs(device_arch=103, num_heads=28, num_heads_kv=4, pack_gqa=True, batch_size=3,
+                    total_q=4096, total_k=4096, max_seqlen_q=2048, max_seqlen_k=2048,
+                    causal=True, has_cu_seqlens_q=True, has_cu_seqlens_k=True),
+        {"use_clc_scheduler"},
+    ),
+    "sm103_dense_short_k_clc": (
+        make_inputs(device_arch=103, num_heads=32, num_heads_kv=8, pack_gqa=True, batch_size=32,
+                    total_q=32 * 64, total_k=32 * 1024, max_seqlen_q=64, max_seqlen_k=1024,
+                    causal=True),
+        {"use_clc_scheduler"},
+    ),
+}
+# Tuned rules cover only plain output-only BF16 attention on 128x128 nonsplit tiles.
+_NOT_PLAIN_BF16 = [
+    {"dtype": "torch.float16"}, {"page_size": 128}, {"use_block_sparsity": True},
+    {"has_score_mod": True}, {"has_mask_mod": True}, {"has_learnable_sink": True},
+    {"has_lse": True}, {"requested_tile_n": 64}, {"requested_num_splits": 2},
+    {"local": True, "window_size_left": 256, "window_size_right": 0},
+]
+
+
+@pytest.mark.parametrize(
+    ("rule", "changes", "fires"),
+    [
+        *[(rule, {}, True) for rule in _TUNED_RULES],
+        # One plain-BF16 gate precedes every rule.
+        *[("sm103_d64_nonpersistent", changes, False) for changes in _NOT_PLAIN_BF16],
+        ("sm103_d64_nonpersistent", {"max_seqlen_k": 4096}, True),
+        ("sm103_d64_nonpersistent", {"max_seqlen_k": 3072}, False),
+        ("sm103_d64_nonpersistent", {"head_dim": 96, "head_dim_v": 96}, False),
+        ("sm103_d64_nonpersistent", {"num_heads_kv": 2, "pack_gqa": False}, False),
+        ("sm103_balanced_varlen_mha_clc", {"total_q": 10239}, False),
+        ("sm103_balanced_varlen_mha_clc", {"max_seqlen_q": 6401}, False),
+        ("sm103_balanced_varlen_mha_clc", {"total_k": 6553}, False),
+        ("sm103_balanced_varlen_mha_clc", {"batch_size": 3}, False),
+        ("sm103_balanced_varlen_mha_clc", {"batch_size": 25}, False),
+        ("sm103_balanced_varlen_mha_clc", {"has_cu_seqlens_k": False}, False),
+        ("sm103_balanced_varlen_mha_clc", {"has_seqused_k": True}, False),
+        ("sm103_balanced_varlen_mha_clc", {"has_caller_scheduler_metadata": True}, False),
+        ("sm103_high_head_varlen_clc", {"causal": False}, True),
+        ("sm103_high_head_varlen_clc", {"total_q": 4095}, False),
+        ("sm103_high_head_varlen_clc", {"batch_size": 2}, False),
+        ("sm103_high_head_varlen_clc", {"batch_size": 65}, False),
+        ("sm103_high_head_varlen_clc", {"num_heads": 23, "num_heads_kv": 1}, False),
+        ("sm103_high_head_varlen_clc", {"pack_gqa": False}, False),
+        ("sm103_dense_short_k_clc", {"max_seqlen_k": 640}, True),
+        ("sm103_dense_short_k_clc", {"max_seqlen_k": 2048}, True),
+        ("sm103_dense_short_k_clc", {"max_seqlen_k": 639}, False),
+        ("sm103_dense_short_k_clc", {"max_seqlen_k": 2049}, False),
+        ("sm103_dense_short_k_clc", {"batch_size": 31}, False),
+        ("sm103_dense_short_k_clc", {"causal": False}, False),
+        ("sm103_dense_short_k_clc", {"num_heads": 28, "num_heads_kv": 4}, False),
+        ("sm103_dense_short_k_clc", {"num_heads": 71, "num_heads_kv": 1}, True),
+        ("sm103_dense_short_k_clc", {"num_heads": 71, "num_heads_kv": 1, "max_seqlen_q": 1}, False),
+        ("sm103_dense_short_k_clc", {"head_dim": 80, "head_dim_v": 80}, False),
+        ("sm103_dense_short_k_clc", {"pack_gqa": False}, False),
+    ],
+)
+def test_tuned_rule_boundaries(rule, changes, fires):
+    inputs, tuned_fields = _TUNED_RULES[rule]
+    inputs = inputs._replace(**changes)
+
+    tuned, untuned = asdict(select_fwd_config(inputs)), asdict(select_untuned(inputs))
+    changed = {name for name in tuned if tuned[name] != untuned[name]}
+
+    assert tuned_fields <= changed if fires else not changed
