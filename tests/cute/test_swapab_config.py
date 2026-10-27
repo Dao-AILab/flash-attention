@@ -44,6 +44,8 @@ def decode(**changes) -> FwdHeuristicInputs:
         {"num_heads": 64, "num_heads_kv": 2},
         {"num_heads": 2, "num_heads_kv": 2},
         {"device_arch": 103},
+        # Dense causal bf16 hd128 is a default causal CLC cell; SwapAB is chosen first.
+        {"causal": True},
         {"causal": True, "local": True, "window_size_left": 31, "window_size_right": 0,
          "has_score_mod": True, "has_mask_mod": True, "pack_gqa": True, "disable_2cta": True},
     ],
@@ -90,7 +92,6 @@ _VETOES = [
     {"requested_mma_pv_is_rs": False},
     {"requested_intra_wg_overlap": False},
     {"pack_gqa": False},
-    {"requested_use_clc_scheduler": True},
     {"disable_s_ping_pong": True},
 ]
 
@@ -98,7 +99,7 @@ _VETOES = [
 @pytest.mark.parametrize("changes", [changes for changes, _ in _UNSUPPORTED] + _VETOES)
 def test_swapab_request_falls_back_to_the_standard_kernel(changes):
     """Automatic selection and a SwapAB request both take the standard kernel's config for a
-    problem SwapAB cannot run or a request vetoes, like an FA_CLC request CLC cannot honor."""
+    problem SwapAB cannot run or a request vetoes."""
     inputs = decode(**changes)
     standard = select_fwd_config(inputs._replace(requested_use_swapab=False))
 
@@ -327,7 +328,6 @@ def test_explicit_configs_force_either_kernel():
     [
         {"requested_tile_m": 128, "requested_tile_n": 128},
         {"requested_mma_pv_is_rs": True},
-        {"requested_use_clc_scheduler": True},
         {"disable_s_ping_pong": True},
         {"requested_use_swapab": False},
     ],
