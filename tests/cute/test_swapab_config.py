@@ -46,6 +46,9 @@ def decode(**changes) -> FwdHeuristicInputs:
         {"device_arch": 103},
         # Dense causal bf16 hd128 is a default causal CLC cell; SwapAB is chosen first.
         {"causal": True},
+        # A GB300 tuned CLC cell (select_tuned_sm100_overrides) of the standard kernel.
+        {"device_arch": 103, "causal": True, "num_heads": 32, "num_heads_kv": 8,
+         "batch_size": 32, "total_q": 32, "max_seqlen_k": 1024},
         {"causal": True, "local": True, "window_size_left": 31, "window_size_right": 0,
          "has_score_mod": True, "has_mask_mod": True, "pack_gqa": True, "disable_2cta": True},
     ],
@@ -175,6 +178,19 @@ def test_standard_request_keeps_the_standard_kernel():
         ({"max_seqlen_k": 600, "seqlen_k_capacity": 4096, "page_size": 256}, 8),
         # An explicit count is kept.
         ({"requested_num_splits": 3}, 3),
+        # SM103 hd128 aims at 128 CTAs from 4 sequences and 16 (batch * KV head) tiles.
+        ({"device_arch": 103, "batch_size": 16, "total_q": 16, "num_heads": 32,
+          "num_heads_kv": 1, "max_seqlen_k": 16384}, 8),
+        ({"device_arch": 103, "batch_size": 16, "total_q": 16}, 4),
+        ({"device_arch": 103, "batch_size": 16, "total_q": 16, "dtype": "torch.float16"}, 2),
+        ({"device_arch": 100, "batch_size": 16, "total_q": 16, "num_heads": 32,
+          "num_heads_kv": 1, "max_seqlen_k": 16384}, 4),
+        ({"device_arch": 103, "batch_size": 12, "total_q": 12, "num_heads": 32,
+          "num_heads_kv": 1, "max_seqlen_k": 16384}, 4),
+        ({"device_arch": 103, "batch_size": 2, "total_q": 2, "num_heads": 64, "num_heads_kv": 8,
+          "max_seqlen_k": 32768}, 4),
+        ({"device_arch": 103, "batch_size": 16, "total_q": 16, "num_heads": 32,
+          "num_heads_kv": 4, "head_dim": 64, "head_dim_v": 64}, 2),
     ],
 )
 def test_split_count(changes, num_splits):
