@@ -100,14 +100,7 @@ def build_step_plan(
     skip_benchmark: bool,
 ) -> list[Step]:
     test_targets = [test_target] if isinstance(test_target, str) else test_target
-    pytest_base = [
-        "python3",
-        "-m",
-        "pytest",
-        *test_targets,
-        *(["-k", test_filter] if test_filter else []),
-        "--durations=20",
-    ]
+    pytest_base = ["python3", "-m", "pytest", *test_targets, *(["-k", test_filter] if test_filter else []), "--durations=20"]
 
     steps = [
         Step(
