@@ -1,6 +1,7 @@
 import logging
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import flash_attn.cute.cache_utils as cache_utils
@@ -103,6 +104,7 @@ def test_persistent_cache_replaces_nonempty_unloadable_entry(tmp_path, monkeypat
     assert other_path.read_bytes() == b"from another process"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="retry helper requires CUDA")
 def test_retry_on_oom_preserves_persistent_cache(tmp_path, monkeypatch):
     from test_flash_attn import retry_on_oom
     from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
