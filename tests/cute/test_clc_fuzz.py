@@ -56,7 +56,8 @@ def select_with_clc(inputs):
     """Default selection, switched to an explicit CLC config where these tests target CLC.
 
     Targets: dense causal/local and varlen GQA on the standard kernel, so decode calls keep it
-    rather than SwapAB. Dense noncausal and varlen MHA keep their default schedulers.
+    rather than SwapAB. Dense noncausal and varlen MHA keep their default schedulers, including
+    the dynamic varlen route for padded calls; CLC replaces the route where it targets.
     """
     inputs = inputs._replace(requested_use_swapab=False)
     config = fwd_config.select_fwd_config(inputs)
@@ -132,12 +133,14 @@ def expected_total_tiles_mha(batch, seqlen_q, heads):
     return num_block * heads * batch
 
 
-def assert_varlen_scheduler(sched_cls, sched_mode, *, heads, kv_heads, num_splits):
+def assert_varlen_scheduler(
+    sched_cls, sched_mode, *, heads, kv_heads, num_splits, dynamic_varlen=False
+):
     expected_mode = (
         SchedulingMode.CLC
         if heads != kv_heads
         else SchedulingMode.DYNAMIC
-        if num_splits > 1
+        if num_splits > 1 or dynamic_varlen
         else SchedulingMode.STATIC
     )
     assert sched_mode == expected_mode, (
@@ -367,6 +370,7 @@ def check_varlen_output(seqlens, heads, d, *, causal=False, kv_heads=None, num_s
     v = torch.randn(total, kv_heads, d, device="cuda", dtype=torch.bfloat16)
 
     _captured_schedulers.clear()
+    _selected_configs.clear()
     out, _ = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens,
@@ -385,6 +389,8 @@ def check_varlen_output(seqlens, heads, d, *, causal=False, kv_heads=None, num_s
             heads=heads,
             kv_heads=kv_heads,
             num_splits=num_splits,
+            # More request slots than M tiles take the dynamic varlen route.
+            dynamic_varlen=_selected_configs[-1].use_dynamic_varlen,
         )
 
     for i in range(len(seqlens)):
