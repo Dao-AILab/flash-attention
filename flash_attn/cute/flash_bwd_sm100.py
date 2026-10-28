@@ -205,8 +205,8 @@ class FlashAttentionBackwardSm100:
             "pack_gqa needs 1 < qhead_per_kvhead | tile_m"
         )
         self.deterministic = deterministic
-        # Deterministic dQ: varlen tiles with fewer m_blocks release each one immediately
-        # instead of one m_block behind, see dQacc_reduce.
+        # Deterministic dQ: tiles with fewer m_blocks (short varlen sequences, local windows)
+        # release each one immediately instead of one m_block behind, see dQacc_reduce.
         self.delay_release_min_m_blocks = 16
         self.spt_override = spt
 
@@ -4325,10 +4325,11 @@ class FlashAttentionBackwardSm100:
             # serial), which is handed back to the peer at every m_block.
             delay_semaphore_release = not self.use_block_sparsity and not self.xchg_aliases_dQaccum
             # release_now: each m_block is released right after its own adds complete instead.
-            # Short varlen tiles do so too: the varlen scheduler has no head swizzle, so the
-            # sibling n_blocks of a chain run in lockstep and the delayed hop stalls them.
+            # Short tiles (few m_blocks: short varlen sequences, local windows) do so too: the
+            # sibling n_blocks of a chain run in lockstep there and the delayed hop stalls them,
+            # up to a 2-4x deterministic slowdown of local attention at long sequences.
             release_now = cutlass.Boolean(self.deterministic and not delay_semaphore_release)
-            if const_expr(self.deterministic and delay_semaphore_release and self.is_varlen_q):
+            if const_expr(self.deterministic and delay_semaphore_release):
                 release_now = loop_count < self.delay_release_min_m_blocks
 
             # dQacc_reduce mainloop
