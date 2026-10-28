@@ -91,6 +91,36 @@ def test_selection_policy(changes, expected):
     assert {name: getattr(config, name) for name in expected} == expected
 
 
+# A 2048-token step in 512 CUDA-graph request slots: slots outnumber the real M tiles.
+_PADDED_VARLEN = dict(has_cu_seqlens_q=True, has_cu_seqlens_k=True, batch_size=512, total_q=2048,
+                      total_k=2048, max_seqlen_q=2048, max_seqlen_k=2048, causal=True)
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        (_PADDED_VARLEN, {"use_dynamic_varlen": True, "num_splits": 1, "use_2cta_instrs": False}),
+        ({**_PADDED_VARLEN, "causal": False}, {"use_dynamic_varlen": True}),
+        # hd256 6/1 runs unpacked 2CTA unless routed; the 1CTA route takes PackGQA.
+        ({**_PADDED_VARLEN, **_HD256, "num_heads": 6, "num_heads_kv": 1},
+         {"use_dynamic_varlen": True, "pack_gqa": True, "use_2cta_instrs": False}),
+        ({**_PADDED_VARLEN, **_HD256, "num_heads": 6, "num_heads_kv": 1, "batch_size": 4},
+         {"use_dynamic_varlen": False, "pack_gqa": False, "use_2cta_instrs": True}),
+        # Not routed: few slots, decode (one M tile), SplitKV, mask_mod, caller metadata.
+        ({**_PADDED_VARLEN, "batch_size": 4}, {"use_dynamic_varlen": False}),
+        ({**_PADDED_VARLEN, "max_seqlen_q": 1}, {"use_dynamic_varlen": False}),
+        ({**_PADDED_VARLEN, "requested_num_splits": 2}, {"use_dynamic_varlen": False}),
+        ({**_PADDED_VARLEN, "has_mask_mod": True}, {"use_dynamic_varlen": False}),
+        ({**_PADDED_VARLEN, **_SEMAPHORE}, {"use_dynamic_varlen": False}),
+        ({**_PADDED_VARLEN, "device_arch": 90}, {"use_dynamic_varlen": False}),
+    ],
+)
+def test_padded_varlen_routes_dynamic_scheduler(changes, expected):
+    config = select_fwd_config(make_inputs(**changes))
+
+    assert {name: getattr(config, name) for name in expected} == expected
+
+
 @pytest.mark.parametrize(
     ("changes", "expected_splits", "expected_tile_n"),
     [

@@ -901,7 +901,7 @@ def _flash_attn_fwd(
         )
         pack_gqa = True
     mla_fwd_cls = None
-    use_swapab = prepare_split_metadata = False
+    use_swapab = prepare_split_metadata = use_dynamic_varlen = False
     if qv is None:
         config, inputs = _get_fwd_config(
             config=config, pack_gqa=pack_gqa, arch=arch, num_sms=num_sms, dtype=q_dtype,
@@ -928,6 +928,7 @@ def _flash_attn_fwd(
         )
         use_swapab = config.use_swapab
         prepare_split_metadata = needs_split_metadata(config, inputs)
+        use_dynamic_varlen = config.use_dynamic_varlen and scheduler_metadata is None
         pack_gqa = config.pack_gqa
         tile_m, tile_n = config.tile_m, config.tile_n
         q_stage, num_splits = config.q_stage, config.num_splits
@@ -1131,6 +1132,13 @@ def _flash_attn_fwd(
     if qv is not None:
         # the MLA kernels write all num_splits partials (no per-batch dynamic split counts)
         assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
+    if use_dynamic_varlen:
+        # The dynamic scheduler computes tile counts on device and resets its semaphore at exit:
+        # no prepare kernel is needed. Allocate a zeroed semaphore per call; callers can reuse
+        # their own via scheduler_metadata to avoid the fill launch.
+        scheduler_metadata = SchedulerMetadataTensorsTorch(
+            tile_count_semaphore=torch.zeros(1, dtype=torch.int32, device=device)
+        )
     if prepare_split_metadata:
         scheduler_metadata = _get_scheduler_metadata(
             num_batch=batch_size,

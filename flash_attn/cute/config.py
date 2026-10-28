@@ -59,6 +59,8 @@ class FwdConfig:
     (freq 0 keeps hardware exp2 throughout); other architectures carry 0 and 0.
     use_swapab selects the SM100/SM103 SwapAB decode kernel (flash_fwd_decode_sm100.py), where
     tile_m is the query-head tile and only num_splits is tunable; see SwapABPolicy.config.
+    use_dynamic_varlen runs SM100 varlen on DynamicPersistentVarlenScheduler with a semaphore the
+    interface allocates when the caller passes no scheduler metadata; see routes_dynamic_varlen.
     """
 
     device_capacity: int
@@ -78,6 +80,7 @@ class FwdConfig:
     ex2_emu_freq: int
     ex2_emu_start_frg: int
     use_swapab: bool = False
+    use_dynamic_varlen: bool = False
 
 
 class FwdHeuristicInputs(NamedTuple):
@@ -594,8 +597,11 @@ def default_pack_gqa(inputs: FwdHeuristicInputs) -> bool:
 
 
 def hd256_2cta_varlen_ok(inputs: FwdHeuristicInputs) -> bool:
-    """Caller-built varlen scheduler metadata assumes 1CTA tiles."""
-    return not inputs.has_cu_seqlens_q or not inputs.has_caller_scheduler_metadata
+    """Varlen scheduler metadata (caller-built, or a tile semaphore for the dynamic scheduler)
+    assumes 1CTA tiles."""
+    return not inputs.has_cu_seqlens_q or not (
+        inputs.has_caller_scheduler_metadata or inputs.has_tile_count_semaphore
+    )
 
 
 def can_use_tma_o(
@@ -910,6 +916,40 @@ class SwapABPolicy:
 SWAPAB = SwapABPolicy()
 
 
+def routes_dynamic_varlen(config: FwdConfig, inputs: FwdHeuristicInputs) -> bool:
+    """Whether a padded SM100 varlen call should run DynamicPersistentVarlenScheduler.
+
+    The single-tile varlen grid launches a partial M tile per request slot, empty or not
+    (CUDA-graph slots with no tokens). When the slots could outnumber the real M tiles, the
+    dynamic scheduler's SM-count grid visits only real tiles. ``config`` is the selection without
+    the route; decode (one M tile per request), SplitKV, CLC, and SwapAB keep it.
+    """
+    m_tile = config.q_stage * config.tile_m
+    rows_per_token = inputs.qhead_per_kvhead if config.pack_gqa else 1
+    if not (
+        inputs.device_capacity in (10, 11)
+        and inputs.has_cu_seqlens_q
+        and not inputs.has_caller_scheduler_metadata
+        and not inputs.has_tile_count_semaphore
+        and not inputs.disable_scheduler_metadata
+        and not inputs.has_mask_mod
+        and not inputs.use_block_sparsity
+        and not config.use_swapab
+        and not config.use_clc_scheduler
+        and config.num_splits == 1
+        and inputs.max_seqlen_q * rows_per_token > m_tile
+        and inputs.batch_size * m_tile > inputs.total_q * rows_per_token
+    ):
+        return False
+    from flash_attn.cute.tile_scheduler import DynamicPersistentVarlenScheduler as Sched
+
+    max_tiles = Sched.max_claimable_tiles(
+        inputs.total_q, inputs.batch_size, m_tile, inputs.num_heads, inputs.num_heads_kv,
+        config.pack_gqa, 1,
+    )
+    return max_tiles < Sched.MAX_TILES
+
+
 def needs_split_metadata(config: FwdConfig, inputs: FwdHeuristicInputs) -> bool:
     """Whether the forward must prepare per-sequence split counts (prepare-scheduler kernel).
 
@@ -929,6 +969,19 @@ def needs_split_metadata(config: FwdConfig, inputs: FwdHeuristicInputs) -> bool:
 @lru_cache(maxsize=1024)
 def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     """Select one fully resolved config from host-visible metadata."""
+    config = _select_fwd_config(inputs)
+    if routes_dynamic_varlen(config, inputs._replace(pack_gqa=config.pack_gqa)):
+        # Re-select as the dynamic scheduler will run: one split, 1CTA (hd256 then prefers
+        # PackGQA unless the caller fixed it).
+        routed = _select_fwd_config(
+            inputs._replace(has_tile_count_semaphore=True, requested_num_splits=1)
+        )
+        config = replace(routed, use_dynamic_varlen=True)
+        validate_fwd_config(config, inputs)
+    return config
+
+
+def _select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     # A SwapAB request overrides only the measured-loss rule: vetoed or unsupported calls take
     # the standard kernel.
     if (
@@ -1149,6 +1202,18 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         if config != expected:
             raise ValueError(f"SwapAB tunes only num_splits: expected {expected}, got {config}")
         return
+    if config.use_dynamic_varlen and not (
+        inputs.device_capacity in (10, 11)
+        and inputs.has_cu_seqlens_q
+        and config.num_splits == 1
+        and not config.use_2cta_instrs
+        and not config.use_clc_scheduler
+        and not config.is_static_persistent
+    ):
+        raise ValueError(
+            "use_dynamic_varlen needs SM100 varlen Q with one split, 1CTA, and no CLC or static "
+            "persistence"
+        )
     if config.tile_m <= 0 or config.tile_n <= 0:
         raise ValueError(f"Tile dimensions must be positive, got {(config.tile_m, config.tile_n)}")
     if config.tile_m % 16 != 0 or config.tile_n % 16 != 0:
