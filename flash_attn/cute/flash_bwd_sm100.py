@@ -4424,7 +4424,7 @@ class FlashAttentionBackwardSm100:
                     if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
                         if delay_release_rt:
                             if m_block > m_block_min:
-                                barrier.arrive_inc(
+                                barrier.arrive_inc_async(
                                     mdQ_semaphore_cur[(m_block - 1, None)].iterator,
                                     tidx,
                                     cta_rank_in_cluster,
@@ -4457,11 +4457,13 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(dQaccum_empty_mbar_ptr)
 
-                # semaphore release
-                # NOTE: arrive_inc calls red_release which issues membar
+                # semaphore release. Every release of this m_block below follows a
+                # cp.async.bulk.wait_group (read=False under deterministic) on the adds it
+                # publishes (the window-tail releases keep arrive_inc); the release itself is
+                # asynchronous (see barrier.arrive_inc_async).
                 if const_expr(release_dQ_semaphore):
                     if not m_block_oob_upper:
-                        barrier.arrive_inc(
+                        barrier.arrive_inc_async(
                             mdQ_semaphore_cur[m_block, None].iterator,
                             tidx,
                             cta_rank_in_cluster,
@@ -4470,7 +4472,7 @@ class FlashAttentionBackwardSm100:
                 elif const_expr(self.deterministic and delay_semaphore_release):
                     if immediate_release_rt:
                         if not m_block_oob_upper:
-                            barrier.arrive_inc(
+                            barrier.arrive_inc_async(
                                 mdQ_semaphore_cur[m_block, None].iterator,
                                 tidx,
                                 cta_rank_in_cluster,
@@ -4484,7 +4486,7 @@ class FlashAttentionBackwardSm100:
                 # final semaphore release
                 if const_expr(self.deterministic and delay_semaphore_release):
                     if delay_release_rt:
-                        barrier.arrive_inc(
+                        barrier.arrive_inc_async(
                             mdQ_semaphore_cur[(m_block_max - 1, None)].iterator,
                             tidx,
                             cta_rank_in_cluster,
