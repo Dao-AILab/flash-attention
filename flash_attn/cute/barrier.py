@@ -68,7 +68,6 @@ def arrive_inc(
     flag_ptr = lock_ptr + flag_offset
     if thread_idx == 0:
         red_release(flag_ptr, val)
-        # red_relaxed(flag_ptr, val)
 
 
 @dsl_user_op
