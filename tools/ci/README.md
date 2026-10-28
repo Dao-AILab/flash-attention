@@ -6,10 +6,17 @@ pulled from Docker Hub (default) or, when the runner has one, a SIF built locall
 
 ## Two-pass test strategy
 
-- **Pass 1** — compile kernels in parallel via `FakeTensorMode` (no GPU memory needed)
+- **Pass 1** — compile kernels in parallel via `FakeTensorMode`; workers still open CUDA contexts,
+  so the driver limits them to the selected GPUs
 - **Pass 2** — run tests using cached compiled kernels on real GPU
 
 See `run_fa4_ci.py` for the shared logic used by both CI and `test_ci_local.sh`.
+
+The default smoke selection targets `test_flash_attn.py`, `test_flash_attn_mla.py`, and
+`test_cuda_graph.py`. Keep the target files aligned with the names selected by
+`FA4_TEST_FILTER` in `.github/workflows/ci.yml`. CI uses eight compile workers for this
+focused selection and prints the 20 slowest tests for each pass. CUDA graph tests skip in
+FakeTensorMode and run in the real-GPU pass.
 
 Before Pass 1 the driver provisions a disk-backed Apptainer overlay (replaces the SIF-baked cutlass-dsl /
 quack / FA4 with the versions pinned in `flash_attn/cute/pyproject.toml` plus the checked-out FA4) and
@@ -51,7 +58,7 @@ time, so DSL pin bumps never need a rebuild. Rebuild when the Dockerfile changes
 
 Edit `FA4_TEST_FILTER` in `.github/workflows/ci.yml`. To run the full suite, set it to an empty string and increase `compile-workers` in the `gpu-test` action call.
 
-Alternatively, edit `run_fa4_ci.py` to change `DEFAULT_TEST_TARGET` or worker defaults — changes there apply to both CI and local runs.
+Alternatively, edit `run_fa4_ci.py` to change `DEFAULT_TEST_TARGETS` or worker defaults — changes there apply to both CI and local runs. Pass multiple paths with `--test-target path/one.py path/two.py` to override the default.
 
 ## FA2 import isolation
 
