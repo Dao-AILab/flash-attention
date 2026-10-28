@@ -101,6 +101,79 @@ def test_selection_policy(changes, expected):
     assert {name: getattr(config, name) for name in expected} == expected
 
 
+# A 2048-token step in 512 CUDA-graph request slots: slots outnumber the real M tiles.
+_PADDED_VARLEN = dict(has_cu_seqlens_q=True, has_cu_seqlens_k=True, batch_size=512, total_q=2048,
+                      total_k=2048, max_seqlen_q=2048, max_seqlen_k=2048, causal=True)
+_HD256_6_1 = dict(_HD256, num_heads=6, num_heads_kv=1)
+# GB300 high-head varlen, where the packed-varlen CLC rule also fires.
+_GB300_CLC_VARLEN = dict(device_arch=103, num_heads=32, num_heads_kv=32, batch_size=64,
+                         total_q=8192, total_k=8192, max_seqlen_q=1024, max_seqlen_k=65536,
+                         causal=True, has_cu_seqlens_q=True, has_cu_seqlens_k=True)
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        (_PADDED_VARLEN, {"use_dynamic_varlen": True, "num_splits": 1, "use_2cta_instrs": False}),
+        # More request slots than M tiles: the route overrides the GB300 CLC rule.
+        (_GB300_CLC_VARLEN, {"use_dynamic_varlen": True, "use_clc_scheduler": False}),
+        ({**_GB300_CLC_VARLEN, "batch_size": 8},
+         {"use_dynamic_varlen": False, "use_clc_scheduler": True}),
+        # Not routed, config unchanged: few slots (hd256 6/1 stays unpacked 2CTA), decode (one M
+        # tile), heuristic SplitKV, mask_mod, caller metadata, SM90.
+        ({**_PADDED_VARLEN, **_HD256_6_1, "batch_size": 4},
+         {"use_dynamic_varlen": False, "pack_gqa": False, "use_2cta_instrs": True}),
+        ({**_PADDED_VARLEN, "max_seqlen_q": 1}, {"use_dynamic_varlen": False}),
+        ({**_PADDED_VARLEN, **_HD256_6_1, "batch_size": 4, "total_q": 150, "total_k": 8192,
+          "max_seqlen_q": 150, "max_seqlen_k": 8192, "requested_num_splits": None},
+         {"use_dynamic_varlen": False, "pack_gqa": False}),
+        ({**_PADDED_VARLEN, "has_mask_mod": True}, {"use_dynamic_varlen": False}),
+        ({**_PADDED_VARLEN, **_SEMAPHORE}, {"use_dynamic_varlen": False}),
+        ({**_PADDED_VARLEN, "device_arch": 90}, {"use_dynamic_varlen": False}),
+    ],
+)
+def test_padded_varlen_routes_dynamic_scheduler(changes, expected):
+    config = select_fwd_config(make_inputs(**changes))
+
+    assert {name: getattr(config, name) for name in expected} == expected
+
+
+def test_routed_config_is_the_semaphore_selection():
+    """A routed config runs with the tile semaphore the interface allocates: it equals the
+    selection for a caller-built semaphore except for the exp2 emulation, which it keeps from
+    the unrouted selection, and its SMEM layout and registers re-derive unchanged. hd256 6/1
+    takes PackGQA on the 1CTA route, and its semaphore selection picks a different exp2
+    emulation."""
+    inputs = make_inputs(**_PADDED_VARLEN, **_HD256_6_1)
+    routed = select_fwd_config(inputs)
+    with_semaphore = select_fwd_config(inputs._replace(**_SEMAPHORE))
+    unrouted = config_module._select_fwd_config(inputs)
+    ex2 = dict(
+        ex2_emu_freq=unrouted.ex2_emu_freq, ex2_emu_start_frg=unrouted.ex2_emu_start_frg
+    )
+
+    assert routed.use_dynamic_varlen and routed.pack_gqa and not unrouted.pack_gqa
+    assert routed == replace(with_semaphore, use_dynamic_varlen=True, **ex2)
+    assert derive_fwd_config(routed, inputs, **ex2) == routed
+
+
+@pytest.mark.parametrize(
+    ("changes", "match"),
+    [
+        ({"disable_scheduler_metadata": True}, "scheduler metadata enabled"),
+        (_SEMAPHORE, "no caller-built scheduler_metadata"),
+        ({"has_cu_seqlens_q": False, "has_seqused_q": True}, "varlen Q"),
+    ],
+)
+def test_explicit_dynamic_varlen_config_validation(changes, match):
+    inputs = make_inputs(**_PADDED_VARLEN)
+    routed = select_fwd_config(inputs)
+
+    validate_fwd_config(routed, inputs)
+    with pytest.raises(ValueError, match=match):
+        validate_fwd_config(routed, inputs._replace(**changes))
+
+
 @pytest.mark.parametrize(
     ("changes", "expected_splits", "expected_tile_n"),
     [
