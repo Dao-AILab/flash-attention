@@ -6,6 +6,7 @@ import pickle
 import sys
 import tempfile
 import time
+import warnings
 from functools import lru_cache
 from getpass import getuser
 from pathlib import Path
@@ -37,6 +38,19 @@ CUTE_DSL_CACHE_ENABLED: bool = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED
 # Customize cache dir via `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`, default is
 # `/tmp/${USER}/flash_attention_cute_dsl_cache``
 CUTE_DSL_CACHE_DIR: str | None = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_DIR", None)
+
+
+_cache_warning_issued = False
+
+
+def _warn_cache_unusable(err: OSError) -> None:
+    global _cache_warning_issued
+    if not _cache_warning_issued:
+        _cache_warning_issued = True
+        warnings.warn(
+            f"Cannot use the persistent JIT cache ({err}); kernels missing from it are "
+            "compiled in memory and not saved."
+        )
 
 
 def get_cache_path() -> Path:
@@ -188,7 +202,10 @@ class JITPersistentCache(JITCache):
 
     def __setitem__(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
         JITCache.__setitem__(self, key, fn)
-        self._try_export_to_storage(key, fn)
+        try:
+            self._try_export_to_storage(key, fn)
+        except OSError as e:
+            _warn_cache_unusable(e)
 
     def __getitem__(self, key: CompileKeyType) -> CallableFunction:
         # Use __contains__ to try populating in-memory cache with persistent storage
@@ -200,7 +217,11 @@ class JITPersistentCache(JITCache):
         # When returning True, guarantees the in-memory cache is populated.
         if JITCache.__contains__(self, key):
             return True
-        return self._try_load_from_storage(key)
+        try:
+            return self._try_load_from_storage(key)
+        except OSError as e:
+            _warn_cache_unusable(e)
+            return False
 
     def _try_load_from_storage(self, key: CompileKeyType) -> bool:
         """
@@ -300,11 +321,15 @@ def get_jit_cache(name: str | None = None) -> JITCache:
     automatically invalidate stale entries.
     """
     if CUTE_DSL_CACHE_ENABLED:
-        path = get_cache_path() / _compute_source_fingerprint()
-        if name:
-            path = path / name
-        fa_log(1, f"Creating persistent JIT cache at {path}")
-        return JITPersistentCache(path)
+        try:
+            path = get_cache_path() / _compute_source_fingerprint()
+            if name:
+                path = path / name
+            fa_log(1, f"Creating persistent JIT cache at {path}")
+            return JITPersistentCache(path)
+        except OSError as e:
+            _warn_cache_unusable(e)
+            return JITCache()
     else:
         fa_log(1, "Persistent cache disabled, using in-memory JIT cache")
         return JITCache()
