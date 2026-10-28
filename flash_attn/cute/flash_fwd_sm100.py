@@ -365,11 +365,12 @@ class FlashAttentionForwardSm100:
             self.empty_warp_ids = self.empty_warp_ids + self.epilogue_warp_ids
             self.epilogue_warp_ids = self.correction_warp_ids
 
-        if self.dynamic_persistent:
-            assert len(self.empty_warp_ids) > 0, (
-                "dynamic persistent scheduling requires an empty warp to serve as the scheduler warp"
-            )
-        self.scheduler_warp_id = self.empty_warp_ids[0] if self.dynamic_persistent else None
+        if self.use_clc_scheduler:
+            assert len(self.empty_warp_ids) > 0, "CLC scheduling requires an empty warp"
+        # CLC dedicates an empty warp to scheduling (idle under clc_late_claim, when the load warp
+        # claims); dynamic scheduling claims from the first load warp after it issues the current
+        # tile's loads.
+        self.scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
         # NOTE [global LPT] (config.py); validate_fwd_config admits it only on this scheduler path.
         self.lpt_global = config.lpt_global
         assert not self.lpt_global or (
@@ -1251,7 +1252,7 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY / SCHEDULER WARP
         # ///////////////////////////////////////////////////////////////////////////////
-        if const_expr(self.dynamic_persistent):
+        if const_expr(self.use_clc_scheduler):
             if warp_idx == self.scheduler_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
                 # CLC: only the leader produces; late claims belong to the load warp.
@@ -1259,14 +1260,13 @@ class FlashAttentionForwardSm100:
                     self.scheduler_warp(tile_scheduler)
                 else:
                     self.empty_warp(tile_scheduler)
-            for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
-                if warp_idx == self.empty_warp_ids[i] and warp_idx != self.scheduler_warp_id:
-                    cute.arch.setmaxregister_decrease(self.num_regs_other)
-                    self.empty_warp(tile_scheduler)
-        else:
-            for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
+        for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
+            if const_expr(self.empty_warp_ids[i] != self.scheduler_warp_id):
                 if warp_idx == self.empty_warp_ids[i]:
                     cute.arch.setmaxregister_decrease(self.num_regs_other)
+                    # Dynamic schedulers need every warp to consume each published tile.
+                    if const_expr(self.dynamic_persistent):
+                        self.empty_warp(tile_scheduler)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
@@ -1486,6 +1486,10 @@ class FlashAttentionForwardSm100:
         issue_q_for_this_warp = (
             const_expr(not self.use_tma_Q or len(self.load_warp_ids) == 1) or
             warp_idx == self.load_warp_ids[0]
+        )
+        is_scheduler_producer = const_expr(self.clc_late_claim) or (
+            const_expr(self.scheduling_mode == SchedulingMode.DYNAMIC)
+            and warp_idx == self.load_warp_ids[0]
         )
         q_producer_phase = Int32(1)
         kv_producer_state = pipeline.make_pipeline_state(
@@ -1743,7 +1747,7 @@ class FlashAttentionForwardSm100:
                     self.kv_subtile_factor,
                 )
 
-            if const_expr(self.clc_late_claim):
+            if is_scheduler_producer:
                 tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.advance_to_next_work()
             if const_expr(pipeline_load_epi is not None):
@@ -1752,7 +1756,7 @@ class FlashAttentionForwardSm100:
                     pipeline_load_epi.consumer_release(load_epi_consumer_state)
                 load_epi_consumer_state.advance()
 
-        if const_expr(self.clc_late_claim):
+        if is_scheduler_producer:
             tile_scheduler.producer_tail()
         if issue_kv_for_this_warp:
             pipeline_kv.producer_tail(kv_producer_state)
@@ -3428,10 +3432,9 @@ class FlashAttentionForwardSm100:
             tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.advance_to_next_work()
             if cute.arch.thread_idx()[0] == self.scheduler_warp_id * cute.arch.WARP_SIZE:
-                prefix_str = "[CLC] query " if const_expr(self.use_clc_scheduler) else "[DYNAMIC] info "
                 fa_printf(
                     3,
-                    prefix_str + "sm={} cta={} (m_blk={},h={},b={},s={}) valid={}\n",
+                    "[CLC] query sm={} cta={} (m_blk={},h={},b={},s={}) valid={}\n",
                     smid(),
                     cute.arch.block_idx()[0],
                     work_tile.tile_idx[0],
