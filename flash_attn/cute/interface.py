@@ -2861,19 +2861,22 @@ def _flash_attn_bwd(
     cu_total_m_blocks_q = None
     cu_total_m_blocks_k = None
     if is_varlen and batch_size > BIN_BATCH_SEARCH_THRESH and not use_dedicated_hd256_kernel:
-        cu_total_m_blocks_q, _ = _compute_tile_cumsum(
-            cu_seqlens=cu_seqlens_q,
-            seqused=seqused_q,
-            tile_size=m_block_size,
-            qhead_per_kvhead=qhead_per_kvhead,
-            pack_gqa=bwd_pack_gqa,
-        )
-        cu_total_m_blocks_k, _ = _compute_tile_cumsum(
-            cu_seqlens=cu_seqlens_k,
-            seqused=seqused_k,
-            tile_size=n_block_size,
-            cluster_shape_m=cluster_size,
-        )
+        # SM100 schedules Q and K independently: a dense side needs no varlen lookup.
+        if arch // 10 not in [10, 11] or cu_seqlens_q is not None or seqused_q is not None:
+            cu_total_m_blocks_q, _ = _compute_tile_cumsum(
+                cu_seqlens=cu_seqlens_q,
+                seqused=seqused_q,
+                tile_size=m_block_size,
+                qhead_per_kvhead=qhead_per_kvhead,
+                pack_gqa=bwd_pack_gqa,
+            )
+        if arch // 10 not in [10, 11] or cu_seqlens_k is not None or seqused_k is not None:
+            cu_total_m_blocks_k, _ = _compute_tile_cumsum(
+                cu_seqlens=cu_seqlens_k,
+                seqused=seqused_k,
+                tile_size=n_block_size,
+                cluster_shape_m=cluster_size,
+            )
 
     dsink = torch.empty_like(learnable_sink) if learnable_sink is not None else None
 
