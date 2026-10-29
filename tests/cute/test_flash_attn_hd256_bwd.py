@@ -102,3 +102,16 @@ def test_hd256_varlen_fwd_bwd(q_lens, k_lens, dtype, mha_type, causal):
     dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
     torch.cuda.synchronize()
     check_against_reference((out.detach(), dq, dk, dv), q, k, v, dout, q_lens, k_lens, causal, dtype)
+
+
+@DTYPES
+def test_hd256_unbounded_left_window_fwd_bwd(dtype):
+    q_len, k_len = 128, 640
+    q, k, v, dout = make_packed_inputs(q_len, k_len, "mha", dtype)
+    q_dense, k_dense, v_dense = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+    out, _ = flash_attn_func(q_dense, k_dense, v_dense, window_size=(-1, 0))
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout.unsqueeze(0))
+    torch.cuda.synchronize()
+    check_against_reference(
+        (out.detach().flatten(0, 1), dq, dk, dv), q, k, v, dout, (q_len,), (k_len,), True, dtype
+    )
