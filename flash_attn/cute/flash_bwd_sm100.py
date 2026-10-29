@@ -4324,6 +4324,10 @@ class FlashAttentionBackwardSm100:
             # the tile order is block sparse or sdQaccum aliases the dS exchange buffer (M=128
             # serial), which is handed back to the peer at every m_block.
             delay_semaphore_release = not self.use_block_sparsity and not self.xchg_aliases_dQaccum
+            if const_expr(self.deterministic and delay_semaphore_release):
+                assert self.sdQaccum_stage <= 2, (
+                    "Delayed dQ release requires at most two staging buffers"
+                )
             # release_now: each m_block is released right after its own adds complete instead.
             # Short tiles (few m_blocks: short varlen sequences, local windows) do so too: the
             # sibling n_blocks of a chain run in lockstep there and the delayed hop stalls them,
