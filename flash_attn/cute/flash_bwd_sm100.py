@@ -205,6 +205,9 @@ class FlashAttentionBackwardSm100:
             "pack_gqa needs 1 < qhead_per_kvhead | tile_m"
         )
         self.deterministic = deterministic
+        # Deterministic dQ: tiles with fewer m_blocks (short varlen sequences, local windows)
+        # release each one immediately instead of one m_block behind, see dQacc_reduce.
+        self.delay_release_min_m_blocks = 16
         self.spt_override = spt
 
         # Score mod and mask mod support
@@ -4257,10 +4260,6 @@ class FlashAttentionBackwardSm100:
                 assert mdQ_semaphore is not None
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
-            delay_semaphore_release = (
-                self.cta_schedule != CtaSchedule.TWO_CTA_SERIAL and not self.use_block_sparsity
-            )
-
             dq_sem_release_inc = Int32(1)
             if const_expr(
                 self.deterministic
@@ -4321,6 +4320,22 @@ class FlashAttentionBackwardSm100:
                             batch_idx, head_idx, n_block_sparse, None
                         ]
 
+            # Overlapped release: m_block - 1 is released while m_block's adds are issued, unless
+            # the tile order is block sparse or sdQaccum aliases the dS exchange buffer (M=128
+            # serial), which is handed back to the peer at every m_block.
+            delay_semaphore_release = not self.use_block_sparsity and not self.xchg_aliases_dQaccum
+            if const_expr(self.deterministic and delay_semaphore_release):
+                assert self.sdQaccum_stage <= 2, (
+                    "Delayed dQ release requires at most two staging buffers"
+                )
+            # release_now: each m_block is released right after its own adds complete instead.
+            # Short tiles (few m_blocks: short varlen sequences, local windows) do so too: the
+            # sibling n_blocks of a chain run in lockstep there and the delayed hop stalls them,
+            # up to a 2-4x deterministic slowdown of local attention at long sequences.
+            release_now = cutlass.Boolean(self.deterministic and not delay_semaphore_release)
+            if const_expr(self.deterministic and delay_semaphore_release):
+                release_now = loop_count < self.delay_release_min_m_blocks
+
             # dQacc_reduce mainloop
             # Block sparsity: iterate over sparse m_block count and derive actual m_block
             # from Q_IDX/FULL_Q_IDX tensors. Dense: iterate m_block_min..m_block_max directly.
@@ -4338,6 +4353,29 @@ class FlashAttentionBackwardSm100:
                         m_block_max=m_block_max,
                     )
                     m_block_oob_upper = m_block >= m_block_max
+                # semaphore acquire, before waiting for the MMA's dQ tile. On main the acquire
+                # followed consumer_release, so the MMA warp could start the next dQ MMA during
+                # the poll; now the poll overlaps the current dQ MMA instead, which measured
+                # faster. This m_block's adds are only issued below, after the acquire.
+                if const_expr(self.deterministic):
+                    if not m_block_oob_upper:
+                        lock_value = self._dq_semaphore_lock_value(
+                            iter_idx,
+                            curr_q_cnt,
+                            curr_dq_write_order,
+                            curr_dq_write_order_full,
+                            blocksparse_tensors,
+                            block_info,
+                            seqlen,
+                            m_block,
+                            n_block_cta_group,
+                        )
+                        barrier.wait_eq(
+                            mdQ_semaphore_cur[(m_block, None)].iterator,
+                            tidx,
+                            cta_rank_in_cluster,
+                            lock_value,
+                        )
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
                 # TMEM -> RMEM
                 tdQrdQ_t2r = cute.make_rmem_tensor(tdQrdQ_t2r_shape, Float32)
@@ -4365,26 +4403,6 @@ class FlashAttentionBackwardSm100:
                     cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_view_async_shared()
-                    # semaphore acquire
-                    if const_expr(self.deterministic and stage == 0):
-                        if not m_block_oob_upper:
-                            lock_value = self._dq_semaphore_lock_value(
-                                iter_idx,
-                                curr_q_cnt,
-                                curr_dq_write_order,
-                                curr_dq_write_order_full,
-                                blocksparse_tensors,
-                                block_info,
-                                seqlen,
-                                m_block,
-                                n_block_cta_group,
-                            )
-                            barrier.wait_eq(
-                                mdQ_semaphore_cur[(m_block, None)].iterator,
-                                tidx,
-                                cta_rank_in_cluster,
-                                lock_value,
-                            )
                     self.reduce_sync_barrier.arrive_and_wait()
                     # Copy from shared memory to global memory
                     if is_tma_warp and not m_block_oob_upper:
@@ -4403,8 +4421,8 @@ class FlashAttentionBackwardSm100:
                     dQ_tma_store_producer_state.advance()
 
                     if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
-                        if m_block > m_block_min:
-                            barrier.arrive_inc(
+                        if not release_now and m_block > m_block_min:
+                            barrier.arrive_inc_async(
                                 mdQ_semaphore_cur[(m_block - 1, None)].iterator,
                                 tidx,
                                 cta_rank_in_cluster,
@@ -4413,27 +4431,27 @@ class FlashAttentionBackwardSm100:
 
                 # With more than one staging stage the tile's newest bulk adds are still in
                 # flight here (each stage only waits for the older groups). Drain them once
-                # when something below needs them complete: the deterministic semaphore
-                # release (the next CTA in order must find the adds performed, which the
+                # when something below needs them complete: the deterministic release of this
+                # m_block (the next CTA in order must find the adds performed, which the
                 # deterministic read_flag = False waits for) and the exchange-buffer alias
                 # handshake (the peer's dS exchange reuses sdQaccum once its reads are done).
-                release_dQ_semaphore = self.deterministic and not delay_semaphore_release
                 if const_expr(
                     self.sdQaccum_stage > 1
-                    and (release_dQ_semaphore or dQaccum_empty_mbar_ptr is not None)
+                    and (self.deterministic or dQaccum_empty_mbar_ptr is not None)
                 ):
-                    if is_tma_warp and not m_block_oob_upper:
-                        cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                    self.reduce_sync_barrier.arrive_and_wait()
+                    if const_expr(dQaccum_empty_mbar_ptr is not None) or release_now:
+                        if is_tma_warp and not m_block_oob_upper:
+                            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                        self.reduce_sync_barrier.arrive_and_wait()
                 if const_expr(dQaccum_empty_mbar_ptr is not None):
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(dQaccum_empty_mbar_ptr)
 
-                # semaphore release
-                # NOTE: arrive_inc calls red_release which issues membar
-                if const_expr(release_dQ_semaphore):
-                    if not m_block_oob_upper:
-                        barrier.arrive_inc(
+                # semaphore release: red.async.release.gpu, every release of an m_block's adds
+                # in this role follows their wait_group + barrier, see barrier.arrive_inc_async.
+                if const_expr(self.deterministic):
+                    if release_now and not m_block_oob_upper:
+                        barrier.arrive_inc_async(
                             mdQ_semaphore_cur[m_block, None].iterator,
                             tidx,
                             cta_rank_in_cluster,
@@ -4446,12 +4464,13 @@ class FlashAttentionBackwardSm100:
                 self.reduce_sync_barrier.arrive_and_wait()
                 # final semaphore release
                 if const_expr(self.deterministic and delay_semaphore_release):
-                    barrier.arrive_inc(
-                        mdQ_semaphore_cur[(m_block_max - 1, None)].iterator,
-                        tidx,
-                        cta_rank_in_cluster,
-                        1,
-                    )
+                    if not release_now:
+                        barrier.arrive_inc_async(
+                            mdQ_semaphore_cur[(m_block_max - 1, None)].iterator,
+                            tidx,
+                            cta_rank_in_cluster,
+                            1,
+                        )
 
             if const_expr(
                 self.deterministic
