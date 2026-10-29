@@ -557,10 +557,10 @@ def test_flash_attn_paged_non_tma_partial_loader_tile():
 # @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0, 15.0])
 # @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-# @pytest.mark.parametrize("local_enum", [0])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize(
+    "causal,local_enum",
+    [(False, 0), (False, 1), (False, 2), (False, 3), (True, 0)],
+)
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -1369,85 +1369,9 @@ def test_flash_attn_hd256_output_singleton_strides(dtype, shape):
     check_tensor_vs_ref("out", out, refs[torch.float64], refs[dtype], rtol=2)
 
 
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("has_learnable_sink", [False, True])
-@pytest.mark.parametrize("has_learnable_sink", [False])
-# @pytest.mark.parametrize("has_qv", [False, True])
-@pytest.mark.parametrize("has_qv", [False])
-@pytest.mark.parametrize("deterministic", [False, True])
-# @pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("softcap", [0.0, 15.0])
-# @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-# @pytest.mark.parametrize("local_enum", [0])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
-# @pytest.mark.parametrize("add_unused_qkv", [False, True])
-@pytest.mark.parametrize("add_unused_qkv", [False])
-# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
-# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
-# @pytest.mark.parametrize("d", [64, 96, 128])
-# @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128, 192, 256])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        # (1, 1),
-        # (1, 3),
-        # (2, 1),
-        (511, 1),
-        (3, 513),
-        (64, 128),
-        (128, 128),
-        (256, 256),
-        (113, 203),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (307, 256),
-        (640, 128),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (2048, 2048),
-        # SM100 hd256 2CTA test cases
-        (64, 1),
-        (255, 256),
-        (4096, 4096),
-        (4224, 4224),
-    ],
-)
-@pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
-# @pytest.mark.parametrize("varlen_mode", ["full"])
-@pytest.mark.parametrize(
-    "zero_lengths_q, zero_lengths_k",
-    [
-        (False, False),
-        (True, False),
-        (False, True),
-        (True, True),
-    ],
-)
-@pytest.mark.parametrize(
-    "unpad_q, unpad_kv",
-    [
-        (True, True),
-        (False, False),
-        (True, False),
-        (False, True),
-    ],
-)
 @retry_on_oom
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_varlen_output(
+def _run_flash_attn_varlen_output(
     seqlen_q,
     seqlen_k,
     d,

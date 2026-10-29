@@ -25,8 +25,9 @@ Dependencies: `nvidia-cutlass-dsl>=4.6.2`, `torch`, `einops`, `apache-tvm-ffi`, 
 ## Running Tests
 
 ```bash
-pytest tests/cute/test_flash_attn.py
+pytest tests/cute/test_flash_attn.py tests/cute/test_flash_attn_varlen_output.py
 pytest tests/cute/test_flash_attn.py -k "test_flash_attn_output" -x  # single test
+pytest tests/cute/test_flash_attn_varlen_output.py -k "test_flash_attn_varlen_output" -x  # varlen output tests
 pytest tests/cute/test_flash_attn_mla.py  # MLA (qv): dense / sparse / paged, 1CTA (FLASH_ATTENTION_MLA_1CTA=1) and 2CTA
 pytest tests/cute/test_flash_attn_varlen.py
 pytest tests/cute/test_mask_mod.py
@@ -40,10 +41,10 @@ Compilation dominates test time. The fast workflow separates compilation (parall
 
 ```bash
 # Pass 1: compile all kernels in parallel using FakeTensorMode (no GPU memory allocation)
-FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -n 64 -x tests/cute/test_flash_attn.py
+FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -n 64 -x tests/cute/test_flash_attn.py tests/cute/test_flash_attn_varlen_output.py
 
 # Pass 2: run tests using cached compiled kernels
-FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x tests/cute/test_flash_attn.py
+FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x tests/cute/test_flash_attn.py tests/cute/test_flash_attn_varlen_output.py
 ```
 
 - `FLASH_ATTENTION_FAKE_TENSOR=1` — uses PyTorch FakeTensorMode to compile kernels without allocating GPU memory or running them.
@@ -59,7 +60,7 @@ FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x
   kernel set of a selection across changes.
 - **Most test files do not support the compilation pass yet.** Only `test_flash_attn_mla.py`
   is fully converted; `test_flash_attn.py` mostly is, and `test_flash_attn_fast.py` and
-  `test_flash_attn_combine.py` partly. The mask_mod, score_mod, block-sparsity, varlen, hd256
+  `test_flash_attn_combine.py` partly. The mask_mod, score_mod, block-sparsity, `test_flash_attn_varlen.py`, hd256
   scheduler and race-condition files are not converted at all. Their tests run with real tensors in pass 1 and
   can compile again in pass 2, so `FLASH_ATTENTION_TEST_EXPECT_CACHED=1` (and
   `tools/two_pass_tests.sh`) reports them as failures even when the results are correct. Run
