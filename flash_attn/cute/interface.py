@@ -74,9 +74,6 @@ from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100_h64 import dQdQvGemmKernelH64
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
-# SM100 head_dim=256 2CTA backward kernel
-from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
-
 from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
@@ -2106,13 +2103,19 @@ def _bwd_pack_gqa_heuristic(
     causal: bool,
     local: bool,
     varlen: bool,
+    kv_group: int = 1,
 ) -> bool:
     """Whether the SM100 backward should pack the query heads of a KV head into the Q tile.
 
     Packing divides the tile count by qhead_per_kvhead. Its per-tile saving (K/V loaded once per
     KV head, dK/dV kept in TMEM, no fp32 dK/dV accumulate + postprocess) shrinks with seqlen_q,
     while the wave-quantization loss of the smaller grid can grow; measured on B200: ~25% gross
-    gain at 2k, ~7% at 8k, and a 3.5-wave packed grid loses ~13%.
+    gain at 2k, ~7% at 8k, and a 3.5-wave packed grid loses ~13%. A partial pack of four or
+    more sub-groups (kv_group tiles per KV head, their dK / dV through the fp32 accumulate +
+    postprocess) keeps half of that saving: hdim 128 / 64 MQA 16/1 and GQA 32/2 pack 4
+    (kv_group 4 / 8) causal gain +7..+10% at 2k, +1..+5% at 4k and lose 2..3% at 8k, where the
+    full-pack model still packs; two sub-groups keep the saving (hdim 192 GQA 32/8 pack 2 +3%
+    at 8k causal, hdim 128 GQA 64/8 pack 4 within 2% of unpacked there).
 
     A packed tile also loops over qhead_per_kvhead times more Q rows, so the longest packed CTA
     runs qh * ceil(seqlen_q / tile_m) iterations (every KV tile, or the first one with causal).
@@ -2147,12 +2150,193 @@ def _bwd_pack_gqa_heuristic(
     ctas_unpacked = batch_size * num_head * n_blocks_kv * cluster_size
     ctas_packed = batch_size * num_head_kv * n_blocks_kv * cluster_size
     gain = 0.25 * 2048 / max(seqlen_q, 1)
+    if kv_group >= 4:
+        gain *= 0.5
     if causal or local:
         # causal / local tiles are uneven and the qh-times longer packed tiles balance
         # worse at the tail: smaller gain, and only pack with a margin
         gain *= 0.6
         gain -= 0.02
     return gain > wave_loss(ctas_packed) - wave_loss(ctas_unpacked)
+
+
+# Fold rules of _bwd_choose_fold, measured on B200 (the cells are in PR #3059).
+_BWD_MAX_PACK = 4  # wider packs lose from 2k on (causal MQA 16/1, GQA 32/2, 64/8: -3..-38%)
+_BWD_CHAIN_WASTE_MAX = 0.03  # deterministic causal: largest fold whose dQ-chain waste stays under
+_BWD_LOOP_DENSE_TRIPS_X_MBLOCKS = 64  # deterministic causal: the head loop serializes past this
+_BWD_LOOP_VARLEN_TRIPS_X_MBLOCKS = 96  # (the varlen LPT schedule tolerates more trips)
+_BWD_WIDE_PACK_MBLOCKS_X_HDIM = 4096  # 2-CTA deterministic causal: pack 4 steps down to pack 2
+_BWD_WIDE_PACK_SLOW_MBLOCKS = 32  # hdim 192 causal: a partial pack 4 steps down to pack 2
+
+
+class BwdFold(NamedTuple):
+    """How the SM100 backward folds the query heads of a KV head into tiles: pack_factor query
+    heads in the Q tile rows and, with head_loop (hdim 256), one tile per KV head that loops
+    over its qhead_per_kvhead // pack_factor sub-groups in the CTA (NOTE [bwd pack_gqa])."""
+
+    pack_factor: int
+    head_loop: bool
+
+
+def _bwd_choose_fold(
+    num_sms: int,
+    cluster_size: int,
+    batch_size: int,
+    num_head: int,
+    num_head_kv: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    total_q: int,
+    total_k: int,
+    m_block_size: int,
+    n_block_size: int,
+    head_dim: int,
+    causal: bool,
+    local: bool,
+    varlen: bool,
+    deterministic: bool,
+    fold_allowed: bool,
+    head_loop_possible: bool,
+    pack_gqa_override: Optional[int] = None,
+    head_loop_override: Optional[bool] = None,
+) -> BwdFold:
+    """Candidates, largest fold first. With the head loop (hdim 256): pack 2 + loop over the
+    other sub-groups (fold = qhead_per_kvhead, the default), loop only, pack 4, pack 2. Without
+    it: pack 4 and pack 2 when they divide qhead_per_kvhead (the other sub-groups go through
+    the dK / dV postprocess). The first one _bwd_pack_gqa_heuristic accepts for its own tile
+    count wins: a smaller fold has a shorter critical path and a bigger grid.
+
+    Deterministic causal adds the dQ semaphore chains over the n_blocks of a (batch, scratch
+    head): a co-resident later tile of a chain is held to the pace of the earlier one, so the
+    looped candidates are dropped once the loop walks too many sub-groups through the chains
+    (_BWD_LOOP_*), a 2-CTA pack 4 steps down to pack 2 once its chain hops cost more than its
+    K / V saving (_BWD_WIDE_PACK_MBLOCKS_X_HDIM), and the largest fold whose chain waste
+    (co-resident tiles per chain - 1) * 2 * m_block_size / seqlen_q stays under
+    _BWD_CHAIN_WASTE_MAX wins, else the smallest accepted fold. Off the deterministic path the
+    hdim 192 kernel steps a partial pack 4 down to pack 2 as well (_BWD_WIDE_PACK_SLOW_MBLOCKS).
+
+    pack_gqa_override (FLASH_ATTENTION_BWD_PACK_GQA: 0 off, 1 on, 2 / 4 that pack) and
+    head_loop_override (FLASH_ATTENTION_BWD_HEAD_LOOP) force or exclude candidates; forced
+    candidates skip the heuristic and the deterministic rules.
+    """
+    qh = num_head // num_head_kv
+    none = BwdFold(1, False)
+    if qh <= 1:
+        return none
+    m_blocks = -(-seqlen_q // m_block_size)
+
+    def fits(pack):
+        return qh % pack == 0 and m_block_size % pack == 0
+
+    candidates = []
+    if pack_gqa_override is not None and pack_gqa_override > 1:
+        pack = pack_gqa_override
+        if fits(pack):
+            if head_loop_possible and head_loop_override is True and qh // pack > 1:
+                candidates.append(BwdFold(pack, True))
+            candidates.append(BwdFold(pack, False))
+    elif head_loop_possible:
+        for pack in (2, 4):
+            if fits(pack):
+                if pack == 2 and qh // pack > 1:
+                    candidates.append(BwdFold(pack, True))
+                candidates.append(BwdFold(pack, False))
+        candidates.append(BwdFold(1, True))
+    else:
+        pack = min(qh & -qh, m_block_size, _BWD_MAX_PACK)
+        while pack > 1:
+            candidates.append(BwdFold(pack, False))
+            pack //= 2
+
+    def allowed(cand):
+        if not fold_allowed and not (cand.head_loop and head_loop_override is True):
+            return False
+        if head_loop_override is not None and cand.head_loop != head_loop_override:
+            return False
+        return pack_gqa_override != 0 or cand.pack_factor == 1
+
+    candidates = [cand for cand in candidates if allowed(cand)]
+    if not candidates:
+        return none
+
+    def fold(cand):
+        return cand.pack_factor * (qh // cand.pack_factor if cand.head_loop else 1)
+
+    # largest fold first; for equal folds pack 2 (+ loop) before the unpacked loop before a
+    # wider pack
+    candidates.sort(key=lambda cand: (-fold(cand), cand.pack_factor != 2, not cand.head_loop))
+
+    def forced(cand):
+        return (cand.head_loop and head_loop_override is True) or (
+            cand.pack_factor > 1 and pack_gqa_override is not None and pack_gqa_override >= 1
+        )
+
+    def accepted(cand):
+        return forced(cand) or _bwd_pack_gqa_heuristic(
+            num_sms=num_sms,
+            # off hdim 256 a pack below qhead_per_kvhead pays the dK / dV postprocess
+            kv_group=1 if head_loop_possible else qh // fold(cand),
+            batch_size=batch_size,
+            num_head=num_head,
+            num_head_kv=num_head // fold(cand),
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            total_q=total_q,
+            total_k=total_k,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            cluster_size=cluster_size,
+            causal=causal,
+            local=local,
+            varlen=varlen,
+        )
+
+    no_override = pack_gqa_override is None and head_loop_override is None
+    det_causal = causal and deterministic and no_override
+    nondet_causal = causal and not deterministic and no_override
+    num_clusters = max(1, num_sms // cluster_size)
+
+    def chain_waste(cand):
+        chains = max(1, batch_size * num_head // fold(cand))
+        return max(0.0, num_clusters / chains - 1.0) * 2 * m_block_size / max(seqlen_q, 1)
+
+    def loop_serialized(cand):
+        if not cand.head_loop:
+            return False
+        trips_x_m_blocks = (qh // cand.pack_factor) * m_blocks
+        if varlen:
+            return trips_x_m_blocks > _BWD_LOOP_VARLEN_TRIPS_X_MBLOCKS
+        return trips_x_m_blocks > _BWD_LOOP_DENSE_TRIPS_X_MBLOCKS
+
+    def wide_pack_steps_down(cand):
+        if cand.head_loop or cand.pack_factor <= 2 or cluster_size == 1:
+            return False
+        if det_causal:
+            return m_blocks * head_dim > _BWD_WIDE_PACK_MBLOCKS_X_HDIM
+        return (
+            nondet_causal
+            and head_dim > 128
+            and not head_loop_possible
+            and qh > cand.pack_factor
+            and m_blocks >= _BWD_WIDE_PACK_SLOW_MBLOCKS
+        )
+
+    ok = [cand for cand in candidates if accepted(cand)]
+    if det_causal and any(not cand.head_loop for cand in ok):
+        # only when an unlooped fold is available: without one (odd qhead_per_kvhead) the
+        # loop stays, one tile per query head with the dK / dV postprocess is far slower
+        ok = [cand for cand in ok if not loop_serialized(cand)]
+    if any(wide_pack_steps_down(cand) for cand in ok):
+        # pack 2 whether or not the heuristic took it for its own tile count (it halves the
+        # gain of a 4+ way partial pack): the saving is there at pack 2 too
+        keep = {cand for cand in ok if not wide_pack_steps_down(cand)} | {BwdFold(2, False)}
+        ok = [cand for cand in candidates if cand in keep]
+    for cand in ok:
+        if not det_causal or cand.head_loop or chain_waste(cand) <= _BWD_CHAIN_WASTE_MAX:
+            return cand
+    # deterministic causal: every fold waits on the chains; the smallest accepted fold still
+    # beats none
+    return ok[-1] if det_causal and ok else none
 
 
 def _flash_attn_bwd(
@@ -2241,6 +2425,7 @@ def _flash_attn_bwd(
         causal, window_size_left, window_size_right
     )
 
+    is_hdim256 = head_dim == 256 and head_dim_v == 256
     bwd_pack_gqa_request = False
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
@@ -2300,10 +2485,9 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
         requested_disable_2cta = utils._get_disable_2cta_default()
-        # hdim 256 on the general kernel runs a 64-row KV tile per CTA (NOTE [M=64 accumulator
-        # layout] in flash_bwd_sm100.py); the 2CTA / block-sparse decisions below see that tile.
-        hd256_generic = head_dim == 256 and head_dim_v == 256 and utils._get_hd256_generic_bwd()
-        if hd256_generic:
+        # hdim 256 runs a 64-row KV tile per CTA (NOTE [M=64 accumulator layout] in
+        # flash_bwd_sm100.py); the 2CTA / block-sparse decisions below see that tile.
+        if is_hdim256:
             n_block_size = 64
         kv_subtile_factor = get_kv_subtile_factor(block_sparse_tensors, n_block_size)
         use_2cta_instrs = (
@@ -2335,7 +2519,7 @@ def _flash_attn_bwd(
         # hdim 256 (64-row KV tile, serial schedule) and block-sparse hdim 192 need 2CTA.
         needs_2cta = (
             "SM100 backward with head_dim=256"
-            if hd256_generic
+            if is_hdim256
             else (
                 "SM100 block-sparse backward with head_dim=192"
                 if block_sparse_tensors is not None and head_dim == 192
@@ -2354,27 +2538,13 @@ def _flash_attn_bwd(
             raise ValueError(f"{needs_2cta} requires 2CTA; {reason}.")
         cluster_size = 2 if use_2cta_instrs else 1
 
-    use_dedicated_hd256_kernel = (
-        arch // 10 in [10, 11]
-        and head_dim == 256
-        and head_dim_v == 256
-        and not utils._get_hd256_generic_bwd()
-    )
-    if (
-        use_dedicated_hd256_kernel
-        or (arch // 10 in [10, 11] and cu_seqlens_q is not None)
-    ) and torch.is_tensor(max_seqlen_q):
-        max_seqlen_q = None
-    if (
-        use_dedicated_hd256_kernel
-        or (arch // 10 in [10, 11] and cu_seqlens_k is not None)
-    ) and torch.is_tensor(max_seqlen_k):
-        max_seqlen_k = None
-    if use_dedicated_hd256_kernel:
-        assert learnable_sink is None, (
-            "SM100 backward with head_dim=256 does not support learnable_sink"
-        )
-    use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    if arch // 10 in [10, 11]:
+        # The SM100 kernels never read the maxima; a device tensor here would only leak into the
+        # host-side seqlen arithmetic (fold choice, dQ semaphore sizing), so drop it.
+        if cu_seqlens_q is not None and torch.is_tensor(max_seqlen_q):
+            max_seqlen_q = None
+        if cu_seqlens_k is not None and torch.is_tensor(max_seqlen_k):
+            max_seqlen_k = None
     is_varlen = (
         cu_seqlens_q is not None
         or cu_seqlens_k is not None
@@ -2495,39 +2665,55 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
-    # NOTE [bwd pack_gqa] spike scope: SM100, dense, non-deterministic, no mask_mod / score_mod /
-    # block sparsity / sink, qhead_per_kvhead | tile_m.
-    bwd_pack_gqa = (
-        bwd_pack_gqa_request
-        and not use_dedicated_hd256_kernel
-        and qhead_per_kvhead > 1
-        and m_block_size % qhead_per_kvhead == 0
-        and block_sparse_tensors is None
+    # Fold of the query heads of a KV head into tiles (NOTE [bwd pack_gqa]): pack_factor query
+    # heads in the Q tile rows and / or, on hdim 256, the head loop over the KV head's
+    # sub-groups; _bwd_choose_fold picks per shape.
+    fold_features_ok = (
+        block_sparse_tensors is None
         and score_mod is None
         and mask_mod is None
         and learnable_sink is None
     )
-    if bwd_pack_gqa:
-        override = utils._get_bwd_pack_gqa_override()
-        if override is None:
-            bwd_pack_gqa = _bwd_pack_gqa_heuristic(
-                num_sms=get_num_sms_for_selection(q.device.index, arch),
-                batch_size=batch_size,
-                num_head=num_head,
-                num_head_kv=num_head_kv,
-                seqlen_q=seqlen_q,
-                seqlen_k=seqlen_k,
-                total_q=total_q,
-                total_k=total_k,
-                m_block_size=m_block_size,
-                n_block_size=n_block_size,
-                cluster_size=cluster_size,
-                causal=causal,
-                local=local,
-                varlen=cu_seqlens_q is not None or cu_seqlens_k is not None,
-            )
-        else:
-            bwd_pack_gqa = override
+    fold_allowed = bwd_pack_gqa_request and qhead_per_kvhead > 1 and fold_features_ok
+    head_loop_possible = (
+        arch // 10 in [10, 11] and is_hdim256 and fold_features_ok
+    )
+    is_varlen_any = cu_seqlens_q is not None or cu_seqlens_k is not None
+    # The heuristics want the longest sequence; a varlen call without max_seqlen only knows
+    # the total, which as an upper bound refuses every causal fold. Use the mean.
+    heur_seqlen_q = (
+        max(1, math.ceil(total_q / max(batch_size, 1)))
+        if cu_seqlens_q is not None and max_seqlen_q is None
+        else seqlen_q
+    )
+    heur_seqlen_k = (
+        max(1, math.ceil(total_k / max(batch_size, 1)))
+        if cu_seqlens_k is not None and max_seqlen_k is None
+        else seqlen_k
+    )
+    bwd_pack_factor, bwd_head_loop = _bwd_choose_fold(
+        num_sms=get_num_sms_for_selection(q.device.index, arch),
+        cluster_size=cluster_size,
+        batch_size=batch_size,
+        num_head=num_head,
+        num_head_kv=num_head_kv,
+        seqlen_q=heur_seqlen_q,
+        seqlen_k=heur_seqlen_k,
+        total_q=total_q,
+        total_k=total_k,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        head_dim=head_dim,
+        causal=causal,
+        local=local,
+        varlen=is_varlen_any,
+        deterministic=deterministic,
+        fold_allowed=fold_allowed,
+        head_loop_possible=head_loop_possible,
+        pack_gqa_override=utils._get_bwd_pack_gqa_override(),
+        head_loop_override=utils._get_bwd_head_loop_override(),
+    )
+    bwd_pack_gqa = bwd_pack_factor > 1
     
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
@@ -2564,8 +2750,8 @@ def _flash_attn_bwd(
 
     # Per-head scratch (dq_accum, dpsum, lse_log2, dQ_semaphore): pack_gqa stores it per KV
     # head with qhead_per_kvhead rows per token (NOTE [bwd pack_gqa]).
-    scratch_heads = num_head_kv if bwd_pack_gqa else num_head
-    rows_per_token = qhead_per_kvhead if bwd_pack_gqa else 1
+    scratch_heads = num_head // bwd_pack_factor
+    rows_per_token = bwd_pack_factor
     seqlen_q_rows_rounded = (
         (seqlen_q * rows_per_token + m_block_size - 1) // m_block_size * m_block_size
     )
@@ -2578,13 +2764,8 @@ def _flash_attn_bwd(
             // m_block_size * m_block_size
         )
         scratch_shape = (scratch_heads, total_q_rows_rounded_padded)
-    dq_accum = (
-        None
-        if use_dedicated_hd256_kernel
-        else torch.empty(
-            *scratch_shape[:-1], scratch_shape[-1] * head_dim_rounded,
-            dtype=torch.float32, device=device,
-        )
+    dq_accum = torch.empty(
+        *scratch_shape[:-1], scratch_shape[-1] * head_dim_rounded, dtype=torch.float32, device=device
     )
     dpsum = torch.empty(*scratch_shape, dtype=torch.float32, device=device)
     lse_log2 = torch.empty(*scratch_shape, dtype=torch.float32, device=device)
@@ -2592,8 +2773,7 @@ def _flash_attn_bwd(
     # GQA (qhead_per_kvhead > 1) needs dK/dV accum+postprocess since multiple Q heads
     # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
     # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
-    # hd=256 2CTA backward has its own internal postprocess for dK/dV.
-    dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel and not bwd_pack_gqa
+    dKV_postprocess = qhead_per_kvhead // bwd_pack_factor > 1 and not bwd_head_loop
     if dKV_postprocess:
         # Same rounding as the kernel's tile_hdimv and the postprocess (64 with dKV_swapAB on
         # SM90): the GQA epilogue reduces tile_n * tile_hdimv fp32 values per block.
@@ -2635,8 +2815,7 @@ def _flash_attn_bwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
 
-    # The dedicated hd256 backward is deterministic without semaphores.
-    if deterministic and not use_dedicated_hd256_kernel:
+    if deterministic:
         # one slot per (scratch head, m block of scratch rows)
         dQ_semaphore = torch.zeros(
             batch_size, scratch_heads, seqlen_q_rows_rounded // m_block_size, cluster_size,
@@ -2656,12 +2835,12 @@ def _flash_attn_bwd(
     # shared across preprocess, main bwd, and the three postprocess calls.
     cu_total_m_blocks_q = None
     cu_total_m_blocks_k = None
-    if is_varlen and batch_size > BIN_BATCH_SEARCH_THRESH and not use_dedicated_hd256_kernel:
+    if is_varlen and batch_size > BIN_BATCH_SEARCH_THRESH:
         cu_total_m_blocks_q, _ = _compute_tile_cumsum(
             cu_seqlens=cu_seqlens_q,
             seqused=seqused_q,
             tile_size=m_block_size,
-            qhead_per_kvhead=qhead_per_kvhead,
+            qhead_per_kvhead=bwd_pack_factor,
             pack_gqa=bwd_pack_gqa,
         )
         cu_total_m_blocks_k, _ = _compute_tile_cumsum(
@@ -2674,7 +2853,6 @@ def _flash_attn_bwd(
     dsink = torch.empty_like(learnable_sink) if learnable_sink is not None else None
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
-    # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
     _bwd_preprocess(
         out, dout, dpsum, lse, lse_log2, dq_accum,
         cu_seqlens_q, seqused_q, dlse,
@@ -2682,8 +2860,8 @@ def _flash_attn_bwd(
         # NOTE [bwd pack_gqa]: packed views of the per-head O / dO / LSE; dPsum / LSElog2 /
         # dQaccum are per KV head in packed row order
         pack_gqa=PackGQA.PACKED_ROW_OUTPUTS if bwd_pack_gqa else PackGQA.OFF,
-        qhead_per_kvhead=qhead_per_kvhead if bwd_pack_gqa else 1,
-        nheads_kv=num_head_kv if bwd_pack_gqa else 1,
+        qhead_per_kvhead=bwd_pack_factor,
+        nheads_kv=num_head // bwd_pack_factor if bwd_pack_gqa else 1,
         cu_total_m_blocks=cu_total_m_blocks_q,
         fake_mode=fake_mode,
         hdim_multiple_of=hdim_multiple_of,
@@ -2796,7 +2974,8 @@ def _flash_attn_bwd(
             head_dim,
             head_dim_v,
             qhead_per_kvhead,
-            bwd_pack_gqa,
+            bwd_pack_factor,
+            bwd_head_loop,
             causal,
             window_size_left is not None,
             window_size_right is not None,
@@ -2830,8 +3009,6 @@ def _flash_attn_bwd(
             single_q_block,
             single_k_block,
             cu_total_m_blocks_k is not None,
-            use_dedicated_hd256_kernel and cu_seqlens_q is not None and max_seqlen_q is None,
-            use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
         )
 
     # SM90 / SM100 bound the K/V TMA loads of varlen / seqused_k calls by rewriting per-CTA
@@ -2840,7 +3017,6 @@ def _flash_attn_bwd(
     bwd_tensormap_workspace = None
     if (
         arch // 10 in [9, 10, 11]
-        and not use_dedicated_hd256_kernel
         and (cu_seqlens_k is not None or seqused_k is not None)
     ):
         # The schedulers pad every batch by up to one (cluster) tile: grid_x = (rows + batch *
@@ -2863,8 +3039,9 @@ def _flash_attn_bwd(
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             to_cute_tensor(t) for t in (q, k, v, dout, dq, dk, dv)
         ]
-        lse_log2_tensor, dpsum_tensor = [to_cute_tensor(t) for t in (lse_log2, dpsum)]
-        dq_accum_tensor = to_cute_tensor(dq_accum) if dq_accum is not None else None
+        lse_log2_tensor, dpsum_tensor, dq_accum_tensor = [
+            to_cute_tensor(t) for t in (lse_log2, dpsum, dq_accum)
+        ]
         if dKV_postprocess:
             dk_accum_tensor, dv_accum_tensor = [
                 to_cute_tensor(t) for t in (dk_accum, dv_accum)
@@ -2933,62 +3110,32 @@ def _flash_attn_bwd(
                 dQ_single_wg=dQ_single_wg,
             )
         else:
-            if use_dedicated_hd256_kernel:
-                assert softcap == 0.0, "SM100 backward with head_dim=256 does not support softcap"
-                assert block_sparse_tensors is None, \
-                    "SM100 backward with head_dim=256 does not support block sparsity"
-                assert dlse is None, \
-                    "SM100 backward with head_dim=256 does not support dlse"
-
-                dq_tile_mn = (128, 128)
-                dkdv_tile_mn = (128, 64)
-                fa_bwd_obj = BlackwellFusedMultiHeadAttentionBackward(
-                    head_dim,
-                    head_dim_v,
-                    is_causal=causal,
-                    is_local=local,
-                    qhead_per_kvhead=qhead_per_kvhead,
-                    is_persistent=False,
-                    deterministic=deterministic,
-                    cluster_size=cluster_size,
-                    use_2cta_instrs=use_2cta_instrs,
-                    score_mod=score_mod,
-                    score_mod_bwd=score_mod_bwd,
-                    mask_mod=mask_mod,
-                    has_aux_tensors=aux_tensors is not None,
-                    q_subtile_factor=q_subtile_factor,
-                    tile_m_dq=dq_tile_mn[0],
-                    tile_n_dq=dq_tile_mn[1],
-                    tile_m_dkdv=dkdv_tile_mn[0],
-                    tile_n_dkdv=dkdv_tile_mn[1],
-                )
-            else:
-                fa_bwd_obj = FlashAttentionBackwardSm100(
-                    head_dim,
-                    head_dim_v,
-                    is_causal=causal,
-                    is_local=local,
-                    qhead_per_kvhead=qhead_per_kvhead,
-                    tile_m=m_block_size,
-                    tile_n=n_block_size,
-                    cluster_size=cluster_size,
-                    use_2cta_instrs=use_2cta_instrs,
-                    deterministic=deterministic,
-                    spt=spt,
-                    score_mod=score_mod,
-                    score_mod_bwd=score_mod_bwd,
-                    mask_mod=mask_mod,
-                    has_aux_tensors=aux_tensors is not None,
-                    q_subtile_factor=q_subtile_factor,
-                    kv_subtile_factor=kv_subtile_factor,
-                    pack_gqa=bwd_pack_gqa,
-                )
+            fa_bwd_obj = FlashAttentionBackwardSm100(
+                head_dim,
+                head_dim_v,
+                is_causal=causal,
+                is_local=local,
+                qhead_per_kvhead=qhead_per_kvhead,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
+                cluster_size=cluster_size,
+                use_2cta_instrs=use_2cta_instrs,
+                deterministic=deterministic,
+                spt=spt,
+                score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None,
+                q_subtile_factor=q_subtile_factor,
+                kv_subtile_factor=kv_subtile_factor,
+                pack_factor=bwd_pack_factor,
+                head_loop=bwd_head_loop,
+            )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         sparse_tensors_compile = None
         if normalized_block_sparse_tensors is not None:
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
-        dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
         compile_args = [
             fa_bwd_obj,
@@ -3013,25 +3160,13 @@ def _flash_attn_bwd(
             dV_semaphore_tensor,
             AuxData(cute_aux_tensors, aux_scalars),
             sparse_tensors_compile,
+            cu_total_m_blocks_k_tensor,
         ]
-        if not use_dedicated_hd256_kernel:
-            compile_args.append(cu_total_m_blocks_k_tensor)
-            if arch // 10 in [9, 10, 11]:
-                compile_args.append(
-                    to_cute_tensor(bwd_tensormap_workspace, assumed_align=128, leading_dim=2)
-                    if bwd_tensormap_workspace is not None
-                    else None
-                )
-        else:
-            compile_args.extend(
-                (
-                    Int32(max_seqlen_q)
-                    if cu_seqlens_q is not None and max_seqlen_q is not None
-                    else None,
-                    Int32(max_seqlen_k)
-                    if cu_seqlens_k is not None and max_seqlen_k is not None
-                    else None,
-                )
+        if arch // 10 in [9, 10, 11]:
+            compile_args.append(
+                to_cute_tensor(bwd_tensormap_workspace, assumed_align=128, leading_dim=2)
+                if bwd_tensormap_workspace is not None
+                else None
             )
         compile_args.append(current_stream)
 
@@ -3040,7 +3175,6 @@ def _flash_attn_bwd(
             *compile_args, options="--enable-tvm-ffi"
         )
     if not fake_mode:
-        dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
         call_args = [
             q.detach(),
             k.detach(),
@@ -3074,77 +3208,63 @@ def _flash_attn_bwd(
             )
             if normalized_block_sparse_tensors is not None
             else None,
+            cu_total_m_blocks_k,
         ]
-        if not use_dedicated_hd256_kernel:
-            call_args.append(cu_total_m_blocks_k)
-            if arch // 10 in [9, 10, 11]:
-                call_args.append(bwd_tensormap_workspace)
-        else:
-            call_args.extend(
-                (
-                    max_seqlen_q
-                    if cu_seqlens_q is not None
-                    else None,
-                    max_seqlen_k
-                    if cu_seqlens_k is not None
-                    else None,
-                )
-            )
+        if arch // 10 in [9, 10, 11]:
+            call_args.append(bwd_tensormap_workspace)
         _flash_attn_bwd.compile_cache[compile_key](*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
-    # hd=256 2CTA backward has its own internal postprocess, skip here.
-    if not use_dedicated_hd256_kernel:
-        if arch // 10 == 9:
-            # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
-            num_threads_post_dQ = 128 if dQ_single_wg else cfg.num_wg * 128
-            num_threads_post_dKV = cfg.num_wg * 128
-        else:
-            num_threads_post_dQ = 128
-            num_threads_post_dKV = 128
+    if arch // 10 == 9:
+        # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
+        num_threads_post_dQ = 128 if dQ_single_wg else cfg.num_wg * 128
+        num_threads_post_dKV = cfg.num_wg * 128
+    else:
+        num_threads_post_dQ = 128
+        num_threads_post_dKV = 128
 
+    _bwd_postprocess_convert(
+        dq_accum, dq, softmax_scale,
+        cu_seqlens_q, seqused_q,
+        arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
+        AtomLayoutMdQ, dQ_swapAB,
+        use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+        accum_order=dQaccum_order,
+        cu_total_m_blocks=cu_total_m_blocks_q,
+        sink_tensors=(
+            LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
+            if learnable_sink is not None
+            else None
+        ),
+        fake_mode=fake_mode,
+        hdim_multiple_of=hdim_multiple_of,
+        pack_factor=bwd_pack_factor,
+    )
+
+    if dKV_postprocess:
+        # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
         _bwd_postprocess_convert(
-            dq_accum, dq, softmax_scale,
-            cu_seqlens_q, seqused_q,
-            arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
-            AtomLayoutMdQ, dQ_swapAB,
-            use_2cta_instrs=use_2cta_instrs, cluster_size=1,
-            accum_order=dQaccum_order,
-            cu_total_m_blocks=cu_total_m_blocks_q,
-            sink_tensors=(
-                LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
-                if learnable_sink is not None
-                else None
-            ),
+            dk_accum, dk, softmax_scale,
+            cu_seqlens_k, seqused_k,
+            arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
+            AtomLayoutNdKV, dKV_swapAB,
+            cluster_size=cluster_size,
+            cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
             fake_mode=fake_mode,
             hdim_multiple_of=hdim_multiple_of,
-            pack_factor=qhead_per_kvhead if bwd_pack_gqa else 1,
+            accum_order=dKVaccum_order,
         )
-
-        if dKV_postprocess:
-            # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
-            _bwd_postprocess_convert(
-                dk_accum, dk, softmax_scale,
-                cu_seqlens_k, seqused_k,
-                arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
-                AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
-                cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
-                fake_mode=fake_mode,
-                hdim_multiple_of=hdim_multiple_of,
-                accum_order=dKVaccum_order,
-            )
-            # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
-            _bwd_postprocess_convert(
-                dv_accum, dv, 1.0,
-                cu_seqlens_k, seqused_k,
-                arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
-                AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
-                cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
-                fake_mode=fake_mode,
-                hdim_multiple_of=hdim_multiple_of,
-                accum_order=dKVaccum_order,
-            )
+        # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
+        _bwd_postprocess_convert(
+            dv_accum, dv, 1.0,
+            cu_seqlens_k, seqused_k,
+            arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
+            AtomLayoutNdKV, dKV_swapAB,
+            cluster_size=cluster_size,
+            cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
+            fake_mode=fake_mode,
+            hdim_multiple_of=hdim_multiple_of,
+            accum_order=dKVaccum_order,
+        )
 
     return (dq, dk, dv) if learnable_sink is None else (dq, dk, dv, dsink)
 
