@@ -9,7 +9,7 @@ from typing import Callable, Optional, Tuple
 from functools import partial
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Int32, const_expr
 
 from quack import copy_utils
 
@@ -17,7 +17,6 @@ from quack import copy_utils
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.softmax import apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.utils import AuxData
 
 
@@ -99,10 +98,10 @@ def get_curr_blocksparse_tensors(
 # KV blocks (total_block_cnt == 0). In that case there is no seqlen_kv iteration, so
 # the softmax warp-group has no row stats to publish.
 #
-# The correction warp-group seeds fully-masked-row stats and runs the usual correction
-# epilogue so output/LSE have well-defined values. Both warp-groups must still perform
-# the softmax<->correction mbarrier handshake so phases advance correctly across
-# empty->empty and empty->non-empty tile sequences.
+# The correction warp-group skips its KV loop, takes fully-masked-row stats and runs the
+# usual correction epilogue with zero_fill so output/LSE have well-defined values. Both
+# warp-groups must still perform the softmax<->correction mbarrier handshake so phases
+# advance correctly across empty->empty and empty->non-empty tile sequences.
 #
 # In the no-sink case, this corresponds to the usual fully-masked-row convention:
 # output is zero and LSE is -inf.
@@ -122,8 +121,10 @@ def get_curr_blocksparse_tensors(
 #   At the `softmax_loop` level, softmax unconditionally waits `mbar_softmax_corr_empty`
 #   before each tile (when block-sparse) to drain a prior correction arrival and keep
 #   phases aligned across non-empty -> empty transitions.
-# - Correction: waits `mbar_softmax_corr_full`, seeds stats + runs `correction_epilogue(scale=0)`,
-#   and arrives `mbar_softmax_corr_empty` (and `mbar_corr_epi_full_/empty` when applicable).
+# - Correction: waits `mbar_softmax_corr_full`, seeds stats + runs `correction_epilogue(zero_fill)`
+#   in the same per-stage epilogue as a non-empty tile, minus the `pipeline_o_acc` wait and
+#   the `mbar_P_full_O_rescaled` arrival, and arrives `mbar_softmax_corr_empty` (and
+#   `mbar_corr_epi_full_/empty` when applicable).
 # - No `mbar_P_full_*` barriers are arrived (no P, no MMA O); only the softmax<->correction
 #   (and correction<->epilogue) handshakes advance phases.
 #
@@ -827,128 +828,6 @@ def get_total_block_count(
         num_splits,
     )
     return mask_end - mask_begin + full_end - full_begin
-
-
-@cute.jit
-def handle_block_sparse_empty_tile_correction_sm100(
-    tidx: Int32,
-    q_stage: cutlass.Constexpr,
-    m_block_size: cutlass.Constexpr,
-    qhead_per_kvhead,
-    pack_gqa: cutlass.Constexpr,
-    is_split_kv: cutlass.Constexpr,
-    learnable_sink,
-    mLSE,
-    seqlen_info,
-    m_block: Int32,
-    head_idx: Int32,
-    batch_idx: Int32,
-    split_idx: Int32,
-    sScale: cute.Tensor,
-    stats: list,
-    correction_epilogue: Callable,
-    thr_mma_pv: cute.ThrMma,
-    tOtO: cute.Tensor,
-    sO: cute.Tensor,
-    pipeline_sm_stats: cutlass.pipeline.PipelineAsync,
-    sm_stats_barrier: cutlass.pipeline.NamedBarrier,
-    pipeline_o_epi: cutlass.pipeline.PipelineAsync,
-    sm_stats_consumer_phase: Int32,
-    o_corr_consumer_phase: Int32,
-    corr_epi_producer_phase: Int32,
-    softmax_scale_log2: Float32,
-    max_offset: Float32,
-    max_offset_scale: Float32,
-    mO_cur: Optional[cute.Tensor] = None,
-    gO: Optional[cute.Tensor] = None,
-    gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
-):
-    """Handle SM100 forward block-sparse tiles with no active KV blocks.
-
-    This path is taken when `total_block_cnt == 0`. The softmax warp-group still
-    arrives `mbar_softmax_corr_full` (synthetic "no work") so the correction
-    warp-group can:
-
-    - seed fully-masked-row stats (row_sum=1; row_max=-inf when tracked) for LSE
-    - run `correction_epilogue` with `scale=0` so the output tile is written as zeros
-      (independent of any prior tmem contents)
-    - wait on `mbar_softmax_corr_full` and arrive `mbar_softmax_corr_empty`
-      (and `mbar_corr_epi_*` when applicable) so phases stay aligned across tiles
-
-    This helper intentionally does not touch `mbar_P_full_*` since no P is produced.
-    See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
-    """
-    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
-
-    for stage in cutlass.range_constexpr(q_stage):
-        row_sum_value = Float32(1.0)
-        row_max_value = (
-            -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None
-        )
-        # Threads >= m_block_size hold no row; their stats are never stored.
-        if const_expr(learnable_sink is not None):
-            if (const_expr(not pack_gqa) or tidx < m_block_size) and (
-                const_expr(not is_split_kv) or split_idx == 0
-            ):
-                sink_val = load_learnable_sink(
-                    learnable_sink,
-                    head_idx,
-                    (q_stage * m_block + stage) * m_block_size + tidx,
-                    qhead_per_kvhead,
-                    pack_gqa,
-                )
-                row_max_value, row_sum_value = apply_learnable_sink(
-                    row_max_value,
-                    row_sum_value,
-                    sink_val,
-                    softmax_scale_log2,
-                    max_offset=max_offset,
-                    empty_row_sum=max_offset_scale,
-                )
-        if tidx < m_block_size:
-            scale_row_idx = tidx + stage * m_block_size
-            sScale[scale_row_idx] = row_sum_value
-            if const_expr(mLSE is not None or learnable_sink is not None):
-                sScale[scale_row_idx + q_stage * m_block_size] = row_max_value
-        acc_flag = row_sum_value == Float32(0.0) or row_sum_value != row_sum_value
-        stats[stage] = (row_sum_value, row_max_value, acc_flag)
-
-        # See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
-        # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
-        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
-        pipeline_sm_stats.consumer_release_w_index(stage)
-
-        if const_expr(gmem_tiled_copy_O is None):
-            pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
-
-        gO_stage = gO[None, None, stage] if const_expr(gO is not None) else None
-        correction_epilogue(
-            thr_mma_pv,
-            tOtO[None, None, None, stage],
-            tidx,
-            stage,
-            m_block,
-            seqlen_info.seqlen_q,
-            Float32(0.0),  # zero scale ensures empty tile writes zeros into staged outputs
-            sO[None, None, stage],
-            mO_cur,
-            gO_stage,
-            gmem_tiled_copy_O,
-            # SM100 only: SM90 has no equivalent flag, it zeroes acc_O inline in the
-            # mainloop because its O accumulator lives in registers, not TMEM.
-            zero_fill=True,
-        )
-        if const_expr(gmem_tiled_copy_O is None):
-            pipeline_o_epi.producer_commit_w_index(stage)
-
-    sm_stats_consumer_phase ^= 1
-    corr_epi_producer_phase ^= 1
-
-    return (
-        sm_stats_consumer_phase,
-        o_corr_consumer_phase,
-        corr_epi_producer_phase,
-    )
 
 
 @cute.jit
