@@ -54,9 +54,9 @@ def retry_on_oom(func):
         except torch.OutOfMemoryError as e:
             if "out of memory" in str(e).lower():
                 if hasattr(_flash_attn_fwd, "compile_cache"):
-                    _flash_attn_fwd.compile_cache.clear()
+                    JITCache.clear(_flash_attn_fwd.compile_cache)
                 if hasattr(_flash_attn_bwd, "compile_cache"):
-                    _flash_attn_bwd.compile_cache.clear()
+                    JITCache.clear(_flash_attn_bwd.compile_cache)
                 gc.collect()
                 torch.cuda.empty_cache()
                 return func(*args, **kwargs)

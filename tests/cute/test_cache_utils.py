@@ -1,6 +1,9 @@
 import logging
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 import flash_attn.cute.cache_utils as cache_utils
 from flash_attn.cute import fa_logging
 
@@ -99,3 +102,37 @@ def test_persistent_cache_replaces_nonempty_unloadable_entry(tmp_path, monkeypat
     other_path.write_bytes(b"from another process")
     cache[other] = Good()
     assert other_path.read_bytes() == b"from another process"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="retry helper requires CUDA")
+def test_retry_on_oom_preserves_persistent_cache(tmp_path, monkeypatch):
+    from test_flash_attn import retry_on_oom
+    from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
+
+    fwd_cache = cache_utils.JITPersistentCache(tmp_path / "fwd")
+    bwd_cache = cache_utils.JITPersistentCache(tmp_path / "bwd")
+    disk_entries = []
+    for cache, key in ((fwd_cache, ("fwd",)), (bwd_cache, ("bwd",))):
+        cache.cache[key] = object()
+        entry = cache.cache_path / f"{cache._key_to_hash(key)}.o"
+        entry.write_bytes(b"cached kernel")
+        disk_entries.append(entry)
+
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", fwd_cache)
+    monkeypatch.setattr(_flash_attn_bwd, "compile_cache", bwd_cache)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    calls = 0
+
+    @retry_on_oom
+    def run():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise torch.OutOfMemoryError("CUDA out of memory.")
+        assert not fwd_cache.cache
+        assert not bwd_cache.cache
+        return "retried"
+
+    assert run() == "retried"
+    assert calls == 2
+    assert [entry.read_bytes() for entry in disk_entries] == [b"cached kernel"] * 2
