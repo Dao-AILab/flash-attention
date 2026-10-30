@@ -61,8 +61,8 @@ from flash_attn.cute.pack_gqa import (
     pack_gqa_layout,
     qheads_first_tma_view,
     regroup_padded_qheads,
-    sparse_mla_qhead_tile,
 )
+from flash_attn.cute.config import sparse_mla_qhead_tile
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -87,25 +87,6 @@ class FlashAttentionMLAForward1CtaSm100:
     # Extra ptxas flags (part of the compile key): the default level spills 352 B/thread on the
     # sparse forward, -O2 none, median +15-17% on GB300 (AI/SPARSE_MLA_1CTA.md, "ptxas levels").
     ptxas_options = "-O2"
-    # sparse MLA: a token's heads padded to one 64-row tile (pack_gqa.sparse_mla_qhead_tile)
-    SPARSE_HEAD_TILE = 64
-
-    @staticmethod
-    def use_clc(*, is_topk_gather, seqlen_q_hint, clc_default) -> bool:
-        """Sparse tiles are one token each with uniform cost: the persistent CLC scheduler
-        overlaps a tile's epilogue with the next tile's gather (~10% at 64 heads). Dense follows
-        the global FA_CLC default."""
-        return is_topk_gather or clc_default
-
-    @staticmethod
-    def use_s_ahead(*, is_fp8, seqlen_q_hint, nheads) -> bool:
-        """fp8 (a two-block V ring): issue S(n) ahead of PVt(n-1) when the tensor core is the
-        bottleneck, i.e. when many tiles share one KV stream, which then stays L2-resident:
-        >= 8 tiles of 64 rows, seqlen_q x heads >= 512 (prefill / extend: +33-36%). Decode
-        streams each tile's KV from DRAM and needs the loads' one-block look-ahead that S-ahead
-        gives up (-5-16%). Varlen without a max_seqlen_q hint stays in order."""
-        return is_fp8 and seqlen_q_hint is not None and seqlen_q_hint * nheads >= 512
-
     # TMEM lane stride and datapath-half offset for hand-built Layout E layouts.
     # TMEM addresses: bits 16-31 = lane, bits 0-15 = column.
     TMEM_LANE_STRIDE = 1 << 16
