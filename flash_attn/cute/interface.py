@@ -477,7 +477,7 @@ _compute_blocks_to_batch.compile_cache = get_jit_cache("blocks_to_batch")
 
 def _mla_1cta_route(
     is_topk_gather, nheads_per_kv, requires_grad, gather_bwd_recompute_p, *,
-    seqlen_q_hint, needs_1cta, split_kv=False, ctas_2cta=None, num_sms=None,
+    seqlen_q_hint, needs_1cta, split_kv=False, ctas_2cta=None, num_sms=None, mla_kernel=None,
 ):
     """Whether an MLA call runs the 1CTA (tcgen05.mma.ws) kernel rather than the 2CTA one.
 
@@ -494,10 +494,24 @@ def _mla_1cta_route(
       - Dense unsplit -> the one-wave rule on decode shapes (seqlen_q x heads per KV head
         <= 64), else 2CTA. Varlen without a host max_seqlen_q counts as prefill.
     FLASH_ATTENTION_MLA_1CTA=1 / 0 overrides it (1: wherever supported; 0: never).
+    mla_kernel="1cta" / "2cta" picks the kernel for one call, ahead of both, and raises if
+    that kernel cannot run the call.
     """
     supported = not is_topk_gather or (
         nheads_per_kv <= 64 and (not requires_grad or gather_bwd_recompute_p)
     )
+    if mla_kernel == "2cta" and needs_1cta:
+        raise ValueError(
+            "mla_kernel='2cta' cannot run fp8, descales or num_splits > 1: "
+            "they need the 1CTA MLA kernel"
+        )
+    if mla_kernel == "1cta" and not supported:
+        raise ValueError(
+            "mla_kernel='1cta' runs sparse MLA only up to 64 Q heads, and in training "
+            "only with gather_bwd_recompute_p"
+        )
+    if mla_kernel is not None:
+        return mla_kernel == "1cta"
     override = os.environ.get("FLASH_ATTENTION_MLA_1CTA")
     if override is not None:
         return override == "1" and supported
@@ -629,6 +643,7 @@ def _flash_attn_fwd(
     gather_bwd_recompute_p: bool = False,
     *,
     config: FwdConfig | None = None,
+    mla_kernel: Optional[str] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -646,7 +661,13 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
         config: Fully resolved forward config, or None for the default. Unsupported with qv.
+        mla_kernel: MLA (qv) only. "1cta" or "2cta" runs that MLA forward kernel; None picks it
+            with _mla_1cta_route's heuristic.
     """
+    if mla_kernel not in (None, "1cta", "2cta"):
+        raise ValueError(f"mla_kernel must be None, '1cta' or '2cta', got {mla_kernel!r}")
+    if mla_kernel is not None and qv is None:
+        raise ValueError("mla_kernel only applies to MLA (qv)")
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
@@ -882,6 +903,7 @@ def _flash_attn_fwd(
         # 2CTA tiles: one per token (sparse) or per batch element (dense decode), 2 CTAs each
         ctas_2cta=2 * num_head_kv * (total_q if gather_kv_indices is not None else batch_size),
         num_sms=num_sms,
+        mla_kernel=mla_kernel,
     )
     # num_splits < 1 (the split heuristic): 1CTA provisionally, re-decided after planning
     num_splits_auto = num_splits < 1
@@ -3793,6 +3815,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        mla_kernel: Optional[str] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3823,6 +3846,7 @@ class FlashAttnFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            mla_kernel=mla_kernel,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -3870,9 +3894,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 15)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 14)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 15)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3901,7 +3925,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 14)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 15)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3941,6 +3965,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        mla_kernel: Optional[str] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3982,6 +4007,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            mla_kernel=mla_kernel,
         )
         ctx.save_for_backward(
             q,
@@ -4055,9 +4081,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 16)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 17)
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 17)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4091,7 +4117,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 16)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 17)
 
 
 def _validate_gather_bwd_kwargs(
@@ -4155,6 +4181,7 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    mla_kernel: Optional[str] = None,
 ):
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -4197,6 +4224,7 @@ def flash_attn_func(
         return_lse,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        mla_kernel,
     )
 
 
@@ -4234,6 +4262,7 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    mla_kernel: Optional[str] = None,
 ):
     """
     Tensor arguments:
@@ -4299,6 +4328,11 @@ def flash_attn_varlen_func(
         gather_bwd_recompute_p, making the whole backward transient bounded by the chunk.
         Must be a positive int (anything else raises); requires varlen or batch 1 (warns
         and runs unchunked otherwise). Small launch-overhead cost. None disables.
+
+    mla_kernel: (MLA, qv) "1cta" or "2cta" runs that forward kernel for this call, ahead of
+        FLASH_ATTENTION_MLA_1CTA and the dispatch heuristic; raises if that kernel cannot run
+        the call (2CTA: no fp8, descales or num_splits > 1; 1CTA: sparse only up to 64 Q heads).
+        None (default) keeps the heuristic.
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -4337,6 +4371,7 @@ def flash_attn_varlen_func(
         disable_scheduler_metadata,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        mla_kernel,
     )
 
 
