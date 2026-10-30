@@ -244,6 +244,11 @@ class TileSchedulerArguments(ParamsBase):
     # every batch's first splits launch before the excess splits, which exit at once. Cluster
     # shape (1, 1) only.
     split_major: cutlass.Constexpr[bool] = False
+    # backward GQA folds: a KV-head tile covers qhead_fold query heads (qhead_pack of them packed
+    # into its rows, the rest walked by the head loop), so its Q / dO / dQaccum footprint -- the
+    # L2 section of the deterministic schedulers -- is that many times a head's
+    qhead_fold: cutlass.Constexpr[int] = 1
+    qhead_pack: cutlass.Constexpr[int] = 1
 
 
 class SingleTileScheduler:
@@ -802,7 +807,10 @@ class SingleTileLPTBwdScheduler:
             )
             size_one_dqaccum_head = cutlass.Int64(args.seqlen_k) * (args.headdim) * 4
             # size_one_dqaccum_head = 0
-            size_one_head = size_one_qdo_head + size_one_dqaccum_head
+            # seqlen_k here is mQ's rows, which already hold the packed heads
+            size_one_head = (
+                (size_one_qdo_head + size_one_dqaccum_head) * args.qhead_fold // args.qhead_pack
+            )
             log2_floor = lambda n: 31 - clz(n)
             swizzle = (
                 1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
@@ -968,6 +976,8 @@ class VarlenDecoder(ParamsBase):
         # if backward, add dqaccum block size to calculate swizzle
         if head_swizzle:
             kv_block_size += args.headdim * 4 * args.tile_shape_mn[1]
+            # num_n_blocks below counts unpacked query rows (from the K tiles): the whole fold
+            kv_block_size *= args.qhead_fold
         max_kvblock_in_l2 = size_l2 // kv_block_size
         return VarlenDecoder(
             num_head=args.num_head,
