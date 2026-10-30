@@ -371,6 +371,11 @@ class FlashAttentionForwardSm100:
         self.num_regs_softmax = config.registers.softmax
         self.num_regs_correction = config.registers.correction
         self.num_regs_other = config.registers.other
+        # See NOTE [softmax stats release order] in config.py.
+        assert not (config.sm_stats_cross_stage and config.use_s_ping_pong), (
+            "S ping-pong keeps its own order"
+        )
+        self.sm_stats_cross_stage_release = config.sm_stats_cross_stage
 
         self.buffer_align_bytes = 1024
 
@@ -2883,13 +2888,14 @@ class FlashAttentionForwardSm100:
 
             if has_work:
                 # Ignore first signal from softmax as no correction is required
-                # pipeline_sm_stats.consumer_wait_w_index_phase(0, sm_stats_consumer_phase)
                 if const_expr(not self.use_s_ping_pong):
-                    sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
-                    pipeline_sm_stats.consumer_release_w_index(0)
-                if const_expr(self.q_stage == 2):
-                    # pipeline_sm_stats.consumer_wait_w_index_phase(1, sm_stats_consumer_phase)
-                    sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
+                    for stage in cutlass.range_constexpr(self.q_stage):
+                        # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+                        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                        # See NOTE [softmax stats release order]: cross-stage holds slot 1 until
+                        # after the next O0 rescale.
+                        if const_expr(stage == 0 or not self.sm_stats_cross_stage_release):
+                            pipeline_sm_stats.consumer_release_w_index(stage)
                 sm_stats_consumer_phase ^= 1
 
                 tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
@@ -2906,6 +2912,10 @@ class FlashAttentionForwardSm100:
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
                         scale = sScale[tidx + sm_stats_index * self.m_block_size]
+                        # Same-stage frees the slot once this thread has loaded its scale; see
+                        # NOTE [softmax stats release order].
+                        if const_expr(not self.use_s_ping_pong and not self.sm_stats_cross_stage_release):
+                            pipeline_sm_stats.consumer_release_w_index(stage)
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         # should_rescale = True
                         # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
@@ -2926,10 +2936,12 @@ class FlashAttentionForwardSm100:
                             o_acc_consumer_count += 1
                         else:
                             pipeline_s_p_o.consumer_release_w_index(stage)
-                            pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
+                            if const_expr(self.sm_stats_cross_stage_release):
+                                pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
                     sm_stats_consumer_phase ^= 1
                     # o_corr_consumer_phase ^= 1
-                if const_expr(self.q_stage == 2):
+                if const_expr(self.q_stage == 2 and self.sm_stats_cross_stage_release):
+                    # See NOTE [softmax stats release order]: the last stage-1 slot read above.
                     pipeline_sm_stats.consumer_release_w_index(1)
                 # End of seqlen_corr_loop_steps
 

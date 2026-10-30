@@ -216,6 +216,29 @@ def test_smem_model_matches_measured_kernel_allocations():
         validate_fwd_config(too_wide, hd192)
 
 
+def test_softmax_stats_release_order_follows_the_measured_table():
+    # BF16 hd64 non-causal measured faster with cross-stage on SM100, same-stage on SM103.
+    inputs = make_inputs(device_arch=100)
+    config = select_fwd_config(inputs)
+    assert config.sm_stats_cross_stage
+    assert not select_fwd_config(inputs._replace(device_arch=103)).sm_stats_cross_stage
+    assert not select_fwd_config(inputs._replace(dtype="torch.float8_e4m3fn",
+                                                 head_dim=128, head_dim_v=128)).sm_stats_cross_stage
+    # Both orders are correct, so an explicit config may pick either.
+    validate_fwd_config(replace(config, sm_stats_cross_stage=False), inputs)
+    # S ping-pong keeps its own order; other architectures have no such choice.
+    decode = inputs._replace(max_seqlen_q=1)
+    decode_config = select_fwd_config(decode)
+    assert decode_config.use_s_ping_pong and not decode_config.sm_stats_cross_stage
+    with pytest.raises(ValueError, match="S ping-pong"):
+        validate_fwd_config(replace(decode_config, sm_stats_cross_stage=True), decode)
+    # Deriving a config re-derives the order for the changed S ping-pong choice.
+    assert derive_fwd_config(decode_config, decode, use_s_ping_pong=False).sm_stats_cross_stage
+    sm90 = inputs._replace(device_arch=90)
+    with pytest.raises(ValueError, match="SM100-only options"):
+        validate_fwd_config(replace(select_fwd_config(sm90), sm_stats_cross_stage=True), sm90)
+
+
 # Frozen copy of the register policy the forward kernels applied before it moved into the
 # selector (flash_fwd_sm100.py __init__ and the FP8 override in __call__; flash_fwd_sm90.py).
 _LEGACY_SM100_TUNING = {

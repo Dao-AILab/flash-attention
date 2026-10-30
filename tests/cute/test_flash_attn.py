@@ -591,6 +591,7 @@ def test_flash_attn_forced_split_config_reuses_specializations():
         registers=Sm100Registers(softmax=200, correction=64, other=48),
         ex2_emu_freq=0,
         ex2_emu_start_frg=0,
+        sm_stats_cross_stage=False,
     )
     out_2 = _flash_attn_fwd(q, k, v, config=config_2)[0]
     main_keys = set(_flash_attn_fwd.compile_cache.cache)
