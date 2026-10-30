@@ -352,6 +352,179 @@ def test_generic_varlen_no_max_shares_flat_scheduler_key(monkeypatch):
     check_against_reference((out_none,), q, k, v, None, q_lens, k_lens, False, dtype)
 
 
+MASKS = {
+    "causal": dict(causal=True),
+    "noncausal": dict(causal=False),
+    "local": dict(causal=False, window_size=(1024, 0)),
+}
+
+
+# hd256 2CTA: 24/4 without PackGQA, 16/4 with it; 6/1 covers one KV head.
+@pytest.mark.parametrize("mask", list(MASKS))
+@pytest.mark.parametrize(
+    "head_dim, num_heads_q, num_heads_kv", [(128, 8, 2), (256, 24, 4), (256, 16, 4), (256, 6, 1)]
+)
+def test_padded_varlen_slots_use_persistent_scheduler(
+    head_dim, num_heads_q, num_heads_kv, mask, monkeypatch
+):
+    """A prompt and 3 decodes in a CUDA graph's 512 request slots, max_seqlen_q = all tokens.
+    The persistent route must match the unpadded (single-tile) call bitwise."""
+    q_real, k_real = (1500, 1, 1, 1), (1500, 700, 4096, 9)
+    q_lens, k_lens = q_real + (0,) * 508, k_real + (0,) * 508
+    dtype = torch.bfloat16
+    torch.manual_seed(SEED)
+    q = torch.randn(sum(q_lens), num_heads_q, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lens), num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    # A fresh compile cache: the mock only sees kernels it constructs.
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", JITCache())
+    constructor = Mock(wraps=interface.FlashAttentionForwardSm100)
+    monkeypatch.setattr(interface, "FlashAttentionForwardSm100", constructor)
+
+    def forward(lens_q, lens_k, max_q):
+        out, lse = flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q=make_cu_seqlens(lens_q), cu_seqlens_k=make_cu_seqlens(lens_k),
+            max_seqlen_q=max_q, max_seqlen_k=max(lens_k), return_lse=True, **MASKS[mask],
+        )
+        return out, lse, constructor.call_args.kwargs["has_tile_count_semaphore"]
+
+    out_padded, lse_padded, persistent = forward(q_lens, k_lens, sum(q_lens))
+    assert persistent
+    out_real, lse_real, persistent = forward(q_real, k_real, max(q_real))
+    assert not persistent
+    assert torch.equal(out_padded, out_real)
+    assert torch.equal(lse_padded, lse_real)
+    if mask != "local":  # the eager reference has no window
+        check_against_reference(
+            (out_padded,), q, k, v, None, q_lens, k_lens, mask == "causal", dtype
+        )
+
+
+@pytest.mark.parametrize("mask", ["causal", "noncausal"])
+def test_persistent_varlen_cuda_graph_replay(mask, monkeypatch):
+    """Replay a persistent-scheduler graph with changing lengths across 64 request slots."""
+    capacity, dtype = 640, torch.bfloat16
+    replays = [
+        (10,) * 64,  # every slot active
+        (300, 1, 1, 1) + (0,) * 60,  # a prompt and 3 decodes
+        (0,) * 40 + (128,) + (0,) * 23,  # one request in the middle
+        (0,) * 64,  # no work: the grid must terminate safely
+    ]
+    torch.manual_seed(SEED)
+    q = torch.randn(capacity, 8, 128, device="cuda", dtype=dtype)
+    k = torch.randn(capacity, 2, 128, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    cu = make_cu_seqlens(replays[0])
+
+    def step():
+        out, _ = flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=capacity,
+            max_seqlen_k=capacity, causal=mask == "causal",
+        )
+        return out
+
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", JITCache())
+    constructor = Mock(wraps=interface.FlashAttentionForwardSm100)
+    monkeypatch.setattr(interface, "FlashAttentionForwardSm100", constructor)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        step()  # compile outside capture
+    assert constructor.call_args.kwargs["has_tile_count_semaphore"]
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        static_out = step()
+    for lengths in replays:
+        cu.copy_(make_cu_seqlens(lengths))
+        graph.replay()
+        torch.cuda.synchronize()
+        total = sum(lengths)
+        if total:
+            check_against_reference(
+                (static_out[:total].clone(),), q, k, v, None, lengths, lengths, mask == "causal", dtype
+            )
+
+
+def test_persistent_varlen_one_split_ignores_seqlen_k_per_split(monkeypatch):
+    """Persistent num_splits=1 ignores seqlen_k_per_split, which only sizes split-KV."""
+    q_lens, k_lens = (300,) + (1,) * 15, (4096,) * 16
+    dtype = torch.bfloat16
+    torch.manual_seed(SEED)
+    q = torch.randn(sum(q_lens), 8, 128, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lens), 2, 128, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", JITCache())
+    constructor = Mock(wraps=interface.FlashAttentionForwardSm100)
+    monkeypatch.setattr(interface, "FlashAttentionForwardSm100", constructor)
+    out, _ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=make_cu_seqlens(q_lens), cu_seqlens_k=make_cu_seqlens(k_lens),
+        max_seqlen_q=300, max_seqlen_k=4096, causal=True, num_splits=1, seqlen_k_per_split=1024,
+    )
+    assert constructor.call_args.kwargs["has_tile_count_semaphore"]
+    check_against_reference((out,), q, k, v, None, q_lens, k_lens, True, dtype)
+
+
+@pytest.mark.parametrize(
+    "q_real, k_real, slots, num_splits, persistent",
+    [
+        ((1500, 1, 1, 1), (1500, 700, 4096, 9), 512, 1, True),  # padded: persistent route
+        ((1500, 1, 1, 1), (1500, 700, 4096, 9), 512, 2, False),  # explicit SplitKV
+        ((150,), (8192,), 4, 0, False),  # heuristic SplitKV (long K, few tiles)
+    ],
+)
+def test_hd256_pack_gqa_changes_only_on_persistent_route(
+    q_real, k_real, slots, num_splits, persistent, monkeypatch
+):
+    """HD256 6/1 keeps the SplitKV call unpacked and the persistent call packed."""
+    q_lens = q_real + (0,) * (slots - len(q_real))
+    k_lens = k_real + (0,) * (slots - len(k_real))
+    dtype = torch.bfloat16
+    torch.manual_seed(SEED)
+    q = torch.randn(sum(q_lens), 6, 256, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lens), 1, 256, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", JITCache())
+    constructor = Mock(wraps=interface.FlashAttentionForwardSm100)
+    monkeypatch.setattr(interface, "FlashAttentionForwardSm100", constructor)
+    out, _ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=make_cu_seqlens(q_lens), cu_seqlens_k=make_cu_seqlens(k_lens),
+        max_seqlen_q=max(q_real), max_seqlen_k=max(k_real), causal=True, num_splits=num_splits,
+    )
+    kwargs = constructor.call_args.kwargs
+    assert (kwargs["config"].num_splits > 1) == (not persistent)
+    assert kwargs["config"].use_dynamic_varlen == persistent
+    assert kwargs["config"].pack_gqa == persistent
+    check_against_reference((out,), q, k, v, None, q_lens, k_lens, True, dtype)
+
+
+@pytest.mark.parametrize(
+    "head_dim, num_heads_q, num_heads_kv, batch", [(128, 8, 2, 512), (256, 24, 4, 2)]
+)
+def test_decode_varlen_keeps_main_scheduler(
+    head_dim, num_heads_q, num_heads_kv, batch, monkeypatch
+):
+    """Single-token decode stays static-persistent, with 2CTA for hd256."""
+    dtype = torch.bfloat16
+    torch.manual_seed(SEED)
+    q = torch.randn(batch, num_heads_q, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(batch * 256, num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", JITCache())
+    constructor = Mock(wraps=interface.FlashAttentionForwardSm100)
+    monkeypatch.setattr(interface, "FlashAttentionForwardSm100", constructor)
+    cu_q, cu_k = make_cu_seqlens((1,) * batch), make_cu_seqlens((256,) * batch)
+    flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=1, max_seqlen_k=256,
+        causal=True, num_splits=1,
+    )
+    kwargs = constructor.call_args.kwargs
+    assert not kwargs["has_tile_count_semaphore"]
+    assert kwargs["config"].is_static_persistent
+    assert kwargs["config"].use_2cta_instrs == (head_dim == 256)
+
+
 def test_generic_paged_seqused_cuda_maxima_use_host_bounds():
     """Paged SplitKV scheduler bounds must not require host reads of CUDA maxima."""
     torch.manual_seed(SEED)
