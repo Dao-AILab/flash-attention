@@ -2584,6 +2584,27 @@ def test_flash_attn_varlen_paged_kv_num_splits(dtype):
         _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("num_splits", [1, 2])
+def test_flash_attn_varlen_paged_kv_gqa_decode_lse(num_splits, d, dtype):
+    """GQA decoding with paged KV swaps seqlen_q and ngroups; softmax_lse must still be (nheads, total_q)."""
+    from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
+
+    batch_size, nheads, nheads_k, seqlen_k = 3, 8, 2, 256
+    q = torch.randn(batch_size, nheads, d, device="cuda", dtype=dtype)
+    k, v = torch.randn(2, batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype)
+    cu_seqlens_q = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+    block_table = torch.arange(batch_size, device="cuda", dtype=torch.int32)[:, None]
+    _, lse, _, _ = _flash_attn_varlen_forward(
+        q, k, v, cu_seqlens_q, cu_seqlens_q * seqlen_k, 1, seqlen_k, dropout_p=0.0, softmax_scale=d ** -0.5,
+        causal=False, block_table=block_table, num_splits=num_splits,
+    )
+    k = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    lse_ref = torch.einsum("bhd,bshd->hbs", q.float(), k.float()).mul(d ** -0.5).logsumexp(-1)
+    assert (lse - lse_ref).abs().max().item() < 1e-3
+
+
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("paged_kv_block_size", [256])
 @pytest.mark.parametrize("append_knew", [False, True])
