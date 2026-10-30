@@ -424,6 +424,7 @@ _SM_STATS_CROSS_STAGE = {
     ("fp8", 96, False, False): ("sm_100",),
     ("fp8", 96, True, False): ("sm_100",),
     ("mxfp8_qk", 64, True, False): ("sm_103", "sm_107"),
+    ("mxfp8_pv", 64, True, False): ("sm_100",),
 }
 # === END SM100 TUNING KNOBS ===
 
@@ -472,11 +473,14 @@ def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs) -> Sm100Registers | No
     family = sm100_arch_family(inputs.device_arch)
     if family == "sm_107":
         # Dedicated scale columns: fewer softmax registers relieve register pressure in the
-        # correction and MMA/load warps at hd64.
-        return Sm100Registers(160, 96, 96) if inputs.head_dim_padded < 96 else None
+        # correction and MMA/load warps at non-causal hd64.
+        if inputs.head_dim_padded < 96 and not inputs.causal:
+            return Sm100Registers(160, 96, 96)
+        return None
     # The MMA warp also issues the PV scale copies and the split-P wait. It spills with the
-    # 48 registers of the hd128 default, and on sm_103 the persistent loop needs 80.
-    if family == "sm_103":
+    # 48 registers of the hd128 default, and on sm_103 the persistent non-causal loop
+    # needs 80 (causal uses a single-tile scheduler).
+    if family == "sm_103" and not inputs.causal:
         softmax, correction = 168, 96
     elif inputs.head_dim_padded >= 96:
         softmax, correction = 184, 80

@@ -90,8 +90,10 @@ def quantize_v_to_fp8_with_sf(
     physical shape (B, H, ceil(D / 128), ceil(S / 128), 32, 4, 4). Its byte
     at [b, h, d//128, g//4, d%32, (d%128)//32, g%4] scales V[b, 32*g:32*g+32, h, d].
 
-    Along-key scales depend on future keys in each group: this representation
-    is for noncausal attention, not causal/local attention or an append-only KV cache.
+    Along-key scales depend on future keys in each group, so this representation alone is
+    for noncausal attention. Causal attention also needs the original BF16 V
+    (`BlockScales.v_bf16`) so the diagonal blocks never read a scale shared with future keys;
+    local attention and append-only KV caches are not supported.
     """
     if v.ndim != 4 or v.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError("V must be a float16, bfloat16, or float32 (B, S, H, D) tensor")
