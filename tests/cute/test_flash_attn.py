@@ -36,6 +36,7 @@ from flash_attn.cute.testing import (
     is_fake_mode,
 )
 from flash_attn.cute.interface import (
+    TensorwiseScales,
     flash_attn_func,
     flash_attn_varlen_func,
     get_scheduler_metadata,
@@ -827,9 +828,9 @@ def test_flash_attn_output(
         else:
             learnable_sink_ref = None
             learnable_sink = None
-        # flash_attn_func exposes no descale kwargs (the kernel then uses descale=1),
+        # flash_attn_func runs without scales here (the kernel then uses descale=1),
         # so attention_ref must not apply descales either. Descale plumbing is
-        # exercised via _flash_attn_fwd directly.
+        # exercised by test_flash_attn_fp8_partial_descales.
         q_descale, k_descale, v_descale = None, None, None
         # FP8 is forward-only: the interface rejects fp8 inputs with requires_grad,
         # and the grad checks below are dtype-gated anyway.
@@ -909,7 +910,7 @@ def test_flash_attn_output(
                 v,
                 qv=qv,
                 causal=causal,
-                # q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                # scales=TensorwiseScales(q_descale, k_descale, v_descale),
                 window_size=window_size,
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
@@ -1848,8 +1849,7 @@ def test_flash_attn_varlen_output(
                     seqused_k=seqused_k if not unpad_kv else None,
                     causal=causal,
                     # qv=qv_unpad,
-                    # q_descale=q_descale,
-                    # k_descale=k_descale, v_descale=v_descale,
+                    # scales=TensorwiseScales(q_descale, k_descale, v_descale),
                     window_size=window_size,
                     # attention_chunk=attention_chunk,
                     learnable_sink=learnable_sink,
@@ -3057,9 +3057,7 @@ def _run_fp8_paged_decode(q, k, v, page_size=128):
         page_table=page_table,
         softmax_scale=d**-0.5,
         causal=True,
-        q_descale=descale,
-        k_descale=descale,
-        v_descale=descale,
+        scales=TensorwiseScales(descale, descale, descale),
     )[0]
 
 
@@ -3544,9 +3542,9 @@ def test_flash_attn_fp8_paged_decode_preserves_tail_mass():
 @pytest.mark.parametrize("present", ["q", "k", "v", "qk", "qv", "kv"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_partial_descales(present):
-    """Any subset of q / k / v descales: a missing one is 1. The partial DescaleTensors must
-    keep each member in its own slot across the kernel boundary (bitwise equal to passing
-    ones for the missing members)."""
+    """Any subset of q / k / v descales: a missing one is 1. flash_attn_func must forward
+    scales, and the partial DescaleTensors must keep each member in its own slot across the
+    kernel boundary (bitwise equal to passing ones for the missing members)."""
     torch.manual_seed(0)
     batch_size, seqlen, nheads, nheads_kv, d = 2, 192, 4, 2, 128
     q, k, v = [
@@ -3555,12 +3553,12 @@ def test_flash_attn_fp8_partial_descales(present):
     ]
     descales = {name: torch.rand(batch_size, nheads_kv, device="cuda") + 0.5 for name in "qkv"}
     ones = torch.ones(batch_size, nheads_kv, device="cuda")
-    out = _flash_attn_fwd(
-        q, k, v, causal=True, **{f"{n}_descale": descales[n] for n in present}
-    )[0]
+    out, _ = flash_attn_func(
+        q, k, v, causal=True, scales=TensorwiseScales(**{n: descales[n] for n in present})
+    )
     out_ref = _flash_attn_fwd(
         q, k, v, causal=True,
-        **{f"{n}_descale": descales[n] if n in present else ones for n in "qkv"},
+        scales=TensorwiseScales(*(descales[n] if n in present else ones for n in "qkv")),
     )[0]
     if is_fake_mode():
         return
