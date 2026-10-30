@@ -39,6 +39,14 @@ def test_every_architecture_selects_a_valid_default(device_arch):
     select_fwd_config(make_inputs(device_arch=device_arch))
 
 
+@pytest.mark.parametrize("device_arch", [80, 86, 89, 90, 100, 110, 120])
+@pytest.mark.parametrize("page_size", [16, 52, 128])
+def test_paged_kv_config(device_arch, page_size):
+    inputs = make_inputs(device_arch=device_arch, page_size=page_size)
+    config = select_fwd_config(inputs)
+    validate_fwd_config(config, inputs)
+
+
 @pytest.mark.parametrize(
     ("changes", "pack_gqa", "expected"),
     [
@@ -83,6 +91,7 @@ def test_pack_gqa_resolves_before_dependent_policy(changes, pack_gqa, expected):
         ({"max_seqlen_q": 1, "disable_s_ping_pong": True, **_HD128}, {"use_s_ping_pong": False}),
         ({"device_arch": 90, "head_dim": 96, "head_dim_v": 96, "requested_tile_m": 128},
          {"tile_m": 128, "mma_pv_is_rs": True, "intra_wg_overlap": True}),
+        ({"device_arch": 120, **_HD256}, {"tile_m": 64, "tile_n": 64}),
     ],
 )
 def test_selection_policy(changes, expected):
@@ -123,7 +132,7 @@ def test_split_selection(changes, expected_splits, expected_tile_n):
     [
         # Selection-time rejections.
         ({"device_arch": 70}, {}, "Unsupported forward architecture family SM7"),
-        ({"device_arch": 120, "page_size": 128}, {}, "SM120 forward does not support"),
+        ({"device_arch": 120, "use_block_sparsity": True}, {}, "SM120 forward does not support"),
         ({"device_arch": 120, "requested_num_splits": 3}, {}, "SM120 forward only supports num_s"),
         ({"head_dim": 72, "head_dim_v": 72, "page_size": 64}, {}, "head dimensions divisible"),
         # Geometry and architecture.

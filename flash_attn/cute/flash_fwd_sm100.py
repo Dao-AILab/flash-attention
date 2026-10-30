@@ -1616,6 +1616,7 @@ class FlashAttentionForwardSm100:
                     self.head_dim_v_padded,
                     num_load_threads,
                     mK.element_type,
+                    same_hdim_kv=self.same_hdim_kv,
                 )
                 tKsK, tKgK = None, None
                 tVsV, tVgV = None, None
