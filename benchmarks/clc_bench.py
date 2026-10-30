@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """CLC benchmark for dense, varlen, and block-sparse FA4 sweeps.
 
+Each case times its default config with CLC off and on, as explicit configs; an arm the
+problem does not support raises ValueError. Rows record the GPU and SM arch.
+
 Run with benchmark against the yaml sweep:
   python benchmarks/clc_bench.py --config benchmarks/configs/clc.yaml
+
+Dense causal prefill (flash_attn_func runs num_splits=1), the NOTE [causal CLC] class in
+flash_attn/cute/config.py:
+  python benchmarks/clc_bench.py --config benchmarks/configs/clc.yaml \
+      --varlen.enabled false --dense.causal true
+
+Timing candidates per (dtype, head_dim, head_dim_v, arch), also printed after each run:
+  python benchmarks/clc_bench.py --summary benchmarks/results/clc/<run>/profile.csv
 
 Useful overrides:
   --workers 64                         # compile parallelism
@@ -18,13 +29,15 @@ import statistics
 import subprocess
 import sys
 import types
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from itertools import product
 from pathlib import Path
 from typing import Literal
+from unittest import mock
 
 try:
     from jsonargparse import CLI
@@ -373,10 +386,52 @@ def flash_attn_imports():
         sys.modules["flash_attn"] = stub
     import torch
     from torch._subclasses.fake_tensor import FakeTensorMode
-    from flash_attn.cute import utils as cute_utils
     from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 
-    return torch, FakeTensorMode, cute_utils, flash_attn_func, flash_attn_varlen_func
+    return torch, FakeTensorMode, flash_attn_func, flash_attn_varlen_func
+
+
+@lru_cache(maxsize=None)
+def explicit_clc_config(inputs, clc: bool):
+    """The default standard-kernel config for inputs with CLC set explicitly; ValueError if
+    unsupported. Both arms stay off SwapAB so decode compares the standard kernel's schedulers."""
+    from flash_attn.cute import config as fwd_config
+
+    inputs = inputs._replace(requested_use_swapab=False)
+    config = fwd_config.select_fwd_config(inputs)
+    if config.use_clc_scheduler == clc:
+        return config
+    resolved = inputs._replace(pack_gqa=config.pack_gqa)
+    # Without CLC, keep the static persistence selection would have chosen.
+    is_static_persistent = not clc and fwd_config.can_use_static_persistent(
+        resolved,
+        tile_m=config.tile_m,
+        q_stage=config.q_stage,
+        num_splits=config.num_splits,
+        use_2cta_instrs=config.use_2cta_instrs,
+        use_clc_scheduler=False,
+    )
+    # derive_fwd_config re-derives the dependent fields, such as registers, and validates.
+    return fwd_config.derive_fwd_config(
+        config, inputs, use_clc_scheduler=clc, is_static_persistent=is_static_persistent
+    )
+
+
+@contextmanager
+def clc_selection(clc: bool):
+    """Run forward calls on explicit CLC on/off configs instead of the default selection."""
+    from flash_attn.cute import interface
+
+    def select(inputs):
+        return explicit_clc_config(inputs, clc)
+
+    with mock.patch.object(interface, "select_fwd_config", select):
+        yield
+
+
+def device_metadata(torch_mod) -> dict:
+    major, minor = torch_mod.cuda.get_device_capability()
+    return {"gpu": torch_mod.cuda.get_device_name(), "arch": f"sm_{major}{minor}"}
 
 
 def block_sparse_imports():
@@ -392,7 +447,7 @@ def block_sparse_imports():
     return compute_block_sparsity, get_mask_pair
 
 
-def build_cu_seqlens(torch_mod, lengths: list[int]) -> torch_mod.Tensor:
+def build_cu_seqlens(torch_mod, lengths: list[int]):
     cu_seqlens = torch_mod.zeros(len(lengths) + 1, device="cuda", dtype=torch_mod.int32)
     cu_seqlens[1:] = torch_mod.tensor(lengths, device="cuda", dtype=torch_mod.int32).cumsum(0)
     return cu_seqlens
@@ -485,7 +540,7 @@ def build_block_sparse_inputs(torch_mod, flash_attn_func, case: Case, dtype, ten
 
 
 def build_inputs(case: Case, dtype_name: DTypeName, fake_tensor: bool):
-    torch, FakeTensorMode, _, flash_attn_func, flash_attn_varlen_func = flash_attn_imports()
+    torch, FakeTensorMode, flash_attn_func, flash_attn_varlen_func = flash_attn_imports()
     dtype = getattr(torch, dtype_name)
     tensor_factory = torch.empty if fake_tensor else torch.randn
     context = FakeTensorMode() if fake_tensor else nullcontext()
@@ -596,7 +651,9 @@ def case_metadata(case: Case) -> dict:
     }
 
 
-def summarize_profile(case: Case, samples_off: list[float], samples_on: list[float], flop_count: float) -> dict:
+def summarize_profile(
+    case: Case, samples_off: list[float], samples_on: list[float], flop_count: float, metadata: dict
+) -> dict:
     mean_off = statistics.mean(samples_off)
     mean_on = statistics.mean(samples_on)
     paired_log_ratios = [math.log(off / on) for off, on in zip(samples_off, samples_on)]
@@ -610,6 +667,7 @@ def summarize_profile(case: Case, samples_off: list[float], samples_on: list[flo
     ci95_high = math.exp(mean_log_ratio + 1.96 * stderr_log_ratio)
     return {
         **case_metadata(case),
+        **metadata,
         "samples_off_us": samples_off,
         "samples_on_us": samples_on,
         "mean_off_us": mean_off,
@@ -634,31 +692,25 @@ def run_single_case(
     bench_iters: int,
     seed: int,
 ) -> dict:
-    os.environ["FA_CLC"] = str(clc)
     os.environ["FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"] = "1"
-    torch, _, cute_utils, _, _ = flash_attn_imports()
+    torch, _, _, _ = flash_attn_imports()
     if not fake_tensor and not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for runtime profiling in clc_bench.py")
     torch.manual_seed(seed)
     fn, kwargs = build_inputs(case, dtype_name, fake_tensor)
-    cute_utils._fa_clc_enabled = bool(clc)
-    fn(**kwargs)
-    if fake_tensor:
-        return {"case": case.name, "clc": clc, "compiled": True}
-    torch.cuda.synchronize()
-    warmup_iters = min(25, max(10, bench_iters // 10))
-    return {
-        "case": case.name,
-        "clc": clc,
-        "time_us": statistics.mean(
-            benchmark_cuda_samples_in_microseconds(
-                fn,
-                **kwargs,
-                NUM_ITERS=bench_iters,
-                MEMORY_WARMUP_ITERS=warmup_iters,
-            )
-        ),
-    }
+    with clc_selection(bool(clc)):
+        fn(**kwargs)
+        if fake_tensor:
+            return {"case": case.name, "clc": clc, "compiled": True}
+        torch.cuda.synchronize()
+        warmup_iters = min(25, max(10, bench_iters // 10))
+        samples = benchmark_cuda_samples_in_microseconds(
+            fn,
+            **kwargs,
+            NUM_ITERS=bench_iters,
+            MEMORY_WARMUP_ITERS=warmup_iters,
+        )
+    return {"case": case.name, "clc": clc, "time_us": statistics.mean(samples)}
 
 
 def run_single_subprocess(case: Case, clc: int, dtype_name: DTypeName, bench_iters: int, seed: int, script_path: Path) -> dict:
@@ -703,9 +755,10 @@ def run_compile(cases: list[Case], dtype_name: DTypeName, workers: int, bench_it
 
 
 def run_profile(cases: list[Case], dtype_name: DTypeName, profile_repeats: int, bench_iters: int, seed: int) -> list[dict]:
-    torch, _, cute_utils, _, _ = flash_attn_imports()
+    torch, _, _, _ = flash_attn_imports()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for clc_bench.py")
+    metadata = {"dtype": dtype_name, **device_metadata(torch)}
     torch.manual_seed(seed)
     total_iters = profile_repeats * bench_iters
     warmup_iters = min(25, max(10, total_iters // 10))
@@ -714,16 +767,16 @@ def run_profile(cases: list[Case], dtype_name: DTypeName, profile_repeats: int, 
         fn, kwargs = build_inputs(case, dtype_name, fake_tensor=False)
         samples: dict[int, list[float]] = {}
         for clc in (0, 1):
-            cute_utils._fa_clc_enabled = bool(clc)
-            fn(**kwargs)
-            torch.cuda.synchronize()
-            samples[clc] = benchmark_cuda_samples_in_microseconds(
-                fn,
-                **kwargs,
-                NUM_ITERS=total_iters,
-                MEMORY_WARMUP_ITERS=warmup_iters,
-            )
-        row = summarize_profile(case, samples[0], samples[1], fwd_flops(case, kwargs))
+            with clc_selection(bool(clc)):
+                fn(**kwargs)
+                torch.cuda.synchronize()
+                samples[clc] = benchmark_cuda_samples_in_microseconds(
+                    fn,
+                    **kwargs,
+                    NUM_ITERS=total_iters,
+                    MEMORY_WARMUP_ITERS=warmup_iters,
+                )
+        row = summarize_profile(case, samples[0], samples[1], fwd_flops(case, kwargs), metadata)
         print(
             f"[{index}/{len(cases)}] {case.name}: "
             f"off={row['mean_off_us']:.3f}us on={row['mean_on_us']:.3f}us "
@@ -755,6 +808,42 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(scalar_rows)
 
 
+def summarize_timing_candidates(rows: list[dict]) -> list[dict]:
+    """Worst and best CLC speedup (off / on time) per (dtype, head_dim, head_dim_v, arch).
+
+    These are timing candidates for NOTE [causal CLC] in flash_attn/cute/config.py, not
+    defaults: a cell needs <=0.5% loss per shape and >1% gain on at least one shape.
+    """
+    groups: dict[tuple, list[float]] = {}
+    for row in rows:
+        key = (row.get("dtype", "?"), int(row["d"]), int(row["dv"]), row.get("arch", "?"))
+        groups.setdefault(key, []).append(float(row["speedup_on_vs_off"]))
+    return [
+        {
+            "dtype": dtype,
+            "head_dim": d,
+            "head_dim_v": dv,
+            "arch": arch,
+            "cases": len(speedups),
+            "worst_speedup": min(speedups),
+            "best_speedup": max(speedups),
+            "meets_note": min(speedups) >= 0.995 and max(speedups) > 1.01,
+        }
+        for (dtype, d, dv, arch), speedups in sorted(groups.items())
+    ]
+
+
+def print_timing_candidates(rows: list[dict]) -> None:
+    print("timing candidates (speedup = CLC off / on time; higher favors CLC):")
+    print(f"{'dtype':<10} {'d':>4} {'dv':>4} {'arch':<7} {'cases':>5} {'worst':>7} {'best':>7} meets_note")
+    for row in summarize_timing_candidates(rows):
+        print(
+            f"{row['dtype']:<10} {row['head_dim']:>4} {row['head_dim_v']:>4} {row['arch']:<7} "
+            f"{row['cases']:>5} {row['worst_speedup']:>6.3f}x {row['best_speedup']:>6.3f}x "
+            f"{row['meets_note']}"
+        )
+
+
 def main(
     out_dir: Path | None = None,
     workers: int = 32,
@@ -766,7 +855,13 @@ def main(
     dense: DenseSweep = DenseSweep(),
     varlen: VarlenSweep = VarlenSweep(),
     block_sparse: BlockSparseSweep = BlockSparseSweep(),
+    summary: Path | None = None,
 ) -> None:
+    """summary: print timing candidates from an existing profile.csv and exit."""
+    if summary is not None:
+        with summary.open(newline="") as handle:
+            print_timing_candidates(list(csv.DictReader(handle)))
+        return
     if (request_json := os.environ.get(INTERNAL_REQUEST_ENV)) is not None:
         request = json.loads(request_json)
         print(
@@ -802,6 +897,7 @@ def main(
     write_csv(profile_csv, profile_rows)
     print("Profile written to:")
     print(profile_csv)
+    print_timing_candidates(profile_rows)
 
 
 if __name__ == "__main__":
