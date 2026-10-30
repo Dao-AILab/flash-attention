@@ -1,10 +1,20 @@
+import importlib.util
 import math
+import os
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 import torch.nn.functional as F
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import get_arch, is_hip
 from einops import rearrange, repeat
+
 from flash_attn import (
+    _backend,
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
@@ -14,9 +24,14 @@ from flash_attn import (
     flash_attn_with_kvcache,
 )
 from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size_n
+from flash_attn.flash_attn_interface import AMD_BACKEND, _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import USE_TRITON_ROCM, is_hip, get_arch
+
+ADAPTER = Path(__file__).resolve().parents[1] / "flash_attn" / "flash_attn_interface_aiter.py"
+INTERFACE = ADAPTER.with_name("flash_attn_interface.py")
+_adapter_spec = importlib.util.spec_from_file_location("flash_attn_interface_aiter_test", ADAPTER)
+adapter = importlib.util.module_from_spec(_adapter_spec)
+_adapter_spec.loader.exec_module(adapter)
 
 
 def _get_block_size_n_triton(device, head_dim, is_dropout, is_causal):
@@ -918,7 +933,7 @@ def test_flash_attn_varlen_qkvpacked(
 def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
-    if USE_TRITON_ROCM:
+    if AMD_BACKEND == "triton":
         if causal:
             if seqlen_q ==1024 and seqlen_k==1024 and d==160:
                 pytest.skip("This test with causal=True is flakey")
@@ -1191,7 +1206,7 @@ def test_flash_attn_output(
 def test_flash_attn_varlen_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
-    if USE_TRITON_ROCM:
+    if AMD_BACKEND == "triton":
         if seqlen_q == 1 and seqlen_k == 147 and kvpacked == True and dropout_p != 0.0:
             pytest.skip("This config with dropout is flaky on AMD.")
     if (
@@ -1502,7 +1517,7 @@ def test_flash_attn_varlen_output(
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
-    if USE_TRITON_ROCM:
+    if AMD_BACKEND == "triton":
         if get_arch().is_rdna:
             if seqlen_q == 1 and seqlen_k == 239 and d == 256:
                 pytest.skip("This config doesnot work on RDNA Devices.")
@@ -1792,7 +1807,7 @@ def test_flash_attn_varlen_causal(
 def test_flash_attn_splitkv(
     seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, alibi, deterministic, dtype
 ):
-    if USE_TRITON_ROCM:
+    if AMD_BACKEND == "triton":
         if seqlen_q == 1 and seqlen_k == 339 and swap_sq_sk == True:
             pytest.skip("This config with is flaky on AMD.")
     if swap_sq_sk:
@@ -2559,3 +2574,188 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
+
+
+class TestAiterAdapter(unittest.TestCase):
+    def setUp(self):
+        self.triton_fa2 = types.SimpleNamespace(
+            fwd=Mock(return_value=("to", "tl", "tp", "tr")),
+            bwd=Mock(return_value=("tq", "tk", "tv", "td")),
+            varlen_fwd=Mock(return_value=("tvo", "tvl", "tvp", "tvr")),
+            varlen_bwd=Mock(return_value=("tvq", "tvk", "tvv", "tvd")),
+            fwd_kvcache=Mock(return_value=("tco", "tcl")),
+        )
+        self.general = types.ModuleType("aiter.ops.mha")
+        self.general._flash_attn_forward = Mock(return_value=("o", "l", "p", "r"))
+        self.general._flash_attn_backward = Mock(return_value="softmax_d")
+        self.general._flash_attn_varlen_forward = Mock(return_value=("vo", "vl", "vp", "vr"))
+        self.general._flash_attn_varlen_backward = Mock(return_value="varlen_d")
+        self.cache = types.ModuleType("aiter.ops.triton.attention.mha")
+        self.cache.flash_attn_with_kvcache = Mock(return_value=("cache_out", "cache_lse"))
+        ops = types.ModuleType("aiter.ops")
+        ops.mha = self.general
+        modules = {
+            "aiter.ops": ops,
+            "aiter.ops.mha": self.general,
+            "aiter.ops.triton.attention.mha": self.cache,
+        }
+        self.module_patch = patch.dict(sys.modules, modules)
+        self.module_patch.start()
+        self.addCleanup(self.module_patch.stop)
+        self.triton_patch = patch.object(adapter, "_triton_fa2", self.triton_fa2)
+        self.triton_patch.start()
+        self.addCleanup(self.triton_patch.stop)
+        self.route_patch = patch.object(adapter, "AMD_BACKEND", "aiter")
+        self.route_patch.start()
+        self.addCleanup(self.route_patch.stop)
+
+    def test_general_dense_forward_uses_aiter_dispatch(self):
+        result = adapter.flash_attn_2.fwd(
+            "q", "k", "v", None, "alibi", 0.1, 0.5, True, 4, 2, 0.0, True
+        )
+        self.assertEqual(result, ("o", "l", "p", "r"))
+        args = self.general._flash_attn_forward.call_args.args
+        self.assertEqual(args[:9], ("q", "k", "v", 0.1, 0.5, True, 4, 2, 0))
+        self.assertEqual(args[10], "alibi")
+        self.assertTrue(args[14])
+        self.assertTrue(args[15])
+        self.triton_fa2.fwd.assert_not_called()
+
+    def test_general_dense_backward_preserves_fa2_return(self):
+        result = adapter.flash_attn_2.bwd(
+            "do", "q", "k", "v", "out", "lse", "dq", "dk", "dv",
+            None, 0.0, 0.5, True, -1, -1, 0.0, False, None, "rng",
+        )
+        self.assertEqual(result, ("dq", "dk", "dv", "softmax_d"))
+        args = self.general._flash_attn_backward.call_args.args
+        self.assertEqual(args[:9], ("do", "q", "k", "v", "out", "lse", "dq", "dk", "dv"))
+        self.assertEqual(args[18], "rng")
+        self.triton_fa2.bwd.assert_not_called()
+
+    def test_general_varlen_forward_passes_block_table(self):
+        result = adapter.flash_attn_2.varlen_fwd(
+            "q", "k", "v", None, "cq", "ck", None, None, "blocks",
+            None, 64, 128, 0.0, 0.5, False, True, -1, -1, 0.0, False,
+        )
+        self.assertEqual(result, ("vo", "vl", "vp", "vr"))
+        args = self.general._flash_attn_varlen_forward.call_args.args
+        self.assertEqual(args[:10], ("q", "k", "v", "cq", "ck", None, None, 64, 128, 0))
+        self.assertEqual(
+            self.general._flash_attn_varlen_forward.call_args.kwargs["block_table"],
+            "blocks",
+        )
+        self.triton_fa2.varlen_fwd.assert_not_called()
+
+    def test_general_varlen_backward_preserves_fa2_return(self):
+        result = adapter.flash_attn_2.varlen_bwd(
+            "do", "q", "k", "v", "out", "lse", "dq", "dk", "dv",
+            "cq", "ck", None, 64, 128, 0.0, 0.5, False, True,
+            -1, -1, 0.0, False, None, "rng",
+        )
+        self.assertEqual(result, ("dq", "dk", "dv", "varlen_d"))
+        args = self.general._flash_attn_varlen_backward.call_args.args
+        self.assertEqual(args[:11], ("do", "q", "k", "v", "out", "lse", "dq", "dk", "dv", "cq", "ck"))
+        self.assertEqual(args[20], "rng")
+        self.triton_fa2.varlen_bwd.assert_not_called()
+
+    def test_general_cache_uses_public_triton_wrapper(self):
+        result = adapter.flash_attn_2.fwd_kvcache(
+            "q", "kc", "vc", None, None, None, None, None, None, None,
+            None, None, None, 0.5, True, -1, -1, 0.0, True, 0,
+        )
+        self.assertEqual(result, ("cache_out", "cache_lse"))
+        self.assertTrue(self.cache.flash_attn_with_kvcache.call_args.kwargs["return_softmax_lse"])
+        self.triton_fa2.fwd_kvcache.assert_not_called()
+
+    def test_triton_route_delegates_low_level_calls(self):
+        adapter.AMD_BACKEND = "triton"
+        result = adapter.flash_attn_2.fwd(
+            "q", "k", "v", None, None, 0.0, 0.5, False, -1, -1, 0.0, False
+        )
+        self.assertEqual(result, ("to", "tl", "tp", "tr"))
+        self.triton_fa2.fwd.assert_called_once()
+        self.general._flash_attn_forward.assert_not_called()
+
+    def test_unsupported_general_args_fail_explicitly(self):
+        with self.assertRaisesRegex(NotImplementedError, "softcap"):
+            adapter.flash_attn_2.fwd(
+                "q", "k", "v", None, None, 0.0, 0.5, False, -1, -1, 1.0, False
+            )
+        with self.assertRaisesRegex(NotImplementedError, "leftpad_k"):
+            adapter.flash_attn_2.varlen_fwd(
+                "q", "k", "v", None, "cq", "ck", None, "leftpad", None,
+                None, 64, 64, 0.0, 0.5, False, False, -1, -1, 0.0, False,
+            )
+
+    def test_public_import_keeps_fa2_functions(self):
+        for route in ("triton", "aiter"):
+            torch = types.ModuleType("torch")
+            torch.Tensor = type("Tensor", (), {})
+            torch.__version__ = "2.3.0"
+            torch.version = types.SimpleNamespace(hip="6.0")
+            autograd = types.ModuleType("torch.autograd")
+            autograd.Function = type("Function", (), {})
+            torch.autograd = autograd
+            package = types.ModuleType("flash_attn")
+            package.__path__ = [str(ADAPTER.parent)]
+            dao_ai = types.ModuleType("aiter.ops.triton._triton_kernels.attention.dao_ai")
+            dao_ai.flash_attn_2 = self.triton_fa2
+            fake_modules = {
+                "torch": torch,
+                "torch.nn": types.ModuleType("torch.nn"),
+                "torch.autograd": autograd,
+                "flash_attn": package,
+                "aiter.ops.triton._triton_kernels.attention.dao_ai": dao_ai,
+            }
+            with patch.dict(sys.modules, fake_modules), patch.object(
+                _backend, "select_amd_backend", return_value=route
+            ):
+                sys.modules.pop("flash_attn.flash_attn_interface_aiter", None)
+                interface_spec = importlib.util.spec_from_file_location(
+                    "flash_attn.flash_attn_interface", INTERFACE
+                )
+                interface = importlib.util.module_from_spec(interface_spec)
+                sys.modules[interface_spec.name] = interface
+                interface_spec.loader.exec_module(interface)
+                self.assertEqual(interface.flash_attn_func.__module__, interface_spec.name)
+                self.assertIs(
+                    interface.flash_attn_gpu,
+                    sys.modules["flash_attn.flash_attn_interface_aiter"].flash_attn_2,
+                )
+
+    def test_backend_flags_select_one_route(self):
+        for triton, aiter, expected in (
+            ("FALSE", "FALSE", "ck"),
+            ("TRUE", "FALSE", "triton"),
+            ("FALSE", "TRUE", "aiter"),
+        ):
+            with patch.dict(os.environ, {
+                "FLASH_ATTENTION_TRITON_AMD_ENABLE": triton,
+                "FLASH_ATTENTION_AITER_AMD_ENABLE": aiter,
+            }):
+                self.assertEqual(_backend.select_amd_backend(), expected)
+        with patch.dict(os.environ, {
+            "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE",
+            "FLASH_ATTENTION_AITER_AMD_ENABLE": "TRUE",
+        }):
+            with self.assertRaisesRegex(ValueError, "Select only one"):
+                _backend.select_amd_backend()
+
+    def test_runtime_backend_handles_missing_ck(self):
+        with patch.dict(os.environ, {
+            "FLASH_ATTENTION_TRITON_AMD_ENABLE": "FALSE",
+            "FLASH_ATTENTION_AITER_AMD_ENABLE": "FALSE",
+        }):
+            self.assertEqual(_backend.select_amd_backend(False), "ck")
+            with patch.dict(sys.modules, {"flash_attn_2_cuda": types.ModuleType("flash_attn_2_cuda")}):
+                self.assertEqual(_backend.select_amd_backend(True), "ck")
+            with patch.dict(sys.modules, {"flash_attn_2_cuda": None}):
+                with pytest.warns(UserWarning, match="falling back to Triton"):
+                    self.assertEqual(_backend.select_amd_backend(True), "triton")
+        with patch.dict(os.environ, {
+            "FLASH_ATTENTION_TRITON_AMD_ENABLE": "FALSE",
+            "FLASH_ATTENTION_AITER_AMD_ENABLE": "TRUE",
+        }):
+            self.assertEqual(_backend.select_amd_backend(True), "aiter")
+            with self.assertRaisesRegex(RuntimeError, "requires ROCm"):
+                _backend.select_amd_backend(False)
