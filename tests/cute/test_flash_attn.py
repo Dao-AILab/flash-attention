@@ -1814,8 +1814,6 @@ def test_flash_attn_varlen_output(
             # SplitKV not supported on SM90/SM120 - skip this iteration
             if (IS_SM90 or IS_SM120) and num_splits > 1:
                 continue
-            if precompute_metadata and is_fake_mode():
-                continue
             if precompute_metadata:
                 scheduler_metadata = get_scheduler_metadata(
                     max_seqlen_q=seqlen_q,
