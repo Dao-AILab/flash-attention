@@ -908,6 +908,57 @@ def test_flash_attn_mla_dispatch_varlen_decode_split(max_seqlen_q, monkeypatch):
     assert err <= 2 * err_pt + 1e-3, (err, err_pt)
 
 
+@pytest.mark.parametrize("api, mla_kernel", [("func", "1cta"), ("varlen", "2cta")])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_kernel_arg(api, mla_kernel, monkeypatch):
+    """mla_kernel picks the MLA forward kernel for one call, through both public entry points
+    and ahead of FLASH_ATTENTION_MLA_1CTA, which is set to the other kernel here. The kernels'
+    numerics are covered by the tests that select them with the variable."""
+    if not IS_SM100:
+        pytest.skip()
+    import flash_attn.cute.interface as fa_interface
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0" if mla_kernel == "1cta" else "1")
+    b, s_q, s_k, h = 2, 1, 1000, 16
+    kw, _ = _mla_inputs(b, s_q, s_k, h, has_qk=True)
+    real_cache = fa_interface._flash_attn_fwd.compile_cache
+    keys = []
+
+    class Spy:
+        def __contains__(self, key):
+            keys.append(key)
+            return key in real_cache
+
+        def __getitem__(self, key):
+            return real_cache[key]
+
+        def __setitem__(self, key, value):
+            real_cache[key] = value
+
+    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", Spy())
+    if api == "func":
+        flash_attn_func(**kw, causal=True, mla_kernel=mla_kernel)
+    else:
+        cu_q = torch.arange(0, b + 1, device="cuda", dtype=torch.int32) * s_q
+        cu_k = torch.arange(0, b + 1, device="cuda", dtype=torch.int32) * s_k
+        flash_attn_varlen_func(
+            *(kw[name].flatten(0, 1) for name in ("q", "k", "v")),
+            qv=kw["qv"].flatten(0, 1), cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=s_q, max_seqlen_k=s_k, causal=True, mla_kernel=mla_kernel,
+        )
+    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", real_cache)
+    # the first key entry is the 1CTA route
+    assert keys and all(key[0] == (mla_kernel == "1cta") for key in keys), keys
+
+
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_kernel_arg_rejects_2cta_split():
+    if not IS_SM100:
+        pytest.skip()
+    kw, _ = _mla_inputs(1, 1, 256, 16, has_qk=True)
+    with pytest.raises(ValueError, match="'2cta' cannot run"):
+        _flash_attn_fwd(**kw, num_splits=3, mla_kernel="2cta")
+
+
 @pytest.mark.parametrize(
     "route",
     [
