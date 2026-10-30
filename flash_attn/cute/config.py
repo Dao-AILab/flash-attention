@@ -408,22 +408,46 @@ MXFP8_PV_FAST_TUNING = {
 
 
 class Sm107PvTuning(NamedTuple):
-    """sm_107 native PV (dedicated scale columns) choices; none changes the arithmetic."""
+    """sm_107 native PV (dedicated scale columns) choices; none changes the arithmetic.
+
+    select_mxfp8_pv_registers reads registers; the forward kernel reads the schedule fields.
+    """
 
     # None keeps the generic FP8 split.
     registers: Sm100Registers | None = None
+    # Split P arrival at the K=64 instruction boundary: PV issues its first MMA on the first 64
+    # keys of P while the softmax warps still store the rest.
+    split_p: bool = False
+    # Signal the softmax -> correction stats with the pipeline_sm_stats mbarrier instead of the
+    # per-warp named barriers.
+    stats_mbarrier: bool = False
+    # Make the exp2 inputs depend on acc_scale, so the scale store and the stats signal issue before
+    # the exp2 work. Otherwise the compiler schedules acc_scale's MUFU.EX2 behind about a third of
+    # the P exponentials and the correction warps start the O rescale that much later.
+    early_stats: bool = False
+    # Shared-memory budget of the K/V ring. Causal hd128 sizes every K/V slot for BF16 V (the
+    # diagonal blocks), so 224 KiB holds only 3 stages; sm_107's larger per-block shared memory
+    # fits 288 KiB (5 stages).
+    smem_budget_kib: int = 224
 
 
 # Keyed by (pv_softmax, head_dim_padded, is_causal); missing keys use the defaults. "exact" has no
 # softmax-side quantized row sum (pv_ones_acc_sum), hence its own spill-free register splits.
 SM107_MXFP8_PV_TUNING = {
-    ("exact", 128, False): Sm107PvTuning(Sm100Registers(192, 80, 48)),
-    ("exact", 128, True): Sm107PvTuning(Sm100Registers(184, 80, 64)),
+    ("exact", 128, False): Sm107PvTuning(
+        Sm100Registers(192, 80, 48), stats_mbarrier=True, early_stats=True
+    ),
+    ("exact", 128, True): Sm107PvTuning(
+        Sm100Registers(184, 80, 64), stats_mbarrier=True, early_stats=True, smem_budget_kib=288
+    ),
     ("exact", 64, False): Sm107PvTuning(Sm100Registers(176, 96, 64)),
     ("exact", 64, True): Sm107PvTuning(Sm100Registers(184, 72, 72)),
-    ("fast", 128, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
-    ("fast", 64, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
-    ("fast", 64, True): Sm107PvTuning(Sm100Registers(192, 64, 64)),
+    ("fast", 128, False): Sm107PvTuning(Sm100Registers(168, 96, 80), split_p=True),
+    ("fast", 128, True): Sm107PvTuning(
+        split_p=True, stats_mbarrier=True, early_stats=True, smem_budget_kib=288
+    ),
+    ("fast", 64, False): Sm107PvTuning(Sm100Registers(168, 96, 80), stats_mbarrier=True),
+    ("fast", 64, True): Sm107PvTuning(Sm100Registers(192, 64, 64), stats_mbarrier=True),
 }
 # NOTE [softmax stats release order]
 # The SM100 correction warpgroup frees softmax stage s's pipeline_sm_stats slot in either order:
