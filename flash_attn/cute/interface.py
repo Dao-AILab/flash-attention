@@ -2166,8 +2166,8 @@ def _bwd_pack_gqa_heuristic(
 # Fold rules of _bwd_choose_fold, measured on B200 (the cells are in PR #3059).
 _BWD_MAX_PACK = 4  # wider packs lose from 2k on (causal MQA 16/1, GQA 32/2, 64/8: -3..-38%)
 _BWD_CHAIN_WASTE_MAX = 0.03  # deterministic causal: largest fold whose dQ-chain waste stays under
-_BWD_LOOP_DENSE_TRIPS_X_MBLOCKS = 48  # deterministic causal: the head loop serializes past this
-_BWD_LOOP_VARLEN_MBLOCKS = 16  # (the varlen LPT schedule tolerates more trips)
+_BWD_LOOP_DENSE_TRIPS_X_MBLOCKS = 64  # deterministic causal: the head loop serializes past this
+_BWD_LOOP_VARLEN_TRIPS_X_MBLOCKS = 96  # (the varlen LPT schedule tolerates more trips)
 _BWD_WIDE_PACK_MBLOCKS_X_HDIM = 4096  # 2-CTA deterministic causal: pack 4 steps down to pack 2
 _BWD_WIDE_PACK_SLOW_MBLOCKS = 32  # hdim 192 causal: a partial pack 4 steps down to pack 2
 
@@ -2306,9 +2306,10 @@ def _bwd_choose_fold(
     def loop_serialized(cand):
         if not cand.head_loop:
             return False
+        trips_x_m_blocks = (qh // cand.pack_factor) * m_blocks
         if varlen:
-            return m_blocks > _BWD_LOOP_VARLEN_MBLOCKS
-        return (qh // cand.pack_factor) * m_blocks > _BWD_LOOP_DENSE_TRIPS_X_MBLOCKS
+            return trips_x_m_blocks > _BWD_LOOP_VARLEN_TRIPS_X_MBLOCKS
+        return trips_x_m_blocks > _BWD_LOOP_DENSE_TRIPS_X_MBLOCKS
 
     def wide_pack_steps_down(cand):
         if cand.head_loop or cand.pack_factor <= 2 or cluster_size == 1:

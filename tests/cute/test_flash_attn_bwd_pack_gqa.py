@@ -456,9 +456,10 @@ CHOOSE_FOLD_CASES = [
     fold_case((1, True), 16, 40, 8, 2048, causal=True, deterministic=False),
     fold_case((4, False), 8, 16, 1, 4096, causal=True, deterministic=False),
     # deterministic causal, hdim 256: the dQ chains pace the looped tiles, so few chains
-    # take an unlooped pack 4 (1k / 2k) and pack 2 from 4k; GQA 24/4 (qh 6) keeps the
-    # loop at 2k; GQA 40/8 (odd qh) has no unlooped fold, the loop stays
-    fold_case((4, False), 32, 16, 1, 1024, causal=True, deterministic=True),
+    # take an unlooped pack 4 at 2k and pack 2 from 4k (at 1k the loop's 8 trips x 8
+    # m_blocks = 64 still fit); GQA 24/4 (qh 6) keeps the loop at 2k; GQA 40/8 (odd qh)
+    # has no unlooped fold, the loop stays
+    fold_case((2, True), 32, 16, 1, 1024, causal=True, deterministic=True),
     fold_case((4, False), 16, 16, 1, 2048, causal=True, deterministic=True),
     fold_case((2, False), 8, 16, 1, 4096, causal=True, deterministic=True),
     fold_case((2, False), 4, 16, 1, 8192, causal=True, deterministic=True),
@@ -485,18 +486,34 @@ CHOOSE_FOLD_CASES = [
     fold_case((4, False), 4, 32, 8, 8192, causal=True, deterministic=False,
               head_loop_possible=False, cluster_size=1, m_block_size=64,
               n_block_size=96, head_dim=192),
-    # the loop stays while trips x m_blocks <= 48 (dense) / m_blocks <= 16 (varlen)
+    # the loop stays while trips x m_blocks <= 64 (dense) / <= 96 (varlen): dense 32/2 and
+    # MQA 16/1 at 1k and 64/8 at 2k (64) loop, 48/4 at 2k (96) does not; varlen 32/2 and
+    # MQA 16/1 at 2k (128) do not, 48/4 at 2k and 24/4 at 4k (96) do, 64/8 at 4k (128)
+    # does not
     fold_case((2, True), 32, 12, 2, 1024, causal=True, deterministic=True),
     fold_case((2, True), 16, 12, 2, 2048, causal=True, deterministic=True),
     fold_case((2, False), 8, 12, 2, 4096, causal=True, deterministic=True),
     fold_case((2, True), 32, 64, 8, 1024, causal=True, deterministic=True),
-    fold_case((4, False), 16, 64, 8, 2048, causal=True, deterministic=True),
+    fold_case((2, True), 16, 64, 8, 2048, causal=True, deterministic=True),
+    fold_case((2, False), 8, 64, 8, 4096, causal=True, deterministic=True),
+    fold_case((2, True), 32, 32, 2, 1024, causal=True, deterministic=True),
+    fold_case((4, False), 16, 32, 2, 2048, causal=True, deterministic=True),
     fold_case((4, False), 16, 48, 4, 2048, causal=True, deterministic=True),
-    fold_case((2, True), 16, 32, 2, 2048, causal=True, deterministic=True,
+    fold_case((2, True), 32, 32, 2, 1024, causal=True, deterministic=True,
+              varlen=True),
+    fold_case((4, False), 16, 32, 2, 2048, causal=True, deterministic=True,
               varlen=True),
     fold_case((2, False), 8, 32, 2, 4096, causal=True, deterministic=True,
               varlen=True),
     fold_case((2, True), 32, 16, 1, 1024, causal=True, deterministic=True,
+              varlen=True),
+    fold_case((4, False), 16, 16, 1, 2048, causal=True, deterministic=True,
+              varlen=True),
+    fold_case((2, True), 16, 48, 4, 2048, causal=True, deterministic=True,
+              varlen=True),
+    fold_case((2, True), 8, 24, 4, 4096, causal=True, deterministic=True,
+              varlen=True),
+    fold_case((2, False), 8, 64, 8, 4096, causal=True, deterministic=True,
               varlen=True),
     fold_case((2, False), 16, 16, 8, 2048, causal=True, deterministic=True),
     # 2-CTA kernels drop pack 4 for pack 2 under deterministic causal once m_blocks *
