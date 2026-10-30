@@ -414,9 +414,13 @@ class Sm107PvTuning(NamedTuple):
     registers: Sm100Registers | None = None
 
 
-# Keyed by (pv_softmax, head_dim_padded, is_causal); missing keys use the defaults.
+# Keyed by (pv_softmax, head_dim_padded, is_causal); missing keys use the defaults. "exact" has no
+# softmax-side quantized row sum (pv_ones_acc_sum), hence its own spill-free register splits.
 SM107_MXFP8_PV_TUNING = {
-    ("exact", 64, False): Sm107PvTuning(Sm100Registers(160, 96, 96)),
+    ("exact", 128, False): Sm107PvTuning(Sm100Registers(192, 80, 48)),
+    ("exact", 128, True): Sm107PvTuning(Sm100Registers(184, 80, 64)),
+    ("exact", 64, False): Sm107PvTuning(Sm100Registers(176, 96, 64)),
+    ("exact", 64, True): Sm107PvTuning(Sm100Registers(184, 72, 72)),
     ("fast", 128, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
     ("fast", 64, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
     ("fast", 64, True): Sm107PvTuning(Sm100Registers(192, 64, 64)),
@@ -510,7 +514,7 @@ def select_sm_stats_cross_stage(inputs: FwdHeuristicInputs, *, use_s_ping_pong: 
     return sm100_arch_family(inputs.device_arch) in _SM_STATS_CROSS_STAGE.get(key, ())
 
 
-def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs) -> Sm100Registers | None:
+def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs, *, q_stage: int) -> Sm100Registers | None:
     """Native MXFP8 PV register split; None keeps the FP8 split."""
     family = sm100_arch_family(inputs.device_arch)
     key = (inputs.head_dim_padded, inputs.causal)
@@ -521,6 +525,10 @@ def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs) -> Sm100Registers | No
         fast_registers := MXFP8_PV_FAST_TUNING[family].get(key, PvFastTuning()).registers
     ):
         return fast_registers
+    if inputs.mxfp8_path == "pv" and q_stage == 2 and inputs.head_dim_padded >= 96:
+        # The ones MMA (pv_ones_step_sum) adds register pressure outside the softmax warps: hd128
+        # splits with the fewest spills under the extra MMA-warp pressure.
+        return Sm100Registers(176, 80, 80) if inputs.causal else Sm100Registers(176, 64, 96)
     # The MMA warp also issues the PV scale copies and the split-P wait. It spills with the
     # 48 registers of the hd128 default, and on sm_103 the persistent non-causal loop
     # needs 80 (causal uses a single-tile scheduler).
@@ -546,7 +554,7 @@ def select_sm100_registers(
     )
     is_fp8 = has_fp8_pv(inputs)
     native_pv = inputs.mxfp8_path in ("pv", "pv_fast")
-    if native_pv and (pv_registers := select_mxfp8_pv_registers(inputs)):
+    if native_pv and (pv_registers := select_mxfp8_pv_registers(inputs, q_stage=q_stage)):
         return pv_registers
     if head_dim_padded < 96:
         small = SM100_FP8_SMALL_HDIM_REGISTERS if is_fp8 else SM100_SMALL_HDIM_REGISTERS

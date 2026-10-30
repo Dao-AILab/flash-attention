@@ -445,20 +445,17 @@ def test_mxfp8_pv_register_splits():
         assert not (config.use_2cta_instrs or config.use_s_ping_pong)
         return astuple(config.registers)
 
-    # sm_100/sm_103: the MMA warp needs more than the hd128 FP8 default leaves it.
-    assert registers() == (184, 80, 64)
+    # sm_100/sm_103 with two Q stages: the ones MMA adds MMA-warp pressure at hd128.
+    assert registers() == (176, 64, 96)
+    assert registers(causal=True) == (176, 80, 80)
+    # Otherwise the MMA warp needs more than the hd128 FP8 default leaves it.
+    assert registers(max_seqlen_q=128, total_q=256) == (184, 80, 64)
     assert registers(head_dim=64, head_dim_v=64) == (192, 64, 64)
-    assert registers(device_arch=103) == (168, 96, 80)
-    # sm_107 has dedicated scale columns: only hd64 overrides the FP8 split.
-    assert registers(device_arch=107, head_dim=64, head_dim_v=64) == (160, 96, 96)
-    assert registers(device_arch=107) == astuple(
-        select_fwd_config(pv._replace(device_arch=107, mxfp8_path=None, pack_gqa=False,
-                                      disable_2cta=True)).registers
-    )
-    # Causal native PV runs a single-tile scheduler, so sm_103 keeps the sm_100 split, and
-    # sm_107 hd64 keeps the FP8 one.
-    assert registers(device_arch=103, causal=True) == (184, 80, 64)
-    assert registers(device_arch=107, head_dim=64, head_dim_v=64, causal=True) == (168, 96, 80)
+    assert registers(device_arch=103, max_seqlen_q=128, total_q=256) == (168, 96, 80)
+    # sm_107 has dedicated scale columns and its own "exact" table.
+    assert registers(device_arch=107) == (192, 80, 48)
+    assert registers(device_arch=107, head_dim=64, head_dim_v=64) == (176, 96, 64)
+    assert registers(device_arch=107, head_dim=64, head_dim_v=64, causal=True) == (184, 72, 72)
 
 
 def test_mxfp8_pv_keeps_hardware_exp2():
@@ -473,11 +470,9 @@ def test_mxfp8_pv_keeps_hardware_exp2():
 def test_mxfp8_pv_fast_policy():
     fast = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128,
                        mxfp8_path="pv_fast")
-    # sm_100 "fast" has its own spill-free splits; sm_103 keeps the "exact" ones.
+    # sm_100 "fast" has its own spill-free splits; sm_103 keeps the native-PV one.
     assert astuple(select_fwd_config(fast).registers) == (176, 64, 96)
-    assert select_fwd_config(fast._replace(device_arch=103)).registers == select_fwd_config(
-        fast._replace(device_arch=103, mxfp8_path="pv")
-    ).registers
+    assert astuple(select_fwd_config(fast._replace(device_arch=103)).registers) == (168, 96, 80)
     assert astuple(select_fwd_config(fast._replace(device_arch=107)).registers) == (168, 96, 80)
     causal = select_fwd_config(fast._replace(causal=True))
     assert astuple(causal.registers) == (192, 64, 64)
