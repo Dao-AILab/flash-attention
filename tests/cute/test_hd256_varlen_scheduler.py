@@ -336,7 +336,7 @@ def test_generic_varlen_no_max_shares_flat_scheduler_key(monkeypatch):
     constructor = Mock(wraps=interface.FlashAttentionForwardSm100)
     monkeypatch.setattr(interface, "FlashAttentionForwardSm100", constructor)
     out_none = forward("none")
-    assert constructor.call_args.kwargs["is_static_persistent"] is False
+    assert constructor.call_args.kwargs["config"].is_static_persistent is False
     assert len(fwd_cache.cache) == 1
     out_cuda = forward("cuda")
     with RejectHostScalarExtraction():

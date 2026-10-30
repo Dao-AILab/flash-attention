@@ -1005,7 +1005,6 @@ def test_sm100_block_sparse_sink_all_masked():
         window_size_right=None,
         learnable_sink=learnable_sink,
         tile_mn=(128, 128),
-        num_threads=384,
         pack_gqa=False,
         block_sparse_tensors=sparse,
         return_lse=True,
@@ -1286,7 +1285,7 @@ def test_sm100_block_sparse_q_stage1():
     original_init = flash_fwd_sm100.FlashAttentionForwardSm100.__init__
 
     def wrapped_init(self, *args, **kwargs):
-        observed["q_stage"] = kwargs.get("q_stage")
+        observed["q_stage"] = kwargs["config"].q_stage
         return original_init(self, *args, **kwargs)
 
     with mock.patch.object(
