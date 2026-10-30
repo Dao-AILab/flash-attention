@@ -246,7 +246,7 @@ def test_bwd_pack_gqa_heuristic():
     """Pack when the grid still hides the qh-times longer packed tiles; keep ragged / long causal
     MQA unpacked (measured on B200: MQA 16/1 hd256, one 8k causal sequence plus 16 x 256 in a
     varlen pack: packed 3946 us, unpacked 2297 us)."""
-    from flash_attn.cute.interface import _bwd_pack_gqa_heuristic
+    from flash_attn.cute.config import BwdHeuristicInputs, bwd_pack_gqa_heuristic
 
     def decide(
         batch,
@@ -259,22 +259,22 @@ def test_bwd_pack_gqa_heuristic():
         total_q=None,
         total_k=None,
     ):
-        return _bwd_pack_gqa_heuristic(
+        inputs = BwdHeuristicInputs(
+            device_arch=100,
+            head_dim=128,
+            head_dim_v=128,
+            num_heads=heads,
+            num_heads_kv=heads_kv,
             num_sms=148,
             batch_size=batch,
-            num_head=heads,
-            num_head_kv=heads_kv,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k,
             total_q=total_q if total_q is not None else batch * seqlen_q,
             total_k=total_k if total_k is not None else batch * seqlen_k,
-            m_block_size=128,
-            n_block_size=128,
-            cluster_size=2,
+            has_cu_seqlens=varlen,
             causal=causal,
-            local=False,
-            varlen=varlen,
         )
+        return bwd_pack_gqa_heuristic(inputs, tile_m=128, tile_n=128, cluster_size=2)
 
     # dense 2k / 4k GQA and MQA batches: enough packed tiles, pack
     assert decide(8, 16, 4, 2048, 2048, False)

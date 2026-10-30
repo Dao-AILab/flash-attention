@@ -18,6 +18,7 @@ from quack import sm90_utils
 from quack.sm90_utils import gemm_zero_init, gemm_w_idx
 
 from cutlass.utils import TensorMapManager, TensorMapUpdateMode
+from flash_attn.cute.config import Sm90BwdRegisters
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
@@ -75,6 +76,9 @@ class FlashAttentionBackwardSm90:
         has_aux_tensors: cutlass.Constexpr = False,
         q_subtile_factor: cutlass.Constexpr[int] = 1,
         dQ_single_wg: bool = False,
+        *,
+        spt: bool,
+        registers: Sm90BwdRegisters,
     ):
         self.dtype = dtype
         # Swapped dK/dV accumulators put head_dim on WGMMA's 64-row M axis.
@@ -90,6 +94,8 @@ class FlashAttentionBackwardSm90:
         self.is_causal = is_causal
         self.is_local = is_local
         self.deterministic = deterministic
+        # BwdConfig.spt: deterministic dQ semaphores in shortest-processing-time order.
+        self.spt = spt
         self.tile_m = tile_m
         self.tile_n = tile_n
         self.num_threads = num_threads
@@ -142,6 +148,10 @@ class FlashAttentionBackwardSm90:
         if dQ_single_wg:
             assert self.num_wg_mma == 2, "dQ_single_wg only supports 2 warp groups"
         self.num_wg_dQ = 1 if dQ_single_wg else self.num_wg_mma
+        # BwdConfig.registers carries the split; config.validate_bwd_registers checks it.
+        self.num_mma_regs_wg0 = registers.mma
+        self.num_mma_regs_wg1 = registers.mma_no_dq
+        self.num_producer_regs = registers.producer
 
     @staticmethod
     def can_implement(
@@ -430,26 +440,6 @@ class FlashAttentionBackwardSm90:
         self.num_threads_per_warp_group = 128
         self.num_producer_threads = 32
 
-        REG_LIMIT = 504 if self.num_wg_mma == 2 else 512
-        if const_expr(self.num_wg_mma == 2):
-            if const_expr(self.num_wg_dQ == 1):
-                self.num_mma_regs_wg0 = 256
-                self.num_mma_regs_wg1 = 224
-            else:
-                self.num_mma_regs_wg0 = 240
-                self.num_mma_regs_wg1 = 240
-            self.num_mma_regs = self.num_mma_regs_wg0  # for backward compat
-            self.num_producer_regs = 24
-            assert (
-                self.num_mma_regs_wg0 + self.num_mma_regs_wg1 + self.num_producer_regs <= REG_LIMIT
-            )
-        else:  # 3 warp groups
-            self.num_mma_regs_wg0 = 160
-            self.num_mma_regs_wg1 = 160
-            self.num_mma_regs = 160
-            self.num_producer_regs = 32
-            assert self.num_mma_regs_wg0 * self.num_wg_mma + self.num_producer_regs <= REG_LIMIT
-
         self._setup_attributes()
         # Bound the K/V loads by the logical seqlen_k (see below); decided here because the
         # shared storage needs descriptor slots for it.
@@ -545,7 +535,6 @@ class FlashAttentionBackwardSm90:
             TileScheduler = SingleTileLPTBwdScheduler
         else:
             TileScheduler = SingleTileScheduler
-        self.spt = (self.is_causal or self.is_local) and self.deterministic
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.tile_n),
             cute.size(mQ.shape[2]),
