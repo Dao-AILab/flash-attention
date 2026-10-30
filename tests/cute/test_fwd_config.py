@@ -410,3 +410,28 @@ def test_selected_configs_carry_the_legacy_policy(case):
     )
     assert (config.ex2_emu_freq, config.ex2_emu_start_frg) == expected_ex2, config
 
+
+
+def test_mxfp8_qk_selects_a_1cta_unpacked_config():
+    inputs = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128,
+                         num_heads=16, num_heads_kv=4, mxfp8_path="qk")
+    config = select_fwd_config(inputs)
+    assert not (config.pack_gqa or config.use_2cta_instrs or config.use_s_ping_pong)
+    # V and P stay BF16, so the BF16 register split and exp2 tuning apply rather than the FP8 ones.
+    hd64 = inputs._replace(head_dim=64, head_dim_v=64)
+    assert select_fwd_config(hd64).registers == Sm100Registers(softmax=200, correction=64, other=48)
+    causal = select_fwd_config(inputs._replace(causal=True))
+    assert (causal.ex2_emu_freq, causal.ex2_emu_start_frg) == (16, 1)
+    with pytest.raises(ValueError, match="MXFP8 forward requires 128 x 128 tiles"):
+        validate_fwd_config(replace(config, tile_n=64), inputs)
+    decode = inputs._replace(max_seqlen_q=1, total_q=2)
+    assert not select_fwd_config(decode).use_s_ping_pong
+    # SplitKV would raise for long-KV decode, so automatic selection keeps one split.
+    assert select_fwd_config(decode._replace(requested_num_splits=None)).num_splits == 1
+
+
+def test_mxfp8_qk_policy_follows_its_own_rows():
+    causal_hd64 = make_inputs(dtype="torch.float8_e4m3fn", causal=True, mxfp8_path="qk")
+    # Softmax stats release: hd64 causal keeps cross-stage on SM103.
+    assert not select_fwd_config(causal_hd64).sm_stats_cross_stage
+    assert select_fwd_config(causal_hd64._replace(device_arch=103)).sm_stats_cross_stage
