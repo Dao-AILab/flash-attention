@@ -1213,12 +1213,16 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
         }
     }
-    // Store the scales exp(lse - lse_logsum) in shared memory.
+    // Store the scales exp(lse - lse_max) / lse_sum in shared memory, as the Hopper combine kernel does.
+    // exp(lse - lse_logsum) would carry the fp32 rounding of lse_logsum (up to ulp(lse_logsum) / 2) into
+    // every scale; since the scales are not renormalized, that rescales the whole output, by an amount
+    // that grows with the magnitude of the logits.
+    const float inv_sum = (lse_sum == 0.f || lse_sum != lse_sum) ? 0.f : 1.f / lse_sum;
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
         const int col = tidx / kRowsPerLoadTranspose;
-        if (row < params.num_splits && col < kBlockM) { sLSE[row][col] = expf(lse_accum(l) - lse_logsum); }
+        if (row < params.num_splits && col < kBlockM) { sLSE[row][col] = expf(lse_accum(l) - lse_max) * inv_sum; }
     }
     __syncthreads();
 
