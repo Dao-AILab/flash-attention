@@ -33,10 +33,10 @@ from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils, layout_utils
 
-from flash_attn.cute.paged_kv import PagedKVManager
+from flash_attn.cute.paged_kv import PagedKVManager, resolve_paged_token
+from flash_attn.cute.tensormap_utils import acquire_tensormap, bound_rows, cta_tensormap_slot
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
-from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
@@ -1501,18 +1501,8 @@ class FlashAttentionForwardSm100:
         tensormap_V_gmem = None
         v_desc_ptr = None
         if const_expr(self.ragged_tma_V):
-            tensormap_manager = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
-            bidx, bidy, bidz = cute.arch.block_idx()
-            gdx, gdy, _ = cute.arch.grid_dim()
-            cta_linear_idx = bidx + bidy * gdx + bidz * gdx * gdy
-            if cta_linear_idx >= cute.size(tensormap_workspace, mode=[0]):
-                # An undersized workspace would silently corrupt memory: fail loudly instead.
-                cute.arch.inline_ptx("trap;", read_only_args=[])
-            tensormap_V_gmem = tensormap_manager.get_tensormap_ptr(
-                tensormap_workspace[(cta_linear_idx, None)].iterator
-            )
-            v_desc_ptr = tensormap_manager.get_tensormap_ptr(
-                tensormap_V_gmem, cute.AddressSpace.generic
+            tensormap_manager, tensormap_V_gmem, v_desc_ptr = cta_tensormap_slot(
+                tensormap_workspace
             )
             tensormap_manager.init_tensormap_from_atom(
                 tma_atom_V, tensormap_V_gmem, self.load_warp_ids[0]
@@ -1538,14 +1528,8 @@ class FlashAttentionForwardSm100:
                     if const_expr(seqlen.has_cu_seqlens_k)
                     else seqlen.seqlen_k
                 )
-                v_rows_end = cutlass.max(v_rows_end, 1)
-                v_shape = list(mV_gmem.shape)
-                v_shape[1] = v_rows_end
-                mV_bounded = cute.make_tensor(
-                    mV_gmem.iterator, cute.make_layout(tuple(v_shape), stride=mV_gmem.stride)
-                )
                 tensormap_manager.update_tensormap(
-                    (mV_bounded,), (tma_atom_V,), (tensormap_V_gmem,),
+                    (bound_rows(mV_gmem, v_rows_end),), (tma_atom_V,), (tensormap_V_gmem,),
                     self.load_warp_ids[0], (None,),
                 )
 
@@ -1670,7 +1654,9 @@ class FlashAttentionForwardSm100:
                 if self.process_work_tile(block_info, seqlen, n_block_min, n_block_max):
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                     page_idx = (
-                        mPageTable[batch_idx, n_block_first]
+                        resolve_paged_token(
+                            mPageTable[batch_idx, None], n_block_first * self.n_block_size, self.n_block_size
+                        )[0]
                         if const_expr(mPageTable is not None and self.use_tma_KV)
                         else None
                     )
@@ -1686,10 +1672,7 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
                         load_Q(block=1, stage=1)
                     if const_expr(self.ragged_tma_V) and v_desc_acquire == 1:
-                        tensormap_manager.fence_tensormap_update(tensormap_V_gmem)
-                        cute.arch.inline_ptx(
-                            "prefetch.tensormap [{$r0}];", read_only_args=[tensormap_V_gmem.toint()]
-                        )
+                        acquire_tensormap(tensormap_manager, tensormap_V_gmem)
                         v_desc_acquire = Int32(0)
                     q_producer_phase ^= 1
                     if const_expr(not self.use_s_ping_pong):
@@ -1699,7 +1682,9 @@ class FlashAttentionForwardSm100:
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
                         page_idx = (
-                            mPageTable[batch_idx, n_block]
+                            resolve_paged_token(
+                                mPageTable[batch_idx, None], n_block * self.n_block_size, self.n_block_size
+                            )[0]
                             if const_expr(mPageTable is not None and self.use_tma_KV)
                             else None
                         )
@@ -1712,7 +1697,9 @@ class FlashAttentionForwardSm100:
                             if const_expr(self.use_s_ping_pong):
                                 # V lags K by one block to match the MMA order QK(i+1) -> PV(i)
                                 page_idx_v = (
-                                    mPageTable[batch_idx, n_block + 1]
+                                    resolve_paged_token(
+                                        mPageTable[batch_idx, None], (n_block + 1) * self.n_block_size, self.n_block_size
+                                    )[0]
                                     if const_expr(mPageTable is not None and self.use_tma_KV)
                                     else None
                                 )
@@ -1723,7 +1710,9 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.use_s_ping_pong):
                         if issue_kv_for_this_warp:
                             page_idx_v = (
-                                mPageTable[batch_idx, n_block_min]
+                                resolve_paged_token(
+                                    mPageTable[batch_idx, None], n_block_min * self.n_block_size, self.n_block_size
+                                )[0]
                                 if const_expr(mPageTable is not None and self.use_tma_KV)
                                 else None
                             )
@@ -1734,10 +1723,7 @@ class FlashAttentionForwardSm100:
                 # Match the dense path (get_n_block_min_max): the scheduler packs the
                 # per-batch dynamic num_splits into the top 16 bits of split_idx.
                 if const_expr(self.ragged_tma_V) and v_desc_acquire == 1:
-                    tensormap_manager.fence_tensormap_update(tensormap_V_gmem)
-                    cute.arch.inline_ptx(
-                        "prefetch.tensormap [{$r0}];", read_only_args=[tensormap_V_gmem.toint()]
-                    )
+                    acquire_tensormap(tensormap_manager, tensormap_V_gmem)
                     v_desc_acquire = Int32(0)
                 num_splits_dyn = num_splits
                 if const_expr(self.is_split_kv and block_info.pack_split_idx):

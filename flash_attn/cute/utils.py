@@ -102,6 +102,17 @@ def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
         return _fa_disable_2cta_enabled
 
 
+def _get_sm100_backend_override() -> Optional[bool]:
+    """FLASH_ATTENTION_SM100_BACKEND=swapab prefers the SM100 SwapAB decode kernel wherever it
+    can serve the call (others run the standard kernel); standard disables it; unset or "auto"
+    leaves it to the forward selector. Read per call."""
+    value = os.getenv("FLASH_ATTENTION_SM100_BACKEND", "auto")
+    overrides = {"auto": None, "swapab": True, "standard": False}
+    if value not in overrides:
+        raise ValueError("FLASH_ATTENTION_SM100_BACKEND must be auto, standard, or swapab")
+    return overrides[value]
+
+
 def _get_bwd_pack_gqa_override() -> Optional[bool]:
     """FLASH_ATTENTION_BWD_PACK_GQA=0/1 forces the SM100 backward GQA head packing off / on
     (NOTE [bwd pack_gqa] in pack_gqa.py); unset or "auto" leaves it to the heuristic."""

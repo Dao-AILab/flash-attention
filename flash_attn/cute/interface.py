@@ -24,6 +24,8 @@ from flash_attn.cute.config import (
     FwdHeuristicInputs,
     num_splits_heuristic,
     select_fwd_config,
+    SWAPAB,
+    needs_split_metadata,
     validate_fwd_config,
 )
 
@@ -263,9 +265,9 @@ def _get_fwd_inputs(
     """Build FwdHeuristicInputs; shared by _get_fwd_config and get_scheduler_metadata.
 
     Derived here: the dtype string, the tile_mn / num_splits requests (num_splits < 1 means
-    automatic), and the FA_CLC / 2CTA / S ping-pong environment knobs. Callers pass every other
-    FwdHeuristicInputs field in **fields as host values: device_arch, num_sms, head dims and
-    counts, batch and token totals, host sequence bounds, and feature bits.
+    automatic), and the FA_CLC / 2CTA / S ping-pong / SM100 backend environment knobs. Callers
+    pass every other FwdHeuristicInputs field in **fields as host values: device_arch, num_sms,
+    head dims and counts, batch and token totals, host sequence bounds, and feature bits.
     """
     return FwdHeuristicInputs(
         **fields,
@@ -276,6 +278,7 @@ def _get_fwd_inputs(
         requested_use_clc_scheduler=utils._get_use_clc_scheduler_default(),
         disable_2cta=utils._get_disable_2cta_default(is_fwd=True),
         disable_s_ping_pong=utils._get_disable_s_ping_pong_default(),
+        requested_use_swapab=utils._get_sm100_backend_override(),
     )
 
 
@@ -287,8 +290,8 @@ def _get_fwd_config(
     scheduler_metadata: SchedulerMetadataTensorsTorch | None,
     block_sparse_tensors: BlockSparseTensorsTorch | None,
     **fields: int | bool | tuple[int, int] | None,
-) -> FwdConfig:
-    """Select a FwdConfig, or validate an explicit one, for the generic forward kernel.
+) -> tuple[FwdConfig, FwdHeuristicInputs]:
+    """Select a FwdConfig, or validate an explicit one, for the non-MLA forward kernels.
 
     Derived here from the metadata: the varlen, scheduler-metadata, and block-sparsity bits. The
     caller passes host facts in **fields: num_sms, head dims and counts, batch_size, total_q/total_k,
@@ -329,7 +332,7 @@ def _get_fwd_config(
         raise ValueError("An explicit config cannot reuse caller-built scheduler_metadata")
     else:
         validate_fwd_config(config, inputs)
-    return config
+    return config, inputs
 
 
 @lru_cache(maxsize=1024)
@@ -897,8 +900,9 @@ def _flash_attn_fwd(
         )
         pack_gqa = True
     mla_fwd_cls = None
+    use_swapab = prepare_split_metadata = False
     if qv is None:
-        config = _get_fwd_config(
+        config, inputs = _get_fwd_config(
             config=config, pack_gqa=pack_gqa, arch=arch, num_sms=num_sms, dtype=q_dtype,
             head_dim=head_dim, head_dim_v=head_dim_v,
             num_heads=num_head, num_heads_kv=num_head_kv,
@@ -916,7 +920,13 @@ def _flash_attn_fwd(
             has_learnable_sink=learnable_sink is not None,
             tile_mn=tile_mn, num_splits=num_splits, seqlen_k_per_split=seqlen_k_per_split,
             requested_mma_pv_is_rs=mma_pv_is_rs, requested_intra_wg_overlap=intra_wg_overlap,
+            disable_scheduler_metadata=disable_scheduler_metadata,
+            seqlen_k_capacity=k_capacity,
+            requires_grad=requires_grad or any(t.requires_grad for t in aux_tensors or ()),
+            has_aux_scalars=aux_scalars is not None,
         )
+        use_swapab = config.use_swapab
+        prepare_split_metadata = needs_split_metadata(config, inputs)
         pack_gqa = config.pack_gqa
         tile_m, tile_n = config.tile_m, config.tile_n
         q_stage, num_splits = config.q_stage, config.num_splits
@@ -1121,13 +1131,7 @@ def _flash_attn_fwd(
     if qv is not None:
         # the MLA kernels write all num_splits partials (no per-batch dynamic split counts)
         assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
-    if (
-        is_split_kv
-        and is_varlen_q
-        and scheduler_metadata is None
-        and not disable_scheduler_metadata
-        and qv is None
-    ):
+    if prepare_split_metadata:
         scheduler_metadata = _get_scheduler_metadata(
             num_batch=batch_size,
             max_seqlen_q=max_seqlen_q,
@@ -1140,7 +1144,8 @@ def _flash_attn_fwd(
             tile_n=tile_n,
             headdim_v=head_dim_v,
             pack_gqa=pack_gqa,
-            causal=causal,
+            # SwapAB's single query needs no causal L2 head swizzle.
+            causal=causal and not use_swapab,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
@@ -1150,6 +1155,7 @@ def _flash_attn_fwd(
             cluster_shape_m=cluster_shape_m,
             total_q=total_q if cu_seqlens_q is not None else None,
             use_clc_scheduler=use_clc_scheduler,
+            **(SWAPAB.split_policy(head_dim) if use_swapab else {}),
         )
 
     has_scheduler_metadata = scheduler_metadata is not None and not disable_scheduler_metadata
@@ -1180,6 +1186,10 @@ def _flash_attn_fwd(
         virtual_batch_idx = None
         num_nheads_in_l2 = None
         tile_count_semaphore = None
+    if use_swapab:
+        # SwapAB's tile scheduler and the combine take only the split counts.
+        num_m_blocks = virtual_batch_idx = num_nheads_in_l2 = tile_count_semaphore = None
+
     # use binary batch search in SingleTileVarlenScheduler to avoid
     # O(N^2) lookup; observed to be faster only for batch_size > BIN_BATCH_SEARCH_THRESH; this is tunable
     cu_total_m_blocks = None
@@ -1188,6 +1198,7 @@ def _flash_attn_fwd(
     use_single_tile_varlen_scheduler = tile_count_semaphore is None
     use_cu_hint = (
         is_varlen_q
+        and not use_swapab
         and use_single_tile_varlen_scheduler
         and batch_size > BIN_BATCH_SEARCH_THRESH
         and qv is None
@@ -1251,7 +1262,7 @@ def _flash_attn_fwd(
     )
 
     # SM90 / SM100 bound the V TMA loads of varlen / seqused_k calls by rewriting a per-CTA copy
-    # of the V descriptor on device (see FlashAttentionForwardSm100 / Sm90). One 128-byte slot
+    # of the V descriptor on device (see FlashAttentionForwardSm100 / Sm90 / Sm100SwapAB). One 128-byte slot
     # per CTA, sized by an upper bound on the grid.
     tensormap_workspace = None
     if (
@@ -1544,7 +1555,11 @@ def _flash_attn_fwd(
                         rescale_threshold=mla_fwd_rescale_threshold,
                     )
             else:
-                fa_fwd = FlashAttentionForwardSm100(
+                fwd_cls = FlashAttentionForwardSm100
+                if use_swapab:
+                    from flash_attn.cute.flash_fwd_decode_sm100 import FlashAttentionForwardSm100SwapAB
+                    fwd_cls = FlashAttentionForwardSm100SwapAB
+                fa_fwd = fwd_cls(
                     head_dim,
                     head_dim_v,
                     config=config,
@@ -1554,7 +1569,7 @@ def _flash_attn_fwd(
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
-                    paged_kv_non_tma=page_size not in [None, tile_n],
+                    paged_kv_non_tma=not use_swapab and page_size not in [None, tile_n],
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
@@ -1768,7 +1783,7 @@ def _flash_attn_fwd(
             lse_combine,
             cu_seqlens_q,
             seqused_q,
-            num_splits_dynamic_ptr=num_splits_dynamic if has_scheduler_metadata else None,
+            num_splits_dynamic_ptr=num_splits_dynamic,
             virtual_batch_idx=virtual_batch_idx if has_scheduler_metadata else None,
             _arch=arch,
         )
@@ -4602,6 +4617,8 @@ def _get_scheduler_metadata(
     zfill_padded_output: bool = True,
     total_q: Optional[int] = None,
     use_clc_scheduler: bool = False,
+    ctas_per_sm: int = 1,
+    min_blocks_floor: Optional[Tuple[int, int]] = None,
 ) -> SchedulerMetadataTensorsTorch:
     device = None
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
@@ -4676,6 +4693,8 @@ def _get_scheduler_metadata(
             tile_count_semaphore is not None,
             n_blocks_per_split is not None,
             zfill_padded_output,
+            ctas_per_sm,
+            min_blocks_floor,
         )
 
         if cache_key not in _get_scheduler_metadata.compile_cache:
@@ -4719,6 +4738,8 @@ def _get_scheduler_metadata(
                 packgqa=pack_gqa,
                 sort=sort,
                 zfill_padded_output=zfill_padded_output,
+                ctas_per_sm=ctas_per_sm,
+                min_blocks_floor=min_blocks_floor,
             )
             _get_scheduler_metadata.compile_cache[cache_key] = cute.compile(
                 scheduler,
@@ -4893,6 +4914,7 @@ def get_scheduler_metadata(
         causal, window_size_left, window_size_right
     )
 
+    # Caller-built metadata serves the standard kernel; SwapAB builds its own.
     config = select_fwd_config(
         _get_fwd_inputs(
             device_arch=arch, num_sms=get_num_sms_for_selection(device.index, arch),
@@ -4911,7 +4933,7 @@ def get_scheduler_metadata(
             has_seqused_k=seqused_k is not None,
             has_caller_scheduler_metadata=True,
             pack_gqa=pack_gqa, num_splits=num_splits,
-        )
+        )._replace(requested_use_swapab=False)
     )
 
     return _get_scheduler_metadata(

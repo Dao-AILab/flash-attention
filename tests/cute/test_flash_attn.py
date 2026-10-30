@@ -21,6 +21,7 @@ try:
 except ImportError:
     apply_rotary_emb = None
 
+from decode_test_utils import require_swapab
 from flash_attn.cute.cache_utils import JITCache
 from flash_attn.cute.config import FwdConfig, Sm100Registers, select_fwd_config
 from flash_attn.cute.testing import (
@@ -86,8 +87,10 @@ VERBOSE = True
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 SplitKV heuristic")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_auto_splits_more_tiles_than_sms():
+def test_flash_attn_auto_splits_more_tiles_than_sms(monkeypatch):
     """num_splits=0 asks for the heuristic; with more tiles than SMs it must pick one split."""
+    # The standard kernel's heuristic; SwapAB decode would otherwise take this call.
+    monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "standard")
     torch.manual_seed(0)
     q = torch.randn(256, 1, 16, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(256, 2048, 16, 128, device="cuda", dtype=torch.bfloat16)
@@ -3081,13 +3084,22 @@ def check_sm100_unused_v_cache(
     nheads_kv=8,
     dv=None,
     v_layout="contiguous",
+    backend="standard",
 ):
-    """Unused nonpaged V cache rows must not contribute NaNs to attention."""
+    """Unused nonpaged V cache rows must not contribute NaNs to attention.
+
+    backend sets FLASH_ATTENTION_SM100_BACKEND: these checks target the standard kernel's
+    ragged V loads unless a test also runs them on SwapAB decode, which must then be selected.
+    """
     from flash_attn.cute import utils
 
     if DISABLE_SPLIT and num_splits > 1:
         pytest.skip("SplitKV disabled by the test environment")
     monkeypatch.setattr(utils, "_fa_disable_2cta_enabled", disable_2cta)
+    if backend == "swapab":
+        require_swapab(monkeypatch)
+    else:
+        monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", backend)
     torch.manual_seed(42)
     k_lengths = [32, 64, 96, 48, 128, 0, 193]
     if v_layout == "broadcast_batch":
@@ -3275,21 +3287,29 @@ def test_flash_attn_sm100_unused_v_cache_dimensions(monkeypatch, dtype, d, dv, v
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# Dense-Q layouts also run on SwapAB decode, which has its own bounded V descriptor; it does
+# not take cu_seqlens_k.
 @pytest.mark.parametrize(
-    "varlen,v_layout",
+    "varlen,v_layout,backend",
     [
-        (False, "strided"),
-        (True, "strided"),
-        (False, "batch_transpose"),
-        (False, "broadcast_batch"),
-        (False, "broadcast_head"),
-        (False, "broadcast_sequence"),
+        (varlen, v_layout, backend)
+        for varlen, v_layout in [
+            (False, "strided"),
+            (True, "strided"),
+            (False, "batch_transpose"),
+            (False, "broadcast_batch"),
+            (False, "broadcast_head"),
+            (False, "broadcast_sequence"),
+        ]
+        for backend in (["standard"] if varlen else ["standard", "swapab"])
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_sm100_unused_v_cache_layouts(monkeypatch, dtype, varlen, v_layout):
+def test_flash_attn_sm100_unused_v_cache_layouts(monkeypatch, dtype, varlen, v_layout, backend):
+    if backend == "swapab" and not IS_SM100:
+        pytest.skip("SwapAB decode is SM100/SM103-only")
     check_sm100_unused_v_cache(
-        monkeypatch, 128, varlen, False, dtype, 1, v_layout=v_layout
+        monkeypatch, 128, varlen, False, dtype, 1, v_layout=v_layout, backend=backend
     )
 
 
@@ -3411,15 +3431,26 @@ def test_flash_attn_sm100_unused_v_cache_fp8(dtype, varlen):
 
 
 @pytest.mark.skipif(not IS_SM100, reason="SM100 paged KV (TMA pages)")
-@pytest.mark.parametrize("d, page_size", [(128, 128), (64, 128), (128, 64)])
+# Pages of 128 tokens also run on SwapAB decode; it does not support 64-token pages.
+@pytest.mark.parametrize(
+    "d, page_size, backend",
+    [(128, 128, "standard"), (128, 128, "swapab"), (64, 128, "standard"), (64, 128, "swapab"),
+     (128, 64, "standard")],
+)
 @pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("padding", ["unused_page_nan", "tail_finite_garbage"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_paged_padding_contract(d, page_size, num_splits, padding):
+def test_flash_attn_paged_padding_contract(
+    d, page_size, backend, num_splits, padding, monkeypatch
+):
     """The paged-KV padding contract (see test_flash_attn_mla_paged_padding_contract): rows past
     seqused_k in a partially used page may hold finite garbage; pages an entry does not use may
     hold NaN, including the one a seqused_k = 0 entry's fully masked dummy tile loads. The output
     equals the run with zero padding, bitwise, and is 0 with LSE = -inf for empty entries."""
+    if backend == "swapab":
+        require_swapab(monkeypatch)
+    else:
+        monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", backend)
     device, dtype = "cuda", torch.bfloat16
     k_lens = [70, 0, 130, 0]
     b, h, h_kv, cap = len(k_lens), 8, 2, 256
@@ -3787,7 +3818,8 @@ def test_flash_attn_paged_sm100_tma_capacity(head_dim):
 @pytest.mark.parametrize("max_seqlen_k_mode", ["batch_max", "page_aligned"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q, num_splits):
-    """Check paged seqused_k against dense varlen for batch-max and capacity extents."""
+    """Check paged seqused_k and dense varlen against the fp32 reference for batch-max and
+    capacity extents."""
     if not IS_SM100:
         pytest.skip("SM100-specific paged hd256 test")
     device = "cuda"
@@ -3891,11 +3923,27 @@ def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q,
     assert out_paged.abs().max().item() < 10.0, (
         "Paged seqused_k output has poison-scale magnitudes: KV past seqused_k leaked"
     )
-    # SplitKV rounds the fp32 combine to bf16 once more than the unsplit reference.
-    atol = 1e-3 if num_splits == 1 else 4e-3
-    assert torch.allclose(out_paged, out_ref, atol=atol, rtol=1e-3), (
-        "Paged seqused_k output does not match the dense varlen reference"
+    # Paged and dense varlen may run different kernels (SM100 SwapAB decode for seqlen_q=1), so
+    # each is checked against the fp32 reference over the used tokens.
+    max_used = max(seqused_k_list)
+    k_pad = torch.zeros(batch_size, max_used, nheads_kv, d, device=device, dtype=dtype)
+    v_pad = torch.zeros_like(k_pad)
+    for b, used in enumerate(seqused_k_list):
+        k_pad[b, :used] = k[k_offsets[b] : k_offsets[b + 1]]
+        v_pad[b, :used] = v[k_offsets[b] : k_offsets[b + 1]]
+    key_padding_mask = (
+        torch.arange(max_used, device=device)[None, :] < seqused_k[:, None]
     )
+    q_pad = q.reshape(batch_size, seqlen_q, nheads, d)
+    fp32_ref, _ = attention_ref(
+        q_pad, k_pad, v_pad, key_padding_mask=key_padding_mask, causal=True
+    )
+    pt_ref, _ = attention_ref(
+        q_pad, k_pad, v_pad, key_padding_mask=key_padding_mask, causal=True,
+        upcast=False, reorder_ops=True,
+    )
+    for name, out in (("paged seqused_k", out_paged), ("dense varlen", out_ref)):
+        check_tensor_vs_ref(name, out.reshape_as(fp32_ref).float(), fp32_ref, pt_ref.float())
     assert torch.equal(out_full_seqused, out_no_seqused), (
         "seqused_k equal to the allocated length must match the non-seqused path"
     )
