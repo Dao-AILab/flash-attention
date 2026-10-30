@@ -77,8 +77,11 @@ from flash_attn.cute.utils import smid
 from flash_attn.cute.utils import AuxData
 from flash_attn.cute.config import (
     SM100_LAUNCH_REGISTERS,
+    SM100_MAX_KV_STAGE,
+    SM100_SMEM_BYTES,
     SM100_THREADS_PER_CTA,
     FwdConfig,
+    sm100_uneven_kv_smem,
 )
 
 # Note [Low Precision Scaling]
@@ -261,13 +264,28 @@ class FlashAttentionForwardSm100:
             has_tile_count_semaphore and is_varlen_q
         ) or self.use_clc_scheduler
         self.is_persistent = self.dynamic_persistent or self.is_static_persistent
-        self.overlap_sO_sQ = (
-            (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-            # Persistent hd256 2CTA separates Q/O to overlap the next Q load with O stores.
-            # 1CTA aliases Q/O to preserve KV pipeline depth.
-            (self.head_dim_padded == 256 and not (self.is_persistent and self.use_2cta_instrs)) or
-            (self.head_dim_v_padded >= 128 and self.is_split_kv)
+        # FwdConfig owns the SMEM layout (config.select_sm100_smem_layout); validate_fwd_config
+        # checks it fits, and __call__ asserts the resulting SharedStorage does.
+        self.overlap_sO_sQ = config.overlap_sO_sQ
+        self.kv_stage = config.kv_stage
+        assert 2 <= self.kv_stage <= SM100_MAX_KV_STAGE, f"kv_stage={self.kv_stage}"
+        self.s_stage = 2
+        assert self.s_stage >= self.q_stage
+        # For hdim 192,128 1CTA, we don't have enough smem to store all 3 stages of KV:
+        # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
+        # Instead we store smem as [smem_large, smem_small, smem_large], where smem_large is
+        # 128 x 192 and smem_small is 128 x 128. We set the stride between the stages to be
+        # 128 * 160, so that indexing the 0th and 2nd stages will get the right address,
+        # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
+        self.uneven_kv_smem = sm100_uneven_kv_smem(
+            self.head_dim_padded, self.head_dim_v_padded, self.kv_stage, self.use_2cta_instrs
         )
+        self.uneven_kv_smem_offset = (
+            self.n_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
+            if self.uneven_kv_smem
+            else 0
+        )
+        assert self.uneven_kv_smem_offset % 1024 == 0
         self.sched_stages = 1
         if self.use_clc_scheduler:
             assert self.cluster_shape_mn[1] == 1, f"CLC requires cluster N == 1: {self.cluster_shape_mn}"
@@ -382,50 +400,6 @@ class FlashAttentionForwardSm100:
 
         self.buffer_align_bytes = 1024
 
-    def _setup_attributes(self):
-        """Set up configurations and parameters for the FMHA kernel operation.
-
-        This method initializes and configures various attributes required for the
-        execution of the fused multi-head attention kernel, mainly about the pipeline stages:
-
-        - Sets up staging parameters for Q, K, V inputs and accumulator data
-        - Configures pipeline stages for softmax, correction, and epilogue operations
-        """
-
-        smem_size_q = self.q_stage * self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
-        smem_size_o = self.q_stage * self.m_block_size * self.epi_head_dim_v * self.o_dtype.width // 8
-        smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
-        smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
-        smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
-        smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
-        # Cap small head_dim from over-staging: the 224*1024 budget undercounts
-        # per-stage state, so at hd_padded=16 the unbounded formula picks 52 stages
-        # and overflows the 227 KB SMEM cap. No-op for hd_padded >= 32 (max 26).
-        # Keep hd192 staging in sync with config.sm100_hd192_uneven_kv_smem_bytes.
-        kv_stage = min((224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage, 32)
-        if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
-            # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
-             kv_stage = 3
-        self.kv_stage = kv_stage
-        # print("kv_stage", self.kv_stage)
-        self.s_stage = 2
-        assert self.s_stage >= self.q_stage
-        # For hdim 192,128 1CTA, we don't have enough smem to store all 3 stages of KV:
-        # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
-        # Instead we store smem as [smem_large, smem_small, smem_large], where smem_large is
-        # 128 x 192 and smem_small is 128 x 128. We set the stride between the stages to be
-        # 128 * 160, so that indexing the 0th and 2nd stages will get the right address,
-        # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
-        self.uneven_kv_smem = (
-            self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
-        )
-        self.uneven_kv_smem_offset = (
-            self.n_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
-            if self.uneven_kv_smem
-            else 0
-        )
-        assert self.uneven_kv_smem_offset % 1024 == 0
-
     @cute.jit
     def __call__(
         self,
@@ -508,7 +482,6 @@ class FlashAttentionForwardSm100:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
-        self._setup_attributes()
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         q_major_mode = cute.nvgpu.OperandMajorMode.K
@@ -791,6 +764,10 @@ class FlashAttentionForwardSm100:
             ]
 
         self.shared_storage = SharedStorage
+        assert SharedStorage.size_in_bytes() <= SM100_SMEM_BYTES, (
+            f"SMEM {SharedStorage.size_in_bytes()} > {SM100_SMEM_BYTES}: "
+            f"overlap_sO_sQ={self.overlap_sO_sQ}, kv_stage={self.kv_stage}"
+        )
 
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
