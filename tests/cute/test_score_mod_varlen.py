@@ -157,6 +157,21 @@ TEST_PAIRS_WITH_GLOBAL = [
     (score_mod_debug_global_idx, debug_global_idx_factory, "kv", "kv"),
 ]
 
+GLOBAL_INDEX_CASES = [
+    (score_mod_tuple, varlen_k, varlen_q)
+    for varlen_q, varlen_k in ((True, True), (True, False), (False, True))
+    for score_mod_tuple in TEST_PAIRS_WITH_GLOBAL
+    if (score_mod_tuple[3] == "q" and varlen_q)
+    or (score_mod_tuple[3] == "kv" and varlen_k)
+    or (score_mod_tuple[3] == "both" and varlen_q and varlen_k)
+]
+PAGED_GLOBAL_INDEX_CASES = [
+    (*case, page_size)
+    for page_size in (None, 128)
+    for case in GLOBAL_INDEX_CASES
+    if page_size is None or not case[1]
+]
+
 SEQLEN_CONFIGS = [
     ([1], [1]),
     ([1, 1], [1, 1]),
@@ -619,11 +634,9 @@ def test_varlen_with_score_mod_vectorized(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("varlen_q", [True, False])
-@pytest.mark.parametrize("varlen_k", [True, False])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
-@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_WITH_GLOBAL)
+@pytest.mark.parametrize("score_mod_tuple,varlen_k,varlen_q", GLOBAL_INDEX_CASES)
 def test_varlen_with_global_idx_score_mod(
     seqlens_q,
     seqlens_k,
@@ -966,12 +979,11 @@ def test_varlen_score_mod_kvcache(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("page_size", [None, 128])
-@pytest.mark.parametrize("varlen_q", [True, False])
-@pytest.mark.parametrize("varlen_k", [True, False])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
-@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_WITH_GLOBAL)
+@pytest.mark.parametrize(
+    "score_mod_tuple,varlen_k,varlen_q,page_size", PAGED_GLOBAL_INDEX_CASES
+)
 def test_varlen_score_mod_with_paged_kvcache_global(
     seqlens_q,
     seqlens_k,
