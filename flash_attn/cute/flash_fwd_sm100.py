@@ -3004,6 +3004,9 @@ class FlashAttentionForwardSm100:
                         # TMA KV loads a dummy tile when seqlen_k == 0 (see correction_epilogue)
                         zero_fill=seqlen.seqlen_k == 0 if const_expr(self.use_tma_KV) else False,
                     )
+                    # The O loads from tmem (tcgen05.ld) are asynchronous: wait for them to
+                    # complete before releasing the O buffers to the mma warp.
+                    cute.arch.fence_view_async_tmem_load()
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
                     if const_expr(self.use_s_ping_pong):
