@@ -702,7 +702,7 @@ def _flash_attn_fwd(
         window_size_left=window_size_left, window_size_right=window_size_right,
         has_score_mod=score_mod is not None or softcap is not None,
         has_mask_mod=mask_mod is not None,
-        has_learnable_sink=learnable_sink is not None,
+        has_learnable_sink=learnable_sink is not None, has_lse=lse is not None,
         tile_mn=tile_mn, num_splits=num_splits, seqlen_k_per_split=seqlen_k_per_split,
         requested_mma_pv_is_rs=mma_pv_is_rs, requested_intra_wg_overlap=intra_wg_overlap,
         disable_scheduler_metadata=disable_scheduler_metadata,
