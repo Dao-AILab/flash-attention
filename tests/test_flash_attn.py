@@ -2827,3 +2827,47 @@ def test_flash_attn_generator_arg_must_be_none():
     with pytest.raises(RuntimeError, match=match):
         flash_attn_gpu.varlen_bwd(qf, qf, kf, vf, qf, lse, None, None, None, cu, cu, None,
                                   seqlen, seqlen, 0.0, scale, False, True, -1, -1, 0.0, False, bad, None)
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA shared-memory requirement")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("d", [192, 193, 224, 256])
+@pytest.mark.parametrize("dropout_p", [0.0, 0.17])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("varlen", [False, True])
+def test_flash_attn_bwd_dropout_shared_memory(dtype, d, dropout_p, causal, varlen):
+    torch.manual_seed(0)
+    batch, seqlen_q, seqlen_k, nheads, nheads_k = 2, 17, 33, 2, 1
+    q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(batch, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    kwargs = dict(dropout_p=dropout_p, causal=causal, return_attn_probs=True)
+    if varlen:
+        cu_q = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * seqlen_q
+        cu_k = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * seqlen_k
+        out, _, s_dmask = flash_attn_varlen_func(
+            q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1), cu_q, cu_k,
+            seqlen_q, seqlen_k, **kwargs,
+        )
+        out = out.view_as(q)
+    else:
+        out, _, s_dmask = flash_attn_func(q, k, v, **kwargs)
+    dout = torch.randn_like(out)
+    max_smem = torch.cuda.get_device_properties(q.device).shared_memory_per_block_optin
+    if d > 192 and dropout_p > 0 and max_smem < 144 * 1024:
+        # The 256-wide backward dispatcher has no dropout kernel for this device.
+        with pytest.raises(RuntimeError, match="head dim > 192 with dropout requires at least 144 KB"):
+            torch.autograd.grad(out, (q, k, v), dout)
+        return
+
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+    dropout_mask = None
+    if dropout_p > 0:
+        dropout_mask = convert_flash_attn_S_to_softmax(
+            s_dmask, seqlen_q, seqlen_k, None, None, d, True, causal=causal,
+        ) >= 0
+    out_ref, _ = attention_ref(q, k, v, dropout_p=dropout_p, dropout_mask=dropout_mask, causal=causal)
+    grads_ref = torch.autograd.grad(out_ref, (q, k, v), dout)
+    tol = 2e-2 if dtype == torch.bfloat16 else 2e-3
+    for grad, grad_ref in zip(grads, grads_ref):
+        torch.testing.assert_close(grad, grad_ref, atol=tol, rtol=tol)
