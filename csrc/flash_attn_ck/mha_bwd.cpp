@@ -6,6 +6,9 @@
 
 #include "fmha_bwd.hpp"
 #include "mask.hpp"
+#include "d256_bwd_gfx12.cuh"
+#include <cstdlib>
+#include <c10/cuda/CUDAException.h>
 
 fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
                                        std::string dtype,
@@ -216,7 +219,7 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         const bool is_causal,
         int window_size_left,
         int window_size_right,
-        const float /*softcap*/,
+        const float softcap,
         const bool deterministic,
         std::optional<at::Generator> gen_,
         std::optional<at::Tensor> &rng_state_)
@@ -226,6 +229,8 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
 #endif
     if (is_causal) { window_size_right = 0; }
 
+    CHECK_DEVICE(q);
+    at::cuda::CUDAGuard device_guard{q.device()};
     const bool is_dropout = p_dropout > 0.0;
 #ifdef HIPIFY_V2
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -291,6 +296,9 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
     CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
     CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size);
 
+    TORCH_CHECK(k.device() == q.device() && v.device() == q.device() &&
+                out.device() == q.device() && dout.device() == q.device() &&
+                softmax_lse.device() == q.device(), "Attention tensors must share a device");
     at::Tensor dq, dk, dv;
     if (dq_.has_value()) {
         dq = dq_.value();
@@ -320,21 +328,108 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         dv = torch::empty_like(v);
     }
 
-    const auto traits = get_ck_fmha_bwd_traits(
-        mask,
-        q_dtype_str,
-        seqlen_q,
-        seqlen_k,
-        batch_size,
-        head_size,
-        num_heads,
-        num_heads_k,
-        is_dropout,
-        alibi_slopes_.has_value(),
-        deterministic);
-    fmha_bwd_launcher launcher(traits);
+    TORCH_CHECK(dq.device() == q.device() && dk.device() == q.device() && dv.device() == q.device(),
+                "Gradient tensors must share the query device");
 
-    at::cuda::CUDAGuard device_guard{q.device()};
+    // gfx1200/gfx1201 BF16 D256: split head-dimension work across four waves.
+    if (head_size == 256 && q_dtype == torch::kBFloat16 && !is_dropout && !deterministic &&
+        softcap == 0.0f && !alibi_slopes_.has_value()) {
+        // Query the tensor's device, not a process-wide cached current device.
+        const auto *prop = at::cuda::getDeviceProperties(q.get_device());
+        const std::string arch = std::string(prop->gcnArchName).substr(0, 7);
+        const bool gfx12 = (arch == "gfx1200" || arch == "gfx1201") &&
+                           (prop->gcnArchName[7] == '\0' || prop->gcnArchName[7] == ':');
+        const char *env = std::getenv("FA_D256_BWD");
+        const bool fa_d256_enabled = gfx12 && !(env && env[0] == '0');
+        // Vector operands require 16-byte alignment at every batch/head/row.
+        const auto aligned = [](const at::Tensor &t) {
+            return (reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0) && t.stride(0) % 8 == 0 &&
+                   t.stride(1) % 8 == 0 && t.stride(2) % 8 == 0;
+        };
+        const bool fa_d256_mask_ok =
+            (is_causal && window_size_left == -1) ||
+            (!is_causal && window_size_left == -1 && window_size_right == -1);
+        if (fa_d256_enabled && fa_d256_mask_ok && seqlen_q > 0 && seqlen_k > 0 &&
+            softmax_lse.scalar_type() == at::kFloat && softmax_lse.dim() == 3 &&
+            softmax_lse.sizes() == torch::IntArrayRef({batch_size, num_heads, seqlen_q}) &&
+            softmax_lse.stride(-1) == 1 && batch_size <= 65535 && num_heads > 0 && num_heads <= 65535 &&
+            aligned(q) && aligned(k) && aligned(v) && aligned(out) && aligned(dout)) {
+            auto opts = q.options();
+            auto softmax_d =
+                torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+            at::Tensor dk_e = dk, dv_e = dv;
+            if (num_heads_k != num_heads) {
+                dk_e = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts);
+                dv_e = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts);
+            }
+            auto bf = [](const at::Tensor &t) {
+                return reinterpret_cast<const __bf16 *>(t.data_ptr());
+            };
+            auto bfm = [](at::Tensor &t) { return reinterpret_cast<__bf16 *>(t.data_ptr()); };
+            fa_d256::Args a{bf(q),
+                            bf(k),
+                            bf(v),
+                            bf(dout),
+                            bf(out),
+                            softmax_lse.data_ptr<float>(),
+                            softmax_d.data_ptr<float>(),
+                            bfm(dq),
+                            bfm(dk_e),
+                            bfm(dv_e),
+                            q.stride(0),
+                            q.stride(1),
+                            q.stride(2),
+                            k.stride(0),
+                            k.stride(1),
+                            k.stride(2),
+                            v.stride(0),
+                            v.stride(1),
+                            v.stride(2),
+                            dout.stride(0),
+                            dout.stride(1),
+                            dout.stride(2),
+                            out.stride(0),
+                            out.stride(1),
+                            out.stride(2),
+                            dq.stride(0),
+                            dq.stride(1),
+                            dq.stride(2),
+                            dk_e.stride(0),
+                            dk_e.stride(1),
+                            dk_e.stride(2),
+                            dv_e.stride(0),
+                            dv_e.stride(1),
+                            dv_e.stride(2),
+                            softmax_lse.stride(0),
+                            softmax_lse.stride(1),
+                            softmax_d.stride(0),
+                            softmax_d.stride(1),
+                            batch_size,
+                            num_heads,
+                            num_heads_k,
+                            seqlen_q,
+                            seqlen_k,
+                            softmax_scale,
+                            is_causal ? 1 : 0};
+            C10_CUDA_CHECK(fa_d256::run(a, stream));
+            if (num_heads_k != num_heads) {
+                at::sum_out(dk,
+                            at::reshape(dk_e, {batch_size, seqlen_k, num_heads_k,
+                                               num_heads / num_heads_k, head_size}),
+                            {3});
+                at::sum_out(dv,
+                            at::reshape(dv_e, {batch_size, seqlen_k, num_heads_k,
+                                               num_heads / num_heads_k, head_size}),
+                            {3});
+            }
+            return {dq, dk, dv, softmax_d};
+        }
+    }
+
+    const auto traits = get_ck_fmha_bwd_traits(mask, q_dtype_str, seqlen_q, seqlen_k, batch_size,
+                                               head_size, num_heads, num_heads_k, is_dropout,
+                                               alibi_slopes_.has_value(), deterministic);
+    fmha_bwd_launcher launcher(traits);
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
