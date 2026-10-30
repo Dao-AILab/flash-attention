@@ -887,6 +887,46 @@ def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Flo
 
 
 @dsl_user_op
+def add_packed_p_to_f32x4(
+    word: Float32, acc: Tuple[Float32, ...], p_dtype: cutlass.Constexpr, *, loc=None, ip=None
+) -> Tuple[Float32, ...]:
+    """Add the P values packed in one 32-bit register (4 E4M3 or 2 BF16) into FP32 accumulators.
+
+    sm_100 has mixed FP32+FP16/BF16 adds (FHADD), so no P value is widened to FP32 first.
+    E4M3 accumulates into acc[0..3], BF16 into acc[0..1].
+    """
+    if const_expr(p_dtype.width == 8):
+        asm = (
+            "{\n\t.reg .b32 w, x, y;\n\t.reg .b16 a, b, x0, x1, y0, y1;\n\t"
+            "mov.b32 w, $4;\n\tmov.b32 {a, b}, w;\n\t"
+            "cvt.rn.f16x2.e4m3x2 x, a;\n\tcvt.rn.f16x2.e4m3x2 y, b;\n\t"
+            "mov.b32 {x0, x1}, x;\n\tmov.b32 {y0, y1}, y;\n\t"
+            "add.rn.f32.f16 $0, x0, $5;\n\tadd.rn.f32.f16 $1, x1, $6;\n\t"
+            "add.rn.f32.f16 $2, y0, $7;\n\tadd.rn.f32.f16 $3, y1, $8;\n\t}\n"
+        )
+        n = 4
+    else:
+        assert p_dtype == cutlass.BFloat16
+        asm = (
+            "{\n\t.reg .b32 w;\n\t.reg .b16 a, b;\n\t"
+            "mov.b32 w, $2;\n\tmov.b32 {a, b}, w;\n\t"
+            "add.rn.f32.bf16 $0, a, $3;\n\tadd.rn.f32.bf16 $1, b, $4;\n\t}\n"
+        )
+        n = 2
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * n),
+        [Float32(word).ir_value(loc=loc, ip=ip)]
+        + [Float32(a).ir_value(loc=loc, ip=ip) for a in acc[:n]],
+        asm,
+        ",".join(["=f"] * n + ["f"] * (n + 1)),
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(n))
+
+
+@dsl_user_op
 def domain_offset_aligned(
     coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None
 ) -> cute.Tensor:

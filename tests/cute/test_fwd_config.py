@@ -1,6 +1,6 @@
 import itertools
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import astuple, replace
 
 import pytest
 
@@ -435,3 +435,32 @@ def test_mxfp8_qk_policy_follows_its_own_rows():
     # Softmax stats release: hd64 causal keeps cross-stage on SM103.
     assert not select_fwd_config(causal_hd64).sm_stats_cross_stage
     assert select_fwd_config(causal_hd64._replace(device_arch=103)).sm_stats_cross_stage
+
+
+def test_mxfp8_pv_register_splits():
+    pv = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128, mxfp8_path="pv")
+
+    def registers(**changes):
+        config = select_fwd_config(pv._replace(**changes))
+        assert not (config.use_2cta_instrs or config.use_s_ping_pong)
+        return astuple(config.registers)
+
+    # sm_100/sm_103: the MMA warp needs more than the hd128 FP8 default leaves it.
+    assert registers() == (184, 80, 64)
+    assert registers(head_dim=64, head_dim_v=64) == (192, 64, 64)
+    assert registers(device_arch=103) == (168, 96, 80)
+    # sm_107 has dedicated scale columns: only hd64 overrides the FP8 split.
+    assert registers(device_arch=107, head_dim=64, head_dim_v=64) == (160, 96, 96)
+    assert registers(device_arch=107) == astuple(
+        select_fwd_config(pv._replace(device_arch=107, mxfp8_path=None, pack_gqa=False,
+                                      disable_2cta=True)).registers
+    )
+
+
+def test_mxfp8_pv_keeps_hardware_exp2():
+    # FP8 hd128 emulates exp2 on SM100; native PV must not, so PV consumes the reference P.
+    pv = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128, mxfp8_path="pv")
+    fp8 = select_fwd_config(pv._replace(mxfp8_path=None, pack_gqa=False, disable_2cta=True))
+    assert fp8.ex2_emu_freq > 0
+    config = select_fwd_config(pv)
+    assert (config.ex2_emu_freq, config.ex2_emu_start_frg) == (0, 0)
