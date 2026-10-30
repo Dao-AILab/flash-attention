@@ -943,8 +943,10 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (UseSchedulerBarrier) {
             // We have NamedBarrier for up to 3 WGs
             static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
-            // WG1 needs the very first signal to start
-            if (warp_group_idx == 1) {
+            // WG1 needs the very first signal to start. It comes from the last MMA WG, which signals WG1 in
+            // the ring: if WG1 gave it itself, WG1 would arrive and then sync on the same barrier in one
+            // phase, which the PTX ISA (bar, barrier) says to avoid.
+            if (warp_group_idx == NumMmaWarpGroups) {
                 cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
             }
         }
