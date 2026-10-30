@@ -642,6 +642,9 @@ class FlashAttentionBackwardSm100:
         self.num_epi_stages_v = max(1, (self.tile_hdimv // 2) // self.sdV_epi_tile[1])
         self.sdK_flat_epi_tile = self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages
         self.sdV_flat_epi_tile = self.tile_n * (self.tile_hdimv // 2) // self.num_epi_stages_v
+        # fp32 staging of the dK / dV accumulate variant (dKV_postprocess); the direct-store
+        # variant allocates sdO at this size as well (see sdO_alloc_bytes).
+        self.sdKV_accum_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
         if const_expr(not self.dKV_postprocess):
             # One (tile_n, epi) stage per compute warpgroup; with the M=64 layout the whole CTA
             # stages the (tile_n, hdim) tile, i.e. hdim / epi stages (the same bytes for hdim 128).
@@ -663,9 +666,8 @@ class FlashAttentionBackwardSm100:
             self.sdK_layout = cute.make_layout((self.tile_n // 2) * self.tile_hdim)
             self.sdV_layout = cute.make_layout((self.tile_n // 2) * self.tile_hdimv)
         else:
-            self.sdK_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
             # self.dK_reduce_ncol same for dV
-            self.sdV_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
+            self.sdK_layout = self.sdV_layout = self.sdKV_accum_layout
 
     @cute.jit
     def __call__(
@@ -1008,9 +1010,14 @@ class FlashAttentionBackwardSm100:
             cute.size_in_bytes(self.q_dtype, self.sQ_layout),
             cute.size_in_bytes(self.dk_dtype, self.sdK_layout),
         )
+        # sdO also holds the dV staging; allocate it at the fp32 staging size of the accumulate
+        # variant in the direct-store variant too, so the buffers behind it (sdS, sLSE, sdPsum,
+        # sdQaccum) keep the same offsets: with the smaller allocation the hdim 64 kernel's LSE /
+        # dPsum smem loads bank-conflict and it runs 9-14% slower (see #3065).
         sdO_alloc_bytes = max(
             cute.size_in_bytes(self.dv_dtype, self.sdV_layout),
             cute.size_in_bytes(self.do_dtype, self.sdO_layout),
+            cute.size_in_bytes(Float32, self.sdKV_accum_layout),
         )
 
         sdK_bytes = cute.size_in_bytes(self.dk_dtype, self.sdK_layout)
