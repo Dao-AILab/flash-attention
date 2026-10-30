@@ -240,6 +240,10 @@ class TileSchedulerArguments(ParamsBase):
     blocks_to_batch_idx_ptr: Optional[cute.Tensor] = None
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistent_cta_multiplier: cutlass.Constexpr[int] = 1
+    # SingleTileScheduler: launch splits as the slowest grid mode, so with per-batch split counts
+    # every batch's first splits launch before the excess splits, which exit at once. Cluster
+    # shape (1, 1) only.
+    split_major: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -254,6 +258,7 @@ class SingleTileScheduler:
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         use_cluster_idx: cutlass.Constexpr[bool] = False
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None
+        num_head_divmod: Optional[FastDivmodDivisorV2] = None  # split-major grid
 
         @staticmethod
         def create(
@@ -269,6 +274,7 @@ class SingleTileScheduler:
                 args.cluster_shape_mn,
                 args.use_cluster_idx,
                 args.num_splits_dynamic_ptr,
+                FastDivmodDivisorV2(args.num_head) if args.split_major else None,
             )
 
     def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
@@ -288,6 +294,9 @@ class SingleTileScheduler:
     ) -> Params:
         assert scheduling_mode == SchedulingMode.STATIC, (
             f"SingleTileScheduler only supports STATIC, got {scheduling_mode!r}"
+        )
+        assert not args.split_major or args.cluster_shape_mn == (1, 1), (
+            "split_major folds the heads into grid X, which clusters span"
         )
         return SingleTileScheduler.Params.create(args, loc=loc, ip=ip)
 
@@ -316,6 +325,11 @@ class SingleTileScheduler:
             grid_x = params.num_block * params.cluster_shape_mn[0]
         else:
             grid_x = cute.round_up(params.num_block, params.cluster_shape_mn[0])
+        if const_expr(params.num_head_divmod is not None):
+            # Split-major: heads vary fastest, then batches, then splits. Only the splits sit in
+            # grid Z, since batch * num_splits can pass the 65535 grid Y/Z limit (num_batch
+            # alone shares that limit with the default layout).
+            return (grid_x * params.num_head, params.num_batch, params.num_splits)
         return (
             grid_x,
             params.num_head * params.num_splits,
@@ -325,7 +339,12 @@ class SingleTileScheduler:
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         block_idx, head_idx, batch_idx = self._blk_coord
         is_valid = self._is_first_block
-        if const_expr(self.params.is_split_kv):
+        if const_expr(self.params.num_head_divmod is not None):
+            # Grid (block * head, batch, split); see get_grid_shape.
+            split_idx = batch_idx
+            batch_idx = head_idx
+            block_idx, head_idx = divmod(block_idx, self.params.num_head_divmod)
+        elif const_expr(self.params.is_split_kv):
             head_idx, split_idx = divmod(head_idx, self.params.num_splits_divmod)
         else:
             split_idx = Int32(0)

@@ -32,6 +32,8 @@ pytest tests/cute/test_flash_attn_varlen.py
 pytest tests/cute/test_mask_mod.py
 pytest tests/cute/test_score_mod.py
 pytest tests/cute/test_block_sparsity.py
+pytest tests/cute/test_flash_attn_decode_sm100.py  # SM100/SM103 SwapAB decode (GPU)
+pytest tests/cute/test_swapab_config.py  # SwapAB selection and split policy (CPU)
 ```
 
 ### Fast two-pass testing
@@ -58,8 +60,8 @@ FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x
 - `FLASH_ATTENTION_TEST_RECORD_KEYS=path` records every compile-cache lookup, for diffing the
   kernel set of a selection across changes.
 - **Most test files do not support the compilation pass yet.** Only `test_flash_attn_mla.py`
-  is fully converted; `test_flash_attn.py` mostly is, and `test_flash_attn_fast.py` and
-  `test_flash_attn_combine.py` partly. The mask_mod, score_mod, block-sparsity, varlen, hd256
+  and `test_flash_attn_decode_sm100.py` are fully converted; `test_flash_attn.py` mostly is,
+  and `test_flash_attn_fast.py` and `test_flash_attn_combine.py` partly. The mask_mod, score_mod, block-sparsity, varlen, hd256
   scheduler and race-condition files are not converted at all. Their tests run with real tensors in pass 1 and
   can compile again in pass 2, so `FLASH_ATTENTION_TEST_EXPECT_CACHED=1` (and
   `tools/two_pass_tests.sh`) reports them as failures even when the results are correct. Run
@@ -95,6 +97,7 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-b
 
 - `flash_fwd.py` — `FlashAttentionForwardSm90`: Hopper forward. No SplitKV or paged KV.
 - `flash_fwd_sm100.py` — `FlashAttentionForwardSm100`: Blackwell forward. Full features including SplitKV, paged KV cache, persistent kernels, 2CTA instructions.
+- `flash_fwd_decode_sm100.py` — `FlashAttentionForwardSm100SwapAB`: SM100/SM103 single-query-token inference decode (dense or varlen Q, dense or paged KV) with query heads on the MMA N side. `select_fwd_config` routes admitted calls to it; `FLASH_ATTENTION_SM100_BACKEND=auto|swapab|standard` (default `auto`) lets the selector choose, prefers SwapAB wherever it can serve the call (falling back to the standard kernel otherwise), or disables it.
 - `flash_fwd_combine.py` — `FlashAttentionForwardCombine`: merges SplitKV partial results.
 
 ### Backward Kernels

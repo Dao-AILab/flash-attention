@@ -15,10 +15,11 @@ from flash_attn.cute.config import (
     validate_fwd_config,
 )
 
+# Standard-selector cases; test_swapab_config.py covers SwapAB selection.
 _BASE_INPUTS = FwdHeuristicInputs(
     device_arch=100, num_sms=132, dtype="torch.bfloat16", head_dim=64, head_dim_v=64,
     num_heads=16, num_heads_kv=16, batch_size=2, total_q=8192, total_k=8192,
-    max_seqlen_q=4096, max_seqlen_k=4096, requested_num_splits=1,
+    max_seqlen_q=4096, max_seqlen_k=4096, requested_num_splits=1, requested_use_swapab=False,
 )
 _HD128 = dict(head_dim=128, head_dim_v=128)
 _HD192 = dict(head_dim=192, head_dim_v=128)

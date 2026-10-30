@@ -25,6 +25,31 @@ class NamedBarrierFwdSm100(enum.IntEnum):
     SoftmaxStatsW7 = enum.auto()
 
 
+class NamedBarrierFwdSm100SwapAB(enum.IntEnum):
+    """Barrier IDs of the SM100 SwapAB decode kernel; each *WG2 ID is its *WG1 ID + 1.
+
+    IDs 1-15 plus sync_threads on 0 use the full hardware budget of 16 named barriers.
+    """
+
+    TmemPtr = 1
+    MaxFull = 2
+    MaxEmpty = 3
+    SumFullWG1 = 4
+    SumFullWG2 = 5
+    SumEmptyWG1 = 6
+    SumEmptyWG2 = 7
+    MaxDone = 8
+    ODone = 9
+    SumDone = 10
+    QKIssued = 11
+    PVIssued = 12
+    MaxTurnWG1 = 13
+    MaxTurnWG2 = 14
+    # Separate from MaxDone: reusing one ID lets a fast correction warp arrive twice
+    # before all warps have contributed to the first generation.
+    StatsReady = 15
+
+
 class NamedBarrierBwd(enum.IntEnum):
     Epilogue = enum.auto()
     WarpSchedulerWG1 = enum.auto()

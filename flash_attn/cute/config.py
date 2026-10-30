@@ -43,7 +43,8 @@ class Sm100Registers:
     other: int
 
 
-# None for architectures whose forward kernels do not split registers by role.
+# None for architectures whose forward kernels do not split registers by role, and for SwapAB,
+# whose kernel owns fixed per-role budgets.
 Registers = Sm90Registers | Sm100Registers | None
 
 
@@ -56,6 +57,8 @@ class FwdConfig:
     per-split KV range also depends on the M tile extent, q_stage * tile_m.
     ex2_emu_freq and ex2_emu_start_frg are the SM100/SM110 softmax exp2 emulation
     (freq 0 keeps hardware exp2 throughout); other architectures carry 0 and 0.
+    use_swapab selects the SM100/SM103 SwapAB decode kernel (flash_fwd_decode_sm100.py), where
+    tile_m is the query-head tile and only num_splits is tunable; see SwapABPolicy.config.
     """
 
     device_capacity: int
@@ -74,6 +77,7 @@ class FwdConfig:
     registers: Registers
     ex2_emu_freq: int
     ex2_emu_start_frg: int
+    use_swapab: bool = False
 
 
 class FwdHeuristicInputs(NamedTuple):
@@ -124,6 +128,16 @@ class FwdHeuristicInputs(NamedTuple):
     requested_use_clc_scheduler: bool = False
     disable_2cta: bool = False
     disable_s_ping_pong: bool = False
+    disable_scheduler_metadata: bool = False
+    # FLASH_ATTENTION_SM100_BACKEND: None selects SwapAB when admitted and not measured slower,
+    # True prefers it wherever admitted (other calls fall back to the standard kernel, as an
+    # FA_CLC request does), False disables it.
+    requested_use_swapab: bool | None = None
+    # Per-sequence KV capacity, the page-table row when paged. The interface always sets it;
+    # None (max_seqlen_k) exists for CPU callers that build inputs by hand.
+    seqlen_k_capacity: int | None = None
+    requires_grad: bool = False  # any input, aux tensors included
+    has_aux_scalars: bool = False
 
     @property
     def device_capacity(self) -> int:
@@ -692,9 +706,242 @@ def can_use_clc(inputs: FwdHeuristicInputs, *, tile_n: int, use_2cta_instrs: boo
     )
 
 
+# CUDA's launch limit on grid Y and Z (grid X allows 2**31 - 1).
+CUDA_MAX_GRID_DIM_YZ = 65535
+
+
+@dataclass(frozen=True)
+class SwapABPolicy:
+    """Shapes, admission, and split policy of the SM100/SM103 SwapAB decode kernel
+    (flash_fwd_decode_sm100.py). The selector, validation, and interface use SWAPAB."""
+
+    # Kernel shapes. Each 256-token KV block is two 128-row MMA subtiles, and pages are resolved
+    # per subtile, so a page holds a whole number of subtiles. One lane owns one query head in
+    # the softmax and correction warpgroups.
+    tile_n: int = 256
+    page_multiple: int = 128
+    max_qhead_per_kvhead: int = 32
+    # Split policy. Decode is bandwidth bound and DRAM saturates with roughly this many CTAs
+    # (hd64 moves fewer bytes per tile, so it needs more); more splits only add per-CTA fixed
+    # cost and combine work. Fitted on B200 within 2% of the best split on average over a
+    # 22-shape sweep.
+    hd64_target_ctas: int = 128
+    default_target_ctas: int = 64
+    max_splits: int = 32
+    min_tokens_per_split: int = 512
+    # With per-sequence splits the prepare-scheduler kernel picks each sequence's split count
+    # (split_policy) and the grid's split extent only caps it. CTAs past a sequence's count exit
+    # at once but still cost a launch each, so the grid holds about grid_ctas_per_sm * num_sms
+    # CTAs.
+    split_min_blocks: int = 16
+    split_ctas_per_sm: int = 4
+    grid_ctas_per_sm: int = 8
+    # Below this KV capacity the static split count is kept: a short capacity bounds how far
+    # lengths can fall below it, so per-sequence counts cannot gain more than the prepare launch
+    # costs (~1.5-2.5 us on B300; 256-token pages with a tight page table measured 1.2-1.7x slower
+    # at <= 8K tokens and within ~2% at 32K+).
+    per_sequence_min_capacity: int = 32768
+    # Automatic selection keeps the standard kernel for many short sequences at head dims <= 128:
+    # at most short_kv_max_tokens of KV capacity (two KV blocks, so per-CTA fixed cost dominates)
+    # and at least short_kv_min_heads (batch * KV heads) CTAs without splitting.
+    # Source: B300 CUDA-graph decode sweep (bf16, num_splits=0, dense KV and paged KV whose page
+    # table fits the lengths; head configs 8/1, 32/8, 64/8 hd128, 32/4 hd64, 16/2 and 24/4 hd256;
+    # batch 1-256, KV 512-128K). SwapAB was 1.12-1.33x slower than the standard kernel on all 10
+    # such shapes (KV 512, batch * KV heads 512-2048), and within 1.05x or faster everywhere else
+    # except one long-KV shape; hd256 stayed 0.89-0.93x faster. The capacity bounds the real
+    # lengths, so large (vLLM-style) page tables never take this rule.
+    short_kv_max_tokens: int = 512
+    short_kv_min_heads: int = 512
+
+    def supports_head_dims(self, head_dim: int, head_dim_v: int) -> bool:
+        """Tested and benchmarked head dims. Adding a shape needs tests and a decode benchmark."""
+        return {head_dim, head_dim_v} <= {64, 96, 128} or (head_dim, head_dim_v) == (256, 256)
+
+    def tile_hq(self, qhead_per_kvhead: int) -> int:
+        """Query heads per CTA: the next power of two, so one head block covers the group."""
+        return 1 << (qhead_per_kvhead - 1).bit_length()
+
+    def target_ctas(self, head_dim: int) -> int:
+        return self.hd64_target_ctas if head_dim == 64 else self.default_target_ctas
+
+    def request_veto(self, inputs: FwdHeuristicInputs) -> str | None:
+        """The selection request that keeps the selector off SwapAB, even under a SwapAB
+        request, or None.
+
+        These steer only select_fwd_config, like the standard kernel's tile, CLC, and S ping-pong
+        requests; an explicit SwapAB config is forced exactly.
+        """
+        requests = {
+            "tile_mn": inputs.requested_tile_m is not None or inputs.requested_tile_n is not None,
+            "mma_pv_is_rs": inputs.requested_mma_pv_is_rs is not None,
+            "intra_wg_overlap": inputs.requested_intra_wg_overlap is not None,
+            "pack_gqa": inputs.pack_gqa is False,
+            "use_clc_scheduler / disable_s_ping_pong": (
+                inputs.requested_use_clc_scheduler or inputs.disable_s_ping_pong
+            ),
+        }
+        return next((reason for reason, vetoed in requests.items() if vetoed), None)
+
+    def rejection(self, inputs: FwdHeuristicInputs) -> str | None:
+        """Why the SwapAB decode kernel cannot run this problem, or None when it can.
+
+        SwapAB is inference with one query token per sequence: dense Q of seqlen 1, or varlen Q
+        (cu_seqlens_q) with a host max_seqlen_q of 1. A new forward option needs a
+        FwdHeuristicInputs fact that is rejected here, unless SwapAB supports it. The split
+        count's grid limit is grid_rejection.
+        """
+        is_dense_q = not inputs.has_cu_seqlens_q
+        unsupported = {
+            "cu_seqlens_k": inputs.has_cu_seqlens_k,
+            "seqused_q": inputs.has_seqused_q,
+            "learnable_sink": inputs.has_learnable_sink,
+            "block_sparse_tensors": inputs.use_block_sparsity,
+            "aux_scalars": inputs.has_aux_scalars,
+            "scheduler_metadata": inputs.has_caller_scheduler_metadata,
+            "disable_scheduler_metadata": inputs.disable_scheduler_metadata,
+            "seqlen_k_per_split": inputs.seqlen_k_per_split is not None,
+            # B200 (SM100) and B300 (SM103) share the tcgen05/TMEM features and SMEM capacity used.
+            "architecture must be SM100 or SM103": inputs.device_arch not in (100, 103),
+            "training": inputs.requires_grad,
+            "varlen Q needs max_seqlen_q == 1": not is_dense_q
+            and not (inputs.has_max_seqlen_q_hint and inputs.max_seqlen_q == 1),
+            "single query token per sequence": is_dense_q and inputs.total_q != inputs.batch_size,
+            "dtype": inputs.dtype not in ("torch.float16", "torch.bfloat16"),
+            "head dimensions": not self.supports_head_dims(inputs.head_dim, inputs.head_dim_v),
+            "GQA ratio": inputs.qhead_per_kvhead > self.max_qhead_per_kvhead,
+            f"page size must be a multiple of {self.page_multiple}": (
+                inputs.page_size is not None and inputs.page_size % self.page_multiple != 0
+            ),
+            # The launch grid holds the batch in grid Z, or grid Y when split-major.
+            f"batch_size must be at most {CUDA_MAX_GRID_DIM_YZ}": (
+                inputs.batch_size > CUDA_MAX_GRID_DIM_YZ
+            ),
+        }
+        return next((reason for reason, rejected in unsupported.items() if rejected), None)
+
+    def grid_rejection(self, inputs: FwdHeuristicInputs, num_splits: int) -> str | None:
+        """Why the launch grid of num_splits splits exceeds CUDA's grid limits, or None.
+
+        The default grid holds the (KV head, split) pairs in grid Y. The split-major grid of
+        per-sequence splits holds only the splits (at most 256) in grid Z.
+        """
+        if (
+            not self.needs_split_metadata(inputs, num_splits)
+            and inputs.num_heads_kv * num_splits > CUDA_MAX_GRID_DIM_YZ
+        ):
+            return f"num_heads_kv * num_splits must be at most {CUDA_MAX_GRID_DIM_YZ}"
+        return None
+
+    def seqlen_k_capacity(self, inputs: FwdHeuristicInputs) -> int:
+        return inputs.max_seqlen_k if inputs.seqlen_k_capacity is None else inputs.seqlen_k_capacity
+
+    def slower_than_standard(self, inputs: FwdHeuristicInputs) -> bool:
+        """Measured SwapAB losses that automatic selection avoids; see short_kv_max_tokens."""
+        return (
+            max(inputs.head_dim, inputs.head_dim_v) <= 128
+            and self.seqlen_k_capacity(inputs) <= self.short_kv_max_tokens
+            and inputs.batch_size * inputs.num_heads_kv >= self.short_kv_min_heads
+        )
+
+    def per_sequence_splits(self, inputs: FwdHeuristicInputs) -> bool:
+        """Whether SwapAB takes per-sequence split counts from the prepare-scheduler kernel.
+
+        Lengths vary per sequence with varlen Q or seqused_k (the SwapAB tile scheduler reads the
+        counts for dense Q too), but only a capacity of per_sequence_min_capacity tokens leaves
+        room for the counts to pay for the prepare launch.
+        """
+        lengths_vary = inputs.is_varlen_q or inputs.has_seqused_k
+        return lengths_vary and self.seqlen_k_capacity(inputs) >= self.per_sequence_min_capacity
+
+    def needs_split_metadata(self, inputs: FwdHeuristicInputs, num_splits: int) -> bool:
+        """Whether SwapAB prepares per-sequence split counts and launches split-major."""
+        return num_splits > 1 and self.per_sequence_splits(inputs)
+
+    def select_num_splits(self, inputs: FwdHeuristicInputs) -> int:
+        """Automatic split count; with per-sequence splits, the cap of the per-sequence counts."""
+        seqlen_k = self.seqlen_k_capacity(inputs)
+        bh = inputs.batch_size * inputs.num_heads_kv
+        # An empty batch has no tiles to split, as in num_splits_heuristic.
+        if bh == 0:
+            return 1
+        if self.per_sequence_splits(inputs):
+            grid_splits = ceil_div(self.grid_ctas_per_sm * inputs.num_sms, bh)
+            return max(1, min(self.max_splits, ceil_div(seqlen_k, self.tile_n), grid_splits))
+        pow2_splits = 1 << (max(1, self.target_ctas(inputs.head_dim) // bh).bit_length() - 1)
+        return min(pow2_splits, self.max_splits, max(1, seqlen_k // self.min_tokens_per_split))
+
+    def split_policy(self, head_dim: int) -> dict:
+        """Split-rule options of prepare_scheduler.num_splits_for_sequence for SwapAB decode.
+
+        The prepare kernel's one-wave rule, at split_ctas_per_sm waves of one CTA per SM, with
+        blocks per split raised to min(ceil(tiles / low_ctas), split_min_blocks): small batches
+        aim at the static policy's DRAM-saturating CTA count, and splits keep at least
+        split_min_blocks blocks until the batch fills the one-wave target.
+        """
+        return dict(
+            ctas_per_sm=self.split_ctas_per_sm,
+            min_blocks_floor=(self.target_ctas(head_dim), self.split_min_blocks),
+        )
+
+    def config(self, inputs: FwdHeuristicInputs, num_splits: int) -> FwdConfig:
+        """The one SwapAB config for a problem: a power-of-two query-head tile covering the GQA
+        group, a 256-token KV tile, and no standard-kernel scheduling features."""
+        return FwdConfig(
+            device_capacity=inputs.device_capacity,
+            tile_m=self.tile_hq(inputs.qhead_per_kvhead),
+            tile_n=self.tile_n,
+            mma_pv_is_rs=False,
+            intra_wg_overlap=False,
+            q_stage=1,
+            pack_gqa=True,
+            use_clc_scheduler=False,
+            is_static_persistent=False,
+            use_tma_o=False,
+            use_s_ping_pong=False,
+            num_splits=num_splits,
+            use_2cta_instrs=False,
+            registers=None,
+            ex2_emu_freq=0,
+            ex2_emu_start_frg=0,
+            use_swapab=True,
+        )
+
+
+SWAPAB = SwapABPolicy()
+
+
+def needs_split_metadata(config: FwdConfig, inputs: FwdHeuristicInputs) -> bool:
+    """Whether the forward must prepare per-sequence split counts (prepare-scheduler kernel).
+
+    num_splits is then the counts' upper bound. Caller-built metadata needs no preparation.
+    MLA (qv) does not use this contract.
+    """
+    if config.use_swapab:
+        return SWAPAB.needs_split_metadata(inputs, config.num_splits)
+    return (
+        config.num_splits > 1
+        and inputs.is_varlen_q
+        and not inputs.has_caller_scheduler_metadata
+        and not inputs.disable_scheduler_metadata
+    )
+
+
 @lru_cache(maxsize=1024)
 def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     """Select one fully resolved config from host-visible metadata."""
+    # A SwapAB request overrides only the measured-loss rule: vetoed or unsupported calls take
+    # the standard kernel.
+    if (
+        inputs.requested_use_swapab is not False
+        and SWAPAB.request_veto(inputs) is None
+        and SWAPAB.rejection(inputs) is None
+        and (inputs.requested_use_swapab or not SWAPAB.slower_than_standard(inputs))
+    ):
+        num_splits = inputs.requested_num_splits or SWAPAB.select_num_splits(inputs)
+        if SWAPAB.grid_rejection(inputs, num_splits) is None:
+            config = SWAPAB.config(inputs, num_splits)
+            validate_fwd_config(config, inputs)
+            return config
     pack_gqa = default_pack_gqa(inputs) if inputs.pack_gqa is None else inputs.pack_gqa
     if inputs.sparse_mask_per_head:
         pack_gqa = False
@@ -810,12 +1057,17 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
     """
     config = replace(base, **changes)
     resolved = inputs._replace(pack_gqa=config.pack_gqa)
-    ex2_emu_freq, ex2_emu_start_frg = select_ex2_emu(
-        resolved, use_2cta_instrs=config.use_2cta_instrs
-    )
-    derived = dict(ex2_emu_freq=ex2_emu_freq, ex2_emu_start_frg=ex2_emu_start_frg)
+    if config.use_swapab:
+        # registers=None: the SwapAB kernel owns its fixed per-role budgets (64/120/208 at
+        # tile_hq=32); it keeps hardware exp2.
+        derived = dict(registers=None, ex2_emu_freq=0, ex2_emu_start_frg=0)
+    else:
+        ex2_emu_freq, ex2_emu_start_frg = select_ex2_emu(
+            resolved, use_2cta_instrs=config.use_2cta_instrs
+        )
+        derived = dict(ex2_emu_freq=ex2_emu_freq, ex2_emu_start_frg=ex2_emu_start_frg)
     # The register tables cover only supported tiles and stages; validation rejects the rest.
-    if "registers" not in changes:
+    if "registers" not in changes and not config.use_swapab:
         derived["registers"] = select_registers(
             resolved,
             tile_m=config.tile_m,
@@ -884,6 +1136,19 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         raise ValueError(
             f"Config targets SM{config.device_capacity}, but the problem targets SM{inputs.device_capacity}"
         )
+    if config.use_swapab:
+        reason = SWAPAB.rejection(inputs)
+        if reason is not None:
+            raise ValueError("SwapAB unsupported: " + reason)
+        if not 1 <= config.num_splits <= 256:
+            raise ValueError(f"num_splits must be in [1, 256], got {config.num_splits}")
+        reason = SWAPAB.grid_rejection(inputs, config.num_splits)
+        if reason is not None:
+            raise ValueError("SwapAB unsupported: " + reason)
+        expected = SWAPAB.config(inputs, config.num_splits)
+        if config != expected:
+            raise ValueError(f"SwapAB tunes only num_splits: expected {expected}, got {config}")
+        return
     if config.tile_m <= 0 or config.tile_n <= 0:
         raise ValueError(f"Tile dimensions must be positive, got {(config.tile_m, config.tile_n)}")
     if config.tile_m % 16 != 0 or config.tile_n % 16 != 0:
