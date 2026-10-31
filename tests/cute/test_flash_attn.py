@@ -4480,6 +4480,279 @@ def test_flash_attn_sm100_bwd_unused_kv_tail(
             )
 
 
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110), reason="SM100/SM110 backward Q/dO tail zero-fill"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "d,disable_2cta", [(64, True), (128, False), (128, True), (256, False)]
+)
+@pytest.mark.parametrize("layout", ["packed", "packed_seqused", "dense_seqused"])
+@pytest.mark.parametrize("pack_gqa", [False, True])
+@pytest.mark.parametrize("dense_kv", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads_kv", [8, 2])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_bwd_unused_query_tail(
+    monkeypatch, dtype, d, disable_2cta, layout, pack_gqa, dense_kv, causal, nheads_kv
+):
+    """Query-side TMA loads must stop at cu_seqlens_q/seqused_q.
+
+    Drive backward from a clean forward, then change only Q or dO beyond each
+    tested sequence. Finite neighbors must be bitwise invisible; NaN/Inf must
+    never reach its dQ/dK/dV. D256 explicitly selects the unified M=64 kernel.
+    """
+    from flash_attn.cute import utils
+
+    monkeypatch.setattr(utils, "_fa_disable_2cta_enabled", disable_2cta)
+    monkeypatch.setenv("FLASH_ATTENTION_BWD_PACK_GQA", str(int(pack_gqa)))
+    monkeypatch.delenv("FLASH_ATTENTION_BWD_TILE_N", raising=False)
+    if d == 256:
+        monkeypatch.setenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "1")
+    torch.manual_seed(0)
+    heads, kv_heads = 8, nheads_kv
+    lengths = [129, 257, 511] if layout == "packed" else [129, 257, 37]
+    batch, capacity = len(lengths), 512
+    packed_q = layout != "dense_seqused"
+    physical_q = lengths if layout == "packed" else [capacity] * batch
+    qshape = (sum(physical_q), heads, d) if packed_q else (batch, capacity, heads, d)
+    q = torch.randn(qshape, device="cuda", dtype=dtype)
+    klengths = [257] * batch
+    k = torch.randn(sum(klengths), kv_heads, d, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    if dense_kv:
+        k, v = (tensor.reshape(batch, klengths[0], kv_heads, d) for tensor in (k, v))
+    kwargs = {
+        "causal": causal,
+        "cu_seqlens_q": torch.tensor(
+            [0, *itertools.accumulate(physical_q)], device="cuda", dtype=torch.int32
+        )
+        if packed_q
+        else None,
+        "cu_seqlens_k": None
+        if dense_kv
+        else torch.tensor(
+            [0, *itertools.accumulate(klengths)], device="cuda", dtype=torch.int32
+        ),
+        "seqused_q": None
+        if layout == "packed"
+        else torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        "max_seqlen_q": max(physical_q),
+        "max_seqlen_k": max(klengths),
+    }
+    window = (None, None)
+    out, lse = flash_attn_varlen_func(
+        q, k, v, return_lse=True, window_size=window, **kwargs
+    )
+    dout = torch.randn_like(out)
+
+    def backward(q_in, dout_in):
+        return _flash_attn_bwd(
+            q_in,
+            k,
+            v,
+            out,
+            dout_in,
+            lse,
+            **kwargs,
+            window_size_left=window[0],
+            window_size_right=window[1],
+            deterministic=True,
+            pack_gqa=pack_gqa,
+        )
+
+    reference = backward(q, dout)
+    if is_fake_mode():
+        return
+    q_valid = torch.zeros(q.shape[:-2], device="cuda", dtype=torch.bool)
+    q_poison = torch.zeros_like(q_valid)
+    k_valid = torch.ones(k.shape[:-2], device="cuda", dtype=torch.bool)
+    if layout == "packed":
+        boundary = sum(lengths[:-1])
+        q_valid[:boundary] = True
+        q_poison[boundary:] = True
+        k_valid.reshape(-1)[sum(klengths[:-1]) :] = False
+    else:
+        q_rows = q_valid.reshape(batch, capacity)
+        for sequence, length in enumerate(lengths):
+            q_rows[sequence, :length] = True
+        q_poison = ~q_valid
+    for name in ("Q", "dO", "Q+dO"):
+        for poison in (0.0, 317.0, float("nan"), float("inf")):
+            q_changed, dout_changed = q.clone(), dout.clone()
+            if "Q" in name:
+                q_changed[q_poison] = poison
+            if "dO" in name:
+                dout_changed[q_poison] = poison
+            result = backward(q_changed, dout_changed)
+            for gradient, got, expected in zip(("dQ", "dK", "dV"), result, reference):
+                mask = q_valid if gradient == "dQ" else k_valid
+                got, expected = got[mask], expected[mask]
+                assert got.isfinite().all(), f"{name}={poison}: {gradient} has NaN/Inf"
+                assert torch.equal(got, expected), (
+                    f"{name}={poison}: used {gradient} changed"
+                )
+
+
+_RAGGED_QUERY_BOUNDARY_SCRIPT = """
+import sys, torch
+from cuda.bindings import driver as cu
+from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+
+d, operand = int(sys.argv[1]), sys.argv[2]
+torch.manual_seed(123)
+nq, nk, heads, kv_heads, used_q = 257, 257, 8, 2, 129
+q = torch.randn(nq, heads, d, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(nk, kv_heads, d, device="cuda", dtype=q.dtype)
+v = torch.randn_like(k)
+cu_q = torch.tensor([0, nq], device="cuda", dtype=torch.int32)
+cu_k = torch.tensor([0, nk], device="cuda", dtype=torch.int32)
+kwargs = dict(cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=nq, max_seqlen_k=nk, seqused_q=torch.tensor([used_q], device="cuda", dtype=torch.int32))
+out, lse, _, _, _ = _flash_attn_fwd(q, k, v, return_lse=True, **kwargs)
+dout = torch.randn_like(out)
+ref = _flash_attn_bwd(q, k, v, out, dout, lse, deterministic=True, **kwargs)
+
+def check(res):
+    assert res[0] == cu.CUresult.CUDA_SUCCESS, res[0]
+    return res[1] if len(res) == 2 else res[1:]
+
+def guarded_copy(source):
+    dev = torch.cuda.current_device()
+    prop = cu.CUmemAllocationProp()
+    prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = dev
+    gran = check(cu.cuMemGetAllocationGranularity(prop, cu.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM))
+    nbytes = source[:used_q].numel() * source.element_size()
+    declared_bytes = source.numel() * source.element_size()
+    size = ((nbytes + gran - 1) // gran) * gran
+    va = check(cu.cuMemAddressReserve(size + max(4 * gran, ((declared_bytes + gran - 1) // gran) * gran), 0, 0, 0))
+    handle = check(cu.cuMemCreate(size, prop, 0))
+    check(cu.cuMemMap(va, size, 0, handle, 0))
+    access = cu.CUmemAccessDesc()
+    access.location.type, access.location.id = prop.location.type, dev
+    access.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+    check(cu.cuMemSetAccess(va, size, [access], 1))
+    storage = torch._C._construct_storage_from_data_pointer(int(va) + size - nbytes, torch.device("cuda", dev), declared_bytes)
+    guarded = torch.empty(0, dtype=source.dtype, device="cuda").set_(storage).view_as(source)
+    guarded[:used_q].copy_(source[:used_q])
+    assert guarded.data_ptr() + nbytes == int(va) + size
+    return guarded
+
+if operand == "q":
+    q = guarded_copy(q)
+else:
+    dout = guarded_copy(dout)
+got = _flash_attn_bwd(q, k, v, out, dout, lse, deterministic=True, **kwargs)
+torch.cuda.synchronize()
+for name, actual, expected in zip(("dQ", "dK", "dV"), got, ref):
+    if name == "dQ":
+        actual, expected = actual[:used_q], expected[:used_q]
+    assert actual.isfinite().all(), name
+    assert torch.equal(actual, expected), name
+print("ok")
+"""
+
+
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110), reason="SM100 query TMA allocation boundary"
+)
+@pytest.mark.parametrize("d", [64, 128, 256])
+@pytest.mark.parametrize("guard_operand", ["q", "do"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_query_tma_allocation_boundary(monkeypatch, d, guard_operand):
+    """The last valid query row ends at an unmapped VMM range, without page slack."""
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "1")
+    monkeypatch.setenv("FLASH_ATTENTION_BWD_PACK_GQA", "0")
+    monkeypatch.delenv("FLASH_ATTENTION_BWD_TILE_N", raising=False)
+    q = torch.randn(257, 8, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(257, 2, d, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    kwargs = {
+        "cu_seqlens_q": torch.tensor([0, 257], device="cuda", dtype=torch.int32),
+        "cu_seqlens_k": torch.tensor([0, 257], device="cuda", dtype=torch.int32),
+        "seqused_q": torch.tensor([129], device="cuda", dtype=torch.int32),
+        "max_seqlen_q": 257,
+        "max_seqlen_k": 257,
+    }
+    out, lse, _, _, _ = _flash_attn_fwd(q, k, v, return_lse=True, **kwargs)
+    _flash_attn_bwd(
+        q, k, v, out, torch.randn_like(out), lse, deterministic=True, **kwargs
+    )
+    if is_fake_mode():
+        return
+    pytest.importorskip("cuda.bindings")
+    if not hasattr(torch._C, "_construct_storage_from_data_pointer"):
+        pytest.skip("needs torch._C._construct_storage_from_data_pointer")
+    env = dict(os.environ)
+    env.pop("FLASH_ATTENTION_FAKE_TENSOR", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", _RAGGED_QUERY_BOUNDARY_SCRIPT, str(d), guard_operand],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+    assert proc.returncode == 0 and proc.stdout.strip().endswith("ok"), (
+        f"returncode={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+
+
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110), reason="SM100 backward query descriptor workspace"
+)
+@pytest.mark.parametrize("d", [64, 128, 256])
+@pytest.mark.parametrize("packed_kv", [False, True])
+@pytest.mark.parametrize("pack_gqa", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_query_tensormap_workspace_padding(
+    monkeypatch, d, packed_kv, pack_gqa
+):
+    """Many short seqused_q sequences exercise scheduler padding and descriptor reuse."""
+    monkeypatch.setenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "1")
+    monkeypatch.setenv("FLASH_ATTENTION_BWD_PACK_GQA", str(int(pack_gqa)))
+    monkeypatch.delenv("FLASH_ATTENTION_BWD_TILE_N", raising=False)
+    torch.manual_seed(73)
+    batch, capacity, heads, kv_heads = 301, 65, 8, 2
+    q = torch.randn(batch, capacity, heads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, capacity, kv_heads, d, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    lengths = (torch.arange(batch, device="cuda", dtype=torch.int32) % 64) + 1
+    cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * capacity
+    kk, vv = (k.flatten(0, 1), v.flatten(0, 1)) if packed_kv else (k, v)
+    for shift in (0, 1):
+        used = torch.roll(lengths, shift)
+        kwargs = {
+            "seqused_q": used,
+            "cu_seqlens_k": cu if packed_kv else None,
+            "max_seqlen_q": capacity,
+            "max_seqlen_k": capacity,
+            "causal": True,
+        }
+        out, lse, _, _, _ = _flash_attn_fwd(q, kk, vv, return_lse=True, **kwargs)
+        dout = torch.randn_like(out)
+        clean = _flash_attn_bwd(q, kk, vv, out, dout, lse, deterministic=True, **kwargs)
+        if is_fake_mode():
+            continue
+        valid = torch.arange(capacity, device="cuda")[None, :] < used[:, None]
+        for poison in (0.0, 317.0, float("nan")):
+            q_changed, do_changed = q.clone(), dout.clone()
+            q_changed[~valid] = poison
+            do_changed[~valid] = poison
+            actual = _flash_attn_bwd(
+                q_changed, kk, vv, out, do_changed, lse, deterministic=True, **kwargs
+            )
+            for name, got, ref in zip(("dQ", "dK", "dV"), actual, clean):
+                if name == "dQ":
+                    got, ref = got[valid], ref[valid]
+                assert got.isfinite().all(), f"{name} contaminated at shift={shift}"
+                assert torch.equal(got, ref), f"{name} changed at shift={shift}"
+
+
 @pytest.mark.skipif(not IS_SM90, reason="SM90 backward K/V tail zero-fill")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [64, 128])
