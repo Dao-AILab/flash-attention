@@ -347,6 +347,18 @@ _FOLD_OFF_CHANGES = {
     "sm90": dict(_HD64, device_arch=90),
     "sm120": dict(_HD64, device_arch=120),
 }
+# Each problem change that keeps the dQ reduce-after-dS-exchange order off for hdim 128 2CTA.
+_DQ_ORDER_OFF_CHANGES = {
+    "deterministic": dict(deterministic=True),
+    "causal_deterministic": dict(causal=True, deterministic=True),
+    "1cta": dict(disable_2cta=True),
+    "hdim64": _HD64,
+    "hdim192": dict(head_dim=192, head_dim_v=128),
+    "hdim256_generic": dict(head_dim=256, head_dim_v=256, hd256_generic=True),
+    "hdim256_dedicated": dict(head_dim=256, head_dim_v=256),
+    "sm90": dict(device_arch=90),
+    "sm120": dict(device_arch=120),
+}
 
 
 def test_pack_gqa_explicit_configs():
@@ -381,6 +393,33 @@ def test_fold_LSE_dPsum_is_selected_for_bf16_hdim64_mha(device_arch, head_dim, c
 @pytest.mark.parametrize("changes", _FOLD_OFF_CHANGES.values(), ids=_FOLD_OFF_CHANGES.keys())
 def test_fold_LSE_dPsum_is_off_outside_its_scope(changes):
     assert not select_bwd_config(make_inputs(**changes)).fold_LSE_dPsum
+
+
+@pytest.mark.parametrize("device_arch", [100, 103, 110])
+@pytest.mark.parametrize("mask", ["none", "causal", "local"])
+@pytest.mark.parametrize(
+    "heads", [dict(num_heads=16, num_heads_kv=16), dict(num_heads=16, num_heads_kv=4, num_sms=148)]
+)
+def test_dQ_after_dS_xchg_is_selected_for_hdim128_2cta(device_arch, mask, heads):
+    inputs = make_inputs(
+        device_arch=device_arch, causal=mask == "causal", local=mask == "local", **heads
+    )
+    config = select_bwd_config(inputs)
+    assert config.use_2cta_instrs and config.dQ_after_dS_xchg
+    validate_bwd_config(replace(config, dQ_after_dS_xchg=False), inputs)
+
+
+@pytest.mark.parametrize("device_arch", [100, 103, 110])
+def test_dQ_after_dS_xchg_is_selected_for_the_2cta_64_row_kv_tile(device_arch):
+    config = select_bwd_config(make_inputs(device_arch=device_arch, requested_tile_n=64))
+    assert config.tile_n == 64 and config.dQ_after_dS_xchg
+
+
+@pytest.mark.parametrize(
+    "changes", _DQ_ORDER_OFF_CHANGES.values(), ids=_DQ_ORDER_OFF_CHANGES.keys()
+)
+def test_dQ_after_dS_xchg_is_off_outside_its_scope(changes):
+    assert not select_bwd_config(make_inputs(**changes)).dQ_after_dS_xchg
 
 
 @pytest.mark.parametrize(
@@ -443,6 +482,13 @@ def test_fold_LSE_dPsum_is_off_outside_its_scope(changes):
         ),
         (make_inputs(**_HD64, device_arch=90), {"fold_LSE_dPsum": True}, "SM100 options"),
         (make_inputs(**_HD64, device_arch=120), {"fold_LSE_dPsum": True}, "SM100 options"),
+        *(
+            (make_inputs(**changes), {"dQ_after_dS_xchg": True}, "dQ_after_dS_xchg needs")
+            for changes in _DQ_ORDER_OFF_CHANGES.values()
+            if changes.get("device_arch") not in (90, 120)
+        ),
+        (make_inputs(device_arch=90), {"dQ_after_dS_xchg": True}, "SM100 options"),
+        (make_inputs(device_arch=120), {"dQ_after_dS_xchg": True}, "SM100 options"),
     ],
 )
 def test_invalid_configs_are_rejected(inputs, changes, error):

@@ -2497,6 +2497,7 @@ def _flash_attn_bwd(
                     Q_stage=config.num_stages_Q,
                     dO_stage=config.num_stages_dO,
                     fold_LSE_dPsum=config.fold_LSE_dPsum,
+                    dQ_after_dS_xchg=config.dQ_after_dS_xchg,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
