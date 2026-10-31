@@ -1486,6 +1486,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_DEVICE(cache_batch_idx);
         CHECK_CONTIGUOUS(cache_batch_idx);
         TORCH_CHECK(cache_batch_idx.scalar_type() == torch::kInt32, "cache_batch_idx must have dtype int32");
+        CHECK_SHAPE(cache_batch_idx, batch_size);
         params.cache_batch_idx = reinterpret_cast<int *>(cache_batch_idx.data_ptr());
     }
 
