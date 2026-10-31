@@ -265,6 +265,7 @@ def test_bwd_pack_gqa_heuristic():
             head_dim_v=128,
             num_heads=heads,
             num_heads_kv=heads_kv,
+            dtype="torch.bfloat16",
             num_sms=148,
             batch_size=batch,
             max_seqlen_q=seqlen_q,

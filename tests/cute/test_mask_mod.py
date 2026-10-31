@@ -1091,7 +1091,7 @@ def test_sm100_block_sparse_bwd_kv_subtile_selects_cta_policy(
 ):
     inputs = BwdHeuristicInputs(
         device_arch=100, head_dim=128, head_dim_v=128, num_heads=4, num_heads_kv=4,
-        use_block_sparsity=sparse_block_size_kv is not None,
+        dtype="torch.bfloat16", use_block_sparsity=sparse_block_size_kv is not None,
         sparse_block_size_q=None if sparse_block_size_kv is None else 256,
         sparse_block_size_kv=sparse_block_size_kv,
     )
