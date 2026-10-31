@@ -498,6 +498,55 @@ def test_flash_attn_sm90_hdim_padding_fp16(d):
     check_sm90_hdim_padding(d, dtype=torch.float16)
 
 
+@pytest.mark.skipif(not IS_SM90, reason="SM90 learnable-sink finalize")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("pack_gqa", [False, True])
+@pytest.mark.parametrize("seqlen_q,seqlen_k,causal", [(4, 64, False), (7, 3, True)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_dominant_learnable_sink(dtype, pack_gqa, seqlen_q, seqlen_k, causal):
+    """A sink logit far above the attention logits must not overflow the softmax normalizer.
+
+    With zero logits and unit values, a row that attends to n keys has
+    O = n / (n + exp(sink)) and LSE = log(n + exp(sink)); fully masked rows have O = 0, LSE = sink.
+    """
+    q = torch.zeros(1, seqlen_q, 4, 64, device="cuda", dtype=dtype)
+    k = torch.zeros(1, seqlen_k, 2, 64, device="cuda", dtype=dtype)
+    v = torch.ones_like(k)
+    # Per head: negligible, equal to the logits, above them, and far above them (exp overflows fp32).
+    sink = torch.tensor([-100.0, 0.0, 8.0, 100.0], device="cuda")
+    out, lse = flash_attn_func(
+        q, k, v, learnable_sink=sink, causal=causal, pack_gqa=pack_gqa, num_splits=1, return_lse=True
+    )
+    if is_fake_mode():
+        return
+    rows = torch.arange(seqlen_q, device="cuda")
+    n = (rows + seqlen_k - seqlen_q + 1).clamp(0, seqlen_k) if causal else torch.full_like(rows, seqlen_k)
+    log_n = n.double().log()[None, :]
+    lse_ref = torch.logaddexp(log_n, sink.double()[:, None])  # (nheads, seqlen_q)
+    out_ref = torch.exp(log_n - lse_ref).T[:, :, None].expand(seqlen_q, 4, 64)
+    torch.testing.assert_close(lse[0].double(), lse_ref, rtol=0, atol=1e-4)
+    rtol = 3e-3 if dtype == torch.float16 else 1e-2
+    torch.testing.assert_close(out[0].double(), out_ref, rtol=rtol, atol=1e-4)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 learnable-sink finalize")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_dominant_learnable_sink_grad(dtype):
+    """d(sum LSE)/d(sink) is the sink's softmax weight summed over rows, about 1 per row here."""
+    batch, seqlen_q, seqlen_k, nheads, d = 2, 4, 64, 2, 64
+    q = torch.zeros(batch, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.zeros(batch, seqlen_k, nheads, d, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.ones(batch, seqlen_k, nheads, d, device="cuda", dtype=dtype, requires_grad=True)
+    sink = torch.full((nheads,), 100.0, device="cuda", requires_grad=True)
+    out, lse = flash_attn_func(q, k, v, learnable_sink=sink, num_splits=1, return_lse=True)
+    (dsink,) = torch.autograd.grad((out, lse), (sink,), (torch.zeros_like(out), torch.ones_like(lse)))
+    if is_fake_mode():
+        return
+    expected = batch * seqlen_q * torch.sigmoid(torch.tensor(100.0 - math.log(seqlen_k)))
+    torch.testing.assert_close(dsink, torch.full_like(sink, expected.item()), rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("head_dim", [72, 104])
 @pytest.mark.parametrize("causal", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
