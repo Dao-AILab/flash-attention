@@ -102,7 +102,9 @@ def _flash_attn_forward(
     page_table, kv_batch_idx, leftpad_k = [
         maybe_contiguous(x) for x in (page_table, kv_batch_idx, leftpad_k)
     ]
-    rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
+    rotary_cos, rotary_sin = [
+        x.contiguous() if x is not None else None for x in (rotary_cos, rotary_sin)
+    ]
     seqlens_rotary = maybe_contiguous(seqlens_rotary)
     out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_gpu.fwd(
         q,
@@ -948,7 +950,7 @@ def flash_attn_with_kvcache(
     qv=None,
     rotary_cos=None,
     rotary_sin=None,
-    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    cache_seqlens: Optional[Union[int, torch.Tensor]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
@@ -1058,6 +1060,12 @@ def flash_attn_with_kvcache(
     """
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    if (k is None) != (v is None):
+        raise ValueError("k and v must either both be provided or both be None")
+    if (rotary_cos is None) != (rotary_sin is None):
+        raise ValueError(
+            "rotary_cos and rotary_sin must either both be provided or both be None"
+        )
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
