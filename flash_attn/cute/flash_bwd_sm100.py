@@ -135,6 +135,7 @@ class FlashAttentionBackwardSm100:
         Q_stage: int,
         dO_stage: int,
         fold_LSE_dPsum: bool,
+        dQ_after_dS_xchg: bool,
     ):
         # Pad head_dim to a multiple of 32 (k_block_size). Must stay a multiple of 32 so
         # that the dQ accumulator reduce (dQ_reduce_ncol up to 32) tiles evenly and matches
@@ -247,6 +248,12 @@ class FlashAttentionBackwardSm100:
         self.spt = spt
         # See NOTE [hdim64 LSE / dPsum fold into the S / dP MMA]
         self.fold_LSE_dPsum = fold_LSE_dPsum
+        # BwdConfig.dQ_after_dS_xchg; NOTE [dQ reduce after the dS exchange], also gates the
+        # Q-before-Qt load order
+        self.dQ_after_dS_xchg = dQ_after_dS_xchg
+        assert not dQ_after_dS_xchg or self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED, (
+            "dQ_after_dS_xchg needs the pipelined 2CTA schedule"
+        )
 
         # Score mod and mask mod support
         self.score_mod = score_mod
@@ -1112,6 +1119,11 @@ class FlashAttentionBackwardSm100:
                 dS_cluster_full_mbar_ptr: cutlass.Int64
                 dS_cluster_leader_mbar_ptr: cutlass.Int64
                 dQaccum_empty_mbar_ptr: cutlass.Int64
+                # dQ_after_dS_xchg (zero-size otherwise): index of the last dS tile whose DSMEM
+                # exchange copy was issued (compute thread -> dQ reduce warp); one work tile per
+                # CTA (not persistent), so it is never reset; see NOTE [dQ reduce after the dS
+                # exchange]
+                dS_xchg_issued: cute.struct.MemRange[Int32, 1 if self.dQ_after_dS_xchg else 0]
 
                 sQ: cute.struct.Align[
                     cute.struct.MemRange[self.q_dtype, cute.cosize(self.sQ_layout)],
@@ -1486,7 +1498,9 @@ class FlashAttentionBackwardSm100:
             dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr
             dS_cluster_empty_mbar_ptr = storage.dS_cluster_empty_mbar_ptr
             dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr
+            dS_xchg_issued_ptr = storage.dS_xchg_issued.data_ptr()
         else:
+            dS_xchg_issued_ptr = None
             dS_cluster_full_mbar_ptr = None
             dS_cluster_empty_mbar_ptr = None
             dS_cluster_leader_mbar_ptr = None
@@ -1506,6 +1520,8 @@ class FlashAttentionBackwardSm100:
                         len(self.reduce_warp_ids),
                     )
             if warp_idx == 4:
+                if const_expr(self.dQ_after_dS_xchg):
+                    barrier.st_volatile_shared(dS_xchg_issued_ptr, Int32(-1))
                 cute.arch.mbarrier_init(dS_cluster_full_mbar_ptr, 1)
                 cute.arch.mbarrier_init(dS_cluster_empty_mbar_ptr, 1)
                 cute.arch.mbarrier_init(dS_cluster_leader_mbar_ptr, 2)
@@ -2065,6 +2081,7 @@ class FlashAttentionBackwardSm100:
                 aux_data,
                 fastdiv_mods,
                 blocksparse_tensors,
+                dS_xchg_issued_ptr=dS_xchg_issued_ptr,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2086,6 +2103,7 @@ class FlashAttentionBackwardSm100:
                 TileSchedulerCls,
                 mdQ_semaphore,
                 blocksparse_tensors,
+                dS_xchg_issued_ptr=dS_xchg_issued_ptr,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2641,7 +2659,9 @@ class FlashAttentionBackwardSm100:
                         #### Main Loop ####
                         for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
                             if const_expr(should_load_Q):
-                                if const_expr(load_Qt is not None):
+                                # dQ_after_dS_xchg: Q(m) goes before Qt(m-1), so the Q issue (on the
+                                # S(m) path) does not wait for the Qt acquire, i.e. for dK(m-2).
+                                if const_expr(load_Qt is not None and not self.dQ_after_dS_xchg):
                                     pipeline_Qt.producer_acquire(producer_state_Qt)
                                     load_Qt(m_block - 1, producer_state=producer_state_Qt)
                                     pipeline_Qt.producer_commit(producer_state_Qt)
@@ -2664,6 +2684,12 @@ class FlashAttentionBackwardSm100:
                                             ),
                                         )
                                 producer_state_Q_LSE.advance()
+
+                                if const_expr(load_Qt is not None and self.dQ_after_dS_xchg):
+                                    pipeline_Qt.producer_acquire(producer_state_Qt)
+                                    load_Qt(m_block - 1, producer_state=producer_state_Qt)
+                                    pipeline_Qt.producer_commit(producer_state_Qt)
+                                    producer_state_Qt.advance()
 
                             if const_expr(should_load_dO):
                                 pipeline_dO.producer_acquire(
@@ -3741,6 +3767,7 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        dS_xchg_issued_ptr: Optional[cute.Pointer] = None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -4332,6 +4359,8 @@ class FlashAttentionBackwardSm100:
                             stage_copy_bytes,
                             peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
                         )
+                        if const_expr(self.dQ_after_dS_xchg):
+                            barrier.st_volatile_shared(dS_xchg_issued_ptr, iter_idx)
 
             # Final signal for dS smem store completion
             if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
@@ -4532,6 +4561,7 @@ class FlashAttentionBackwardSm100:
         TileSchedulerCls: Callable,
         mdQ_semaphore: Optional[cute.Tensor],
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        dS_xchg_issued_ptr: Optional[cute.Pointer] = None,
     ):
         num_reduce_threads = cute.arch.WARP_SIZE * len(self.reduce_warp_ids)
         tidx = cute.arch.thread_idx()[0] % num_reduce_threads
@@ -4744,6 +4774,22 @@ class FlashAttentionBackwardSm100:
                     self.reduce_sync_barrier.arrive_and_wait()
                     # Copy from shared memory to global memory
                     if is_tma_warp and not m_block_oob_upper:
+                        if const_expr(stage == 0 and self.dQ_after_dS_xchg):
+                            # NOTE [dQ reduce after the dS exchange]
+                            # The dS exchange copy and these bulk reduce-adds go through the same
+                            # per-SM TMA unit, which (as clock64 timelines show) serves bulk copies
+                            # roughly in issue order. Issuing dQ(i) right after its TMEM release
+                            # queues up to sdQaccum_stage reduce-adds ahead of the dS(i+1) copy,
+                            # which is on the critical path (dS(i+1) -> dQ(i+1) MMA), and overlaps
+                            # the SMEM-heavy dS phase. So the first reduce-add of dQ(i) waits until
+                            # the dS(i+1) copy has been issued. dS_xchg_issued is only a timing
+                            # hint: the reduce warp reads no dS data, so relaxed volatile accesses
+                            # suffice. BwdConfig.dQ_after_dS_xchg (config.can_use_dQ_after_dS_xchg)
+                            # keeps it off in deterministic mode: there the dQ adds are serialized
+                            # across CTAs, and this gate and the Q-before-Qt order measured slower.
+                            if iter_idx + 1 < loop_count:
+                                while barrier.ld_volatile_shared(dS_xchg_issued_ptr) < iter_idx + 1:
+                                    pass
                         with cute.arch.elect_one():
                             copy_utils.cpasync_reduce_bulk_add_f32(
                                 sdQaccum[None, smem_idx].iterator,

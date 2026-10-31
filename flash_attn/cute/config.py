@@ -2005,7 +2005,9 @@ class BwdConfig:
     the preprocess then writes LSE_log2 / dPsum / dQaccum per KV head in packed row order and
     the postprocess reads them that way. fold_LSE_dPsum (SM100 generic kernel only) folds the
     LSE / dPsum subtractions into the S / dP MMAs (NOTE [hdim64 LSE / dPsum fold into the S / dP
-    MMA] in flash_bwd_sm100.py).
+    MMA] in flash_bwd_sm100.py). dQ_after_dS_xchg (SM100 pipelined 2CTA schedule only) issues Q
+    before Qt and starts each dQ reduce-add after the next dS exchange copy (NOTE [dQ reduce
+    after the dS exchange] in flash_bwd_sm100.py).
     """
 
     device_capacity: int
@@ -2029,6 +2031,7 @@ class BwdConfig:
     use_dedicated_hd256_kernel: bool
     pack_gqa: bool
     fold_LSE_dPsum: bool
+    dQ_after_dS_xchg: bool
     registers: BwdRegisters
 
     @property
@@ -2305,6 +2308,25 @@ def can_fold_LSE_dPsum(
     )
 
 
+def can_use_dQ_after_dS_xchg(
+    inputs: BwdHeuristicInputs, *, use_2cta_instrs: bool, use_dedicated_hd256_kernel: bool
+) -> bool:
+    """Whether the SM100 backward orders Q before Qt and the dQ reduce-adds after the dS exchange.
+
+    NOTE [dQ reduce after the dS exchange] (flash_bwd_sm100.py) scope: the generic kernel's
+    pipelined 2CTA schedule (2CTA with head_dim padded to neither 192 nor 256, i.e. hdim 128).
+    Selected wherever allowed; also non-deterministic only, since both orderings measured slower
+    with the serialized deterministic dQ adds.
+    """
+    return (
+        inputs.device_capacity in (10, 11)
+        and use_2cta_instrs
+        and not use_dedicated_hd256_kernel
+        and bwd_tile_hdim(inputs.head_dim) not in (192, 256)
+        and not inputs.deterministic
+    )
+
+
 # fmt: off
 def select_sm90_bwd_tile(
     head_dim: int,
@@ -2372,8 +2394,8 @@ def select_sm100_bwd_registers(
 
 
 # Architecture-specific options at their neutral values, for architectures that do not
-# expose them: the SM90 MMA options, and the SM100 2CTA, pack_gqa, and fold options. spt (SM90
-# and SM100) is always bwd_spt(inputs) there and False on SM120.
+# expose them: the SM90 MMA options, and the SM100 2CTA, pack_gqa, fold, and dQ-order options.
+# spt (SM90 and SM100) is always bwd_spt(inputs) there and False on SM120.
 _SM90_ONLY_NEUTRAL_FIELDS = dict(
     num_stages_PdS=1,
     SdP_swapAB=False,
@@ -2391,6 +2413,7 @@ _SM100_ONLY_NEUTRAL_FIELDS = dict(
     use_dedicated_hd256_kernel=False,
     pack_gqa=False,
     fold_LSE_dPsum=False,
+    dQ_after_dS_xchg=False,
 )
 # The SM100 kernel launches 16 warps: dQ reduce, 2x compute, MMA, load, relay, and empty.
 SM100_BWD_THREADS_PER_CTA = 512
@@ -2474,6 +2497,9 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 ),
                 fold_LSE_dPsum=can_fold_LSE_dPsum(
                     inputs, tile_m=128, tile_n=tile_n, cluster_size=cluster_size
+                ),
+                dQ_after_dS_xchg=can_use_dQ_after_dS_xchg(
+                    inputs, use_2cta_instrs=any_2cta, use_dedicated_hd256_kernel=dedicated
                 ),
             )
             registers = (
@@ -2690,6 +2716,15 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
                 "SM100 backward fold_LSE_dPsum needs the 1-CTA 128x128 kernel with head dims "
                 "padded to 64, bf16, MHA, non-deterministic, and no block sparsity, score_mod, "
                 "score_mod_bwd, or softcap"
+            )
+        if config.dQ_after_dS_xchg and not can_use_dQ_after_dS_xchg(
+            inputs,
+            use_2cta_instrs=config.use_2cta_instrs,
+            use_dedicated_hd256_kernel=config.use_dedicated_hd256_kernel,
+        ):
+            raise ValueError(
+                "SM100 backward dQ_after_dS_xchg needs the generic kernel's pipelined 2CTA "
+                "schedule (hdim 128) and a non-deterministic run"
             )
     sparse_q = bwd_sparse_q_block_size(inputs)
     if sparse_q is not None and (sparse_q <= 0 or sparse_q % config.tile_m != 0):

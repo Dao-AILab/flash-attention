@@ -111,3 +111,30 @@ def arrive_inc_async(
     flag_ptr = lock_ptr + flag_offset
     if thread_idx == 0:
         red_release_async(flag_ptr, val)
+
+
+@dsl_user_op
+def st_volatile_shared(ptr: cute.Pointer, val: Int32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [ptr.toint(loc=loc, ip=ip).ir_value(), Int32(val).ir_value(loc=loc, ip=ip)],
+        "st.volatile.shared.u32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def ld_volatile_shared(ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int32:
+    state = llvm.inline_asm(
+        T.i32(),
+        [ptr.toint(loc=loc, ip=ip).ir_value()],
+        "ld.volatile.shared.u32 $0, [$1];",
+        "=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Int32(state)
