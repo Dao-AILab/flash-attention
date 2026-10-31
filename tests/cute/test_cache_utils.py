@@ -1,6 +1,8 @@
 import logging
 from types import SimpleNamespace
 
+import quack
+
 import flash_attn.cute.cache_utils as cache_utils
 from flash_attn.cute import fa_logging
 
@@ -99,3 +101,16 @@ def test_persistent_cache_replaces_nonempty_unloadable_entry(tmp_path, monkeypat
     other_path.write_bytes(b"from another process")
     cache[other] = Good()
     assert other_path.read_bytes() == b"from another process"
+
+
+def test_source_fingerprint_tracks_quack_version(monkeypatch):
+    """FA4 kernels compile Quack device code in (e.g. the SM90 backward's bulk copies), so a
+    Quack upgrade must not load kernels compiled against the previous version."""
+    cache_utils._compute_source_fingerprint.cache_clear()
+    try:
+        before = cache_utils._compute_source_fingerprint()
+        monkeypatch.setattr(quack, "__version__", "0.0.0+test")
+        cache_utils._compute_source_fingerprint.cache_clear()
+        assert cache_utils._compute_source_fingerprint() != before
+    finally:
+        cache_utils._compute_source_fingerprint.cache_clear()
