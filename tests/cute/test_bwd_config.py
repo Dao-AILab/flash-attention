@@ -21,6 +21,7 @@ _BASE_INPUTS = BwdHeuristicInputs(
     head_dim_v=128,
     num_heads=16,
     num_heads_kv=16,
+    dtype="torch.bfloat16",
 )
 
 
@@ -292,7 +293,8 @@ _ENVS = [  # (disable_2cta, hd256_generic, requested_tile_n)
 
 @pytest.mark.parametrize("device_arch", [90, 100, 103, 110, 120])
 def test_selection_matches_the_legacy_policy(device_arch):
-    # Dtype does not affect this policy; V_in_regs is only forwarded on SM90.
+    # Dtype only selects fold_LSE_dPsum, which the legacy policy did not own; V_in_regs is
+    # only forwarded on SM90.
     for (d, dv), mask, det, sparse, env in itertools.product(
         _HEAD_DIMS,
         ["none", "causal", "local"],
@@ -331,6 +333,22 @@ def test_selection_matches_the_legacy_policy(device_arch):
 
 
 _GQA8 = dict(num_heads=16, num_heads_kv=2, num_sms=148, max_seqlen_q=2048, max_seqlen_k=2048)
+_HD64 = dict(head_dim=64, head_dim_v=64)
+# Each problem change that keeps the SM100 LSE / dPsum fold off for a bf16 hdim-64 MHA call.
+_FOLD_OFF_CHANGES = {
+    "fp16": dict(_HD64, dtype="torch.float16"),
+    "gqa": dict(_HD64, num_heads=16, num_heads_kv=4, num_sms=148, requested_pack_gqa=False),
+    "deterministic": dict(_HD64, deterministic=True),
+    "hdim128_1cta": dict(head_dim=128, head_dim_v=128, disable_2cta=True),
+    "hdim_v128": dict(head_dim=64, head_dim_v=128),
+    "block_sparse": dict(
+        _HD64, use_block_sparsity=True, sparse_block_size_q=128, sparse_block_size_kv=128
+    ),
+    "score_mod_bwd": dict(_HD64, has_score_mod_bwd=True),
+    "zero_softmax_scale": dict(_HD64, zero_softmax_scale=True),
+    "softcap": dict(_HD64, has_softcap=True),
+    "sm120": dict(_HD64, device_arch=120),
+}
 
 
 def test_pack_gqa_explicit_configs():
@@ -356,6 +374,19 @@ def test_pack_gqa_explicit_configs():
         total_q=8192, total_k=8192, causal=True,
     )
     assert select_bwd_config(long_mqa).pack_factor == 1
+
+
+def test_fold_LSE_dPsum_is_selected_for_bf16_hdim64_mha():
+    inputs = make_inputs(**_HD64)
+    config = select_bwd_config(inputs)
+    assert config.fold_LSE_dPsum
+    # An explicit config may leave it off.
+    validate_bwd_config(replace(config, fold_LSE_dPsum=False), inputs)
+
+
+@pytest.mark.parametrize("changes", _FOLD_OFF_CHANGES.values(), ids=_FOLD_OFF_CHANGES.keys())
+def test_fold_LSE_dPsum_is_off_outside_its_scope(changes):
+    assert not select_bwd_config(make_inputs(**changes)).fold_LSE_dPsum
 
 
 @pytest.mark.parametrize(
@@ -416,8 +447,14 @@ def test_pack_gqa_explicit_configs():
             {"pack_factor": 8},
             "query-head folds",
         ),
-        (make_inputs(**_GQA8, device_arch=90), {"pack_factor": 8}, "2CTA or query-head fold"),
-        (make_inputs(**_GQA8, device_arch=120), {"pack_factor": 8}, "2CTA or query-head fold"),
+        (make_inputs(**_GQA8, device_arch=90), {"pack_factor": 8}, "SM100 options"),
+        (make_inputs(**_GQA8, device_arch=120), {"pack_factor": 8}, "SM100 options"),
+        *(
+            (make_inputs(**changes), {"fold_LSE_dPsum": True}, "fold_LSE_dPsum needs")
+            for changes in _FOLD_OFF_CHANGES.values()
+            if changes.get("device_arch") not in (90, 120)
+        ),
+        (make_inputs(**_HD64, device_arch=120), {"fold_LSE_dPsum": True}, "SM100 options"),
     ],
 )
 def test_invalid_configs_are_rejected(inputs, changes, error):
@@ -444,6 +481,7 @@ def choose_fold(
     """select_bwd_fold on B200 (148 SMs, 74 clusters) for a shape of batch x seqlen tokens on
     the generic kernel; hdim 256 (the head loop) unless given, hdim 192 pairs with hdim_v 128."""
     inputs = BwdHeuristicInputs(
+        dtype="torch.bfloat16",
         device_arch=100,
         head_dim=head_dim,
         head_dim_v=128 if head_dim == 192 else head_dim,
@@ -746,6 +784,7 @@ def test_bwd_pack_gqa_heuristic_partial_pack_keeps_half_the_gain():
     """hdim 128 MQA 16/1 at 8k causal: the full-pack model still packs 4 heads as a 4-way
     partial pack (kv_group 4), the halved gain leaves it unpacked; non-causal still packs."""
     inputs = BwdHeuristicInputs(
+        dtype="torch.bfloat16",
         device_arch=100, head_dim=128, head_dim_v=128, num_heads=16, num_heads_kv=4,
         num_sms=148, batch_size=4, max_seqlen_q=8192, max_seqlen_k=8192,
         total_q=4 * 8192, total_k=4 * 8192, causal=True,

@@ -1878,12 +1878,13 @@ def _get_bwd_inputs(
     device_index: int | None,
     block_sparse_tensors: BlockSparseTensorsTorch | None,
     V_in_regs: bool,
-    **fields: int | bool,
+    **fields: int | bool | str,
 ) -> BwdHeuristicInputs:
     """Host facts and env knobs for select_bwd_config; never reads tensor data.
 
-    The caller passes head dims and counts, batch_size, token totals, host sequence bounds,
-    and feature bits in **fields; block_sparse_tensors contributes its block sizes and spt.
+    The caller passes the dtype, head dims and counts, batch_size, token totals, host
+    sequence bounds, and feature bits in **fields; block_sparse_tensors contributes its block
+    sizes and spt.
     """
     block_size = block_sparse_tensors.block_size if block_sparse_tensors is not None else None
     inputs = BwdHeuristicInputs(
@@ -2024,8 +2025,8 @@ def _flash_attn_bwd(
 
     inputs = _get_bwd_inputs(
         arch=arch, device_index=q.device.index, causal=causal, local=local,
-        deterministic=deterministic, head_dim=head_dim, head_dim_v=head_dim_v,
-        num_heads=num_head, num_heads_kv=num_head_kv, batch_size=batch_size,
+        deterministic=deterministic, dtype=str(q.dtype), head_dim=head_dim,
+        head_dim_v=head_dim_v, num_heads=num_head, num_heads_kv=num_head_kv, batch_size=batch_size,
         total_q=total_q, total_k=total_k,
         max_seqlen_q=heuristic_seqlen(
             seqlen_q, total_q, cu_seqlens_q is None or max_seqlen_q is not None
@@ -2036,7 +2037,9 @@ def _flash_attn_bwd(
         has_cu_seqlens=cu_seqlens_q is not None or cu_seqlens_k is not None,
         block_sparse_tensors=block_sparse_tensors, V_in_regs=V_in_regs,
         # The user's score_mod: softcap becomes a score_mod only below and still packs.
-        has_score_mod=score_mod is not None, has_mask_mod=mask_mod is not None,
+        has_score_mod=score_mod is not None, has_score_mod_bwd=score_mod_bwd is not None,
+        has_softcap=softcap != 0.0, zero_softmax_scale=softmax_scale == 0.0,
+        has_mask_mod=mask_mod is not None,
         has_learnable_sink=learnable_sink is not None,
     )
     if config is None:
@@ -2570,6 +2573,7 @@ def _flash_attn_bwd(
                     registers=config.registers,
                     Q_stage=config.num_stages_Q,
                     dO_stage=config.num_stages_dO,
+                    fold_LSE_dPsum=config.fold_LSE_dPsum,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
