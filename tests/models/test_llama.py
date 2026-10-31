@@ -32,6 +32,21 @@ from transformers import LlamaConfig, LlamaTokenizer
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers import AutoConfig
 
+def check_correctness(out, out_ref, out_hf, logits, logits_ref, logits_hf, multiplier=1.0):
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"HF fp16 max diff: {(out_hf - out_ref).abs().max().item()}")
+    print(f"HF fp16 mean diff: {(out_hf - out_ref).abs().mean().item()}")
+    assert (out - out_ref).abs().max().item() < multiplier * \
+        (out_hf - out_ref).abs().max().item()
+
+    print(f"Logits max diff: {(logits - logits_ref).abs().max().item()}")
+    print(f"Logits mean diff: {(logits - logits_ref).abs().mean().item()}")
+    print(f"HF fp16 max diff: {(logits_hf - logits_ref).abs().max().item()}")
+    print(f"HF fp16 mean diff: {(logits_hf - logits_ref).abs().mean().item()}")
+    assert (logits - logits_ref).abs().max().item() < multiplier * (
+        logits_hf - logits_ref
+    ).abs().max().item()
 
 def _pretrained_state_dict_from_checkpoint(checkpoint_path, model_name, config, checkpoint_format):
     if checkpoint_format == "meta":
@@ -163,19 +178,7 @@ def test_llama_optimized(model_name):
         logits_hf = model_hf(input_ids).logits
     del model_hf
 
-    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-    print(f"HF fp16 max diff: {(out_hf - out_ref).abs().max().item()}")
-    print(f"HF fp16 mean diff: {(out_hf - out_ref).abs().mean().item()}")
-    assert (out - out_ref).abs().max().item() < 3 * (out_hf - out_ref).abs().max().item()
-
-    print(f"Logits max diff: {(logits - logits_ref).abs().max().item()}")
-    print(f"Logits mean diff: {(logits - logits_ref).abs().mean().item()}")
-    print(f"HF fp16 max diff: {(logits_hf - logits_ref).abs().max().item()}")
-    print(f"HF fp16 mean diff: {(logits_hf - logits_ref).abs().mean().item()}")
-    assert (logits - logits_ref).abs().max().item() < 3 * (
-        logits_hf - logits_ref
-    ).abs().max().item()
+    check_correctness(out, out_ref, out_hf, logits, logits_ref, logits_hf, multiplier=3.0)
 
 
 # torchrun --no_python --nproc_per_node=2 pytest -q -s tests/models/test_llama.py -k "parallel"
@@ -268,19 +271,7 @@ def test_llama_parallel(model_name, world_size):
             logits_hf = model_hf(input_ids).logits.to(device=device)
         del model_hf
 
-        print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-        print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-        print(f"HF fp16 max diff: {(out_hf - out_ref).abs().max().item()}")
-        print(f"HF fp16 mean diff: {(out_hf - out_ref).abs().mean().item()}")
-        assert (out - out_ref).abs().max().item() < 2 * (out_hf - out_ref).abs().max().item()
-
-        print(f"Logits max diff: {(logits - logits_ref).abs().max().item()}")
-        print(f"Logits mean diff: {(logits - logits_ref).abs().mean().item()}")
-        print(f"HF fp16 max diff: {(logits_hf - logits_ref).abs().max().item()}")
-        print(f"HF fp16 mean diff: {(logits_hf - logits_ref).abs().mean().item()}")
-        assert (logits - logits_ref).abs().max().item() < 2 * (
-            logits_hf - logits_ref
-        ).abs().max().item()
+        check_correctness(out, out_ref, out_hf, logits, logits_ref, logits_hf, multiplier=2.0)
 
 
 # @pytest.mark.parametrize('model_name', ["7B", "13B"])
@@ -588,7 +579,6 @@ def test_llama_parallel_uneven_num_heads(world_size):
     model.load_state_dict(shard_state_dict_tp(pretrained_state_dict, config, world_size, rank))
     model.eval()
 
-    # TODO: Avoid duplicate code. Modularize the comparison of two forward pass diffs.
     out = model.transformer(input_ids)
     out, _ = all_gather_raw(out, process_group=process_group)
     out = rearrange(out, "(b s) d -> b s d", b=batch_size)
@@ -615,19 +605,7 @@ def test_llama_parallel_uneven_num_heads(world_size):
         logits_hf = model_hf(input_ids).logits.to(device=device)
         del model_hf
 
-        print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-        print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-        print(f"HF fp16 max diff: {(out_hf - out_ref).abs().max().item()}")
-        print(f"HF fp16 mean diff: {(out_hf - out_ref).abs().mean().item()}")
-        assert (out - out_ref).abs().max().item() < 2 * (out_hf - out_ref).abs().max().item()
-
-        print(f"Logits max diff: {(logits - logits_ref).abs().max().item()}")
-        print(f"Logits mean diff: {(logits - logits_ref).abs().mean().item()}")
-        print(f"HF fp16 max diff: {(logits_hf - logits_ref).abs().max().item()}")
-        print(f"HF fp16 mean diff: {(logits_hf - logits_ref).abs().mean().item()}")
-        assert (logits - logits_ref).abs().max().item() < 2 * (
-            logits_hf - logits_ref
-        ).abs().max().item()
+        check_correctness(out, out_ref, out_hf, logits, logits_ref, logits_hf, multiplier=2.0)
 
         if os.path.exists(checkpoint_path / f"{model_name}-hf"):
             shutil.rmtree(checkpoint_path / f"{model_name}-hf")
