@@ -8,6 +8,8 @@ from padding import pad_input, unpad_input
 
 def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", zero_lengths=False):
     assert mode in ["full", "random", "third"]
+    assert max_seqlen >= 0, f"max_seqlen must be non-negative, got {max_seqlen}"
+    assert batch_size > 0, f"batch_size must be positive, got {batch_size}"
     if mode == "full":
         lengths = torch.full((batch_size, 1), max_seqlen, device=device, dtype=torch.int32)
     elif mode == "random":
@@ -164,6 +166,7 @@ def construct_local_mask(
     key_leftpad=None,
     device=None,
 ):
+    assert len(window_size) == 2, f"window_size must be a sequence of length 2, got {window_size}"
     row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
     col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
     if key_leftpad is not None:
@@ -244,6 +247,7 @@ def attention_ref(
     reorder_ops=False,
     intermediate_dtype=None,
 ):
+    assert 0.0 <= dropout_p < 1.0, f"dropout_p must be in [0, 1), got {dropout_p}"
     """
     Arguments:
         q: (batch_size, seqlen_q, nheads, head_dim)
