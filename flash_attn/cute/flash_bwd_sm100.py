@@ -2720,7 +2720,7 @@ class FlashAttentionBackwardSm100:
         # dQ = dS @ K
         tdQrdS = tiled_mma_dQ.make_fragment_A(sdS)
         tdQrK = tiled_mma_dQ.make_fragment_B(sKt)
-        # dV = P @ dO.T
+        # dV = P.T @ dO
         tdVrdO = tiled_mma_dV.make_fragment_B(sdO)
         tdVrP = tiled_mma_dV.make_fragment_A(sP if const_expr(self.acc_m64) else tP)
 
