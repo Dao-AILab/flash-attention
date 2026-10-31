@@ -2827,3 +2827,83 @@ def test_flash_attn_generator_arg_must_be_none():
     with pytest.raises(RuntimeError, match=match):
         flash_attn_gpu.varlen_bwd(qf, qf, kf, vf, qf, lse, None, None, None, cu, cu, None,
                                   seqlen, seqlen, 0.0, scale, False, True, -1, -1, 0.0, False, bad, None)
+
+
+def _skip_if_free_memory_below(gib):
+    free, _ = torch.cuda.mem_get_info()
+    if free < gib * 2**30:
+        pytest.skip(f"needs {gib} GiB of free GPU memory")
+
+
+def _with_row_stride(x, row_stride):
+    """The values of `x` (batch 1), with consecutive rows `row_stride` elements apart."""
+    _, seqlen, nheads, d = x.shape
+    buf = torch.empty((seqlen - 1) * row_stride + nheads * d, device=x.device, dtype=x.dtype)
+    y = buf.as_strided(x.shape, (seqlen * row_stride, row_stride, d, 1))
+    y.copy_(x)
+    return y
+
+
+@pytest.mark.parametrize("strided", ["k_cache", "v_cache", "k", "v"])
+def test_flash_attn_kvcache_large_row_stride(strided):
+    # The split-KV kernel steps K/V and the appended K/V back one block of kBlockN rows at a
+    # time. The step was truncated to 32 bits, so with a row stride of 2**31 / kBlockN or more
+    # every block after the first was loaded from the wrong address (#3096).
+    # d = 256 gives kBlockN = 64; 65 rows are two blocks, about 4.3 GB at this row stride.
+    _skip_if_free_memory_below(12)
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    nheads, d, row_stride = 2, 256, 2**25 + 128
+    append = strided in ("k", "v")
+    seqlen_k = seqlen_new = 65  # with append, the cache starts empty and receives k/v
+    q = torch.randn(1, 1, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(1, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    k_new = torch.randn(1, seqlen_new, nheads, d, device=device, dtype=dtype) if append else None
+    v_new = torch.randn_like(k_new) if append else None
+    # One split, so the kernel steps from the second key block back to the first.
+    kwargs = dict(cache_batch_idx=torch.zeros(1, device=device, dtype=torch.int32), num_splits=1)
+    if append:
+        kwargs["cache_seqlens"] = 0
+
+    def run(strided_name):
+        args = {"k_cache": k_cache.clone(), "v_cache": v_cache.clone(), "k": k_new, "v": v_new}
+        if strided_name is not None:
+            args[strided_name] = _with_row_stride(args[strided_name], row_stride)
+        out = flash_attn_with_kvcache(q, args["k_cache"], args["v_cache"], k=args["k"], v=args["v"], **kwargs)
+        return out, args["k_cache"], args["v_cache"]
+
+    out_ref, k_cache_ref, v_cache_ref = run(None)
+    out, k_cache_out, v_cache_out = run(strided)
+    torch.cuda.synchronize()
+    # Same values in the same order: only the addresses differ.
+    assert torch.equal(out, out_ref)
+    assert torch.equal(k_cache_out, k_cache_ref)
+    assert torch.equal(v_cache_out, v_cache_ref)
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,num_splits,free_gib",
+    [
+        # The out_accum offsets of splits 13-15 reach 2**31; b * h * seqlen_q * d stays below it.
+        (81920, 16, 16),
+        # b * h * seqlen_q * d > 2**31: split 1's out_accum offsets, and the combine kernel's
+        # per-split step and its row offsets for the last rows, reach 2**31.
+        (1114112, 2, 44),
+    ],
+)
+def test_flash_attn_kvcache_splitkv_large_accum(seqlen_q, num_splits, free_gib):
+    # The split-KV out_accum offsets and the combine kernel's offsets were 32-bit products
+    # (#3096). Compare against the unsplit kernel, which writes O directly.
+    _skip_if_free_memory_below(free_gib)
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    nheads, d = 8, 256
+    seqlen_k = num_splits * 64  # d = 256 gives kBlockN = 64: one key block per split
+    q = torch.randn(1, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(1, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    out = flash_attn_with_kvcache(q, k_cache, v_cache, num_splits=num_splits)
+    torch.cuda.synchronize()
+    out_ref = flash_attn_with_kvcache(q, k_cache, v_cache, num_splits=1)
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
