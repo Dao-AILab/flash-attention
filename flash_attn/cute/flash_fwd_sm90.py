@@ -1154,6 +1154,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     else FastDivmodDivisorV2(seqlen.seqlen_k),
                 )
 
+            if const_expr(self.mask_mod is not None):
+                qhead_per_kvhead_packgqa = self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+                check_q_boundary = (
+                    m_block + 1
+                ) * self.tile_m > seqlen.seqlen_q * qhead_per_kvhead_packgqa
+            else:
+                check_q_boundary = False
+
             mask = AttentionMaskCls(seqlen)
             mask_fn = partial(
                 mask.apply_mask,
@@ -1165,6 +1173,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mask_local=self.is_local,
                 aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
+                check_q_boundary=check_q_boundary,
             )
             score_mod_fn = None
             if const_expr(self.score_mod is not None):
