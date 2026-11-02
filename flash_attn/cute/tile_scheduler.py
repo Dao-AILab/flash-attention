@@ -246,8 +246,10 @@ class TileSchedulerArguments(ParamsBase):
     split_slot_batch_ptr: Optional[cute.Tensor] = None
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistent_cta_multiplier: cutlass.Constexpr[int] = 1
-    # L2 bytes each forward LPT head group fills with K / V.
+    # L2 bytes each LPT head group fills: K / V in the forward, Q / dO / dQaccum in the backward.
     l2_group_bytes: cutlass.Constexpr[int] = 50 * 1024 * 1024
+    # Backward: at most this many CTAs per head group (0: no cap), see SingleTileLPTBwdScheduler.
+    l2_group_max_ctas: cutlass.Constexpr[int] = 0
     # SingleTileScheduler: launch splits as the slowest grid mode, so with per-batch split counts
     # every batch's first splits launch before the excess splits, which exit at once. Cluster
     # shape (1, 1) only.
@@ -813,7 +815,7 @@ class SingleTileLPTBwdScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileLPTBwdScheduler.Params":
-            size_l2 = 50 * 1024 * 1024
+            size_l2 = args.l2_group_bytes
             # int64: these products overflow int32 at large seqlen_k (> ~4M for
             # hdim-128 bf16; the dqaccum *4 term wraps even sooner).
             size_one_qdo_head = (
@@ -826,6 +828,16 @@ class SingleTileLPTBwdScheduler:
             swizzle = (
                 1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
             )
+            if cutlass.const_expr(args.l2_group_max_ctas > 0):
+                # A group no wider than one wave: the KV tiles of a head then run together and
+                # share its Q / dO and dQaccum rows while they are in L2; a wider group visits
+                # them a wave or more apart.
+                wave_heads = cutlass.max(
+                    Int32(args.l2_group_max_ctas)
+                    // cute.ceil_div(args.num_block, args.cluster_shape_mn[0]),
+                    Int32(1),
+                )
+                swizzle = cutlass.min(Int32(swizzle), Int32(1) << log2_floor(wave_heads))
             # swizzle = 8
             # If we're in the last section (called residual), we don't want to divide by
             # swizzle. Instead we want to divide by the remainder.

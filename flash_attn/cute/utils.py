@@ -235,6 +235,26 @@ def create_softcap_scoremod_bwd(softcap_val):
 LOG2_E = math.log2(math.e)
 
 
+def fit_row_copy(
+    dtype: Type[cutlass.Numeric], rows: int, cols: int, num_threads: int, threads_per_row: int
+) -> Tuple[int, int]:
+    """(threads_per_row, elements per copy) of a 2D copy of a (rows, cols) tile, whose pass
+    covers num_threads // threads_per_row rows. The 16 B copy at threads_per_row is kept when
+    its pass tiles the rows. Otherwise (96 columns: 4 threads a row, a 64-row pass over a
+    32-row tile) the widest copy whose power-of-two group of threads per row does is taken."""
+    elems = 128 // dtype.width
+    if rows % (num_threads // threads_per_row) == 0:
+        return threads_per_row, elems
+    while elems >= 1:
+        tpr = 32
+        while tpr > 1 and ((cols // elems) % tpr or num_threads % tpr):
+            tpr //= 2
+        if cols % elems == 0 and rows % (num_threads // tpr) == 0:
+            return tpr, elems
+        elems //= 2
+    raise ValueError(f"no 2D copy of {num_threads} threads tiles a ({rows}, {cols}) tile")
+
+
 def compute_softmax_scale_log2(softmax_scale, score_mod):
     """Compute softmax_scale_log2 and adjusted softmax_scale based on whether score_mod is used.
 

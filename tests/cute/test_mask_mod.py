@@ -380,10 +380,15 @@ def _run_mask_test(
         *_,
     ) = bm.as_tuple()
 
-    # SM90 block-sparse backward expects BlockMask granularity (128, 128) regardless of fwd tiling.
+    # The SM90 and SM12x block-sparse backwards expect BlockMask granularity (128, 128) regardless
+    # of fwd tiling.
     sparse_tile_m_bwd = sparse_tile_m
     tile_n_bwd = tile_n
-    if COMPUTE_CAPABILITY == 9 and use_block_sparsity and (sparse_tile_m, tile_n) != (128, 128):
+    if (
+        COMPUTE_CAPABILITY in (9, 12)
+        and use_block_sparsity
+        and (sparse_tile_m, tile_n) != (128, 128)
+    ):
         bm_bwd = create_block_mask(
             mask_mod_flex,
             batch_size,
@@ -593,7 +598,7 @@ def test_mask_mod_ima_partial_block():
     )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10, 11), reason="mask_mod backward")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10, 11, 12), reason="mask_mod backward")
 def test_mask_mod_bwd_ignores_causal_like_fwd():
     """A mask_mod replaces causal masking: the forward drops causal, so the backward must as
     well, or its gradients belong to a different attention than the output."""

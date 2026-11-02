@@ -2535,22 +2535,9 @@ SM100_BWD_THREADS_PER_CTA = 512
 SM100_BWD_TILE_M = 128
 
 
-def sm120_bwd_fields(inputs: BwdHeuristicInputs) -> dict:
-    """The one SM120 backward configuration: SM80 MMA, 99 KB SMEM, 128 threads (4 warps)."""
-    stages = 2 if inputs.head_dim <= 64 else 1
-    return {
-        **_SM90_ONLY_NEUTRAL_FIELDS,
-        **_SM100_ONLY_NEUTRAL_FIELDS,
-        "tile_m": 64,
-        "tile_n": 64,
-        "num_stages_Q": stages,
-        "num_stages_dO": stages,
-        "AtomLayoutMSdP": 4,
-        "AtomLayoutNdKV": 4,
-        "AtomLayoutMdQ": 4,
-        "num_threads": 128,
-        "spt": False,
-    }
+_SM12X_BWD_PLANNED = (
+    "The SM12x backward is planned by flash_attn.cute.sm120 (bwd_runtime.flash_attn_bwd)"
+)
 
 
 @lru_cache(maxsize=1024)
@@ -2618,8 +2605,7 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 else select_sm100_bwd_registers(inputs, use_2cta_instrs=use_2cta_instrs)
             )
         case 12:
-            fields = sm120_bwd_fields(inputs)
-            registers = None
+            raise ValueError(_SM12X_BWD_PLANNED)
         case _:
             raise ValueError(f"Unsupported backward architecture family SM{inputs.device_capacity}")
     config = BwdConfig(device_capacity=inputs.device_capacity, registers=registers, **fields)
@@ -2765,7 +2751,9 @@ def validate_sm90_bwd_mma(config: BwdConfig, inputs: BwdHeuristicInputs) -> None
 def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
     """Reject known unsupported or silently normalized backward config combinations."""
     capacity = inputs.device_capacity
-    if capacity not in (9, 10, 11, 12):
+    if capacity == 12:
+        raise ValueError(_SM12X_BWD_PLANNED)
+    if capacity not in (9, 10, 11):
         raise ValueError(f"Unsupported backward architecture family SM{capacity}")
     if config.device_capacity != capacity:
         raise ValueError(
@@ -2783,20 +2771,12 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
         getattr(config, name) != value for name, value in _SM100_ONLY_NEUTRAL_FIELDS.items()
     ):
         raise ValueError(f"SM{capacity} backward does not support SM100 2CTA or pack_gqa options")
-    if capacity != 12 and config.spt != bwd_spt(inputs):
+    if config.spt != bwd_spt(inputs):
         raise ValueError(
             f"SM{capacity} backward needs spt={bwd_spt(inputs)} (deterministic dQ lock order)"
         )
     if capacity == 9:
         validate_sm90_bwd_mma(config, inputs)
-    elif capacity == 12:
-        mismatched = {
-            name: value
-            for name, value in sm120_bwd_fields(inputs).items()
-            if getattr(config, name) != value
-        }
-        if mismatched:
-            raise ValueError(f"SM120 backward supports one configuration; expected {mismatched}")
     else:
         neutral = _SM90_ONLY_NEUTRAL_FIELDS
         if any(getattr(config, name) != value for name, value in neutral.items()):

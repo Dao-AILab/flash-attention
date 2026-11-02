@@ -19,3 +19,13 @@ def get_forward_host(arch: int):
         return sm120_forward_host
     return None
 
+
+@lru_cache(maxsize=None)
+def get_backward_host(arch: int):
+    """Return the optional architecture-owned backward, a module exposing bwd_config(inputs)
+    and flash_attn_bwd(...)."""
+    if arch // 10 == 12:
+        from flash_attn.cute.sm120 import bwd_runtime
+
+        return bwd_runtime
+    return None

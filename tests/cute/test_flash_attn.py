@@ -1002,6 +1002,7 @@ def test_flash_attn_output(
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
                 or (IS_SM100 and d == 256 and dv == 256 and (softcap == 0.0 or HD256_GENERIC_BWD))
+                or (IS_SM120 and d == 256 and dv == 256)
             )
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
@@ -1956,6 +1957,7 @@ def test_flash_attn_varlen_output(
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
                 or (IS_SM100 and d == 256 and dv == 256 and (softcap == 0.0 or HD256_GENERIC_BWD))
+                or (IS_SM120 and d == 256 and dv == 256)
             )
             and not has_learnable_sink
             # and False

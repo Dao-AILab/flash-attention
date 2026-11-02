@@ -63,12 +63,11 @@ from flash_attn.cute.cute_dsl_utils import (
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
-from flash_attn.cute.sm120.dispatch import get_forward_host
+from flash_attn.cute.sm120.dispatch import get_backward_host, get_forward_host
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess, PackGQA
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
-from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import (
     FlashAttentionBackwardPostprocess,
     LearnableSinkBwdTensors,
@@ -2064,8 +2063,8 @@ def _flash_attn_bwd(
             and seqused_q is None
             and seqused_k is None
         ), "Varlen backward with block sparsity is not yet supported"
+    arch_backward_host = get_backward_host(arch)
     if learnable_sink is not None:
-        assert arch // 10 in [9, 10, 11], "Learnable sink backward is supported on SM90 and SM100/SM110"
         assert lse is not None, "learnable_sink backward requires LSE"
     if q.numel() == 0 or k.numel() == 0:
         dq = torch.zeros_like(q) if dq is None else dq.zero_()
@@ -2088,11 +2087,6 @@ def _flash_attn_bwd(
         causal, window_size_left, window_size_right, mask_mod
     )
 
-    if arch // 10 == 12:
-        assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
-        assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
-        assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
-        assert deterministic is False, "deterministic backward not supported on SM 12.0"
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
         total_q = batch_size * seqlen_q
@@ -2123,7 +2117,12 @@ def _flash_attn_bwd(
         has_score_mod=score_mod is not None, has_mask_mod=mask_mod is not None,
         has_learnable_sink=learnable_sink is not None,
     )
-    if config is None:
+    if arch_backward_host is not None:
+        if config is not None:
+            raise ValueError(f"The SM {arch // 10}.x backward plans its own launch; config must be None")
+        # The shared checks below read the architecture backward's own tiles.
+        config = arch_backward_host.bwd_config(inputs)
+    elif config is None:
         config = select_bwd_config(inputs)
     else:
         validate_bwd_config(config, inputs)
@@ -2246,8 +2245,7 @@ def _flash_attn_bwd(
         ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
-    if arch // 10 != 12:
-        _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
+    _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
@@ -2283,6 +2281,35 @@ def _flash_attn_bwd(
         dv = torch.empty_like(v)
     else:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
+
+    if arch_backward_host is not None:
+        return arch_backward_host.flash_attn_bwd(
+            q, k, v, out, dout, lse,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            local=local,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=max_seqlen_q,
+            deterministic=deterministic,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            dlse=dlse,
+            learnable_sink=learnable_sink,
+            block_sparse_tensors=block_sparse_tensors,
+            score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+            fake_mode=fake_mode,
+            compile_cache=_flash_attn_bwd.compile_cache,
+        )
 
     # Keep accumulator allocation, zeroing, and readback aligned with SM90's swapped MMA.
     hdim_multiple_of = 64 if config.dKV_swapAB else 32
@@ -2538,9 +2565,8 @@ def _flash_attn_bwd(
             if t is not None else None
             for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
         ]
-        if arch // 10 in [8, 12]:
-            flash_bwd_obj_cls = FlashAttentionBackwardSm120 if arch // 10 == 12 else FlashAttentionBackwardSm80
-            fa_bwd_obj = flash_bwd_obj_cls(
+        if arch // 10 == 8:
+            fa_bwd_obj = FlashAttentionBackwardSm80(
                 dtype,
                 head_dim,
                 head_dim_v,
