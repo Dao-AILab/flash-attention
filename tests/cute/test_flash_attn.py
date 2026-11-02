@@ -4565,10 +4565,11 @@ def test_flash_attn_sm100_bwd_unused_query_tail(
     from flash_attn.cute import utils
 
     monkeypatch.setattr(utils, "_fa_disable_2cta_enabled", disable_2cta)
-    monkeypatch.setenv("FLASH_ATTENTION_BWD_PACK_GQA", str(int(pack_gqa)))
-    monkeypatch.delenv("FLASH_ATTENTION_BWD_TILE_N", raising=False)
-    if d == 256:
-        monkeypatch.setenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "1")
+    # Backward selection caches environment reads; patch the getters so every
+    # parametrized case uses its own configuration in both test passes.
+    monkeypatch.setattr(utils, "_get_bwd_pack_gqa_override", lambda: pack_gqa)
+    monkeypatch.setattr(utils, "_get_bwd_tile_n_override", lambda: None)
+    monkeypatch.setattr(utils, "_get_hd256_generic_bwd", lambda: d == 256)
     torch.manual_seed(0)
     heads, kv_heads = 8, nheads_kv
     lengths = [129, 257, 511] if layout == "packed" else [129, 257, 37]
@@ -4725,6 +4726,12 @@ def test_flash_attn_sm100_query_tma_allocation_boundary(monkeypatch, d, guard_op
     import subprocess
     import sys
 
+    from flash_attn.cute import utils
+
+    monkeypatch.setattr(utils, "_get_hd256_generic_bwd", lambda: True)
+    monkeypatch.setattr(utils, "_get_bwd_pack_gqa_override", lambda: False)
+    monkeypatch.setattr(utils, "_get_bwd_tile_n_override", lambda: None)
+    # The allocation-boundary child starts a fresh interpreter and reads env.
     monkeypatch.setenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "1")
     monkeypatch.setenv("FLASH_ATTENTION_BWD_PACK_GQA", "0")
     monkeypatch.delenv("FLASH_ATTENTION_BWD_TILE_N", raising=False)
@@ -4773,9 +4780,11 @@ def test_flash_attn_sm100_query_tensormap_workspace_padding(
     monkeypatch, d, packed_kv, pack_gqa
 ):
     """Many short seqused_q sequences exercise scheduler padding and descriptor reuse."""
-    monkeypatch.setenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "1")
-    monkeypatch.setenv("FLASH_ATTENTION_BWD_PACK_GQA", str(int(pack_gqa)))
-    monkeypatch.delenv("FLASH_ATTENTION_BWD_TILE_N", raising=False)
+    from flash_attn.cute import utils
+
+    monkeypatch.setattr(utils, "_get_hd256_generic_bwd", lambda: True)
+    monkeypatch.setattr(utils, "_get_bwd_pack_gqa_override", lambda: pack_gqa)
+    monkeypatch.setattr(utils, "_get_bwd_tile_n_override", lambda: None)
     torch.manual_seed(73)
     batch, capacity, heads, kv_heads = 301, 65, 8, 2
     q = torch.randn(batch, capacity, heads, d, device="cuda", dtype=torch.bfloat16)
