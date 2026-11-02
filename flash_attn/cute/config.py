@@ -59,6 +59,8 @@ class FwdConfig:
     (freq 0 keeps hardware exp2 throughout); other architectures carry 0 and 0.
     use_swapab selects the SM100/SM103 SwapAB decode kernel (flash_fwd_decode_sm100.py), where
     tile_m is the query-head tile and only num_splits is tunable; see SwapABPolicy.config.
+    lpt_global orders a 1CTA unsplit dense CLC launch longest-first over the whole problem
+    instead of per L2 section; see NOTE [global LPT].
     """
 
     device_capacity: int
@@ -78,6 +80,7 @@ class FwdConfig:
     ex2_emu_freq: int
     ex2_emu_start_frg: int
     use_swapab: bool = False
+    lpt_global: bool = False
 
 
 class FwdHeuristicInputs(NamedTuple):
@@ -125,13 +128,12 @@ class FwdHeuristicInputs(NamedTuple):
     requested_mma_pv_is_rs: bool | None = None
     requested_intra_wg_overlap: bool | None = None
     requested_num_splits: int | None = None
-    requested_use_clc_scheduler: bool = False
     disable_2cta: bool = False
     disable_s_ping_pong: bool = False
     disable_scheduler_metadata: bool = False
     # FLASH_ATTENTION_SM100_BACKEND: None selects SwapAB when admitted and not measured slower,
-    # True prefers it wherever admitted (other calls fall back to the standard kernel, as an
-    # FA_CLC request does), False disables it.
+    # True prefers it wherever admitted (other calls fall back to the standard kernel), False
+    # disables it.
     requested_use_swapab: bool | None = None
     # Per-sequence KV capacity, the page-table row when paged. The interface always sets it;
     # None (max_seqlen_k) exists for CPU callers that build inputs by hand.
@@ -474,13 +476,22 @@ def select_registers(
     tile_m: int,
     tile_n: int,
     q_stage: int,
+    num_splits: int,
     use_2cta_instrs: bool,
+    use_clc_scheduler: bool,
 ) -> Registers:
-    """Resolve the register split after the final tile, stage, and 2CTA choices."""
+    """Resolve the register split after the final tile, stage, split, 2CTA, and CLC choices."""
     match inputs.device_capacity:
         case 9:
             return select_sm90_registers(inputs, tile_m=tile_m, tile_n=tile_n)
         case 10 | 11:
+            # Persistent CLC keeps scheduler state live across tiles; see NOTE [causal CLC].
+            if use_clc_scheduler:
+                _, clc_registers = causal_clc_policy(
+                    inputs, num_splits=num_splits, q_stage=q_stage, use_2cta_instrs=use_2cta_instrs
+                )
+                if clc_registers is not None:
+                    return clc_registers
             return select_sm100_registers(
                 inputs, tile_n=tile_n, q_stage=q_stage, use_2cta_instrs=use_2cta_instrs
             )
@@ -696,18 +707,147 @@ def can_use_static_persistent(
     return dense_noncausal or single_m_block
 
 
-def can_use_clc(inputs: FwdHeuristicInputs, *, tile_n: int, use_2cta_instrs: bool) -> bool:
+# CUDA's launch limit on grid Y and Z (grid X allows 2**31 - 1).
+CUDA_MAX_GRID_DIM_YZ = 65535
+
+
+def can_use_clc(
+    inputs: FwdHeuristicInputs, *, tile_n: int, num_splits: int, use_2cta_instrs: bool
+) -> bool:
     """Whether the SM100 kernel honors CLC for this layout."""
     return (
         inputs.page_size in (None, tile_n)
+        # The CLC grid is (m blocks, heads, batch * splits), without the folding of the
+        # nonpersistent grid.
+        and (inputs.num_heads_kv if inputs.pack_gqa else inputs.num_heads) <= CUDA_MAX_GRID_DIM_YZ
+        and inputs.batch_size * num_splits <= CUDA_MAX_GRID_DIM_YZ
         and not inputs.has_varlen_q_semaphore
-        # CLC does not map hd256 2CTA tiles correctly.
-        and not (inputs.is_hdim256 and use_2cta_instrs)
+        # Varlen CLC maps hd256 2CTA tiles per CTA, not per cluster.
+        and not (inputs.is_hdim256 and use_2cta_instrs and inputs.is_varlen)
     )
 
 
-# CUDA's launch limit on grid Y and Z (grid X allows 2**31 - 1).
-CUDA_MAX_GRID_DIM_YZ = 65535
+# NOTE [causal CLC]
+# CLC amortizes CTA setup across tiles while preserving L2-swizzled LPT order
+# (clc_late_claim). The benefit depends on dtype, head dimension, and architecture, so this
+# table enables it by default only for benchmark-validated combinations: <=0.5% loss per
+# shape, >1% gain on at least one shape. A cell may carry a measured register split that
+# runs faster under CLC; None keeps the default split; missing entries leave CLC off by
+# default. Timing candidates: see benchmarks/clc_bench.py --summary.
+# hd256 runs one Q tile per 2CTA cluster, and its CLC launch takes tiles in grid order, head by
+# head (only 1CTA reuses the L2-swizzled LPT order), so with few (batch, launched head) slices
+# the longest tiles of the last heads start late. hd256 cells therefore need at least
+# _HD256_CLC_MIN_HEAD_SLICES slices: on B200, CLC measured 1.006-1.148x on all 24 shapes with 32
+# or more, and 0.83-1.04x (20 of 28 shapes slower) below.
+# (dtype path, head_dim_padded) -> {arch family: register override}.
+_CAUSAL_CLC_DEFAULT = {
+    ("bf16", 64): {"sm_100": None},
+    ("bf16", 96): {"sm_100": None, "sm_103": None, "sm_107": None},
+    ("bf16", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
+    ("bf16", 192): {"sm_103": None},
+    ("bf16", 256): {"sm_100": None},
+    ("fp16", 64): {"sm_103": Sm100Registers(softmax=184, correction=64, other=80)},
+    ("fp16", 96): {"sm_103": None, "sm_107": None},
+    ("fp16", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
+    ("fp16", 192): {"sm_100": None, "sm_103": None},
+    ("fp16", 256): {"sm_100": None},
+    ("fp8", 64): {"sm_100": None, "sm_103": None, "sm_107": None},
+    ("fp8", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
+}
+_HD256_CLC_MIN_HEAD_SLICES = 32
+
+
+def causal_clc_policy(
+    inputs: FwdHeuristicInputs, *, num_splits: int, q_stage: int, use_2cta_instrs: bool
+) -> tuple[bool, Sm100Registers | None]:
+    """Return (enabled, register override) for measured dense causal CLC cells.
+
+    An enabled cell with no override keeps the default register split; see NOTE [causal CLC].
+    """
+    launched_heads = inputs.num_heads_kv if inputs.pack_gqa else inputs.num_heads
+    if (
+        inputs.device_capacity != 10
+        or not inputs.causal
+        or inputs.is_varlen
+        or inputs.local
+        or num_splits != 1
+        # Measured tiles: two Q tiles per CTA, or one Q tile per 2CTA cluster at hd256.
+        or q_stage != (1 if inputs.is_hdim256 else 2)
+        or (
+            inputs.is_hdim256
+            and (
+                not use_2cta_instrs
+                or inputs.batch_size * launched_heads < _HD256_CLC_MIN_HEAD_SLICES
+            )
+        )
+        or inputs.page_size is not None
+        or inputs.use_block_sparsity
+        or inputs.has_score_mod
+        or inputs.has_mask_mod
+    ):
+        return False, None
+    minor = inputs.device_arch % 10
+    family = "sm_107" if minor >= 7 else "sm_103" if minor >= 3 else "sm_100"
+    dtype = inputs.dtype
+    dtype_path = "fp8" if "float8" in dtype else "fp16" if dtype == "torch.float16" else "bf16"
+    row = _CAUSAL_CLC_DEFAULT.get((dtype_path, inputs.head_dim_padded), {})
+    return family in row, row.get(family)
+
+
+# NOTE [global LPT]
+# The L2-swizzled LPT order (SingleTileLPTScheduler) visits heads in sections whose K/V fit L2,
+# longest tiles first within each section. When a launch ends in a partial section, that
+# section's longest tiles start only after every earlier section's tiles were claimed, and
+# finish last. With few tiles per SM, balance outweighs L2 locality, so 1CTA unsplit dense causal
+# CLC orders the whole problem as one section (lpt_global; #2909, Zhuobin Huang) at up to
+# _GLOBAL_LPT_MAX_TILES_PER_SM tiles per SM. On grids with a partial section this measured
+# 1.07-1.28x on B200, 1.05-1.23x on B300, and 1.04-1.41x on GB300, and within 0.4% on the
+# others; at 2.4-2.8 tiles per SM single shapes lost up to 1.8%, and with every section full
+# it lost up to 8%. Only this CLC path uses the swizzled order with a dynamic tile claim.
+_GLOBAL_LPT_MAX_TILES_PER_SM = 2.25
+
+
+def can_use_lpt_global(
+    inputs: FwdHeuristicInputs, *, use_clc_scheduler: bool, use_2cta_instrs: bool, num_splits: int
+) -> bool:
+    """Whether the kernel's scheduler honors lpt_global: the swizzled CLC order of dense LPT."""
+    return (
+        use_clc_scheduler
+        and not use_2cta_instrs
+        and num_splits == 1
+        and not inputs.is_varlen_q
+        and (inputs.causal or inputs.local)
+    )
+
+
+def select_lpt_global(
+    inputs: FwdHeuristicInputs,
+    *,
+    tile_m: int,
+    q_stage: int,
+    use_clc_scheduler: bool,
+    use_2cta_instrs: bool,
+    num_splits: int,
+) -> bool:
+    """The measured global LPT region: dense causal CLC with few tiles per SM (NOTE)."""
+    heads_per_m_block = 1 if inputs.pack_gqa else inputs.qhead_per_kvhead
+    num_tiles = (
+        inputs.batch_size
+        * inputs.num_heads_kv
+        * heads_per_m_block
+        * ceil_div(inputs.packed_max_seqlen_q, q_stage * tile_m)
+    )
+    return (
+        can_use_lpt_global(
+            inputs,
+            use_clc_scheduler=use_clc_scheduler,
+            use_2cta_instrs=use_2cta_instrs,
+            num_splits=num_splits,
+        )
+        and not inputs.local
+        and not inputs.is_varlen
+        and num_tiles <= _GLOBAL_LPT_MAX_TILES_PER_SM * inputs.num_sms
+    )
 
 
 @dataclass(frozen=True)
@@ -768,17 +908,16 @@ class SwapABPolicy:
         """The selection request that keeps the selector off SwapAB, even under a SwapAB
         request, or None.
 
-        These steer only select_fwd_config, like the standard kernel's tile, CLC, and S ping-pong
-        requests; an explicit SwapAB config is forced exactly.
+        These steer only select_fwd_config, like the standard kernel's tile and S ping-pong
+        requests; an explicit SwapAB config is forced exactly. The default causal CLC scheduler
+        (NOTE [causal CLC]) is chosen after SwapAB is declined, so it vetoes nothing.
         """
         requests = {
             "tile_mn": inputs.requested_tile_m is not None or inputs.requested_tile_n is not None,
             "mma_pv_is_rs": inputs.requested_mma_pv_is_rs is not None,
             "intra_wg_overlap": inputs.requested_intra_wg_overlap is not None,
             "pack_gqa": inputs.pack_gqa is False,
-            "use_clc_scheduler / disable_s_ping_pong": (
-                inputs.requested_use_clc_scheduler or inputs.disable_s_ping_pong
-            ),
+            "disable_s_ping_pong": inputs.disable_s_ping_pong,
         }
         return next((reason for reason, vetoed in requests.items() if vetoed), None)
 
@@ -988,16 +1127,16 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         and is_2cta_eligible(inputs, tile_m=tile_m, q_stage=q_stage, num_splits=num_splits)
     )
 
-    # A CLC request alone skips varlen MHA (K/V traffic under imbalance) and dense
-    # noncausal (work-stealing overhead).
-    is_varlen_mha = inputs.is_varlen and inputs.qhead_per_kvhead == 1
-    is_dense_noncausal = not inputs.is_varlen and not inputs.causal and not inputs.local
+    # CLC runs by default only on measured cells; explicit configs may choose it elsewhere.
+    default_clc, _ = causal_clc_policy(
+        inputs, num_splits=num_splits, q_stage=q_stage, use_2cta_instrs=use_2cta_instrs
+    )
     use_clc_scheduler = (
         is_sm100_family
-        and can_use_clc(inputs, tile_n=tile_n, use_2cta_instrs=use_2cta_instrs)
-        and inputs.requested_use_clc_scheduler
-        and not is_varlen_mha
-        and not is_dense_noncausal
+        and default_clc
+        and can_use_clc(
+            inputs, tile_n=tile_n, num_splits=num_splits, use_2cta_instrs=use_2cta_instrs
+        )
     )
     is_static_persistent = is_sm100_family and can_use_static_persistent(
         inputs,
@@ -1008,6 +1147,14 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         use_clc_scheduler=use_clc_scheduler,
     )
     use_tma_o = is_sm100_family and can_use_tma_o(inputs, tile_m=tile_m, num_splits=num_splits)
+    lpt_global = select_lpt_global(
+        inputs,
+        tile_m=tile_m,
+        q_stage=q_stage,
+        use_clc_scheduler=use_clc_scheduler,
+        use_2cta_instrs=use_2cta_instrs,
+        num_splits=num_splits,
+    )
     n_blocks_per_split = ceil_div(num_n_blocks, num_splits)
     use_s_ping_pong = (
         is_sm100_family
@@ -1040,10 +1187,13 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
             tile_m=tile_m,
             tile_n=tile_n,
             q_stage=q_stage,
+            num_splits=num_splits,
             use_2cta_instrs=use_2cta_instrs,
+            use_clc_scheduler=use_clc_scheduler,
         ),
         ex2_emu_freq=ex2_emu_freq,
         ex2_emu_start_frg=ex2_emu_start_frg,
+        lpt_global=lpt_global,
     )
     validate_fwd_config(config, inputs)
     return config
@@ -1052,8 +1202,9 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
 def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) -> FwdConfig:
     """Apply changes to base and re-derive the fields the selector computes from them.
 
-    registers and the exp2 emulation are recomputed for the changed tile, stage, 2CTA, and
-    PackGQA choices unless changes sets them. The result is validated.
+    registers, the exp2 emulation, and lpt_global are recomputed for the changed tile, stage,
+    split, 2CTA, PackGQA, and scheduler choices unless changes sets them. The result is
+    validated.
     """
     config = replace(base, **changes)
     resolved = inputs._replace(pack_gqa=config.pack_gqa)
@@ -1065,7 +1216,18 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
         ex2_emu_freq, ex2_emu_start_frg = select_ex2_emu(
             resolved, use_2cta_instrs=config.use_2cta_instrs
         )
-        derived = dict(ex2_emu_freq=ex2_emu_freq, ex2_emu_start_frg=ex2_emu_start_frg)
+        derived = dict(
+            ex2_emu_freq=ex2_emu_freq,
+            ex2_emu_start_frg=ex2_emu_start_frg,
+            lpt_global=select_lpt_global(
+                resolved,
+                tile_m=config.tile_m,
+                q_stage=config.q_stage,
+                use_clc_scheduler=config.use_clc_scheduler,
+                use_2cta_instrs=config.use_2cta_instrs,
+                num_splits=config.num_splits,
+            ),
+        )
     # The register tables cover only supported tiles and stages; validation rejects the rest.
     if "registers" not in changes and not config.use_swapab:
         derived["registers"] = select_registers(
@@ -1073,11 +1235,35 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
             tile_m=config.tile_m,
             tile_n=config.tile_n,
             q_stage=config.q_stage,
+            num_splits=config.num_splits,
             use_2cta_instrs=config.use_2cta_instrs,
+            use_clc_scheduler=config.use_clc_scheduler,
         )
     config = replace(config, **{k: v for k, v in derived.items() if k not in changes})
     validate_fwd_config(config, inputs)
     return config
+
+
+def with_clc_scheduler(config: FwdConfig, inputs: FwdHeuristicInputs, enable: bool) -> FwdConfig:
+    """config with the CLC scheduler on or off, for tests and benchmarks that compare schedulers.
+
+    Turning CLC off restores the static persistence selection would choose without it.
+    derive_fwd_config re-derives the dependent fields, such as registers, and validates, so a
+    layout CLC cannot run raises ValueError.
+    """
+    if config.use_clc_scheduler == enable:
+        return config
+    is_static_persistent = not enable and can_use_static_persistent(
+        inputs._replace(pack_gqa=config.pack_gqa),
+        tile_m=config.tile_m,
+        q_stage=config.q_stage,
+        num_splits=config.num_splits,
+        use_2cta_instrs=config.use_2cta_instrs,
+        use_clc_scheduler=False,
+    )
+    return derive_fwd_config(
+        config, inputs, use_clc_scheduler=enable, is_static_persistent=is_static_persistent
+    )
 
 
 # Architecture-specific fields at their neutral values, for architectures that do not expose
@@ -1093,6 +1279,7 @@ _FWD_SM100_ONLY_NEUTRAL_FIELDS = dict(
     use_s_ping_pong=False,
     ex2_emu_freq=0,
     ex2_emu_start_frg=0,
+    lpt_global=False,
 )
 
 _SM100_SMEM_BYTES = 227 * 1024
@@ -1226,9 +1413,19 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
     if paged_kv_non_tma and (inputs.head_dim % 16 != 0 or inputs.head_dim_v % 16 != 0):
         raise ValueError("Non-TMA paged KV requires head dimensions divisible by 16")
     if config.use_clc_scheduler and not can_use_clc(
-        inputs, tile_n=config.tile_n, use_2cta_instrs=config.use_2cta_instrs
+        inputs,
+        tile_n=config.tile_n,
+        num_splits=config.num_splits,
+        use_2cta_instrs=config.use_2cta_instrs,
     ):
         raise ValueError("CLC is not supported for this forward problem")
+    if config.lpt_global and not can_use_lpt_global(
+        inputs,
+        use_clc_scheduler=config.use_clc_scheduler,
+        use_2cta_instrs=config.use_2cta_instrs,
+        num_splits=config.num_splits,
+    ):
+        raise ValueError("lpt_global needs 1CTA unsplit dense causal or local CLC")
     if config.is_static_persistent and not can_use_static_persistent(
         inputs,
         tile_m=config.tile_m,

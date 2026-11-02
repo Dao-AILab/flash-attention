@@ -17,13 +17,19 @@ Current emit sites:
 ## How to capture a trace
 
 Important:
-- `FA_LOG_LEVEL=3` is needed for the `[CLC] query ...` device-side prints.
-- `FA_CLC=1` only requests CLC; the kernel may still fall back if the shape/features disable it.
+- `FA_LOG_LEVEL=3` is needed for the `[CLC] query ...` device-side prints. The scheduler warp
+  emits them; kernels with `clc_late_claim` (1CTA LPT, no SplitKV, one load warp, the default
+  dense causal case) claim from the load warp and emit no query records. To trace claims, use a
+  2CTA or SplitKV CLC config, which keeps the scheduler-warp claim.
+- Dense causal forward uses CLC by default on the measured cells in `NOTE [causal CLC]`
+  (`flash_attn/cute/config.py`). Elsewhere, pass an explicit `FwdConfig` with
+  `use_clc_scheduler=True` to `flash_attn.cute.interface._flash_attn_fwd(..., config=...)`;
+  validation raises `ValueError` if the problem cannot run CLC.
 
 Minimal repro pattern:
 
 ```bash
-FA_LOG_LEVEL=3 FA_CLC=1 CUDA_VISIBLE_DEVICES=0 python - <<'PY' \
+FA_LOG_LEVEL=3 CUDA_VISIBLE_DEVICES=0 python - <<'PY' \
   > agent_space/clc_trace.log 2>&1
 import torch
 from flash_attn.cute.interface import flash_attn_func
@@ -69,7 +75,7 @@ python AI/parse_clc_log.py agent_space/clc_trace.log --html -o agent_space/clc_t
 
 ## Suggested workflow
 
-1. Reproduce the surprising case with `FA_LOG_LEVEL=3 FA_CLC=1`.
+1. Reproduce the surprising case with `FA_LOG_LEVEL=3` on a CLC config (default or explicit).
 2. Save stdout/stderr to `agent_space/clc_trace.log`.
 3. Run `AI/parse_clc_log.py` on that log to get a compact per-SM / per-CTA summary.
 4. If the trace still looks suspicious, attach or paste that log in the investigation thread / agent notes.
@@ -79,4 +85,4 @@ python AI/parse_clc_log.py agent_space/clc_trace.log --html -o agent_space/clc_t
 
 - The trace is noisy and expensive; use a single small shape first.
 - Because the print happens on scheduler queries, many lines may be terminal `valid=0` queries after work is exhausted.
-- Dense noncausal and varlen MHA may intentionally fall back away from CLC depending on the current heuristic in `flash_attn/cute/interface.py`.
+- Default selection runs CLC only where `flash_attn/cute/config.py` measured a win; other shapes need an explicit config.
