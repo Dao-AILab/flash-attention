@@ -4,7 +4,7 @@ import math
 import hashlib
 import inspect
 import os
-from functools import partial
+from functools import cache, partial
 from typing import Type, Callable, Optional, Tuple, overload, NamedTuple
 
 import cutlass
@@ -113,6 +113,11 @@ def _get_sm100_backend_override() -> Optional[bool]:
     return overrides[value]
 
 
+# The backward env knobs below are read once per process (the backward builds its selection
+# inputs on every call); code that changes one at runtime calls its cache_clear().
+
+
+@cache
 def _get_bwd_pack_gqa_override() -> Optional[bool]:
     """FLASH_ATTENTION_BWD_PACK_GQA=0/1 forces the SM100 backward GQA head packing off / on
     (NOTE [bwd pack_gqa] in pack_gqa.py); unset or "auto" leaves it to the heuristic."""
@@ -123,6 +128,7 @@ def _get_bwd_pack_gqa_override() -> Optional[bool]:
     return value == "1"
 
 
+@cache
 def _get_hd256_generic_bwd() -> bool:
     """FLASH_ATTENTION_HD256_GENERIC_BWD=1 runs the SM100 hdim 256 backward on
     FlashAttentionBackwardSm100 (64-row KV tile, serial 2CTA schedule) instead of the dedicated
@@ -130,6 +136,7 @@ def _get_hd256_generic_bwd() -> bool:
     return os.getenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "0") == "1"
 
 
+@cache
 def _get_bwd_tile_n_override() -> Optional[int]:
     """Test knob: FLASH_ATTENTION_BWD_TILE_N=64 selects the 64-row KV tile per CTA on the SM100
     2CTA backward (the layout the hd256 backward needs). Unset or 128 keeps the default."""
