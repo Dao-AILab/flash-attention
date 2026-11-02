@@ -913,6 +913,73 @@ def test_flash_attn_mla_dispatch_varlen_decode_split(max_seqlen_q, monkeypatch):
     assert err <= 2 * err_pt + 1e-3, (err, err_pt)
 
 
+@pytest.mark.parametrize("api, kernel", [("func", "1cta"), ("varlen", "2cta")])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_explicit_config(api, kernel, monkeypatch):
+    """An explicit MlaFwdConfig picks the MLA forward kernel through both public entry points,
+    ahead of FLASH_ATTENTION_MLA_1CTA, which is set to the other kernel here. As in
+    benchmarks/fwd_config_bench.py, the config starts from what config=None selects: the same
+    inputs with the route forced to the wanted kernel."""
+    if not IS_SM100:
+        pytest.skip()
+    from functools import partial
+    from unittest import mock
+
+    import flash_attn.cute.interface as fa_interface
+
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0" if kernel == "1cta" else "1")
+    b, s_q, s_k, h = 2, 1, 1000, 16
+    kw, _ = _mla_inputs(b, s_q, s_k, h, has_qk=True)
+    if api == "func":
+        run = partial(flash_attn_func, **kw, causal=True)
+    else:
+        cu_q = torch.arange(0, b + 1, device="cuda", dtype=torch.int32) * s_q
+        cu_k = torch.arange(0, b + 1, device="cuda", dtype=torch.int32) * s_k
+        run = partial(
+            flash_attn_varlen_func,
+            *(kw[name].flatten(0, 1) for name in ("q", "k", "v")),
+            qv=kw["qv"].flatten(0, 1), cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=s_q, max_seqlen_k=s_k, causal=True,
+        )
+    selected, select = [], fa_interface.select_mla_fwd_config
+
+    def capture(inputs):
+        selected.append((select(inputs), inputs))
+        return selected[-1][0]
+
+    with mock.patch.object(fa_interface, "select_mla_fwd_config", capture):
+        out_default, _ = run()
+    default, inputs = selected[0]
+    config = select(inputs._replace(mla_1cta_override=kernel == "1cta"))
+    assert (default.kernel == "2cta") == (kernel == "1cta"), default
+    assert (config.kernel == "2cta") == (kernel == "2cta"), config
+
+    real_cache = fa_interface._flash_attn_fwd.compile_cache
+    keys = []
+
+    class Spy:
+        def __contains__(self, key):
+            keys.append(key)
+            return key in real_cache
+
+        def __getitem__(self, key):
+            return real_cache[key]
+
+        def __setitem__(self, key, value):
+            real_cache[key] = value
+
+    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", Spy())
+    out, _ = run(config=config)
+    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", real_cache)
+    # The compile key leads with the config the kernel specializes on.
+    codegen = fa_interface.fwd_codegen_config(config)
+    assert keys and all(key[0] == codegen for key in keys), keys
+    if is_fake_mode():
+        return
+    # The 1CTA and 2CTA kernels agree to bf16 rounding.
+    _assert_mla_fwd_close(out, out_default, what=f"{api} {kernel}")
+
+
 @pytest.mark.parametrize(
     "route",
     [
