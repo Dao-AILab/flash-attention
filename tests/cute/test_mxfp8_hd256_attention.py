@@ -102,6 +102,7 @@ def eager_operands(q8, sfq, k8, sfk, qh, kh, vh, v, out, dout, stats, mode, caus
     do2 = dout.float() * (256.0 / stats[..., 1]).transpose(1, 2).unsqueeze(-1)
     do8, sfdo, sdo = bsu.quantize_to_fp8_with_sf(do2)
     ops.update(along_d("do", do8, sfdo, 128))
+    ops["do_band"] = (do2 * (1.0 / 256.0)).bfloat16() if causal else None  # dO / L
     ops["qt"], ops["sfqt"], _ = bsu.quantize_v_to_fp8_with_sf(qh)
     ops["dot"], ops["sfdot"], _ = bsu.quantize_v_to_fp8_with_sf(do2)
     ops["sfqt"], ops["sfdot"] = ops["sfqt"].reshape(-1), ops["sfdot"].reshape(-1)
@@ -135,11 +136,17 @@ def mirrored_reference(qh, kh, vh, v, out, dout, stats, mode, causal):
         p = p.masked_fill(j > i, 0.0)
     p_hat = p.float().to(torch.float8_e4m3fn).to(d64)
     dp = dout @ vh.transpose(-1, -2)
-    if causal:  # the forward's BF16 band reads the original V
+    if causal:  # the forward's BF16 band: the original V, and P in BF16
         band = (j >= 256 * (i // 256)) & (j <= i)
         dp = torch.where(band, dout @ v.transpose(-1, -2), dp)
+        do_band = (dout.float() * (256.0 / L.float()) * (1.0 / 256.0)).bfloat16().to(d64)
+        p_band = p.float().bfloat16().to(d64)
+        dv = (torch.where(band, 0.0, p_hat) / L).transpose(-1, -2) @ dout
+        dv += torch.where(band, p_band, 0.0).transpose(-1, -2) @ do_band
+    else:
+        dv = (p_hat / L).transpose(-1, -2) @ dout
     ds = p / L * (dp - (dout * out).sum(-1, keepdim=True))
-    grads = scale * ds @ kh, scale * ds.transpose(-1, -2) @ qh, (p_hat / L).transpose(-1, -2) @ dout
+    grads = scale * ds @ kh, scale * ds.transpose(-1, -2) @ qh, dv
     return [g.transpose(1, 2) for g in grads]
 
 
@@ -159,6 +166,16 @@ def test_backward_matches_mirrored_reference(shape, causal, mode):
         assert torch.isfinite(g.float()).all()
         # dO'' and dS quantization (MXFP8) and the BF16 outputs: ~0.03 on these inputs
         assert rel(g, r) < 0.06
+
+
+@pytest.mark.parametrize("mode", ["exact", "fast"])
+def test_causal_band_dv_reads_bf16_p(mode):
+    # seqlen 256: every causal dK / dV step is a band step (NOTE [MXFP8 hd256 band dV]), so dV is
+    # BF16 P~ against BF16 dO / L and is exact up to that rounding; e4m3 P gives ~0.03 here
+    q, k, v, do = inputs(1, 256, 2, seed=7)
+    grads, (out, _, stats, qh, kh, vh) = eager_backward(q, k, v, do, True, mode)
+    dv_ref = mirrored_reference(qh, kh, vh, v, out, do, stats, mode, True)[2]
+    assert rel(grads[2], dv_ref) < 5e-3
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -204,10 +221,23 @@ def test_fused_prep_matches_eager(shape, causal):
     assert torch.equal(fwd.k_hat, k_hat)
     for name in MxHd256BwdOperands._fields:
         a, b = getattr(fused, name), getattr(eager, name)
+        assert (a is None) == (b is None), name
+        if a is None:
+            continue
         if name == "dpsum":
             torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
         else:
             assert torch.equal(a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)), name
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_band_dout_required_exactly_when_causal(causal):
+    q, k, v, do = inputs(1, 256, 2, seed=8)
+    out, lse, stats, (qh, kh, vh), (q8, sfq, k8, sfk, _, _) = eager_forward(q, k, v, causal, "exact")
+    ops, k_hat = eager_operands(q8, sfq, k8, sfk, qh, kh, vh, v, out, do, stats, "exact", causal)
+    ops = ops._replace(do_band=None if causal else do)
+    with pytest.raises(ValueError, match="do_band"):
+        _flash_attn_bwd(k_hat, k_hat, k_hat, out, do, lse, causal=causal, mx_hd256=ops)
 
 
 @pytest.mark.parametrize("causal", [False, True])

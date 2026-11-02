@@ -10,7 +10,8 @@ hd256 backward] in sm100_hd256_2cta_fmha_backward.py).
     V -> E4M3 + UE8M0 per 32 keys (the forward's PV), and V-hat requantized along head_dim (dP's B operand);
          causal adds the band residual R = MX(V - rq(V-hat)) as keys [s, 2s) of the same buffers.
   backward (`backward_operands`), one pass over dO: dO'' = 2^8 dO / L along head_dim and along queries,
-    D'' = rowsum(dequant(dO''_d) * O), and the two LSE slots M - off + 8 and M - off.
+    D'' = rowsum(dequant(dO''_d) * O), and the two LSE slots M - off + 8 and M - off; causal adds
+    dO / L in BF16 (the band's dV operand).
 For finite inputs, payloads and scales are byte-identical to blockscaled_utils' eager quantizers (same ceil scale
 rule, exact power-of-two scaling, round-to-nearest-even E4M3, no FMA contraction where the eager path rounds twice);
 D'' is an FP32 sum in a different order.
@@ -185,14 +186,16 @@ def _dout_kernel(
     dpsum_ptr,
     lse_ptr,
     lse_dkdv_ptr,
+    dob_ptr,
     S,
     H,
     c_log2,
     off,
+    BAND: tl.constexpr,
 ):
     """One (b, 32-query group, h) tile: dO'' = (256 / L) dO along head_dim and along queries (E4M3 + UE8M0),
     D'' = rowsum(dequant(dO''_d) O), the LSE slots M - off + 8 / M - off with M = m c; per-row outputs
-    (B, H, S)."""
+    (B, H, S). BAND (causal): also dO'' / 256 = dO / L in BF16."""
     pid_g, pid_bh = tl.program_id(0), tl.program_id(1)
     b, h = pid_bh // H, pid_bh % H
     t = pid_g * 32 + tl.arange(0, 32)
@@ -203,6 +206,8 @@ def _dout_kernel(
     lq = tl.load(stats_ptr + srow * 2 + 1)
     mult = tl.math.div_rn(tl.full([32], 256.0, tl.float32), lq)
     x = tl.load(do_ptr + offs).to(tl.float32) * mult[:, None]
+    if BAND:
+        tl.store(dob_ptr + offs, (x * (1.0 / 256.0)).to(tl.bfloat16))
     q, e = _quant_d(x, 32)
     tl.store(do8_ptr + offs, q)
     _store_sf_d(e, pid_bh, t, S, sfdo_il_ptr, sfdo_dk_ptr, 1)
@@ -354,6 +359,8 @@ def backward_operands(
     sfdo_dk = _bytes(b * h * triton.cdiv(s, 128) * 1024, dev, s, 128)
     sfdot = _bytes(_il_t_bytes(b, h, s), dev, s, 128)
     dpsum, lse, lse_dkdv = (torch.empty(b, h, s, dtype=torch.float32, device=dev) for _ in range(3))
+    band = fwd.v.shape[1] == 2 * s  # causal: the V copy carries the band residual
+    dob = torch.empty_like(dout) if band else None
     # c = softmax_scale * log2(e) rounded to FP32, as BlockScales.stats_out defines M = m c
     c = float(torch.tensor(softmax_scale * math.log2(math.e), dtype=torch.float32))
     _dout_kernel[(s // 32, b * h)](
@@ -368,10 +375,12 @@ def backward_operands(
         dpsum,
         lse,
         lse_dkdv,
+        dob,
         s,
         h,
         c,
         MAX_OFFSET[pv_softmax],
+        BAND=band,
         num_warps=4,
     )
     return MxHd256BwdOperands(
@@ -384,4 +393,5 @@ def backward_operands(
         lse_log2=lse,
         lse_log2_dkdv=lse_dkdv,
         dpsum=dpsum,
+        do_band=dob,
     )

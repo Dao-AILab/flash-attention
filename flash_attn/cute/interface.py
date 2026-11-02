@@ -494,8 +494,9 @@ class MxHd256BwdOperands(NamedTuple):
 
     E4M3 copies are (batch, seqlen, nheads, 256). Scale buffers are flat UE8M0: `sf<x>` in the
     interleave_sf layout, `sf<x>_dkdv` in the dK / dV kernel's pair tiles. Causal: v / sfv /
-    sfv_dkdv hold V-hat (keys [0, s)) followed by the band residual R (keys [s, 2s)). The (batch,
-    nheads, seqlen) FP32 rows: lse_log2 = M - offset + 8 (dQ kernel), lse_log2_dkdv = M - offset, and
+    sfv_dkdv hold V-hat (keys [0, s)) followed by the band residual R (keys [s, 2s)), and do_band
+    holds dO / L in BF16 (the band's dV operand); non-causal leaves do_band None. The (batch, nheads,
+    seqlen) FP32 rows: lse_log2 = M - offset + 8 (dQ kernel), lse_log2_dkdv = M - offset, and
     dpsum = D''.
     """
 
@@ -518,6 +519,7 @@ class MxHd256BwdOperands(NamedTuple):
     lse_log2: torch.Tensor
     lse_log2_dkdv: torch.Tensor
     dpsum: torch.Tensor
+    do_band: torch.Tensor | None = None  # causal: dO / L in BF16
 
 
 def _validate_mx_hd256_operands(mx: MxHd256BwdOperands, k: torch.Tensor, causal: bool) -> None:
@@ -556,6 +558,17 @@ def _validate_mx_hd256_operands(mx: MxHd256BwdOperands, k: torch.Tensor, causal:
                 f"{'numel' if isinstance(want, int) else 'shape'} {want} on {k.device}; got "
                 f"{t.dtype} {tuple(t.shape)}"
             )
+    t = mx.do_band
+    if (t is not None) != causal:
+        raise ValueError("mx_hd256.do_band must be set exactly when causal")
+    if causal and (
+        t.dtype != torch.bfloat16 or tuple(t.shape) != payload or not t.is_contiguous()
+        or t.device != k.device
+    ):
+        raise ValueError(
+            f"mx_hd256.do_band must be a contiguous torch.bfloat16 tensor of shape {payload} on "
+            f"{k.device}; got {t.dtype} {tuple(t.shape)}"
+        )
 
 
 def _check_shared_kv_scales(scales) -> None:
@@ -2635,6 +2648,8 @@ def _flash_attn_bwd(
             return buf
 
         lse_log2, dpsum = as_scratch(mx_hd256.lse_log2), as_scratch(mx_hd256.dpsum)
+        if causal:  # the BF16 dO slot, which the MXFP8 kernels read only for the band's dV
+            dout = mx_hd256.do_band
         hd256_mx_args = (
             as_scratch(mx_hd256.lse_log2_dkdv),
             *(getattr(mx_hd256, name) for name in _HD256_MX_KERNEL_FIELDS[1:]),

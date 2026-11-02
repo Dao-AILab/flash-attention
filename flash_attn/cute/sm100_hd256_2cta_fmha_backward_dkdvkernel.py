@@ -121,6 +121,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # MXFP8 on sm_107: the dS^T descale fused into its E4M3 convert (cvt.rn.satfinite.scaled,
         # which sm_100a / sm_103a do not have)
         self.fused_scaled_cvt = mxfp8 and mxu.is_sm107()
+        # causal MXFP8: dV on the band as a BF16 MMA, NOTE [MXFP8 hd256 band dV]
+        self.band_dv = self.band_residual
         self.sched_warp_id = 10 if use_clc_scheduler else None
         # TODO: need check, not sure whether need to *2 if 2cta
         self.tile_shape_Q = cta_tiler[0]
@@ -273,8 +275,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         """Host function to launch CuTeDSL kernel.
 
         mxfp8: the *_mx operands of NOTE [MXFP8 hd256 backward] (E4M3 (b, s, h_k, h_r, d) copies and
-        raw UE8M0 scale buffers); the BF16 Q / K / V / dO only provide shapes. scaled_LSE is the
-        dK / dV kernel's LSE slot (M - offset)."""
+        raw UE8M0 scale buffers); the BF16 Q / K / V / dO only provide shapes, except that causal
+        dO holds dO / L (NOTE [MXFP8 hd256 band dV]). scaled_LSE is the dK / dV kernel's LSE slot
+        (M - offset)."""
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
         self.use_varlen_scheduler = cumulative_s_k is not None and max_seqlen_k is None
         # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D).
@@ -407,6 +410,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             ),
         )
 
+        # band_dv: the BF16 dO slot carries dO / L (NOTE [MXFP8 hd256 band dV])
+        dOT_bf16 = dOT
         mSFQT = mSFdOT = None
         if cutlass.const_expr(self.mxfp8):
             assert not varlen and seqused_q is None and seqused_k is None
@@ -899,6 +904,48 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 cute.size_in_bytes(mxu.MX_DTYPE, dOT_smem_layout) * atom_thr_size + sf_bytes
             )
 
+        PdO_band_tiled_mma = tma_atom_dOT_band = tma_tensor_dOT_band = None
+        P_band_smem_layout = dOT_band_smem_layout = None
+        if cutlass.const_expr(self.band_dv):
+            # NOTE [MXFP8 hd256 band dV]: the BF16 dV MMA and the TMA of its dO / L B operand
+            band_dtype = dOT_bf16.element_type
+            self.dOT_band_tiler = (
+                self.PdO_mma_tiler[0],
+                self.PdO_mma_tiler[1],
+                self.PdO_mma_tiler[2] // 2,
+            )
+            PdO_band_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+                band_dtype,
+                band_dtype,
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.MN,
+                self.acc_dtype,
+                cta_group,
+                self.PdO_mma_tiler[:2],
+                PT_source,
+            )
+            P_band_smem_layout = sm100_utils.make_smem_layout_a(
+                PdO_band_tiled_mma, self.PdO_mma_tiler, band_dtype, self.compute_mma_P_stage
+            )
+            dOT_band_smem_layout = sm100_utils.make_smem_layout_b(
+                PdO_band_tiled_mma, self.dOT_band_tiler, band_dtype, self.load_mma_dO_stage
+            )
+            assert cute.cosize(P_band_smem_layout) <= P_smem_cosize
+            assert cute.cosize(dOT_band_smem_layout) <= dOT_smem_cosize
+            dOT_band_one = cute.select(dOT_band_smem_layout, mode=[0, 1, 2])
+            tma_atom_dOT_band, tma_tensor_dOT_band = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                dOT_bf16,
+                dOT_band_one,
+                self.dOT_band_tiler,
+                PdO_band_tiled_mma,
+                self.cluster_layout_vmnk.shape,
+            )
+            assert (
+                cute.size_in_bytes(band_dtype, dOT_band_one) * atom_thr_size
+                == cute.size_in_bytes(mxu.MX_DTYPE, dOT_smem_layout) * atom_thr_size
+            )
+
         # Variant 3a epilogue: TMA store atoms (S2G) for dK / dV.
         # Each compute warp group owns half the hd_v output via split_wg, so
         # the per-WG epi tile is (cta_tiler[1], cta_tiler[2] / num_compute_wgs).
@@ -1154,6 +1201,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tSFA_sdp_layout,
             tSFB_sdp_layout,
             sSFV_sdp_layout,
+            PdO_band_tiled_mma,
+            tma_atom_dOT_band,
+            tma_tensor_dOT_band,
+            P_band_smem_layout,
+            dOT_band_smem_layout,
         ).launch(
             grid=bwd_grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1241,6 +1293,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         tSFA_sdp_layout: cute.Layout | None = None,
         tSFB_sdp_layout: cute.Layout | None = None,
         sSFV_sdp_layout: cute.Layout | None = None,
+        # band_dv
+        PdO_band_tiled_mma: cute.TiledMma | None = None,
+        tma_atom_dOT_band: cute.CopyAtom | None = None,
+        dOT_band_in: cute.Tensor | None = None,
+        P_band_smem_layout: cute.ComposedLayout | None = None,
+        dOT_band_smem_layout: cute.ComposedLayout | None = None,
     ):
         """Core CuTeDSL backward kernel."""
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -1262,6 +1320,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             if cutlass.const_expr(self.mxfp8):
                 for atom in (tma_atom_SFK, tma_atom_SFV, tma_atom_SFQ, tma_atom_SFdO):
                     cpasync.prefetch_descriptor(atom)
+            if cutlass.const_expr(self.band_dv):
+                cpasync.prefetch_descriptor(tma_atom_dOT_band)
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -1561,6 +1621,31 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         tdVtdV = PdO_tiled_mma.make_fragment_C(tdVtdV_shape)
         # tdVtdV shape : (MMA, MMA_M, MMA_N)
         tdVtdV = cute.make_tensor(tmem_ptr + self.tmem_dV_offset, tdVtdV.layout)
+
+        # band_dv: BF16 views of sP and the dO^T ring, and the BF16 MMA's fragments over the same dV
+        # accumulator
+        sP_band = None
+        band_mma = band_load = None
+        if cutlass.const_expr(self.band_dv):
+            sP_band = storage.sP.get_tensor(
+                P_band_smem_layout.outer, swizzle=P_band_smem_layout.inner, dtype=cutlass.BFloat16
+            )
+            sdOT_band = storage.sdOT.get_tensor(
+                dOT_band_smem_layout.outer,
+                swizzle=dOT_band_smem_layout.inner,
+                dtype=cutlass.BFloat16,
+            )
+            tdVtdV_band = PdO_band_tiled_mma.make_fragment_C(
+                PdO_band_tiled_mma.partition_shape_C(cute.select(self.PdO_mma_tiler, mode=[0, 1]))
+            )
+            tdVtdV_band = cute.make_tensor(tmem_ptr + self.tmem_dV_offset, tdVtdV_band.layout)
+            band_mma = (
+                PdO_band_tiled_mma,
+                tdVtdV_band,
+                PdO_band_tiled_mma.make_fragment_A(sP_band),
+                PdO_band_tiled_mma.make_fragment_B(sdOT_band),
+            )
+            band_load = (tma_atom_dOT_band, dOT_band_in, sdOT_band, PdO_band_tiled_mma)
 
         # get the current batch problem shape
 
@@ -2135,6 +2220,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         tSF_layouts=(tSFA_layout, tSFB_layout),
                         sSF_sdp=(sSFK, sSFQ, sSFV, sSFdO),
                         tSF_sdp_layouts=(tSFA_sdp_layout, tSFB_sdp_layout),
+                        band=band_mma,
                     )
                 else:
                     self.mma_2cta(
@@ -2220,6 +2306,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     sdK_epi_layout,
                     sdV_epi_layout,
                     sSFdS=sSFdS,
+                    sP_band=sP_band,
                 )
 
                 cute.arch.barrier(
@@ -2229,6 +2316,25 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             else:
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                if cutlass.const_expr(self.band_dv):
+                    if warp_idx == self.empty_warp_id:
+                        self.load_dOT(
+                            dOT_in,
+                            sdOT,
+                            PdO_tiled_mma,
+                            tma_atom_dOT,
+                            band_load,
+                            blk_offset,
+                            iter_count,
+                            iter_start,
+                            load_mma_dOT_producer,
+                            blk_coord_k,
+                            blk_coord_h_k,
+                            blk_coord_b,
+                            tma_atom_SFdOT,
+                            mSFdOT,
+                            sSFdOT,
+                        )
 
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
@@ -2595,15 +2701,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 sSum_OdO_for_copy[None, sSum_OdO_idx, sum_odo_handle.index].fill(0.0)
         sum_odo_handle.commit()
 
-        dot_handle = load_mma_dOT_producer.acquire_and_advance()
-        cute.copy(
-            tma_atom_dOT,
-            tdOTgdOT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
-            tdOTsdOT[None, dot_handle.index],
-            tma_bar_ptr=dot_handle.barrier,
-        )
-        if cutlass.const_expr(self.mxfp8):
-            load_SFdOT(iter_index, dot_handle.index, tma_bar_ptr=dot_handle.barrier)
+        if cutlass.const_expr(not self.band_dv):
+            # (band_dv: the dO^T loads run on their own warp, load_dOT)
+            dot_handle = load_mma_dOT_producer.acquire_and_advance()
+            cute.copy(
+                tma_atom_dOT,
+                tdOTgdOT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
+                tdOTsdOT[None, dot_handle.index],
+                tma_bar_ptr=dot_handle.barrier,
+            )
+            if cutlass.const_expr(self.mxfp8):
+                load_SFdOT(iter_index, dot_handle.index, tma_bar_ptr=dot_handle.barrier)
 
         qt_handle = load_mma_QT_producer.acquire_and_advance()
         cute.copy(
@@ -2678,15 +2786,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     sSum_OdO_for_copy[None, sSum_OdO_idx, sum_odo_handle.index].fill(0.0)
             sum_odo_handle.commit()
 
-            dot_handle = load_mma_dOT_producer.acquire_and_advance()
-            cute.copy(
-                tma_atom_dOT,
-                tdOTgdOT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
-                tdOTsdOT[None, dot_handle.index],
-                tma_bar_ptr=dot_handle.barrier,
-            )
-            if cutlass.const_expr(self.mxfp8):
-                load_SFdOT(iter_index, dot_handle.index, tma_bar_ptr=dot_handle.barrier)
+            if cutlass.const_expr(not self.band_dv):
+                dot_handle = load_mma_dOT_producer.acquire_and_advance()
+                cute.copy(
+                    tma_atom_dOT,
+                    tdOTgdOT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
+                    tdOTsdOT[None, dot_handle.index],
+                    tma_bar_ptr=dot_handle.barrier,
+                )
+                if cutlass.const_expr(self.mxfp8):
+                    load_SFdOT(iter_index, dot_handle.index, tma_bar_ptr=dot_handle.barrier)
 
             qt_handle = load_mma_QT_producer.acquire_and_advance()
             cute.copy(
@@ -2707,7 +2816,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             load_mma_Q_producer.tail()
             load_compute_LSE_producer.tail()
             load_mma_dO_producer.tail()
-            load_mma_dOT_producer.tail()
+            if cutlass.const_expr(not self.band_dv):
+                load_mma_dOT_producer.tail()
             load_compute_sum_OdO_producer.tail()
             load_mma_QT_producer.tail()
 
@@ -2721,6 +2831,132 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             load_compute_sum_OdO_producer,
             load_mma_QT_producer,
         )
+
+    # NOTE [MXFP8 hd256 band dV]
+    # The backward differentiates what the forward computed. On the causal band (keys
+    # [256 floor(i / 256), i], NOTE [MXFP8 hd256 backward]) the forward's PV used BF16 P, not
+    # e4m3(P), so dV there is P~^T (dO / L) with P~ and dO / L in BF16 (MxHd256BwdOperands.do_band,
+    # passed in the BF16 dO slot): a BF16 SS MMA (kind::f16, M=128 pair, A K-major, B MN-major) into
+    # the same dV accumulator, whose layout equals the block-scaled one. The band is this kernel's
+    # first two query tiles, the steps that also run the dP residual. The 2^8 that the MXFP8 path
+    # removes with its P^T scale is folded into dO / L, so P~ goes to sP (BF16-sized storage) as is.
+    # The BF16 dO^T tile (128 queries x 128 channels per CTA, 32 KB) is two 64-query halves, one
+    # 16 KB E4M3 dO^T ring stage each; each half's TMA also loads that stage's (unused) dO^T scales,
+    # so the stage's transaction count is unchanged. With the band, every dO^T load runs on the
+    # otherwise idle warp (load_dOT): the load warp issues in order, and a band step holds both ring
+    # stages until its dV retires, which would delay the next Q / dO loads behind it. No SMEM or
+    # TMEM is added.
+    @cute.jit
+    def load_dOT(
+        self,
+        dOT_in: cute.Tensor,
+        sdOT: cute.Tensor,
+        PdO_tiled_mma: cute.TiledMma,
+        tma_atom_dOT: cute.CopyAtom,
+        band_load: tuple,
+        blk_offset: cute.Shape,
+        iter_count: Int32,
+        iter_start: Int32,
+        load_mma_dOT_producer,
+        blk_coord_k: Int32,
+        blk_coord_h_k: Int32,
+        blk_coord_b: Int32,
+        tma_atom_SFdOT: cute.CopyAtom,
+        mSFdOT: cute.Tensor,
+        sSFdOT: cute.Tensor,
+    ):
+        """band_dv: the dO^T ring's producer on the otherwise idle warp, NOTE [MXFP8 hd256 band dV].
+        The band's two query tiles load BF16 dO / L as two 64-query halves, one ring stage each,
+        each with that stage's (unused) dO^T scales; the other tiles load the E4M3 dO^T stage."""
+        blk_coord_h = (Int32(0), blk_coord_h_k)
+        mma_tile_coord_v = cute.arch.block_idx_in_cluster() % cute.size(PdO_tiled_mma.thr_id.shape)
+        cta_layout_vmnk = cute.tiled_divide(
+            cute.make_layout(self.cluster_shape_mnk), (PdO_tiled_mma.thr_id,)
+        )
+        cta_in_cluster_coord_vmnk = cta_layout_vmnk.get_flat_coord(cute.arch.block_idx_in_cluster())
+        tma_atom_band, dOT_band_in, sdOT_band, PdO_band_tiled_mma = band_load
+
+        part_layout = cute.make_layout(cute.size(cta_layout_vmnk, mode=[1]))
+        dOT = cute.domain_offset(cute.select(blk_offset, mode=[2, 0, 3]), dOT_in)
+        gdOT = cute.local_tile(
+            dOT, cute.select(self.PdO_mma_tiler, mode=[1, 2]), (None, None, None)
+        )
+        tdOTsdOT, tdOTgdOT_mkl = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_dOT,
+            cta_in_cluster_coord_vmnk[1],
+            part_layout,
+            cute.group_modes(sdOT, 0, 3),
+            cute.group_modes(PdO_tiled_mma.get_slice(mma_tile_coord_v).partition_B(gdOT), 0, 3),
+        )
+        dOT_band = cute.domain_offset(cute.select(blk_offset, mode=[2, 0, 3]), dOT_band_in)
+        gdOT_band = cute.local_tile(
+            dOT_band, cute.select(self.dOT_band_tiler, mode=[1, 2]), (None, None, None)
+        )
+        tbsb, tbgb_mkl = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_band,
+            cta_in_cluster_coord_vmnk[1],
+            part_layout,
+            cute.group_modes(sdOT_band, 0, 3),
+            cute.group_modes(
+                PdO_band_tiled_mma.get_slice(mma_tile_coord_v).partition_B(gdOT_band), 0, 3
+            ),
+        )
+
+        # the dO^T scales (as in load)
+        tiled_mma_sfb = mxu.make_mx_tiled_mma(
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
+            tcgen05.CtaGroup.ONE,
+            self.mma_tiler_sfb[:2],
+            k32=True,
+        )
+        cluster_layout_sfb_vmnk = cute.tiled_divide(
+            cute.make_layout(self.cluster_shape_mnk), (tiled_mma_sfb.thr_id.shape,)
+        )
+        coord_sfb = cluster_layout_sfb_vmnk.get_flat_coord(cute.arch.block_idx_in_cluster())
+        gSF = cute.local_tile(
+            mSFdOT[None, None, (blk_coord_h, blk_coord_b)],
+            cute.select(self.mma_tiler_sfb, mode=[1, 2]),
+            (0, None),
+        )
+        load_SFdOT, _, _ = fa_copy_utils.tma_get_copy_fn(
+            tma_atom_SFdOT,
+            cta_coord=coord_sfb[1],
+            cta_layout=cute.make_layout(
+                cute.slice_(cluster_layout_sfb_vmnk, (0, None, 0, 0)).shape
+            ),
+            src_tensor=tiled_mma_sfb.get_slice(0).partition_B(gSF),
+            dst_tensor=sSFdOT,
+            filter_zeros=True,
+            mcast_mask=cpasync.create_tma_multicast_mask(
+                cluster_layout_sfb_vmnk, coord_sfb, mcast_mode=1
+            ),
+        )
+
+        iter_index = iter_start
+        while iter_count > 0:
+            if iter_index - iter_start < 2:
+                for half in cutlass.range_constexpr(2):
+                    dot_handle = load_mma_dOT_producer.acquire_and_advance()
+                    cute.copy(
+                        tma_atom_band,
+                        tbgb_mkl[(None, 0, 2 * iter_index + half, (blk_coord_h, blk_coord_b))],
+                        tbsb[None, dot_handle.index],
+                        tma_bar_ptr=dot_handle.barrier,
+                    )
+                    load_SFdOT(iter_index, dot_handle.index, tma_bar_ptr=dot_handle.barrier)
+            else:
+                dot_handle = load_mma_dOT_producer.acquire_and_advance()
+                cute.copy(
+                    tma_atom_dOT,
+                    tdOTgdOT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
+                    tdOTsdOT[None, dot_handle.index],
+                    tma_bar_ptr=dot_handle.barrier,
+                )
+                load_SFdOT(iter_index, dot_handle.index, tma_bar_ptr=dot_handle.barrier)
+            iter_count -= 1
+            iter_index += 1
+        load_mma_dOT_producer.tail()
 
     @cute.jit
     def mma_2cta(
@@ -3006,9 +3242,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         tSF_layouts: tuple,
         sSF_sdp: tuple,
         tSF_sdp_layouts: tuple,
+        band: tuple | None = None,
     ):
         """MXFP8 MMA warp, NOTE [MXFP8 hd256 dK/dV schedule]: S(0), dP(0), then S(j+1), dV(j),
-        dP(j+1), dK(j) per step, and dV(n-1), dK(n-1) last."""
+        dP(j+1), dK(j) per step, and dV(n-1), dK(n-1) last. band (band_dv): the BF16 MMA, its dV
+        accumulator, and its P / dO^T fragments for dV(0) and dV(1), NOTE [MXFP8 hd256 band dV]."""
+        band_mma = tdVtdV_band = tdVrP_band = tdVrdOT_band = None
+        if cutlass.const_expr(self.band_dv):
+            band_mma, tdVtdV_band, tdVrP_band, tdVrdOT_band = band
         # S^T / dP^T: K / V scales are copied once (constant per CTA), Q / dO per iteration;
         # the Q / dO copies broadcast two chunks to lane quadrants 0/1 and 2/3
         sSFK, sSFQ, sSFV, sSFdO = sSF_sdp
@@ -3099,6 +3340,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dp_handle.commit()
             do_handle.release()
             PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            if cutlass.const_expr(self.band_dv):
+                band_mma.set(tcgen05.Field.ACCUMULATE, False)
 
         dSQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
         iter_count -= 1
@@ -3123,21 +3366,60 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 s_handle.commit()
 
                 # dV(j)
-                p_handle = compute_mma_P_consumer.wait_and_advance()
-                dot_handle = load_mma_dOT_consumer.wait_and_advance()
-                self.copy_sf(sf_dv, dot_handle.index)
-                for k_block in cutlass.range(0, cute.size(tdVrP, mode=[2]), unroll_full=True):
-                    self.set_sf(PdO_tiled_mma, sf_dv, k_block)
-                    cute.gemm(
-                        PdO_tiled_mma,
-                        tdVtdV,
-                        tdVrP[None, None, k_block, 0],
-                        tdVrdOT[None, None, k_block, dot_handle.index],
-                        tdVtdV,
-                    )
-                    PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                p_handle.release()
-                dot_handle.release()
+                if cutlass.const_expr(self.band_dv):
+                    # NOTE [MXFP8 hd256 band dV]: dV(0), dV(1) on BF16 P / dO / L
+                    if next_it <= 2:
+                        p_handle = compute_mma_P_consumer.wait_and_advance()
+                        for half in cutlass.range_constexpr(2):
+                            dot_handle = load_mma_dOT_consumer.wait_and_advance()
+                            n_kb = cute.size(tdVrdOT_band, mode=[2])
+                            for k_block in cutlass.range(0, n_kb, unroll_full=True):
+                                cute.gemm(
+                                    band_mma,
+                                    tdVtdV_band,
+                                    tdVrP_band[None, None, half * n_kb + k_block, 0],
+                                    tdVrdOT_band[None, None, k_block, dot_handle.index],
+                                    tdVtdV_band,
+                                )
+                                band_mma.set(tcgen05.Field.ACCUMULATE, True)
+                            dot_handle.release()
+                        p_handle.release()
+                        PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    else:
+                        p_handle = compute_mma_P_consumer.wait_and_advance()
+                        dot_handle = load_mma_dOT_consumer.wait_and_advance()
+                        self.copy_sf(sf_dv, dot_handle.index)
+                        for k_block in cutlass.range(
+                            0, cute.size(tdVrP, mode=[2]), unroll_full=True
+                        ):
+                            self.set_sf(PdO_tiled_mma, sf_dv, k_block)
+                            cute.gemm(
+                                PdO_tiled_mma,
+                                tdVtdV,
+                                tdVrP[None, None, k_block, 0],
+                                tdVrdOT[None, None, k_block, dot_handle.index],
+                                tdVtdV,
+                            )
+                            PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        p_handle.release()
+                        dot_handle.release()
+                        band_mma.set(tcgen05.Field.ACCUMULATE, True)
+                else:
+                    p_handle = compute_mma_P_consumer.wait_and_advance()
+                    dot_handle = load_mma_dOT_consumer.wait_and_advance()
+                    self.copy_sf(sf_dv, dot_handle.index)
+                    for k_block in cutlass.range(0, cute.size(tdVrP, mode=[2]), unroll_full=True):
+                        self.set_sf(PdO_tiled_mma, sf_dv, k_block)
+                        cute.gemm(
+                            PdO_tiled_mma,
+                            tdVtdV,
+                            tdVrP[None, None, k_block, 0],
+                            tdVrdOT[None, None, k_block, dot_handle.index],
+                            tdVtdV,
+                        )
+                        PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    p_handle.release()
+                    dot_handle.release()
 
                 # dP(j+1): the compute warps released dP^T right after their dP^T(j) load
                 dp_handle = mma_compute_dP_producer.acquire_and_advance()
@@ -3183,21 +3465,58 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         if is_leader_cta:
             # dV(n-1), then dV is complete (first dKdV commit)
-            p_handle = compute_mma_P_consumer.wait_and_advance()
-            dot_handle = load_mma_dOT_consumer.wait_and_advance()
-            self.copy_sf(sf_dv, dot_handle.index)
-            for k_block in cutlass.range(0, cute.size(tdVrP, mode=[2]), unroll_full=True):
-                self.set_sf(PdO_tiled_mma, sf_dv, k_block)
-                cute.gemm(
-                    PdO_tiled_mma,
-                    tdVtdV,
-                    tdVrP[None, None, k_block, 0],
-                    tdVrdOT[None, None, k_block, dot_handle.index],
-                    tdVtdV,
-                )
-                PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-            p_handle.release()
-            dot_handle.release()
+            if cutlass.const_expr(self.band_dv):
+                # NOTE [MXFP8 hd256 band dV]: dV(0), dV(1) on BF16 P / dO / L
+                if next_it <= 2:
+                    p_handle = compute_mma_P_consumer.wait_and_advance()
+                    for half in cutlass.range_constexpr(2):
+                        dot_handle = load_mma_dOT_consumer.wait_and_advance()
+                        n_kb = cute.size(tdVrdOT_band, mode=[2])
+                        for k_block in cutlass.range(0, n_kb, unroll_full=True):
+                            cute.gemm(
+                                band_mma,
+                                tdVtdV_band,
+                                tdVrP_band[None, None, half * n_kb + k_block, 0],
+                                tdVrdOT_band[None, None, k_block, dot_handle.index],
+                                tdVtdV_band,
+                            )
+                            band_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        dot_handle.release()
+                    p_handle.release()
+                    PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                else:
+                    p_handle = compute_mma_P_consumer.wait_and_advance()
+                    dot_handle = load_mma_dOT_consumer.wait_and_advance()
+                    self.copy_sf(sf_dv, dot_handle.index)
+                    for k_block in cutlass.range(0, cute.size(tdVrP, mode=[2]), unroll_full=True):
+                        self.set_sf(PdO_tiled_mma, sf_dv, k_block)
+                        cute.gemm(
+                            PdO_tiled_mma,
+                            tdVtdV,
+                            tdVrP[None, None, k_block, 0],
+                            tdVrdOT[None, None, k_block, dot_handle.index],
+                            tdVtdV,
+                        )
+                        PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    p_handle.release()
+                    dot_handle.release()
+                    band_mma.set(tcgen05.Field.ACCUMULATE, True)
+            else:
+                p_handle = compute_mma_P_consumer.wait_and_advance()
+                dot_handle = load_mma_dOT_consumer.wait_and_advance()
+                self.copy_sf(sf_dv, dot_handle.index)
+                for k_block in cutlass.range(0, cute.size(tdVrP, mode=[2]), unroll_full=True):
+                    self.set_sf(PdO_tiled_mma, sf_dv, k_block)
+                    cute.gemm(
+                        PdO_tiled_mma,
+                        tdVtdV,
+                        tdVrP[None, None, k_block, 0],
+                        tdVrdOT[None, None, k_block, dot_handle.index],
+                        tdVtdV,
+                    )
+                    PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                p_handle.release()
+                dot_handle.release()
             dkdv_handle = mma_compute_dKdV_producer.acquire_and_advance()
             dkdv_handle.commit()
             load_mma_K_releaser.release()
@@ -3443,6 +3762,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sdK_epi_layout: cute.ComposedLayout,
         sdV_epi_layout: cute.ComposedLayout,
         sSFdS: cute.Tensor | None = None,
+        sP_band: cute.Tensor | None = None,
     ):
         """CuTeDSL kernel for recomputing softmax and producing dk and dv."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -3503,6 +3823,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 cute.recast_ptr(sSFdS.iterator, dtype=cutlass.Uint8), cute.make_layout(512)
             )
             sf_idx = 16 * (mx_key % 32) + 4 * (mx_key // 32) + mx_group
+            sP_band_kq = None
+            if cutlass.const_expr(self.band_dv):
+                sP_band_kq = self.band_kq_view(sP_band)
 
         tdVcST = PdO_tiled_mma.get_slice(0).partition_A(cST)
 
@@ -3616,9 +3939,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 tTR_rPT = self.quantize(tTR_rST, mxu.MX_DTYPE)
                 # (the sP stage: free once dV(j-1) has retired)
                 p_handle = compute_mma_P_producer.acquire_and_advance()
-                cute.autovec_copy(
-                    self.flat32(tTR_rPT), sP_kq[mx_key, (None, mx_group), p_handle.index]
-                )
+                if cutlass.const_expr(self.band_dv):
+                    # NOTE [MXFP8 hd256 band dV]: BF16 P~ on the band (2^8 folded into dO / L)
+                    if iter_index - iter_start < 2:
+                        tTR_rPb = self.quantize(tTR_rST, cutlass.BFloat16)
+                        cute.autovec_copy(
+                            self.flat32(tTR_rPb),
+                            sP_band_kq[mx_key, (None, mx_group), p_handle.index],
+                        )
+                    else:
+                        cute.autovec_copy(
+                            self.flat32(tTR_rPT), sP_kq[mx_key, (None, mx_group), p_handle.index]
+                        )
+                else:
+                    cute.autovec_copy(
+                        self.flat32(tTR_rPT), sP_kq[mx_key, (None, mx_group), p_handle.index]
+                    )
             else:
                 # convert fp32 P to fp16 P which will be used in the PdO
                 tTR_rPT = self.quantize(tTR_rST, dV.element_type)  # tTR_rST is ST in fp32 in RF.
@@ -3802,6 +4138,21 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cute.make_layout(
                 (64, (32, (k_inst // 32, n_kb)), cute.size(s, mode=[3])),
                 stride=(1, (64, (64 * 32, 64 * k_inst)), 64 * k_inst * n_kb),
+            ),
+        )
+
+    @cute.jit
+    def band_kq_view(self, s: cute.Tensor) -> cute.Tensor:
+        """band_dv: (key, (32, query // 32), stage) view of the BF16 K-major P^T tile whose stage
+        layout is ((64 keys, 16 queries), 1, queries // 16)."""
+        k_inst = cute.size(s.shape[0], mode=[1])
+        n_kb = cute.size(s, mode=[2])
+        per = 32 // k_inst
+        return cute.composition(
+            s,
+            cute.make_layout(
+                (64, ((k_inst, per), n_kb // per), cute.size(s, mode=[3])),
+                stride=(1, ((64, 64 * k_inst), 64 * k_inst * per), 64 * k_inst * n_kb),
             ),
         )
 
