@@ -118,6 +118,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # waits for the dQ kernel before it exits, so this kernel's completion still implies dQ's
         self.pdl_secondary = mxfp8
         assert not (mxfp8 and use_clc_scheduler)
+        # MXFP8 on sm_107: the dS^T descale fused into its E4M3 convert (cvt.rn.satfinite.scaled,
+        # which sm_100a / sm_103a do not have)
+        self.fused_scaled_cvt = mxfp8 and mxu.is_sm107()
         self.sched_warp_id = 10 if use_clc_scheduler else None
         # TODO: need check, not sure whether need to *2 if 2cta
         self.tile_shape_Q = cta_tiler[0]
@@ -2098,40 +2101,72 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             elif warp_idx == self.mma_warp_id:
                 cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
 
-                self.mma_2cta(
-                    KQ_tiled_mma,
-                    VdO_tiled_mma,
-                    PdO_tiled_mma,
-                    dSQ_tiled_mma,
-                    tSTtST,
-                    tSTrQ,
-                    tSTrK,
-                    tdPTtdPT,
-                    tdPTrV,
-                    tdPTrdO,
-                    tdVtdV,
-                    tdVrP,
-                    tdVrdOT,
-                    tdKrdST,
-                    tdKtdK,
-                    tdKrQT,
-                    iter_count,
-                    load_mma_Q_consumer,
-                    load_mma_K_consumer,
-                    load_mma_V_consumer,
-                    mma_compute_S_producer,
-                    load_mma_dO_consumer,
-                    mma_compute_dP_producer,
-                    load_mma_dOT_consumer,
-                    compute_mma_P_consumer,
-                    compute_mma_dS_consumer,
-                    load_mma_QT_consumer,
-                    mma_compute_dKdV_producer,
-                    sSF=(sSFP, sSFdOT, sSFdS, sSFQT),
-                    tSF_layouts=(tSFA_layout, tSFB_layout),
-                    sSF_sdp=(sSFK, sSFQ, sSFV, sSFdO),
-                    tSF_sdp_layouts=(tSFA_sdp_layout, tSFB_sdp_layout),
-                )
+                if cutlass.const_expr(self.mxfp8):
+                    self.mma_2cta_mxfp8(
+                        KQ_tiled_mma,
+                        VdO_tiled_mma,
+                        PdO_tiled_mma,
+                        dSQ_tiled_mma,
+                        tSTtST,
+                        tSTrQ,
+                        tSTrK,
+                        tdPTtdPT,
+                        tdPTrV,
+                        tdPTrdO,
+                        tdVtdV,
+                        tdVrP,
+                        tdVrdOT,
+                        tdKrdST,
+                        tdKtdK,
+                        tdKrQT,
+                        iter_count,
+                        load_mma_Q_consumer,
+                        load_mma_K_consumer,
+                        load_mma_V_consumer,
+                        mma_compute_S_producer,
+                        load_mma_dO_consumer,
+                        mma_compute_dP_producer,
+                        load_mma_dOT_consumer,
+                        compute_mma_P_consumer,
+                        compute_mma_dS_consumer,
+                        load_mma_QT_consumer,
+                        mma_compute_dKdV_producer,
+                        sSF=(sSFP, sSFdOT, sSFdS, sSFQT),
+                        tSF_layouts=(tSFA_layout, tSFB_layout),
+                        sSF_sdp=(sSFK, sSFQ, sSFV, sSFdO),
+                        tSF_sdp_layouts=(tSFA_sdp_layout, tSFB_sdp_layout),
+                    )
+                else:
+                    self.mma_2cta(
+                        KQ_tiled_mma,
+                        VdO_tiled_mma,
+                        PdO_tiled_mma,
+                        dSQ_tiled_mma,
+                        tSTtST,
+                        tSTrQ,
+                        tSTrK,
+                        tdPTtdPT,
+                        tdPTrV,
+                        tdPTrdO,
+                        tdVtdV,
+                        tdVrP,
+                        tdVrdOT,
+                        tdKrdST,
+                        tdKtdK,
+                        tdKrQT,
+                        iter_count,
+                        load_mma_Q_consumer,
+                        load_mma_K_consumer,
+                        load_mma_V_consumer,
+                        mma_compute_S_producer,
+                        load_mma_dO_consumer,
+                        mma_compute_dP_producer,
+                        load_mma_dOT_consumer,
+                        compute_mma_P_consumer,
+                        compute_mma_dS_consumer,
+                        load_mma_QT_consumer,
+                        mma_compute_dKdV_producer,
+                    )
 
             # ///////////////////////////////////////////////////////////////////////////////
             #  Compute
@@ -2718,56 +2753,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         compute_mma_dS_consumer,
         load_mma_QT_consumer,
         mma_compute_dKdV_producer,
-        sSF: tuple = (None, None, None, None),
-        tSF_layouts: tuple = (None, None),
-        sSF_sdp: tuple = (None, None, None, None),
-        tSF_sdp_layouts: tuple = (None, None),
     ):
-        """CuTeDSL kernel for mma pipeline."""
-        sf_s = sf_dp = None
-        if cutlass.const_expr(self.mxfp8):
-            # S^T / dP^T: K / V scales are copied once (constant per CTA), Q / dO per iteration;
-            # the Q / dO copies broadcast two chunks to lane quadrants 0/1 and 2/3
-            sSFK, sSFQ, sSFV, sSFdO = sSF_sdp
-            tSFA_sdp_layout, tSFB_sdp_layout = tSF_sdp_layouts
-            cta_group_sdp = tcgen05.CtaGroup.TWO
-            sf_s = (
-                mxu.make_sf_s2t(sSFK, tSFA_sdp_layout, self.tmem_sfk_offset, cta_group_sdp),
-                mxu.make_sf_s2t(
-                    sSFQ, tSFB_sdp_layout, self.tmem_sfq_offset, cta_group_sdp, lane_halves=True
-                ),
-            )
-            sf_dp = (
-                mxu.make_sf_s2t(sSFV, tSFA_sdp_layout, self.tmem_sfv_offset, cta_group_sdp),
-                mxu.make_sf_s2t(
-                    sSFdO, tSFB_sdp_layout, self.tmem_sfdo_offset, cta_group_sdp, lane_halves=True
-                ),
-            )
-        sf_vr = None
-        if cutlass.const_expr(self.band_residual):
-            sf_vr = (
-                mxu.make_sf_s2t(sSFV, tSFA_sdp_layout, self.tmem_sfvr_offset, cta_group_sdp),
-                sf_dp[1],
-            )
-        sf_dv = sf_dk = None
-        if cutlass.const_expr(self.mxfp8):
-            # dV / dK: TMEM scales and their SMEM -> TMEM copies, issued right before the MMA
-            # that reads them (same-thread tcgen05.cp / tcgen05.mma issue order)
-            sSFP, sSFdOT, sSFdS, sSFQT = sSF
-            tSFA_layout, tSFB_layout = tSF_layouts
-            cta_group = tcgen05.CtaGroup.TWO
-            sf_dv = (
-                mxu.make_sf_s2t(sSFP, tSFA_layout, self.tmem_sfp_offset, cta_group),
-                mxu.make_sf_s2t(
-                    sSFdOT, tSFB_layout, self.tmem_sfdot_offset, cta_group, lane_halves=True
-                ),
-            )
-            sf_dk = (
-                mxu.make_sf_s2t(sSFdS, tSFA_layout, self.tmem_sfds_offset, cta_group),
-                mxu.make_sf_s2t(
-                    sSFQT, tSFB_layout, self.tmem_sfqt_offset, cta_group, lane_halves=True
-                ),
-            )
+        """CuTeDSL kernel for mma pipeline (BF16 / FP16; MXFP8: mma_2cta_mxfp8)."""
         load_mma_Q_releaser = load_mma_Q_consumer.clone()
         load_mma_K_releaser = load_mma_K_consumer.clone()
         load_mma_V_releaser = load_mma_V_consumer.clone()
@@ -2781,12 +2768,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             q_handle = load_mma_Q_consumer.wait_and_advance()
 
             # Compute S = K * Q
-            if cutlass.const_expr(self.mxfp8):
-                self.copy_sf(sf_s, q_handle.index)
             for k_block in cutlass.range(0, cute.size(tSTrQ, mode=[2]), unroll_full=True):
                 KQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, k_block != 0)
-                if cutlass.const_expr(self.mxfp8):
-                    self.set_sf(KQ_tiled_mma, sf_s, k_block)
                 cute.gemm(
                     KQ_tiled_mma,
                     tSTtST,
@@ -2806,11 +2789,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             # Compute dP = V * dO
             VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-            if cutlass.const_expr(self.mxfp8):
-                self.copy_sf(sf_dp, do_handle.index)
             for k_block in cutlass.range(0, cute.size(tdPTrV, mode=[2]), unroll_full=True):
-                if cutlass.const_expr(self.mxfp8):
-                    self.set_sf(VdO_tiled_mma, sf_dp, k_block)
                 cute.gemm(
                     VdO_tiled_mma,
                     tdPTtdPT,
@@ -2819,14 +2798,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     tdPTtdPT,
                 )
                 VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-            if cutlass.const_expr(self.band_residual):
-                # NOTE [MXFP8 hd256 backward]: the first two causal
-                # query tiles cover the forward's BF16 band of this key tile (seqlen_q ==
-                # seqlen_k; get_Q_block_min_max starts the pair at an even query tile, so for odd
-                # 128-key tiles the first one is fully masked and the residual is inert there):
-                # dP^T += R dO^T with R = MX(V - Vhat) along d, so dP reads V to about BF16
-                # precision there, as the forward's PV did
-                self.dp_residual(VdO_tiled_mma, tdPTtdPT, tdPTrV, tdPTrdO, do_handle.index, sf_vr)
 
             dp_handle.commit()
             do_handle.release()
@@ -2837,11 +2808,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             # Compute dV = P * dO (First iteration)
             PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-            if cutlass.const_expr(self.mxfp8):
-                self.copy_sf(sf_dv, dot_handle.index)
             for k_block in cutlass.range(0, cute.size(tdVrP, mode=[2]), unroll_full=True):
-                if cutlass.const_expr(self.mxfp8):
-                    self.set_sf(PdO_tiled_mma, sf_dv, k_block)
                 cute.gemm(
                     PdO_tiled_mma,
                     tdVtdV,
@@ -2857,19 +2824,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         iter_count -= 1
 
         dSQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        vres_it = Int32(1)  # band_residual: the loop's iteration index (the first one is peeled)
         while iter_count > 0:
             if is_leader_cta:
                 q_handle = load_mma_Q_consumer.wait_and_advance()
                 s_handle = mma_compute_S_producer.acquire_and_advance()
 
                 # Compute S = K * Q
-                if cutlass.const_expr(self.mxfp8):
-                    self.copy_sf(sf_s, q_handle.index, copy_a=False)
                 for k_block in cutlass.range(0, cute.size(tSTrQ, mode=[2]), unroll_full=True):
                     KQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, k_block != 0)
-                    if cutlass.const_expr(self.mxfp8):
-                        self.set_sf(KQ_tiled_mma, sf_s, k_block)
                     cute.gemm(
                         KQ_tiled_mma,
                         tSTtST,
@@ -2885,11 +2847,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 ds_handle = compute_mma_dS_consumer.wait_and_advance()
 
                 # Compute dK = dS * QT
-                if cutlass.const_expr(self.mxfp8):
-                    self.copy_sf(sf_dk, qt_handle.index)
                 for k_block in cutlass.range(0, cute.size(tdKrdST, mode=[2]), unroll_full=True):
-                    if cutlass.const_expr(self.mxfp8):
-                        self.set_sf(dSQ_tiled_mma, sf_dk, k_block)
                     cute.gemm(
                         dSQ_tiled_mma,
                         tdKtdK,
@@ -2911,11 +2869,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 do_handle = load_mma_dO_consumer.wait_and_advance()
                 # V only produced once by load(); reuse same V (index 0) for all loop iterations
                 VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                if cutlass.const_expr(self.mxfp8):
-                    self.copy_sf(sf_dp, do_handle.index, copy_a=False)
                 for k_block in cutlass.range(0, cute.size(tdPTrV, mode=[2]), unroll_full=True):
-                    if cutlass.const_expr(self.mxfp8):
-                        self.set_sf(VdO_tiled_mma, sf_dp, k_block)
                     cute.gemm(
                         VdO_tiled_mma,
                         tdPTtdPT,
@@ -2924,11 +2878,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         tdPTtdPT,
                     )
                     VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                if cutlass.const_expr(self.band_residual):
-                    if vres_it == 1:
-                        self.dp_residual(
-                            VdO_tiled_mma, tdPTtdPT, tdPTrV, tdPTrdO, do_handle.index, sf_vr
-                        )
 
                 dp_handle.commit()
                 do_handle.release()
@@ -2938,11 +2887,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 dot_handle = load_mma_dOT_consumer.wait_and_advance()
 
                 # Compute dV = P * dO (Loop iterations)
-                if cutlass.const_expr(self.mxfp8):
-                    self.copy_sf(sf_dv, dot_handle.index)
                 for k_block in cutlass.range(0, cute.size(tdVrP, mode=[2]), unroll_full=True):
-                    if cutlass.const_expr(self.mxfp8):
-                        self.set_sf(PdO_tiled_mma, sf_dv, k_block)
                     cute.gemm(
                         PdO_tiled_mma,
                         tdVtdV,
@@ -2956,7 +2901,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 dot_handle.release()
 
             iter_count -= 1
-            vres_it += 1
 
         if is_leader_cta:
             dkdv_handle = mma_compute_dKdV_producer.acquire_and_advance()
@@ -2974,11 +2918,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             qt_handle = load_mma_QT_consumer.wait_and_advance()
 
             # Compute dK = dS * Q
-            if cutlass.const_expr(self.mxfp8):
-                self.copy_sf(sf_dk, qt_handle.index)
             for k_block in cutlass.range(0, cute.size(tdKrdST, mode=[2]), unroll_full=True):
-                if cutlass.const_expr(self.mxfp8):
-                    self.set_sf(dSQ_tiled_mma, sf_dk, k_block)
                 cute.gemm(
                     dSQ_tiled_mma,
                     tdKtdK,
@@ -3010,6 +2950,283 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             compute_mma_dS_consumer,
             load_mma_QT_consumer,
         )
+
+    # NOTE [MXFP8 hd256 dK/dV schedule]
+    # The MXFP8 MMA warp issues S(0), dP(0), then S(j+1), dV(j), dP(j+1), dK(j) per step and
+    # dV(n-1), dK(n-1) last (BF16 keeps S(j), dK(j-1), dP(j), dV(j)). The compute warps release
+    # S^T / dP^T right after their TMEM loads and acquire the P / dS^T SMEM stages just before their
+    # stores, so S(j+1) runs under the compute of P(j) and dS(j), dP(j+1) under that of dS(j), and
+    # every compute dependency has at least two GEMMs of queued tensor work in front of it. S^T / dP^T
+    # stay single-stage, so the TMEM map is unchanged. Why the early releases are safe, per TMEM
+    # column range:
+    #   * S^T [256, 320): S(j+1) overwrites it only after every compute thread of both CTAs has
+    #     arrived on the S pipeline, which each does after tcgen05.wait::ld of its own S^T(j) load;
+    #     the values live on in registers (P feeds dS).
+    #   * dP^T [320, 384): the same with dP(j+1) and the dP^T(j) load.
+    #   * scales [384, 456): each slot is written by the MMA warp's tcgen05.cp right before the MMAs
+    #     that read it (same-thread tcgen05 issue order). The new order rewrites sfq for S(j+1) and
+    #     sfdo for dP(j+1) while other GEMMs are still pending, but none of those reads the slot
+    #     being rewritten: the S(j) / dP(j) that did completed before S^T / dP^T were released.
+    #     sfk / sfv are copied once, sfvr only for the residual's dP.
+    #   * dK [0, 128) / dV [128, 256): MMA accumulators only, read by the epilogue after the dKdV
+    #     commits, as before.
+    # sP and sdS^T stay single-stage: each store waits for dV(j-1) / dK(j-1) to retire.
+    @cute.jit
+    def mma_2cta_mxfp8(
+        self,
+        KQ_tiled_mma: cute.TiledMma,
+        VdO_tiled_mma: cute.TiledMma,
+        PdO_tiled_mma: cute.TiledMma,
+        dSQ_tiled_mma: cute.TiledMma,
+        tSTtST: cute.Tensor,
+        tSTrQ: cute.Tensor,
+        tSTrK: cute.Tensor,
+        tdPTtdPT: cute.Tensor,
+        tdPTrV: cute.Tensor,
+        tdPTrdO: cute.Tensor,
+        tdVtdV: cute.Tensor,
+        tdVrP: cute.Tensor,
+        tdVrdOT: cute.Tensor,
+        tdKrdST: cute.Tensor,
+        tdKtdK: cute.Tensor,
+        tdKrQT: cute.Tensor,
+        iter_count: Int32,
+        load_mma_Q_consumer,
+        load_mma_K_consumer,
+        load_mma_V_consumer,
+        mma_compute_S_producer,
+        load_mma_dO_consumer,
+        mma_compute_dP_producer,
+        load_mma_dOT_consumer,
+        compute_mma_P_consumer,
+        compute_mma_dS_consumer,
+        load_mma_QT_consumer,
+        mma_compute_dKdV_producer,
+        sSF: tuple,
+        tSF_layouts: tuple,
+        sSF_sdp: tuple,
+        tSF_sdp_layouts: tuple,
+    ):
+        """MXFP8 MMA warp, NOTE [MXFP8 hd256 dK/dV schedule]: S(0), dP(0), then S(j+1), dV(j),
+        dP(j+1), dK(j) per step, and dV(n-1), dK(n-1) last."""
+        # S^T / dP^T: K / V scales are copied once (constant per CTA), Q / dO per iteration;
+        # the Q / dO copies broadcast two chunks to lane quadrants 0/1 and 2/3
+        sSFK, sSFQ, sSFV, sSFdO = sSF_sdp
+        tSFA_sdp_layout, tSFB_sdp_layout = tSF_sdp_layouts
+        cta_group_sdp = tcgen05.CtaGroup.TWO
+        sf_s = (
+            mxu.make_sf_s2t(sSFK, tSFA_sdp_layout, self.tmem_sfk_offset, cta_group_sdp),
+            mxu.make_sf_s2t(
+                sSFQ, tSFB_sdp_layout, self.tmem_sfq_offset, cta_group_sdp, lane_halves=True
+            ),
+        )
+        sf_dp = (
+            mxu.make_sf_s2t(sSFV, tSFA_sdp_layout, self.tmem_sfv_offset, cta_group_sdp),
+            mxu.make_sf_s2t(
+                sSFdO, tSFB_sdp_layout, self.tmem_sfdo_offset, cta_group_sdp, lane_halves=True
+            ),
+        )
+        sf_vr = None
+        if cutlass.const_expr(self.band_residual):
+            sf_vr = (
+                mxu.make_sf_s2t(sSFV, tSFA_sdp_layout, self.tmem_sfvr_offset, cta_group_sdp),
+                sf_dp[1],
+            )
+        # dV / dK: TMEM scales and their SMEM -> TMEM copies, issued right before the MMA
+        # that reads them (same-thread tcgen05.cp / tcgen05.mma issue order)
+        sSFP, sSFdOT, sSFdS, sSFQT = sSF
+        tSFA_layout, tSFB_layout = tSF_layouts
+        cta_group = tcgen05.CtaGroup.TWO
+        sf_dv = (
+            mxu.make_sf_s2t(sSFP, tSFA_layout, self.tmem_sfp_offset, cta_group),
+            mxu.make_sf_s2t(
+                sSFdOT, tSFB_layout, self.tmem_sfdot_offset, cta_group, lane_halves=True
+            ),
+        )
+        sf_dk = (
+            mxu.make_sf_s2t(sSFdS, tSFA_layout, self.tmem_sfds_offset, cta_group),
+            mxu.make_sf_s2t(sSFQT, tSFB_layout, self.tmem_sfqt_offset, cta_group, lane_halves=True),
+        )
+        load_mma_K_releaser = load_mma_K_consumer.clone()
+        load_mma_V_releaser = load_mma_V_consumer.clone()
+
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        is_leader_cta = cta_rank_in_cluster % 2 == 0
+
+        if is_leader_cta:
+            # S(0)
+            load_mma_K_consumer.wait_and_advance()
+            s_handle = mma_compute_S_producer.acquire_and_advance()
+            q_handle = load_mma_Q_consumer.wait_and_advance()
+            self.copy_sf(sf_s, q_handle.index)
+            for k_block in cutlass.range(0, cute.size(tSTrQ, mode=[2]), unroll_full=True):
+                KQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, k_block != 0)
+                self.set_sf(KQ_tiled_mma, sf_s, k_block)
+                cute.gemm(
+                    KQ_tiled_mma,
+                    tSTtST,
+                    tSTrK[None, None, k_block, 0],
+                    tSTrQ[None, None, k_block, q_handle.index],
+                    tSTtST,
+                )
+            q_handle.release()
+            s_handle.commit()
+
+            # dP(0); V is produced once by load() and released after the last dV
+            load_mma_V_consumer.wait_and_advance()
+            dp_handle = mma_compute_dP_producer.acquire_and_advance()
+            do_handle = load_mma_dO_consumer.wait_and_advance()
+            VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            self.copy_sf(sf_dp, do_handle.index)
+            for k_block in cutlass.range(0, cute.size(tdPTrV, mode=[2]), unroll_full=True):
+                self.set_sf(VdO_tiled_mma, sf_dp, k_block)
+                cute.gemm(
+                    VdO_tiled_mma,
+                    tdPTtdPT,
+                    tdPTrV[None, None, k_block, 0],
+                    tdPTrdO[None, None, k_block, do_handle.index],
+                    tdPTtdPT,
+                )
+                VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+            if cutlass.const_expr(self.band_residual):
+                # NOTE [MXFP8 hd256 backward]: the first two causal
+                # query tiles cover the forward's BF16 band of this key tile (seqlen_q ==
+                # seqlen_k; get_Q_block_min_max starts the pair at an even query tile, so for odd
+                # 128-key tiles the first one is fully masked and the residual is inert there):
+                # dP^T += R dO^T with R = MX(V - Vhat) along d, so dP reads V to about BF16
+                # precision there, as the forward's PV did
+                self.dp_residual(VdO_tiled_mma, tdPTtdPT, tdPTrV, tdPTrdO, do_handle.index, sf_vr)
+            dp_handle.commit()
+            do_handle.release()
+            PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
+        dSQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        iter_count -= 1
+        next_it = Int32(1)  # band_residual: the step whose dP this iteration issues
+        while iter_count > 0:
+            if is_leader_cta:
+                # S(j+1): the compute warps released S^T right after their S^T(j) load
+                s_handle = mma_compute_S_producer.acquire_and_advance()
+                q_handle = load_mma_Q_consumer.wait_and_advance()
+                self.copy_sf(sf_s, q_handle.index, copy_a=False)
+                for k_block in cutlass.range(0, cute.size(tSTrQ, mode=[2]), unroll_full=True):
+                    KQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, k_block != 0)
+                    self.set_sf(KQ_tiled_mma, sf_s, k_block)
+                    cute.gemm(
+                        KQ_tiled_mma,
+                        tSTtST,
+                        tSTrK[None, None, k_block, 0],
+                        tSTrQ[None, None, k_block, q_handle.index],
+                        tSTtST,
+                    )
+                q_handle.release()
+                s_handle.commit()
+
+                # dV(j)
+                p_handle = compute_mma_P_consumer.wait_and_advance()
+                dot_handle = load_mma_dOT_consumer.wait_and_advance()
+                self.copy_sf(sf_dv, dot_handle.index)
+                for k_block in cutlass.range(0, cute.size(tdVrP, mode=[2]), unroll_full=True):
+                    self.set_sf(PdO_tiled_mma, sf_dv, k_block)
+                    cute.gemm(
+                        PdO_tiled_mma,
+                        tdVtdV,
+                        tdVrP[None, None, k_block, 0],
+                        tdVrdOT[None, None, k_block, dot_handle.index],
+                        tdVtdV,
+                    )
+                    PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                p_handle.release()
+                dot_handle.release()
+
+                # dP(j+1): the compute warps released dP^T right after their dP^T(j) load
+                dp_handle = mma_compute_dP_producer.acquire_and_advance()
+                do_handle = load_mma_dO_consumer.wait_and_advance()
+                VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                self.copy_sf(sf_dp, do_handle.index, copy_a=False)
+                for k_block in cutlass.range(0, cute.size(tdPTrV, mode=[2]), unroll_full=True):
+                    self.set_sf(VdO_tiled_mma, sf_dp, k_block)
+                    cute.gemm(
+                        VdO_tiled_mma,
+                        tdPTtdPT,
+                        tdPTrV[None, None, k_block, 0],
+                        tdPTrdO[None, None, k_block, do_handle.index],
+                        tdPTtdPT,
+                    )
+                    VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                if cutlass.const_expr(self.band_residual):
+                    if next_it == 1:
+                        self.dp_residual(
+                            VdO_tiled_mma, tdPTtdPT, tdPTrV, tdPTrdO, do_handle.index, sf_vr
+                        )
+                dp_handle.commit()
+                do_handle.release()
+
+                # dK(j)
+                qt_handle = load_mma_QT_consumer.wait_and_advance()
+                ds_handle = compute_mma_dS_consumer.wait_and_advance()
+                self.copy_sf(sf_dk, qt_handle.index)
+                for k_block in cutlass.range(0, cute.size(tdKrdST, mode=[2]), unroll_full=True):
+                    self.set_sf(dSQ_tiled_mma, sf_dk, k_block)
+                    cute.gemm(
+                        dSQ_tiled_mma,
+                        tdKtdK,
+                        tdKrdST[None, None, k_block, ds_handle.index],
+                        tdKrQT[None, None, k_block, qt_handle.index],
+                        tdKtdK,
+                    )
+                    dSQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                qt_handle.release()
+                ds_handle.release()
+            iter_count -= 1
+            next_it += 1
+
+        if is_leader_cta:
+            # dV(n-1), then dV is complete (first dKdV commit)
+            p_handle = compute_mma_P_consumer.wait_and_advance()
+            dot_handle = load_mma_dOT_consumer.wait_and_advance()
+            self.copy_sf(sf_dv, dot_handle.index)
+            for k_block in cutlass.range(0, cute.size(tdVrP, mode=[2]), unroll_full=True):
+                self.set_sf(PdO_tiled_mma, sf_dv, k_block)
+                cute.gemm(
+                    PdO_tiled_mma,
+                    tdVtdV,
+                    tdVrP[None, None, k_block, 0],
+                    tdVrdOT[None, None, k_block, dot_handle.index],
+                    tdVtdV,
+                )
+                PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+            p_handle.release()
+            dot_handle.release()
+            dkdv_handle = mma_compute_dKdV_producer.acquire_and_advance()
+            dkdv_handle.commit()
+            load_mma_K_releaser.release()
+            load_mma_K_releaser.advance()
+            load_mma_V_releaser.release()
+            load_mma_V_releaser.advance()
+
+            # dK(n-1), then dK is complete
+            dkdv_handle = mma_compute_dKdV_producer.acquire_and_advance()
+            qt_handle = load_mma_QT_consumer.wait_and_advance()
+            ds_handle = compute_mma_dS_consumer.wait_and_advance()
+            self.copy_sf(sf_dk, qt_handle.index)
+            for k_block in cutlass.range(0, cute.size(tdKrdST, mode=[2]), unroll_full=True):
+                self.set_sf(dSQ_tiled_mma, sf_dk, k_block)
+                cute.gemm(
+                    dSQ_tiled_mma,
+                    tdKtdK,
+                    tdKrdST[None, None, k_block, ds_handle.index],
+                    tdKrQT[None, None, k_block, qt_handle.index],
+                    tdKtdK,
+                )
+                dSQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+            dkdv_handle.commit()
+            qt_handle.release()
+            ds_handle.release()
+
+        mma_compute_S_producer.tail()
+        mma_compute_dP_producer.tail()
+        mma_compute_dKdV_producer.tail()
 
     @cute.jit
     def copy_sf(self, sf, B_idx: Int32, copy_a: cutlass.Constexpr[bool] = True):
@@ -3234,8 +3451,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         iter_index = iter_start
 
-        # adi: TMEM_ST, TMEM_DPT
-        tmem_load_op = tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16))
+        # adi: TMEM_ST, TMEM_DPT (MXFP8: each thread's 32 values in one load)
+        tmem_load_op = tcgen05.copy.Ld32x32bOp(
+            tcgen05.copy.Repetition(32 if cutlass.const_expr(self.mxfp8) else 16)
+        )
         tmem_load_atom = cute.make_copy_atom(
             tmem_load_op,
             self.acc_dtype,
@@ -3292,7 +3511,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         while iter_count > 0:
             s_handle = mma_compute_S_consumer.wait_and_advance()
-            p_handle = compute_mma_P_producer.acquire_and_advance()
+            p_handle = None
+            if cutlass.const_expr(not self.mxfp8):
+                p_handle = compute_mma_P_producer.acquire_and_advance()
             lse_handle = load_compute_LSE_consumer.wait_and_advance()
 
             leading_causal_masking = cutlass.Boolean(False)
@@ -3333,6 +3554,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             # Compute P = softmax(S, LSE)
             cute.copy(tiled_t2r, tTR_tST, tTR_rST)
+            if cutlass.const_expr(self.mxfp8):
+                # NOTE [MXFP8 hd256 dK/dV schedule]: S^T stays in registers (P feeds dS), so its
+                # TMEM columns are free for S(j+1) once the load has landed
+                cute.arch.fence_view_async_tmem_load()
+                s_handle.release()
 
             if is_masked_tile:
                 for i in cutlass.range(cute.size(tTR_rST), unroll_full=True):
@@ -3388,6 +3614,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             if cutlass.const_expr(self.mxfp8):
                 # P * 2^8 (the LSE carries the shift) in E4M3 with the constant scale 2^-8
                 tTR_rPT = self.quantize(tTR_rST, mxu.MX_DTYPE)
+                # (the sP stage: free once dV(j-1) has retired)
+                p_handle = compute_mma_P_producer.acquire_and_advance()
                 cute.autovec_copy(
                     self.flat32(tTR_rPT), sP_kq[mx_key, (None, mx_group), p_handle.index]
                 )
@@ -3413,15 +3641,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             p_handle.commit()
 
-            s_handle.release()
+            if cutlass.const_expr(not self.mxfp8):
+                s_handle.release()
             lse_handle.release()
 
             sum_odo_handle = load_compute_sum_OdO_consumer.wait_and_advance()
             dp_handle = mma_compute_dP_consumer.wait_and_advance()
-            ds_handle = compute_mma_dS_producer.acquire_and_advance()
+            ds_handle = None
+            if cutlass.const_expr(not self.mxfp8):
+                ds_handle = compute_mma_dS_producer.acquire_and_advance()
 
             # Compute dS = dsoftmax(P, dP, sum_OdO)
             cute.copy(tiled_t2r, tTR_tdPT, tTR_rdPT)
+            if cutlass.const_expr(self.mxfp8):
+                # dP^T in registers from here on: its TMEM columns are free for dP(j+1)
+                cute.arch.fence_view_async_tmem_load()
+                dp_handle.release()
 
             for i in cutlass.range(0, cute.size(tTR_rdPT), 2, unroll_full=True):
                 dpsum_0 = -sSum_OdO[
@@ -3455,11 +3690,20 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             if cutlass.const_expr(self.mxfp8):
                 # dS^T (x 2^8, see the P shift) in E4M3 with this thread's scale for its 32
                 # queries; the scale byte drops the 2^8
-                sf_ds, inv_scale_ds = mxu.mx_scale(tTR_rdPT)
                 tTR_rdST = cute.make_rmem_tensor(tTR_rdPT.shape, mxu.MX_DTYPE)
-                mxu.mx_apply(tTR_rdPT, inv_scale_ds, tTR_rdST)
-                cute.arch.fence_view_async_tmem_load()
-                dp_handle.release()
+                sf_ds, inv_scale_ds = mxu.mx_scale(tTR_rdPT)
+                if cutlass.const_expr(self.fused_scaled_cvt):
+                    words = cute.recast_tensor(tTR_rdST, Int32)
+                    for h in cutlass.range_constexpr(2):
+                        w4 = mxu.cvt_e4m3x16_scaled(
+                            [tTR_rdPT[16 * h + i] for i in range(16)], sf_ds
+                        )
+                        for i in cutlass.range_constexpr(4):
+                            words[4 * h + i] = w4[i]
+                else:
+                    mxu.mx_apply(tTR_rdPT, inv_scale_ds, tTR_rdST)
+                # (the sdS^T stage and its scale bytes: free once dK(j-1) has retired)
+                ds_handle = compute_mma_dS_producer.acquire_and_advance()
                 cute.autovec_copy(
                     self.flat32(tTR_rdST), sdST_kq[mx_key, (None, mx_group), ds_handle.index]
                 )
