@@ -558,6 +558,68 @@ def test_flash_attn_varlen_backward_non_aligned_head_dim(head_dim, causal):
 
 
 @pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110), reason="SM100/SM110 backward value-dimension regression"
+)
+@pytest.mark.parametrize(
+    "d,dv", [(56, 80), (112, 72), (112, 80), (64, 96), (96, 64), (72, 80), (48, 16)],
+    ids=["d56-dv80", "d112-dv72", "d112-dv80", "d64-dv96", "d96-dv64", "d72-dv80", "d48-dv16"],
+)
+@pytest.mark.parametrize("nheads_kv", [1, 6], ids=["gqa", "mha"])
+@pytest.mark.parametrize("varlen", [False, True], ids=["dense", "varlen"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_backward_value_dim(d, dv, nheads_kv, varlen, dtype):
+    """Different Q/K and V widths must preserve every dK/dV column."""
+    torch.manual_seed(0)
+    q = torch.randn(2, 17, 6, d, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(2, 29, nheads_kv, d, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(2, 29, nheads_kv, dv, device="cuda", dtype=dtype, requires_grad=True)
+    q_mask = k_mask = None
+    if varlen:
+        q_mask = torch.arange(17, device="cuda")[None, :] < torch.tensor(
+            [11, 17], device="cuda"
+        )[:, None]
+        k_mask = torch.arange(29, device="cuda")[None, :] < torch.tensor(
+            [19, 29], device="cuda"
+        )[:, None]
+        out, _ = flash_attn_varlen_func(
+            torch.cat((q[0, :11], q[1])),
+            torch.cat((k[0, :19], k[1])),
+            torch.cat((v[0, :19], v[1])),
+            cu_seqlens_q=torch.tensor([0, 11, 28], device="cuda", dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 19, 48], device="cuda", dtype=torch.int32),
+            max_seqlen_q=17,
+            max_seqlen_k=29,
+            causal=True,
+        )
+    else:
+        out, _ = flash_attn_func(q, k, v, causal=True)
+    dout = torch.randn_like(out)
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+    if is_fake_mode():
+        return
+
+    q_ref, k_ref, v_ref = [x.detach().float().requires_grad_() for x in (q, k, v)]
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, q_mask, k_mask, causal=True)
+    out_pt, _ = attention_ref(
+        q, k, v, q_mask, k_mask, causal=True, upcast=False, reorder_ops=True
+    )
+    if varlen:
+        out_ref = torch.cat((out_ref[0, :11], out_ref[1]))
+        out_pt = torch.cat((out_pt[0, :11], out_pt[1]))
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), dout.float())
+    grads_pt = torch.autograd.grad(out_pt, (q, k, v), dout)
+    for name, actual, reference, baseline in zip(
+        ("out", "dQ", "dK", "dV"),
+        (out, *grads),
+        (out_ref, *grads_ref),
+        (out_pt, *grads_pt),
+    ):
+        assert actual.isfinite().all(), name
+        check_tensor_vs_ref(name, actual, reference, baseline)
+
+
+@pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
     reason="SM100/SM110 runtime paged-KV tail-loading test",
 )
