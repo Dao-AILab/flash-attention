@@ -1507,6 +1507,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         mSplitSlotBatch: Optional[cute.Tensor] = None,  # compact split layout
         stream: cuda.CUstream = None,
     ):
+        self._kv_block_sparse = blocksparse_tensors is not None
         if const_expr(blocksparse_tensors is not None):
             assert not self._uses_n_distributed_qk(), (
                 "SM120 block sparsity does not run the N-distributed paged decode"
@@ -3485,6 +3486,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             smem_thr_copy_v=smem_thr_copy_v,
             pipeline_v=pipeline_v,
             pipeline_p=pipeline_p,
+            seqlen=seqlen,
         )
         role_state = (
             PipelineState(self._num_v_stages(), Int32(0), Int32(0), Int32(0)),
@@ -3548,6 +3550,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         smem_thr_copy_v: cute.TiledCopy,
         pipeline_v: PipelineAsync,
         pipeline_p: PipelineAsync,
+        seqlen: Optional[SeqlenInfoQK] = None,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
     ):
@@ -3570,6 +3573,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
 
         v_wait_token = pipeline_v.consumer_try_wait(v_state)
         pipeline_v.consumer_wait(v_state, v_wait_token)
+        self._zero_v_tail(
+            sV[None, None, v_state.index], seqlen.seqlen_k - n_block * self.tile_n, is_first_n_block
+        )
         self._gemm_pv_phase_local(
             thr_mma_pv,
             acc_o,
@@ -4876,6 +4882,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
 
         v_wait_token = pipeline_v.consumer_try_wait(consumer_state)
         pipeline_v.consumer_wait(consumer_state, v_wait_token)
+        self._zero_v_tail(
+            smem_copy_params.sV[None, None, consumer_state.index],
+            seqlen.seqlen_k - n_block * self.tile_n,
+            is_first_n_block,
+        )
         self._gemm_pv_phase_local(
             mma_params.thr_mma_pv,
             mma_params.acc_O,
@@ -4974,6 +4985,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             softmax=softmax,
             pipeline_v=pipeline_v,
             n_block_min=Int32(0),
+            seqlen=seqlen,
             loader=loader,
         )
 
@@ -5062,6 +5074,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             softmax=softmax,
             pipeline_v=pipeline_v,
             n_block_min=n_block_min,
+            seqlen=seqlen,
             loader=loader,
         )
         num = 1 + cutlass.max(n_first - n_block_min, 0)
@@ -5169,6 +5182,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         softmax: Softmax,
         pipeline_v: PipelineAsync,
         n_block_min: Int32,
+        seqlen: SeqlenInfoQK,
         loader: Optional[SimpleNamespace] = None,
         n_next: Optional[Int32] = None,
     ):
@@ -5180,6 +5194,11 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         tOrP = layout_utils.reshape_acc_to_frgA(rP)
         v_wait_token = pipeline_v.consumer_try_wait(v_state)
         pipeline_v.consumer_wait(v_state, v_wait_token)
+        self._zero_v_tail(
+            smem_copy_params.sV[None, None, v_state.index],
+            seqlen.seqlen_k - n_block * self.tile_n,
+            is_first,
+        )
         self._gemm_pv_phase_local(
             mma_params.thr_mma_pv,
             mma_params.acc_O,
@@ -5457,6 +5476,31 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             smem_thr_copy_Q,
             smem_thr_copy_K,
         )
+
+    @cute.jit
+    def _zero_v_tail(self, sV: cute.Tensor, v_valid: Int32, is_first: cutlass.Constexpr[bool]):
+        """Zero the rows (keys) at or past v_valid of a (head dim, key) V stage that this warp
+        reads. The TMA box covers the whole KV block, so past the sequence end it brings
+        whatever the cache holds; P is zero for those keys, but 0 * NaN = NaN in the PV MMA.
+        Blocks run from the one holding the sequence end down, so only a tile's first block
+        can need it (any block of a block-sparse list). Every warp that reads the stage
+        writes the same zeros, so no cross-warp ordering is needed; the fence orders them
+        before the stage's next TMA refill."""
+        if const_expr(is_first or self._kv_block_sparse):
+            if v_valid < self.tile_n:
+                lane = cute.arch.lane_idx()
+                vec = 128 // sV.element_type.width
+                chunks = cute.size(sV, mode=[0]) // vec
+                first = cutlass.max(v_valid, 0)
+                zeros = cute.make_rmem_tensor((vec,), sV.element_type)
+                zeros.fill(0.0)
+                sV_vec = cute.logical_divide(sV, (vec,))
+                for i in cutlass.range(
+                    lane, (self.tile_n - first) * chunks, cute.arch.WARP_SIZE, unroll=1
+                ):
+                    cute.autovec_copy(zeros, sV_vec[(None, i % chunks), first + i // chunks])
+                cute.arch.sync_warp()
+                cute.arch.fence_proxy("async.shared", space="cta")
 
     @cute.jit
     def _gemm_pv_phase_local(

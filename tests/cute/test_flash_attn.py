@@ -3383,7 +3383,9 @@ def check_sm100_unused_v_cache(
         assert torch.equal(lse, results[0][1])
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110 or IS_SM120), reason="SM100/SM110/SM12x nonpaged V cache"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("varlen", [False, True])
@@ -3399,7 +3401,9 @@ def test_flash_attn_sm100_unused_v_cache(
     )
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110 or IS_SM120), reason="SM100/SM110/SM12x nonpaged V cache"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "varlen,causal,num_splits,disable_2cta",
@@ -3428,7 +3432,9 @@ def test_flash_attn_sm100_unused_v_cache_edges(
     )
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110 or IS_SM120), reason="SM100/SM110/SM12x nonpaged V cache"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "d,dv", [(128, 8), (128, 24), (128, 80), (192, 128), (256, 256)]
@@ -3439,7 +3445,9 @@ def test_flash_attn_sm100_unused_v_cache_dimensions(monkeypatch, dtype, d, dv, v
     check_sm100_unused_v_cache(monkeypatch, d, varlen, False, dtype, 1, dv=dv)
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110 or IS_SM120), reason="SM100/SM110/SM12x nonpaged V cache"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 # Dense-Q layouts also run on SwapAB decode, which has its own bounded V descriptor; it does
 # not take cu_seqlens_k.
@@ -3467,7 +3475,9 @@ def test_flash_attn_sm100_unused_v_cache_layouts(monkeypatch, dtype, varlen, v_l
     )
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110 or IS_SM120), reason="SM100/SM110/SM12x nonpaged V cache"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_sm100_unused_v_cache_packed_boundary(dtype):
