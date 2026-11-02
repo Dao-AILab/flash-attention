@@ -60,3 +60,24 @@ def test_block_scales_head_dims(head_dims):
     with pytest.raises(NotImplementedError, match="head dimensions 64 and 128, or 256 and 256"):
         flash_attn_func(q, k, v, scales=BlockScales(sf, sf))
 
+
+@pytest.mark.parametrize("invalid", ["dtype", "shape", "contiguity", "device", "softcap"])
+def test_block_scales_validate_stats_out(invalid):
+    q, k, v = fp8_inputs()
+    sfq, sfk = (torch.ones(2 * heads * 512).to(torch.float8_e8m0fnu) for heads in (4, 2))
+    stats, kwargs, error = torch.empty(2, 4, 128, 2), {}, ValueError
+    if invalid == "dtype":
+        stats = stats.double()
+    elif invalid == "shape":
+        stats = torch.empty(2, 128, 4, 2)
+    elif invalid == "contiguity":
+        stats = torch.empty(2, 4, 2, 128).transpose(-1, -2)
+    elif invalid == "device":
+        stats = torch.empty(stats.shape, device="meta")
+    else:
+        kwargs, error = {"softcap": 5.0}, NotImplementedError
+    with pytest.raises(error, match="stats_out"):
+        flash_attn_func(
+            q, k, v.to(torch.bfloat16), scales=BlockScales(sfq, sfk, stats_out=stats), **kwargs
+        )
+
