@@ -50,6 +50,7 @@ from flash_attn.cute.interface import (
     _bwd_postprocess_convert,
     _flash_attn_fwd,
     _flash_attn_fwd_combine,
+    _get_scheduler_metadata,
     _flash_attn_bwd,
 )
 
@@ -2252,6 +2253,98 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
         assert (x - x_ref).abs().max().item() <= 2 * (
             x_pt - x_ref
         ).abs().max().item() + atol, name
+
+
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="Reads the prepare kernel's per-batch split counts")
+@pytest.mark.parametrize("batch_size", [8, 4096])
+def test_scheduler_metadata_max_n_blocks_per_split(batch_size):
+    """max_n_blocks_per_split: a batch's split takes at most that many KV blocks unless the
+    batch already has the static split count, and the cap only raises a batch's count."""
+    torch.manual_seed(0)
+    tile_n, num_splits, cap = 128, 16, 4
+    seqused_k = torch.randint(1, 8192, (batch_size,), dtype=torch.int32, device="cuda")
+    seqused_k[0] = 8192
+    common = dict(
+        num_batch=batch_size,
+        max_seqlen_q=1,
+        max_seqlen_k=8192,
+        nheads=8,
+        nheads_kv=2,
+        headdim=128,
+        num_splits=num_splits,
+        tile_m=128,
+        tile_n=tile_n,
+        pack_gqa=True,
+        cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32, device="cuda"),
+        seqused_k=seqused_k,
+    )
+    free = _get_scheduler_metadata(**common).num_splits_dynamic_ptr
+    capped = _get_scheduler_metadata(
+        **common, max_n_blocks_per_split=cap
+    ).num_splits_dynamic_ptr
+    n_blocks = (seqused_k + tile_n - 1) // tile_n
+    floor = torch.clamp((n_blocks + cap - 1) // cap, 1, num_splits)
+    assert (capped >= floor).all() and (capped <= num_splits).all()
+    assert (capped >= free).all()
+
+
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="Reads the prepare kernel's split layout")
+@pytest.mark.parametrize("max_extra_splits", [0, 5, 40, 1000])
+@pytest.mark.parametrize("seqlen_q", [1, 4])
+def test_scheduler_metadata_compact_split_layout(max_extra_splits, seqlen_q):
+    """max_extra_splits: the counts keep at most that many splits beyond one per batch, and
+    split_slot_batch lists each batch's (m block, split) slots in batch order, then -1."""
+    torch.manual_seed(0)
+    batch_size, nheads, nheads_kv, tile_m, tile_n = 37, 8, 2, 16, 64
+    seqused_k = torch.randint(1, 4096, (batch_size,), dtype=torch.int32, device="cuda")
+    seqused_k[3] = 32768
+    meta = _get_scheduler_metadata(
+        num_batch=batch_size,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=32768,
+        nheads=nheads,
+        nheads_kv=nheads_kv,
+        headdim=128,
+        num_splits=32,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        pack_gqa=True,
+        cu_seqlens_q=torch.arange(
+            0, (batch_size + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device="cuda"
+        ),
+        seqused_k=seqused_k,
+        max_extra_splits=max_extra_splits,
+    )
+    counts = meta.num_splits_dynamic_ptr.tolist()
+    assert all(1 <= c <= 32 for c in counts)
+    assert sum(c - 1 for c in counts) <= max_extra_splits
+    m = -(-seqlen_q * nheads // nheads_kv // tile_m)
+    expected = [(b << 16) | j for b, c in enumerate(counts) for j in range(m * c)]
+    table = meta.split_slot_batch.tolist()
+    assert len(table) == m * (batch_size + max_extra_splits)
+    assert table == expected + [-1] * (len(table) - len(expected))
+
+
+def test_scheduler_metadata_compact_split_layout_rejects_fixed_split_length():
+    """A fixed split length sets the split counts, so the compact layout cannot bound them."""
+    batch_size = 4
+    with pytest.raises(ValueError, match="seqlen_k_per_split"):
+        _get_scheduler_metadata(
+            num_batch=batch_size,
+            max_seqlen_q=1,
+            max_seqlen_k=4096,
+            nheads=8,
+            nheads_kv=2,
+            headdim=128,
+            num_splits=32,
+            tile_m=16,
+            tile_n=64,
+            pack_gqa=True,
+            cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32, device="cuda"),
+            seqused_k=torch.full((batch_size,), 4096, dtype=torch.int32, device="cuda"),
+            seqlen_k_per_split=128,
+            max_extra_splits=0,
+        )
 
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="hd256 2CTA is SM100/SM110 only")
