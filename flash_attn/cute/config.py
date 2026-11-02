@@ -1013,6 +1013,12 @@ class SwapABPolicy:
     # 22-shape sweep.
     hd64_target_ctas: int = 128
     default_target_ctas: int = 64
+    # SM103 (B300/GB300) BF16 hd128 with at least 4 sequences and 16 (batch * KV head) tiles
+    # fills the GPU better at hd64's CTA target: 0.996-1.41x (geomean 1.10) on 25 B300 and
+    # GB300 decode shapes. Fewer sequences with 8 KV heads measured up to 1.5% slower on GB300.
+    sm103_hd128_target_ctas: int = 128
+    sm103_hd128_min_batch: int = 4
+    sm103_hd128_min_heads: int = 16
     max_splits: int = 32
     min_tokens_per_split: int = 512
     # With per-sequence splits the prepare-scheduler kernel picks each sequence's split count
@@ -1049,6 +1055,18 @@ class SwapABPolicy:
 
     def target_ctas(self, head_dim: int) -> int:
         return self.hd64_target_ctas if head_dim == 64 else self.default_target_ctas
+
+    def static_target_ctas(self, inputs: FwdHeuristicInputs) -> int:
+        """CTAs the static split count aims at; see sm103_hd128_target_ctas."""
+        if (
+            sm100_is_sm103_family(inputs.device_arch)
+            and inputs.dtype == "torch.bfloat16"
+            and inputs.head_dim == inputs.head_dim_v == 128
+            and inputs.batch_size >= self.sm103_hd128_min_batch
+            and inputs.batch_size * inputs.num_heads_kv >= self.sm103_hd128_min_heads
+        ):
+            return self.sm103_hd128_target_ctas
+        return self.target_ctas(inputs.head_dim)
 
     def request_veto(self, inputs: FwdHeuristicInputs) -> str | None:
         """The selection request that keeps the selector off SwapAB, even under a SwapAB
@@ -1152,7 +1170,7 @@ class SwapABPolicy:
         if self.per_sequence_splits(inputs):
             grid_splits = ceil_div(self.grid_ctas_per_sm * inputs.num_sms, bh)
             return max(1, min(self.max_splits, ceil_div(seqlen_k, self.tile_n), grid_splits))
-        pow2_splits = 1 << (max(1, self.target_ctas(inputs.head_dim) // bh).bit_length() - 1)
+        pow2_splits = 1 << (max(1, self.static_target_ctas(inputs) // bh).bit_length() - 1)
         return min(pow2_splits, self.max_splits, max(1, seqlen_k // self.min_tokens_per_split))
 
     def split_policy(self, head_dim: int) -> dict:
@@ -1211,6 +1229,92 @@ def needs_split_metadata(config: FwdConfig, inputs: FwdHeuristicInputs) -> bool:
         and not inputs.has_caller_scheduler_metadata
         and not inputs.disable_scheduler_metadata
     )
+
+
+class TunedSm100Overrides(NamedTuple):
+    """Measured scheduling wins applied on top of the default policy."""
+
+    clc: bool = False
+    nonpersistent: bool = False
+
+
+def select_tuned_sm100_overrides(
+    inputs: FwdHeuristicInputs,
+    *,
+    tile_n: int,
+    num_n_blocks: int,
+    is_split_kv: bool,
+) -> TunedSm100Overrides:
+    """Return measured BF16 output-only scheduling wins for one problem.
+
+    Rules come from benchmarks/fwd_config_bench.py A/B campaigns on the GPU named in
+    each arm, and cover only plain output-only BF16 attention on 128x128 nonsplit tiles.
+    They tune the standard kernel only: select_fwd_config returns SwapAB decode configs first.
+    """
+    plain = (
+        inputs.dtype == "torch.bfloat16"
+        and inputs.page_size is None
+        and not inputs.use_block_sparsity
+        and not inputs.has_score_mod
+        and not inputs.has_mask_mod
+        and not inputs.has_learnable_sink
+        and not inputs.has_lse
+        and tile_n == 128
+        and not is_split_kv
+        and inputs.head_dim == inputs.head_dim_v
+        and not inputs.local
+    )
+    if not plain:
+        return TunedSm100Overrides()
+    head_dim, num_heads, batch = inputs.head_dim, inputs.num_heads, inputs.batch_size
+    packs_all_q_heads = inputs.qhead_per_kvhead == 1 or inputs.pack_gqa
+    dense_noncausal = not inputs.is_varlen and not inputs.causal
+    match inputs.device_arch:
+        case 103:
+            # GB300: nonpersistent scheduling wins once D64 spans at least 32 K tiles.
+            nonpersistent = (
+                dense_noncausal and head_dim == 64 and packs_all_q_heads and num_n_blocks >= 32
+            )
+            # CLC wins on balanced MHA or packed high-head varlen and dense causal short-K.
+            packed_varlen = (
+                inputs.has_cu_seqlens_q
+                and inputs.has_cu_seqlens_k
+                and not inputs.has_seqused_q
+                and not inputs.has_seqused_k
+                # Caller metadata may select dynamic scheduling via a tile semaphore.
+                and not inputs.has_caller_scheduler_metadata
+            )
+            balanced_mha = (
+                inputs.qhead_per_kvhead == 1
+                and not inputs.causal
+                and num_heads in (8, 16)
+                and 4 <= batch <= 24
+                and inputs.total_q >= 10240
+                # Mean sequence length at least 40% of the maximum, for Q and K.
+                and inputs.total_q * 5 >= 2 * batch * inputs.max_seqlen_q
+                and inputs.total_k * 5 >= 2 * batch * inputs.max_seqlen_k
+            )
+            high_head = (
+                num_heads >= 24
+                and packs_all_q_heads
+                and 3 <= batch <= 64
+                and inputs.total_q >= 4096
+            )
+            dense_short_k = (
+                not inputs.is_varlen
+                and inputs.causal
+                and num_heads >= 24
+                and (num_heads % 8 == 0 or inputs.num_heads_kv == 1)
+                and (inputs.num_heads_kv != 1 or inputs.max_seqlen_q > 1)
+                and packs_all_q_heads
+                and batch >= 32
+                and 640 <= inputs.max_seqlen_k <= 2048
+            )
+            clc = head_dim in (64, 96, 128) and (
+                (packed_varlen and (balanced_mha or high_head)) or dense_short_k
+            )
+            return TunedSm100Overrides(clc=clc, nonpersistent=nonpersistent)
+    return TunedSm100Overrides()
 
 
 @lru_cache(maxsize=1024)
@@ -1275,24 +1379,34 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         and is_2cta_eligible(inputs, tile_m=tile_m, q_stage=q_stage, num_splits=num_splits)
     )
 
+    tuned = select_tuned_sm100_overrides(
+        inputs,
+        tile_n=tile_n,
+        num_n_blocks=num_n_blocks,
+        is_split_kv=is_split_kv,
+    )
     # CLC runs by default only on measured cells; explicit configs may choose it elsewhere.
     default_clc, _ = causal_clc_policy(
         inputs, num_splits=num_splits, q_stage=q_stage, use_2cta_instrs=use_2cta_instrs
     )
     use_clc_scheduler = (
         is_sm100_family
-        and default_clc
+        and (tuned.clc or default_clc)
         and can_use_clc(
             inputs, tile_n=tile_n, num_splits=num_splits, use_2cta_instrs=use_2cta_instrs
         )
     )
-    is_static_persistent = is_sm100_family and can_use_static_persistent(
-        inputs,
-        tile_m=tile_m,
-        q_stage=q_stage,
-        num_splits=num_splits,
-        use_2cta_instrs=use_2cta_instrs,
-        use_clc_scheduler=use_clc_scheduler,
+    is_static_persistent = (
+        is_sm100_family
+        and not tuned.nonpersistent
+        and can_use_static_persistent(
+            inputs,
+            tile_m=tile_m,
+            q_stage=q_stage,
+            num_splits=num_splits,
+            use_2cta_instrs=use_2cta_instrs,
+            use_clc_scheduler=use_clc_scheduler,
+        )
     )
     use_tma_o = is_sm100_family and can_use_tma_o(inputs, tile_m=tile_m, num_splits=num_splits)
     lpt_global = select_lpt_global(
