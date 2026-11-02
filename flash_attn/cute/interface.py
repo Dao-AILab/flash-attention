@@ -1949,7 +1949,7 @@ def _flash_attn_bwd(
 
     window_size = [window_size_left, window_size_right]
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
-        causal, window_size_left, window_size_right
+        causal, window_size_left, window_size_right, mask_mod
     )
 
     if arch // 10 == 12:
