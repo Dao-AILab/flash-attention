@@ -246,6 +246,8 @@ class TileSchedulerArguments(ParamsBase):
     split_slot_batch_ptr: Optional[cute.Tensor] = None
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistent_cta_multiplier: cutlass.Constexpr[int] = 1
+    # L2 bytes each forward LPT head group fills with K / V.
+    l2_group_bytes: cutlass.Constexpr[int] = 50 * 1024 * 1024
     # SingleTileScheduler: launch splits as the slowest grid mode, so with per-batch split counts
     # every batch's first splits launch before the excess splits, which exit at once. Cluster
     # shape (1, 1) only.
@@ -548,7 +550,7 @@ class SingleTileLPTScheduler:
                 cutlass.Int64(args.seqlen_k) * (args.headdim + args.headdim_v) * args.element_size
             )
             size_one_head = size_one_kv_head
-            size_l2 = 50 * 1024 * 1024  # 40 MB for K & V
+            size_l2 = args.l2_group_bytes
             # Swizzle is the size of each "section". Round swizzle to a power of 2
             # Need to be careful about the case where only one head will fit
             # swizzle is how many heads can fit in L2

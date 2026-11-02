@@ -32,6 +32,9 @@ class SchedulerMetadataTensorsTorch(NamedTuple):
     # Compact split layout (max_extra_splits): (batch << 16) | (split * num_m_blocks + m_block)
     # per (m block, split) slot, batches in order, -1 past the last batch.
     split_slot_batch: Optional[torch.Tensor] = None
+    # Architecture-owned forwards: the plan these tensors were built for; the forward checks
+    # it against its own plan before using them.
+    plan_key: Optional[tuple] = None
 
 
 @cute.jit

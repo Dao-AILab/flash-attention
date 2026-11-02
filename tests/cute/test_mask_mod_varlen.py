@@ -918,7 +918,7 @@ def test_varlen_block_sparse(
     head_dim = 128
     dtype = torch.bfloat16
     # On Blackwell (SM100) q_stage=2 → effective tile is 256; elsewhere 128.
-    tile_m = 256 if COMPUTE_CAPABILITY >= 10 else 128
+    tile_m = 256 if COMPUTE_CAPABILITY in (10, 11) else 128
     tile_n = 128
 
     base_seqlens_q, base_seqlens_k = seqlens
@@ -1044,7 +1044,7 @@ def test_varlen_block_sparse(
     )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 coarse KV forward only")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11, 12), reason="SM100/SM110/SM12x coarse KV forward only")
 @pytest.mark.parametrize("seqlens_k", [[512, 512], [384, 384], [128, 128]])
 @pytest.mark.parametrize("varlen_k", [False, True])
 def test_varlen_block_sparse_coarse_kv_metadata_stride_repro(seqlens_k, varlen_k):
@@ -1055,7 +1055,7 @@ def test_varlen_block_sparse_coarse_kv_metadata_stride_repro(seqlens_k, varlen_k
     head_dim = 128
     dtype = torch.bfloat16
     physical_tile_n = 128
-    sparse_tile_m = 256
+    sparse_tile_m = 256 if COMPUTE_CAPABILITY in (10, 11) else 128
     sparse_tile_n = 256
 
     q = torch.randn(sum(seqlens_q), num_heads, head_dim, device=device, dtype=dtype)
@@ -1116,7 +1116,7 @@ def test_varlen_block_sparse_coarse_kv_metadata_stride_repro(seqlens_k, varlen_k
     )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 coarse KV forward only")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11, 12), reason="SM100/SM110/SM12x coarse KV forward only")
 @pytest.mark.parametrize("k_mode,num_splits,seed", [("packed", 3, 14), ("seqused", 1, 15)])
 def test_varlen_block_sparse_coarse_kv_requires_offsets(k_mode, num_splits, seed):
     """Variable-K packed metadata must provide per-batch index offsets."""
@@ -1127,7 +1127,7 @@ def test_varlen_block_sparse_coarse_kv_requires_offsets(k_mode, num_splits, seed
     num_heads = 2
     head_dim = 128
     dtype = torch.bfloat16
-    sparse_tile_m = 256
+    sparse_tile_m = 256 if COMPUTE_CAPABILITY in (10, 11) else 128
     sparse_tile_n = 384
 
     q = torch.randn(sum(seqlens_q), num_heads, head_dim, device=device, dtype=dtype)
@@ -1247,7 +1247,7 @@ def _get_splitkv_varlen_mask(mask_name, max_seqlen_q, max_seqlen_k):
             return get_mask_pair(mask_name)[0]
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 SplitKV forward only")
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11, 12), reason="SM100/SM110/SM12x SplitKV forward only")
 @pytest.mark.parametrize("use_seqused_k", [False, True])
 @pytest.mark.parametrize("mask_name", VARLEN_BLOCK_SPARSE_SPLITKV_MASKS)
 @pytest.mark.parametrize("seqlens_q,seqlens_k", VARLEN_BLOCK_SPARSE_SPLITKV_SEQLENS)
@@ -1259,7 +1259,7 @@ def test_varlen_block_sparse_splitkv_matches_unsplit(seqlens_q, seqlens_k, mask_
     num_heads = 4
     head_dim = 128
     dtype = torch.bfloat16
-    sparse_tile_m = 256 if sum(seqlens_q) > 128 else 128
+    sparse_tile_m = 256 if COMPUTE_CAPABILITY in (10, 11) and sum(seqlens_q) > 128 else 128
     tile_n = 128
     max_seqlen_q = max(seqlens_q)
     max_seqlen_k = max(seqlens_k)

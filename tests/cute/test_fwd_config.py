@@ -42,7 +42,7 @@ def make_inputs(*, pack_gqa: bool | None = None, **changes) -> FwdHeuristicInput
     return _BASE_INPUTS._replace(pack_gqa=pack_gqa, **changes)
 
 
-@pytest.mark.parametrize("device_arch", [80, 90, 100, 103, 110, 120])
+@pytest.mark.parametrize("device_arch", [80, 90, 100, 103, 110])
 @pytest.mark.parametrize("causal", [False, True])
 def test_every_architecture_selects_a_valid_default(device_arch, causal):
     inputs = make_inputs(device_arch=device_arch, causal=causal)
@@ -133,15 +133,14 @@ def test_split_selection(changes, expected_splits, expected_tile_n):
     [
         # Selection-time rejections.
         ({"device_arch": 70}, {}, "Unsupported forward architecture family SM7"),
-        ({"device_arch": 120, "page_size": 128}, {}, "SM120 forward does not support"),
-        ({"device_arch": 120, "requested_num_splits": 3}, {}, "SM120 forward only supports num_s"),
+        ({"device_arch": 120}, {}, "planned by flash_attn.cute.sm120"),
         ({"head_dim": 72, "head_dim_v": 72, "page_size": 64}, {}, "head dimensions divisible"),
         # Geometry and architecture.
         ({}, dict(tile_m=64), "tile_m=128"),
         ({}, dict(tile_n=127), "multiples of 16"),
         ({}, dict(device_capacity=9), "targets SM9"),
         ({"device_arch": 90, **_HD128}, dict(tile_m=256), "SM90 tile_m must be"),
-        ({"device_arch": 120}, dict(mma_pv_is_rs=True), "does not expose SM90 MMA flags"),
+        ({"device_arch": 80}, dict(mma_pv_is_rs=True), "does not expose SM90 MMA flags"),
         ({**_HD256}, dict(q_stage=2), "TMEM"),
         # pack_gqa: an explicit request must match; an unspecified one lets the config decide.
         ({"num_heads_kv": 4, "pack_gqa": True}, dict(pack_gqa=False), "disagrees"),

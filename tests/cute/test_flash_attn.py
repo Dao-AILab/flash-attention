@@ -249,17 +249,16 @@ def test_flash_attn_work_tiles_cover_q(
     torch.testing.assert_close(lse, scores.logsumexp(dim=-1), atol=1e-3, rtol=1e-4)
 
 
-@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
-@pytest.mark.parametrize("num_splits", [0, -1])
+@pytest.mark.skipif(not IS_SM120, reason="SM120 SplitKV policy")
+@pytest.mark.parametrize("num_splits", [0, -1, 3])
 def test_flash_attn_sm120_num_splits(num_splits):
+    torch.manual_seed(0)
     q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 4096, 1, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 4096, 1, 64, device="cuda", dtype=torch.bfloat16)
     out = flash_attn_func(q, k, v)
-    out_auto = flash_attn_func(q, k, v, num_splits=num_splits)
-    torch.testing.assert_close(out_auto, out)
-    with pytest.raises(ValueError, match="SM120 forward only supports num_splits=1"):
-        flash_attn_func(q, k, v, num_splits=3)
+    out_split = flash_attn_func(q, k, v, num_splits=num_splits)
+    torch.testing.assert_close(out_split, out, atol=2e-3, rtol=0)
 
 
 @pytest.mark.skipif(
@@ -953,13 +952,13 @@ def test_flash_attn_output(
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         # num_splits_vals = [1, 3]
         pack_gqa_vals = [True] if has_qv else [False, True, None] if not TEST_BWD_ONLY else [False]
-        # SplitKV is not supported for hdim >= 192, except hd256 on SM100
+        # SplitKV is not supported for hdim >= 192, except hd256 on SM100 and all on SM12x
         # pack_gqa_vals = [False]
-        split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
+        split_hdim_ok = d < 192 or IS_SM120 or (IS_SM100 and d == 256 and dv == 256)
         num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY and not has_qv else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            # SplitKV not supported on SM90/SM120 - skip this iteration
-            if (IS_SM90 or IS_SM120) and num_splits > 1:
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
                 continue
             if IS_SM100 and (d >= 192 and dv >= 192) and not (d == 256 and dv == 256):
                 continue
@@ -1865,15 +1864,15 @@ def test_flash_attn_varlen_output(
         pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
         # pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
-        # SplitKV is not supported for hdim >= 192, except hd256 on SM100
-        split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
+        # SplitKV is not supported for hdim >= 192, except hd256 on SM100 and all on SM12x
+        split_hdim_ok = d < 192 or IS_SM120 or (IS_SM100 and d == 256 and dv == 256)
         num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         precompute_metadata_vals = [False, True]
         for pack_gqa, num_splits, precompute_metadata in itertools.product(
             pack_gqa_vals, num_splits_vals, precompute_metadata_vals
         ):
-            # SplitKV not supported on SM90/SM120 - skip this iteration
-            if (IS_SM90 or IS_SM120) and num_splits > 1:
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
                 continue
             if precompute_metadata and is_fake_mode():
                 continue
@@ -2108,8 +2107,8 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
     - "metadata_full": scheduler_metadata with num_splits>1 (SM100 only).
       Runs the full prepare kernel.
     """
-    if cumsum_mode == "metadata_full" and (IS_SM90 or DISABLE_SPLIT):
-        pytest.skip("split-kv not yet implemented on SM90")
+    if cumsum_mode == "metadata_full" and (IS_SM90 or IS_SM120 or DISABLE_SPLIT):
+        pytest.skip("caller-built split-kv scheduler metadata is SM100-only")
     device = "cuda"
     torch.manual_seed(0)
     random.seed(0)
@@ -2838,8 +2837,8 @@ def test_flash_attn_kvcache(
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
-            # SplitKV not supported on SM90/SM120 - skip this iteration
-            if (IS_SM90 or IS_SM120) and num_splits > 1:
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
                 continue
             if precompute_metadata and is_fake_mode():
                 continue
@@ -4908,8 +4907,8 @@ def test_flash_attn_ragged_tensormap_workspace_padding(packed_kv, seqlen_q, num_
     """Dense Q + seqused_q with many short sequences: the varlen schedulers pad every
     batch by a cluster-sized tile, so the grid exceeds sum(ceil(seqlen_q / tile)) and the
     descriptor workspace must cover it (the kernel traps otherwise)."""
-    if (IS_SM90 or IS_SM120) and num_splits > 1:
-        pytest.skip("SplitKV not supported on SM90/SM120")
+    if IS_SM90 and num_splits > 1:
+        pytest.skip("SplitKV not supported on SM90")
     torch.manual_seed(0)
     batch, seqlen_k, nheads, d = 49, 217, 6, 128
     q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)

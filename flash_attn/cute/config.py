@@ -567,10 +567,6 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
                     inputs.sparse_q_block_size,
                     inputs.sparse_kv_block_size,
                 )
-        case 12 if inputs.head_dim > 64:
-            # SM120 has 99 KB SMEM: 128×128 is preferred for D<=64, and 128×64
-            # avoids the occupancy loss from a 96 KB tile for larger head dimensions.
-            tile_n = 64
 
     if inputs.requested_tile_m is not None:
         tile_m = inputs.requested_tile_m
@@ -1338,8 +1334,10 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         pack_gqa = False
     inputs = inputs._replace(pack_gqa=pack_gqa)
     device_capacity = inputs.device_capacity
-    if device_capacity == 12 and inputs.requested_num_splits not in (None, 1):
-        raise ValueError("SM120 forward only supports num_splits=1")
+    if device_capacity == 12:
+        raise ValueError(
+            "The SM12x forward is planned by flash_attn.cute.sm120 (Sm120ForwardHost.plan_forward)"
+        )
 
     tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap = select_initial_fwd_tile(inputs)
     is_sm100_family = device_capacity in (10, 11)
@@ -1641,8 +1639,6 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
                 raise ValueError("SM80 forward does not support paged KV")
             case 9 if config.tile_m not in (64, 128, 192):
                 raise ValueError(f"SM90 tile_m must be 64, 128, or 192, got {config.tile_m}")
-            case 12 if inputs.page_size is not None or inputs.use_block_sparsity:
-                raise ValueError("SM120 forward does not support paged KV or block sparsity")
         neutral = _FWD_SM100_ONLY_NEUTRAL_FIELDS
         mismatched = [name for name, value in neutral.items() if getattr(config, name) != value]
         if mismatched:
