@@ -1,5 +1,5 @@
-"""MXFP8 hdim-256 backward (NOTE [MXFP8 hd256 backward]): gradients against the FP64 mirrored reference,
-determinism, causal leakage."""
+"""MXFP8 hdim-256 backward (NOTE [MXFP8 hd256 backward]) and its autograd entry point (NOTE [MXFP8 hd256
+attention]): gradients against the FP64 mirrored reference, determinism, causal leakage, fused prep identity."""
 
 import math
 
@@ -9,6 +9,8 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass.utils.blockscaled_layout")
 from flash_attn.cute import blockscaled_utils as bsu  # noqa: E402
+from flash_attn.cute import mxfp8_hd256_attention as attn  # noqa: E402
+from flash_attn.cute import mxfp8_hd256_prep as prep  # noqa: E402
 from flash_attn.cute.interface import (  # noqa: E402
     BlockScales,
     MxHd256BwdOperands,
@@ -186,3 +188,41 @@ def test_causal_dq_does_not_see_future_keys(mode):
     (dq2, _, _), (out2, lse2, _, _, _, _) = eager_backward(q, k2, v2, do, True, mode)
     assert torch.equal(out2[:, :t0], out[:, :t0]) and torch.equal(lse2[..., :t0], lse[..., :t0])
     assert torch.equal(dq2[:, :t0], dq[:, :t0])
+
+
+@pytest.mark.parametrize("shape,causal", [((1, 1024, 2), False), ((1, 1024, 2), True), ((1, 544, 2), False)])
+def test_fused_prep_matches_eager(shape, causal):
+    q, k, v, do = inputs(*shape, seed=5)
+    out, lse, saved = attn.mxfp8_hd256_forward(q, k, v, causal=causal)
+    out_e, lse_e, stats, (qh, kh, vh), (q8, sfq, k8, sfk, sfv_il, v8) = eager_forward(q, k, v, causal, "exact")
+    assert torch.equal(out, out_e) and torch.equal(lse, lse_e) and torch.equal(saved.stats, stats)
+    fwd = prep.quantize_forward(q, k, v, causal)
+    for a, b in ((fwd.v8, v8), (fwd.sfv, sfv_il)):
+        assert torch.equal(a.view(torch.uint8).reshape(-1), b.view(torch.uint8).reshape(-1))
+    fused = prep.backward_operands(fwd.bwd, out, do, stats, saved.softmax_scale, "exact")
+    eager, k_hat = eager_operands(q8, sfq, k8, sfk, qh, kh, vh, v, out, do, stats, "exact", causal)
+    assert torch.equal(fwd.k_hat, k_hat)
+    for name in MxHd256BwdOperands._fields:
+        a, b = getattr(fused, name), getattr(eager, name)
+        if name == "dpsum":
+            torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
+        else:
+            assert torch.equal(a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)), name
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("mode", ["exact", "fast"])
+def test_autograd_gradients(causal, mode):
+    q, k, v, do = inputs(1, 1024, 2, seed=6)
+    leaves = [t.clone().requires_grad_() for t in (q, k, v)]
+    attn.mxfp8_hd256_attn_func(*leaves, causal=causal, pv_softmax=mode).backward(do)
+    _, _, saved = attn.mxfp8_hd256_forward(q, k, v, causal=causal, pv_softmax=mode)
+    halves = attn.mxfp8_hd256_backward(saved, do)
+    eager, _ = eager_backward(q, k, v, do, causal, mode)
+    ref = [t.float().transpose(1, 2).requires_grad_() for t in (q, k, v)]
+    F.scaled_dot_product_attention(*ref, is_causal=causal).backward(do.float().transpose(1, 2))
+    for t, g, e, r in zip(leaves, halves, eager, ref):
+        assert torch.equal(t.grad, g)
+        # the fused prep's operands are byte-identical to the eager ones except D'' (FP32 sum order)
+        assert rel(g, e) < 1e-2
+        assert rel(g, r.grad.transpose(1, 2)) < 0.2  # MXFP8 gradients vs FP32 attention: ~0.1
