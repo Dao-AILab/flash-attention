@@ -46,7 +46,7 @@ from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile
+from flash_attn.cute.config import sparse_mla_qhead_tile
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManagerH64
 from flash_attn.cute.utils import get_batch_from_cu_tensor
 
@@ -65,7 +65,7 @@ class dQdQvGemmKernelH64:
     ):
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.nheads = nheads
-        # one 64-row tile per token; fewer heads are padded rows (pack_gqa.sparse_mla_qhead_tile)
+        # one 64-row tile per token; fewer heads are padded rows (config.sparse_mla_qhead_tile)
         self.tile_m = sparse_mla_qhead_tile(nheads, min_tile=64)
         assert self.tile_m == 64, f"dQdQvGemmKernelH64 serves 1..64 Q heads, got {nheads}"
         self.head_dim_k = head_dim_k or 0  # when head_dim_k not provided, dQ is not computed
