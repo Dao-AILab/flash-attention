@@ -490,8 +490,9 @@ class MxHd256BwdOperands(NamedTuple):
     sm100_hd256_2cta_fmha_backward.py).
 
     E4M3 copies are (batch, seqlen, nheads, 256). Scale buffers are flat UE8M0: `sf<x>` in the
-    interleave_sf layout, `sf<x>_dkdv` in the dK / dV kernel's pair tiles. The (batch, nheads,
-    seqlen) FP32 rows: lse_log2 = M - offset + 8 (dQ kernel), lse_log2_dkdv = M - offset, and
+    interleave_sf layout, `sf<x>_dkdv` in the dK / dV kernel's pair tiles. Causal: v / sfv /
+    sfv_dkdv hold V-hat (keys [0, s)) followed by the band residual R (keys [s, 2s)). The (batch,
+    nheads, seqlen) FP32 rows: lse_log2 = M - offset + 8 (dQ kernel), lse_log2_dkdv = M - offset, and
     dpsum = D''.
     """
 
@@ -501,7 +502,7 @@ class MxHd256BwdOperands(NamedTuple):
     k: torch.Tensor  # the forward's K payload, scales along head_dim
     sfk: torch.Tensor
     sfk_dkdv: torch.Tensor
-    v: torch.Tensor  # V-hat requantized along head_dim
+    v: torch.Tensor  # V-hat requantized along head_dim [+ R]
     sfv: torch.Tensor
     sfv_dkdv: torch.Tensor
     do: torch.Tensor  # dO'' along head_dim
@@ -516,7 +517,7 @@ class MxHd256BwdOperands(NamedTuple):
     dpsum: torch.Tensor
 
 
-def _validate_mx_hd256_operands(mx: MxHd256BwdOperands, k: torch.Tensor) -> None:
+def _validate_mx_hd256_operands(mx: MxHd256BwdOperands, k: torch.Tensor, causal: bool) -> None:
     """Check MxHd256BwdOperands against the BF16 K-hat (batch, seqlen, nheads, 256) in the K slot:
     dtypes, shapes, scale-buffer sizes, contiguity, and device. The kernels size their TMA loads from
     the payloads, so a short scale buffer would be read out of bounds."""
@@ -529,13 +530,14 @@ def _validate_mx_hd256_operands(mx: MxHd256BwdOperands, k: torch.Tensor) -> None
         return b * h * math.ceil(n / rows) * 1024
 
     payload = (b, s, h, d)
+    s_v = 2 * s if causal else s  # causal: V-hat, then the band residual R
     expected = {
-        "q": payload, "k": payload, "v": payload,
+        "q": payload, "k": payload, "v": (b, s_v, h, d),
         "do": payload, "qt": payload, "dot": payload,
-        "sfq": interleaved(s, d), "sfk": interleaved(s, d), "sfv": interleaved(s, d),
+        "sfq": interleaved(s, d), "sfk": interleaved(s, d), "sfv": interleaved(s_v, d),
         "sfdo": interleaved(s, d), "sfqt": interleaved(d, s), "sfdot": interleaved(d, s),
         "sfq_dkdv": pair_tiles(s, 128), "sfdo_dkdv": pair_tiles(s, 128),
-        "sfk_dkdv": pair_tiles(s, 64), "sfv_dkdv": pair_tiles(s, 64),
+        "sfk_dkdv": pair_tiles(s, 64), "sfv_dkdv": pair_tiles(s_v, 64),
         "lse_log2": (b, h, s), "lse_log2_dkdv": (b, h, s), "dpsum": (b, h, s),
     }
     for name, want in expected.items():
@@ -2319,9 +2321,9 @@ def _flash_attn_bwd(
         # The config runs MXFP8 on the dedicated hdim-256 kernels (validate_bwd_config).
         assert not is_varlen and num_head == num_head_kv and q.dtype == torch.bfloat16
         assert not local and score_mod is None and mask_mod is None and dlse is None
-        assert not causal, "mx_hd256 is non-causal"
         assert seqlen_k == seqlen_q and k.dtype == torch.bfloat16
-        _validate_mx_hd256_operands(mx_hd256, k)
+        assert not causal or seqlen_q % 256 == 0
+        _validate_mx_hd256_operands(mx_hd256, k, causal)
 
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink = [
         maybe_contiguous(t)
@@ -2802,6 +2804,7 @@ def _flash_attn_bwd(
                     tile_m_dkdv=dkdv_tile_mn[0],
                     tile_n_dkdv=dkdv_tile_mn[1],
                     mxfp8=mx_hd256 is not None,
+                    dq_reverse=config.hd256_dq_reverse,
                 )
             else:
                 fa_bwd_obj = FlashAttentionBackwardSm100(

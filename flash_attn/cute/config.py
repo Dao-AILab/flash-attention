@@ -2578,6 +2578,9 @@ class BwdConfig:
     use_dedicated_hd256_kernel: bool
     pack_gqa: bool
     registers: BwdRegisters
+    # Dedicated hdim-256 dQ kernel: run each head's query pairs from the end (causal: longest
+    # first); see select_hd256_dq_reverse.
+    hd256_dq_reverse: bool = False
 
     @property
     def num_wg(self) -> int:
@@ -2590,9 +2593,10 @@ class BwdHeuristicInputs(NamedTuple):
 
     Holds only the facts the policy reads. sparse_block_size_q / sparse_block_size_kv are the
     caller's block_size, None when unset. num_sms, batch_size, the sequence bounds, and the
-    token totals feed only the SM100 GQA pack_gqa heuristic (bwd_pack_gqa_heuristic);
-    max_seqlen_q / max_seqlen_k fall back to the token totals for varlen calls without a
-    host bound, and num_sms is 0 where the heuristic does not run (bwd_selection_reads_num_sms).
+    token totals feed only the SM100 GQA pack_gqa heuristic (bwd_pack_gqa_heuristic) and the
+    causal MXFP8 dQ order (select_hd256_dq_reverse); max_seqlen_q / max_seqlen_k fall back to
+    the token totals for varlen calls without a host bound, and num_sms is 0 where neither runs
+    (bwd_selection_reads_num_sms).
     """
 
     device_arch: int
@@ -2836,13 +2840,14 @@ def select_bwd_pack_gqa(
 
 
 def bwd_selection_reads_num_sms(inputs: BwdHeuristicInputs) -> bool:
-    """Whether select_bwd_config reads inputs.num_sms: only bwd_pack_gqa_heuristic does, for SM100
-    calls that can pack and set neither FLASH_ATTENTION_BWD_TILE_N nor FLASH_ATTENTION_BWD_PACK_GQA.
+    """Whether select_bwd_config reads inputs.num_sms: bwd_pack_gqa_heuristic does for SM100 calls
+    that can pack and set neither FLASH_ATTENTION_BWD_TILE_N nor FLASH_ATTENTION_BWD_PACK_GQA, and
+    select_hd256_dq_reverse for causal MXFP8.
 
     The interface looks the SM count up only then, so cross-compiling other calls needs no
     FLASH_ATTENTION_NUM_SMS.
     """
-    return (
+    return select_hd256_dq_reverse_reads_num_sms(inputs) or (
         inputs.requested_tile_n is None
         and inputs.requested_pack_gqa is None
         and can_use_bwd_pack_gqa(
@@ -2851,6 +2856,24 @@ def bwd_selection_reads_num_sms(inputs: BwdHeuristicInputs) -> bool:
             use_dedicated_hd256_kernel=inputs.uses_dedicated_hd256_kernel,
         )
     )
+
+
+# The causal MXFP8 hdim-256 dQ grid (two CTAs per 256-query pair and head) runs longest-first
+# up to this many waves, where its last wave dominates; longer grids keep the natural order.
+_HD256_DQ_REVERSE_MAX_WAVES = 5
+
+
+def select_hd256_dq_reverse_reads_num_sms(inputs: BwdHeuristicInputs) -> bool:
+    """Whether select_hd256_dq_reverse reads num_sms: SM100 causal MXFP8 hdim 256."""
+    return inputs.device_capacity in (10, 11) and inputs.mxfp8 and inputs.causal
+
+
+def select_hd256_dq_reverse(inputs: BwdHeuristicInputs) -> bool:
+    """BwdConfig.hd256_dq_reverse: measured for the causal MXFP8 backward only."""
+    if not select_hd256_dq_reverse_reads_num_sms(inputs):
+        return False
+    num_dq_ctas = 2 * ceil_div(inputs.max_seqlen_q, 256) * inputs.num_heads * inputs.batch_size
+    return num_dq_ctas <= _HD256_DQ_REVERSE_MAX_WAVES * inputs.num_sms
 
 
 # fmt: off
@@ -2938,6 +2961,7 @@ _SM100_ONLY_NEUTRAL_FIELDS = dict(
     cluster_size=1,
     use_dedicated_hd256_kernel=False,
     pack_gqa=False,
+    hd256_dq_reverse=False,
 )
 # The SM100 kernel launches 16 warps: dQ reduce, 2x compute, MMA, load, relay, and empty.
 SM100_BWD_THREADS_PER_CTA = 512
@@ -3013,6 +3037,7 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 cluster_size=cluster_size,
                 spt=bwd_spt(inputs),
                 use_dedicated_hd256_kernel=dedicated,
+                hd256_dq_reverse=select_hd256_dq_reverse(inputs),
                 pack_gqa=select_bwd_pack_gqa(
                     inputs,
                     tile_m=SM100_BWD_TILE_M,
@@ -3190,10 +3215,15 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
         raise ValueError("Pipeline stage counts must be positive")
     if inputs.mxfp8 and not config.use_dedicated_hd256_kernel:
         raise ValueError("The MXFP8 backward runs only on the dedicated SM100 hdim-256 kernels")
+    if config.hd256_dq_reverse and not config.use_dedicated_hd256_kernel:
+        raise ValueError("hd256_dq_reverse needs the dedicated SM100 hdim-256 kernels")
     if capacity not in (10, 11) and any(
         getattr(config, name) != value for name, value in _SM100_ONLY_NEUTRAL_FIELDS.items()
     ):
-        raise ValueError(f"SM{capacity} backward does not support SM100 2CTA or pack_gqa options")
+        raise ValueError(
+            f"SM{capacity} backward does not support SM100 2CTA or pack_gqa options "
+            "or the hd256 dQ order"
+        )
     if capacity != 12 and config.spt != bwd_spt(inputs):
         raise ValueError(
             f"SM{capacity} backward needs spt={bwd_spt(inputs)} (deterministic dQ lock order)"

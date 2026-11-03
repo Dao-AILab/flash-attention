@@ -112,10 +112,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.cta_tiler = cta_tiler
         self.use_clc_scheduler = use_clc_scheduler
         self.mxfp8 = mxfp8
+        # causal MXFP8: the dP residual on the forward's BF16 band (NOTE [MXFP8 hd256 backward])
+        self.band_residual = mxfp8 and is_causal
         # MXFP8: launched as the dQ kernel's programmatic dependent (no data dependency); each CTA
         # waits for the dQ kernel before it exits, so this kernel's completion still implies dQ's
         self.pdl_secondary = mxfp8
-        assert not (mxfp8 and (use_clc_scheduler or is_causal))
+        assert not (mxfp8 and use_clc_scheduler)
         self.sched_warp_id = 10 if use_clc_scheduler else None
         # TODO: need check, not sure whether need to *2 if 2cta
         self.tile_shape_Q = cta_tiler[0]
@@ -197,6 +199,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             self.tmem_sfq_offset = 424
             self.tmem_sfv_offset = 432
             self.tmem_sfdo_offset = 440
+            self.tmem_sfvr_offset = 448  # band_residual: the residual R's scales (A, 8 columns)
 
         self.num_regs_reduce = 152
         self.num_regs_compute = 128
@@ -436,8 +439,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             n64 = cute.ceil_div(K.shape[0], 64)
             n128 = cute.ceil_div(Q.shape[0], 128)
 
+            # band_residual: V_mx / SFV_mx hold V (keys [0, s)) then the residual R (keys [s, 2s))
+            n64_v = n64 * 2 if cutlass.const_expr(self.band_residual) else n64
             mSFK_tma, mSFV_tma = [
-                mxu.mx_sf_tile_view(t, 64, n64, hb, h_r, h_k, True) for t in (SFK_mx, SFV_mx)
+                mxu.mx_sf_tile_view(t, 64, n, hb, h_r, h_k, True)
+                for t, n in ((SFK_mx, n64), (SFV_mx, n64_v))
             ]
             mSFQ_tma, mSFdO_tma = [
                 mxu.mx_sf_tile_view(t, 64, n128, hb, h_r, h_k, False) for t in (SFQ_mx, SFdO_mx)
@@ -694,6 +700,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         self.sdp_ab_dtype = K.element_type
         sSFA_sdp_layout = sSFB_sdp_layout = tSFA_sdp_layout = tSFB_sdp_layout = None
+        sSFV_sdp_layout = None
         if cutlass.const_expr(self.mxfp8):
             # NOTE [MXFP8 hd256 backward]: S^T / dP^T as SS block-scaled MMAs
             self.sdp_ab_dtype = mxu.MX_DTYPE
@@ -704,7 +711,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 KQ_tiled_mma, self.KQ_mma_tiler, mxu.MX_DTYPE, self.load_mma_Q_stage
             )
             V_smem_layout_staged = sm100_utils.make_smem_layout_a(
-                VdO_tiled_mma, self.VdO_mma_tiler, mxu.MX_DTYPE, 1
+                VdO_tiled_mma, self.VdO_mma_tiler, mxu.MX_DTYPE, 2 if self.band_residual else 1
             )
             dO_smem_layout_staged = sm100_utils.make_smem_layout_b(
                 VdO_tiled_mma, self.VdO_mma_tiler, mxu.MX_DTYPE, self.load_mma_dO_stage
@@ -723,6 +730,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             )
             sSFA_sdp_layout = blockscaled_layout.make_smem_layout_sfa(
                 proxy_a, (256, 128, K_dim), mxu.SF_VEC, 1
+            )
+            # V's scale tiles (stage 1: the band residual R)
+            sSFV_sdp_layout = blockscaled_layout.make_smem_layout_sfa(
+                proxy_a, (256, 128, K_dim), mxu.SF_VEC, 2 if self.band_residual else 1
             )
             tSFA_sdp_layout = blockscaled_layout.make_tmem_layout_sfa(
                 proxy_a,
@@ -836,6 +847,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             )
             self.tma_copy_K_bytes += atom_thr_size * 1024
             self.tma_copy_V_bytes += atom_thr_size * 1024
+            if cutlass.const_expr(self.band_residual):
+                self.tma_copy_V_bytes *= 2  # V and the residual R ride on one V stage
             self.tma_copy_Q_bytes += atom_thr_size * 1024
             self.tma_copy_dO_bytes += atom_thr_size * 1024
         tma_atom_SFQT = tma_tensor_SFQT = tma_atom_SFdOT = tma_tensor_SFdOT = None
@@ -931,6 +944,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sfa_size = cute.cosize(sSFA_layout) if cutlass.const_expr(self.mxfp8) else 0
         sfb_size = cute.cosize(sSFB_layout) if cutlass.const_expr(self.mxfp8) else 0
         sfa_sdp_size = 1024 if cutlass.const_expr(self.mxfp8) else 0
+        sfv_sdp_size = sfa_sdp_size * (2 if cutlass.const_expr(self.band_residual) else 1)
         sfb_sdp_size = 1024 * self.load_mma_Q_stage if cutlass.const_expr(self.mxfp8) else 0
 
         @cute.struct
@@ -1020,7 +1034,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sSFQT: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfb_size], 128]
             # MXFP8: K / V (A) and Q / dO (B) scale tiles
             sSFK: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfa_sdp_size], 128]
-            sSFV: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfa_sdp_size], 128]
+            sSFV: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfv_sdp_size], 128]
             sSFQ: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfb_sdp_size], 128]
             sSFdO: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfb_sdp_size], 128]
 
@@ -1136,6 +1150,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sSFB_sdp_layout,
             tSFA_sdp_layout,
             tSFB_sdp_layout,
+            sSFV_sdp_layout,
         ).launch(
             grid=bwd_grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1222,6 +1237,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sSFB_sdp_layout: cute.Layout | None = None,
         tSFA_sdp_layout: cute.Layout | None = None,
         tSFB_sdp_layout: cute.Layout | None = None,
+        sSFV_sdp_layout: cute.Layout | None = None,
     ):
         """Core CuTeDSL backward kernel."""
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -1266,7 +1282,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sSFK = sSFV = sSFQ = sSFdO = None
         if cutlass.const_expr(self.mxfp8):
             sSFK = storage.sSFK.get_tensor(sSFA_sdp_layout, dtype=mxu.SF_DTYPE)
-            sSFV = storage.sSFV.get_tensor(sSFA_sdp_layout, dtype=mxu.SF_DTYPE)
+            sSFV = storage.sSFV.get_tensor(sSFV_sdp_layout, dtype=mxu.SF_DTYPE)
             sSFQ = storage.sSFQ.get_tensor(sSFB_sdp_layout, dtype=mxu.SF_DTYPE)
             sSFdO = storage.sSFdO.get_tensor(sSFB_sdp_layout, dtype=mxu.SF_DTYPE)
 
@@ -2501,6 +2517,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
         if cutlass.const_expr(self.mxfp8):
             load_SFV(blk_coord_k, 0, tma_bar_ptr=v_handle.barrier)
+        if cutlass.const_expr(self.band_residual):
+            # the residual R of this key tile, s keys further in V_mx / SFV_mx (s % 128 == 0)
+            cute.copy(
+                tma_atom_V,
+                tVgV_mkl[
+                    (
+                        None,
+                        mma_tile_coord_m + problem_shape[1] // 128,
+                        0,
+                        (blk_coord_h, blk_coord_b),
+                    )
+                ],
+                tVsV[(None, 1)],
+                tma_bar_ptr=v_handle.barrier,
+            )
+            load_SFV(blk_coord_k + problem_shape[1] // 64, 1, tma_bar_ptr=v_handle.barrier)
 
         do_handle = load_mma_dO_producer.acquire_and_advance()
         cute.copy(
@@ -2711,6 +2743,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     sSFdO, tSFB_sdp_layout, self.tmem_sfdo_offset, cta_group_sdp, lane_halves=True
                 ),
             )
+        sf_vr = None
+        if cutlass.const_expr(self.band_residual):
+            sf_vr = (
+                mxu.make_sf_s2t(sSFV, tSFA_sdp_layout, self.tmem_sfvr_offset, cta_group_sdp),
+                sf_dp[1],
+            )
         sf_dv = sf_dk = None
         if cutlass.const_expr(self.mxfp8):
             # dV / dK: TMEM scales and their SMEM -> TMEM copies, issued right before the MMA
@@ -2781,6 +2819,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     tdPTtdPT,
                 )
                 VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+            if cutlass.const_expr(self.band_residual):
+                # NOTE [MXFP8 hd256 backward]: the first two causal
+                # query tiles cover the forward's BF16 band of this key tile (seqlen_q ==
+                # seqlen_k; get_Q_block_min_max starts the pair at an even query tile, so for odd
+                # 128-key tiles the first one is fully masked and the residual is inert there):
+                # dP^T += R dO^T with R = MX(V - Vhat) along d, so dP reads V to about BF16
+                # precision there, as the forward's PV did
+                self.dp_residual(VdO_tiled_mma, tdPTtdPT, tdPTrV, tdPTrdO, do_handle.index, sf_vr)
 
             dp_handle.commit()
             do_handle.release()
@@ -2811,6 +2857,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         iter_count -= 1
 
         dSQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        vres_it = Int32(1)  # band_residual: the loop's iteration index (the first one is peeled)
         while iter_count > 0:
             if is_leader_cta:
                 q_handle = load_mma_Q_consumer.wait_and_advance()
@@ -2877,6 +2924,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         tdPTtdPT,
                     )
                     VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                if cutlass.const_expr(self.band_residual):
+                    if vres_it == 1:
+                        self.dp_residual(
+                            VdO_tiled_mma, tdPTtdPT, tdPTrV, tdPTrdO, do_handle.index, sf_vr
+                        )
 
                 dp_handle.commit()
                 do_handle.release()
@@ -2904,6 +2956,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 dot_handle.release()
 
             iter_count -= 1
+            vres_it += 1
 
         if is_leader_cta:
             dkdv_handle = mma_compute_dKdV_producer.acquire_and_advance()
@@ -2966,6 +3019,23 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         if cutlass.const_expr(copy_a):
             cute.copy(cp_a, src_a[None, None, None, None, 0], dst_a)
         cute.copy(copy_b, src_b[None, None, None, None, B_idx], dst_b)
+
+    @cute.jit
+    def dp_residual(self, tiled_mma, tdPTtdPT, tdPTrV, tdPTrdO, do_idx: Int32, sf_vr):
+        """band_residual: dP^T += R dO^T, R (V's SMEM stage 1) with its scales copied to their own TMEM
+        columns; dO's scales are already in TMEM from this step's dP MMA."""
+        _, cp_vr, src_vr, dst_vr = sf_vr[0]
+        cute.copy(cp_vr, src_vr[None, None, None, None, 1], dst_vr)
+        for k_block in cutlass.range(0, cute.size(tdPTrV, mode=[2]), unroll_full=True):
+            self.set_sf(tiled_mma, sf_vr, k_block)
+            cute.gemm(
+                tiled_mma,
+                tdPTtdPT,
+                tdPTrV[None, None, k_block, 1],
+                tdPTrdO[None, None, k_block, do_idx],
+                tdPTtdPT,
+            )
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @cute.jit
     def set_sf(self, tiled_mma: cute.TiledMma, sf, k_block: Int32):
@@ -3252,11 +3322,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             trailing_residual_masking = cute.arch.shuffle_sync(trailing_residual_masking, 0)
 
             # For causal, every tile may contain (q,k) with k > q; we must apply per-element mask for all Q tiles.
+            # MXFP8 (dense): only the leading tiles do (the pair's diagonal query tile and, with
+            # iter_start rounded down to even, the one before it), so the rest skip the mask
             is_masked_tile = (
                 leading_causal_masking
                 or trailing_residual_masking
                 or self.has_sliding_window
-                or cutlass.const_expr(self.is_causal)
+                or cutlass.const_expr(self.is_causal and not self.mxfp8)
             )
 
             # Compute P = softmax(S, LSE)
@@ -3373,15 +3445,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     (tTR_rdPT[i], tTR_rdPT[i + 1]), (tTR_rST[i], tTR_rST[i + 1])
                 )
             # For causal, force dS to zero at masked (q,k) so dK/dV accumulation is correct
+            # (MXFP8, dense: P is exactly 0 there, but dP - D may be anything, so only the masked tiles)
             if cutlass.const_expr(self.is_causal):
-                for i in cutlass.range(cute.size(tTR_rdPT), unroll_full=True):
-                    c_transpose = tTR_cdPT[i]
-                    pos = (
-                        cute.get(c_transpose, mode=[1]) + iter_index * self.tile_shape_Q,
-                        cute.get(c_transpose, mode=[0]) + blk_coord_k * self.tile_shape_K,
-                    )
-                    if pos[0] + K - Q < pos[1] or not cute.elem_less(pos, (Q, K)):
-                        tTR_rdPT[i] = cutlass.Float32(0.0)
+                if cutlass.const_expr(self.mxfp8):
+                    if is_masked_tile:
+                        self.causal_zero_ds(tTR_rdPT, tTR_cdPT, iter_index, blk_coord_k, Q, K)
+                else:
+                    self.causal_zero_ds(tTR_rdPT, tTR_cdPT, iter_index, blk_coord_k, Q, K)
             if cutlass.const_expr(self.mxfp8):
                 # dS^T (x 2^8, see the P shift) in E4M3 with this thread's scale for its 32
                 # queries; the scale byte drops the 2^8
@@ -3465,6 +3535,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             compute_mma_dS_consumer,
             mma_compute_dKdV_consumer,
         )
+
+    @cute.jit
+    def causal_zero_ds(self, tTR_rdPT, tTR_cdPT, iter_index, blk_coord_k, Q, K):
+        for i in cutlass.range(cute.size(tTR_rdPT), unroll_full=True):
+            c_transpose = tTR_cdPT[i]
+            pos = (
+                cute.get(c_transpose, mode=[1]) + iter_index * self.tile_shape_Q,
+                cute.get(c_transpose, mode=[0]) + blk_coord_k * self.tile_shape_K,
+            )
+            if pos[0] + K - Q < pos[1] or not cute.elem_less(pos, (Q, K)):
+                tTR_rdPT[i] = cutlass.Float32(0.0)
 
     @cute.jit
     def mx_kq_view(self, s: cute.Tensor) -> cute.Tensor:
