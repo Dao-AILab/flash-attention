@@ -1858,6 +1858,7 @@ def _get_bwd_inputs(
         requested_V_in_regs=V_in_regs,
         requested_tile_n=utils._get_bwd_tile_n_override(),
         requested_pack_gqa=utils._get_bwd_pack_gqa_override(),
+        requested_head_loop=utils._get_bwd_head_loop_override(),
         disable_2cta=utils._get_disable_2cta_default(),
         hd256_generic=utils._get_hd256_generic_bwd(),
     )
@@ -2115,9 +2116,11 @@ def _flash_attn_bwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
-    # NOTE [bwd pack_gqa] (pack_gqa.py): BwdConfig.pack_gqa folds the query heads of a KV head
-    # into the Q tile; the legacy pack_gqa argument stays ignored.
-    bwd_pack_gqa = config.pack_gqa
+    # NOTE [bwd pack_gqa] (pack_gqa.py): BwdConfig.pack_factor query heads of a KV head share
+    # the Q tile rows and, with BwdConfig.head_loop (hdim 256), one tile per KV head loops over
+    # the remaining sub-groups in the CTA; the legacy pack_gqa argument stays ignored.
+    bwd_pack_factor, bwd_head_loop = config.pack_factor, config.head_loop
+    bwd_pack_gqa = bwd_pack_factor > 1
     
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
@@ -2152,10 +2155,10 @@ def _flash_attn_bwd(
     hdim_multiple_of = 64 if config.dKV_swapAB else 32
     head_dim_rounded = (head_dim + hdim_multiple_of - 1) // hdim_multiple_of * hdim_multiple_of
 
-    # Per-head scratch (dq_accum, dpsum, lse_log2, dQ_semaphore): pack_gqa stores it per KV
-    # head with qhead_per_kvhead rows per token (NOTE [bwd pack_gqa]).
-    scratch_heads = num_head_kv if bwd_pack_gqa else num_head
-    rows_per_token = qhead_per_kvhead if bwd_pack_gqa else 1
+    # Per-head scratch (dq_accum, dpsum, lse_log2, dQ_semaphore): a pack stores it per scratch
+    # head (num_head / pack_factor) with pack_factor rows per token (NOTE [bwd pack_gqa]).
+    scratch_heads = num_head // bwd_pack_factor
+    rows_per_token = bwd_pack_factor
     seqlen_q_rows_rounded = (
         (seqlen_q * rows_per_token + tile_m - 1) // tile_m * tile_m
     )
@@ -2183,7 +2186,11 @@ def _flash_attn_bwd(
     # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
     # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
     # hd=256 2CTA backward has its own internal postprocess for dK/dV.
-    dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel and not bwd_pack_gqa
+    dKV_postprocess = (
+        qhead_per_kvhead // bwd_pack_factor > 1
+        and not use_dedicated_hd256_kernel
+        and not bwd_head_loop
+    )
     if dKV_postprocess:
         # Same rounding as the kernel's tile_hdimv and the postprocess (64 with dKV_swapAB on
         # SM90): the GQA epilogue reduces tile_n * tile_hdimv fp32 values per block.
@@ -2251,7 +2258,7 @@ def _flash_attn_bwd(
             cu_seqlens=cu_seqlens_q,
             seqused=seqused_q,
             tile_size=tile_m,
-            qhead_per_kvhead=qhead_per_kvhead,
+            qhead_per_kvhead=bwd_pack_factor,
             pack_gqa=bwd_pack_gqa,
         )
         cu_total_m_blocks_k, _ = _compute_tile_cumsum(
@@ -2272,8 +2279,8 @@ def _flash_attn_bwd(
         # NOTE [bwd pack_gqa]: packed views of the per-head O / dO / LSE; dPsum / LSElog2 /
         # dQaccum are per KV head in packed row order
         pack_gqa=PackGQA.PACKED_ROW_OUTPUTS if bwd_pack_gqa else PackGQA.OFF,
-        qhead_per_kvhead=qhead_per_kvhead if bwd_pack_gqa else 1,
-        nheads_kv=num_head_kv if bwd_pack_gqa else 1,
+        qhead_per_kvhead=bwd_pack_factor,
+        nheads_kv=num_head // bwd_pack_factor if bwd_pack_gqa else 1,
         cu_total_m_blocks=cu_total_m_blocks_q,
         fake_mode=fake_mode,
         hdim_multiple_of=hdim_multiple_of,
@@ -2507,7 +2514,8 @@ def _flash_attn_bwd(
                     has_aux_tensors=aux_tensors is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
-                    pack_gqa=config.pack_gqa,
+                    pack_factor=config.pack_factor,
+                    head_loop=config.head_loop,
                     registers=config.registers,
                     Q_stage=config.num_stages_Q,
                     dO_stage=config.num_stages_dO,
@@ -2645,7 +2653,7 @@ def _flash_attn_bwd(
             ),
             fake_mode=fake_mode,
             hdim_multiple_of=hdim_multiple_of,
-            pack_factor=qhead_per_kvhead if bwd_pack_gqa else 1,
+            pack_factor=bwd_pack_factor,
         )
 
         if dKV_postprocess:
