@@ -3139,10 +3139,14 @@ class FlashAttentionMLAForwardSm100:
                     self.pack_gqa,
                     self.qhead_per_kvhead_valid if const_expr(self.pad_qheads) else None,
                 )
-                row_max, row_sum = apply_learnable_sink(row_max, row_sum, sink_val, softmax_scale_log2)
+                row_max, row_sum, o_rescale = apply_learnable_sink(
+                    row_max, row_sum, sink_val, softmax_scale_log2
+                )
 
             acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
             scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+            if const_expr(learnable_sink is not None):
+                scale = scale * o_rescale
             # seqlen_k == 0 with TMA KV: the fully masked dummy block still loaded a KV tile, and
             # P = 0 times a NaN V row is NaN (scaling by 0 would keep it): write zeros instead.
             zero_O = seqlen.seqlen_k == 0 if const_expr(self.use_tma_KV) else False
