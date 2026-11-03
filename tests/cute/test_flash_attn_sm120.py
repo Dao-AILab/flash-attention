@@ -189,6 +189,60 @@ def test_sm120_decode_visible_k_uses_exact_local_window():
     )
 
 
+@pytest.mark.parametrize(
+    "device, total_mblocks, resident_ctas_per_sm, num_n_blocks, split",
+    [
+        pytest.param("discrete", 128, 1, 512, True, id="short-tail"),
+        pytest.param("discrete", 112, 1, 512, True, id="two-cta-tail"),
+        pytest.param("discrete", 110, 1, 512, False, id="exact-wave"),
+        pytest.param("discrete", 128, 2, 512, False, id="fits-two-resident"),
+        pytest.param("discrete", 128, 1, 4, False, id="short-kv"),
+        pytest.param("discrete", 256, 1, 512, False, id="bandwidth-bound-tail"),
+        pytest.param("integrated", 50, 1, 512, True, id="integrated-short-tail"),
+        pytest.param("integrated", 64, 1, 128, False, id="integrated-bandwidth-bound-tail"),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_sm120_decode_splits_past_partial_wave(
+    device, total_mblocks, resident_ctas_per_sm, num_n_blocks, split
+):
+    from flash_attn.cute.sm120.runtime import _DecodeHardware, _split_past_partial_wave
+
+    hardware = {
+        "discrete": _DecodeHardware(
+            num_sms=110,
+            memory_channels=12,
+            peak_memory_gbps=1344.0,
+            core_clock_ghz=2.6,
+            is_integrated=False,
+        ),
+        "integrated": _DecodeHardware(
+            num_sms=48,
+            memory_channels=8,
+            peak_memory_gbps=273.0,
+            core_clock_ghz=2.4,
+            is_integrated=True,
+        ),
+    }[device]
+    num_splits = _split_past_partial_wave(
+        num_splits=1,
+        total_mblocks=total_mblocks,
+        packed_q_rows=24,
+        num_n_blocks=num_n_blocks,
+        tile_n=64,
+        head_dim=256,
+        head_dim_v=256,
+        element_size=2,
+        resident_ctas_per_sm=resident_ctas_per_sm,
+        hardware=hardware,
+    )
+    assert (num_splits > 1) == split
+    if split:
+        # Every split owns KV blocks.
+        per_split = -(-num_n_blocks // num_splits)
+        assert (num_splits - 1) * per_split < num_n_blocks
+
+
 @cute.jit
 def _coordinate_score_mod(
     score,

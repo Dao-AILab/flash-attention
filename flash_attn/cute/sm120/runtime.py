@@ -199,15 +199,72 @@ def _predict_decode_split_us(
     main_us = max(latency_main_us, memory_main_us)
     if num_splits == 1:
         return main_us
-    output_rows = batch_head_groups * packed_q_rows
+    return main_us + _decode_combine_us(num_splits, batch_head_groups * packed_q_rows, head_dim_v)
+
+
+def _decode_combine_us(num_splits: int, output_rows: int, head_dim_v: int) -> float:
     combine_ctas = ((output_rows + 7) // 8) * ((head_dim_v + 127) // 128)
-    combine_us = (
+    return (
         _DECODE_COMBINE_FIXED_US
         + _DECODE_COMBINE_SPLIT_TO_8_US * min(num_splits, 8)
         + _DECODE_COMBINE_SPLIT_ABOVE_8_US * max(num_splits - 8, 0)
         + _DECODE_COMBINE_OUTPUT_CTA_US * combine_ctas
     )
-    return main_us + combine_us
+
+
+@lru_cache(maxsize=1024)
+def _split_past_partial_wave(
+    *,
+    num_splits: int,
+    total_mblocks: int,
+    packed_q_rows: int,
+    num_n_blocks: int,
+    tile_n: int,
+    head_dim: int,
+    head_dim_v: int,
+    element_size: int,
+    resident_ctas_per_sm: int,
+    hardware: _DecodeHardware,
+) -> int:
+    """Split a one-m-block grid that spills past its resident waves.
+
+    With one m block per batch-head, every CTA streams a whole KV range. A wave of CTAs takes
+    the longer of one CTA's latency-bound KV loop and the wave's bytes at the memory
+    bandwidth, so a tail wave of a few CTAs costs a whole CTA's KV loop while moving little.
+    Splitting KV shortens every CTA's loop, but every split CTA writes an FP32 partial O and
+    LSE that the combine reads back, and the combine pays per split.
+    """
+    slots = hardware.num_sms * resident_ctas_per_sm
+    if total_mblocks * num_splits <= slots or num_n_blocks <= 4:
+        return num_splits
+    clock_scale = _DECODE_REFERENCE_CORE_GHZ / hardware.core_clock_ghz
+    tile_bytes = tile_n * (head_dim + head_dim_v) * element_size
+    partial_bytes = packed_q_rows * (head_dim_v + 1) * 4
+    bytes_per_us = hardware.peak_memory_gbps * _DECODE_MEMORY_SOL * 1000.0
+    output_rows = total_mblocks * packed_q_rows
+
+    def predict_us(splits: int) -> float:
+        tiles = -(-num_n_blocks // splits)
+        cta_us = (
+            _DECODE_LATENCY_FIXED_REF_US + _DECODE_LATENCY_PER_KV_TILE_REF_US * tiles
+        ) * clock_scale
+        cta_bytes = tiles * tile_bytes + (partial_bytes if splits > 1 else 0)
+        full_waves, tail_ctas = divmod(total_mblocks * splits, slots)
+        wave_us = max(cta_us, slots * cta_bytes / bytes_per_us)
+        tail_us = max(cta_us, tail_ctas * cta_bytes / bytes_per_us) if tail_ctas else 0.0
+        combine_us = (
+            _decode_combine_us(splits, output_rows, head_dim_v)
+            + total_mblocks * splits * partial_bytes / bytes_per_us
+            if splits > 1
+            else 0.0
+        )
+        return full_waves * wave_us + tail_us + combine_us
+
+    candidates = {
+        _normalize_num_splits(splits, num_n_blocks)
+        for splits in range(num_splits, min(128, num_n_blocks) + 1)
+    }
+    return min(sorted(candidates), key=predict_us)
 
 
 def _select_decode_num_splits(
@@ -410,6 +467,7 @@ class Sm120ForwardHost:
         fake_mode: bool,
         generic_heuristic: Callable[[int, int, int, int], int],
         block_sparse: bool = False,
+        resident_ctas_per_sm: int,
     ) -> Sm120ForwardPlan:
         """Resolve all SM120 dataflow decisions behind one host-side boundary."""
         has_compact_q_groups = pack_gqa or packed_q_rows == max_seqlen_q
@@ -440,6 +498,7 @@ class Sm120ForwardHost:
             device=device,
             fake_mode=fake_mode,
             generic_heuristic=generic_heuristic,
+            resident_ctas_per_sm=resident_ctas_per_sm,
         )
         is_split_kv = num_splits > 1
         direct_uniform_batch = cls.use_direct_uniform_batch(
@@ -651,6 +710,16 @@ class Sm120ForwardHost:
             fake_mode=fake_mode,
             generic_heuristic=num_splits_heuristic,
             block_sparse=block_sparse,
+            resident_ctas_per_sm=cls.resident_ctas_per_sm(
+                cutlass.BFloat16,
+                head_dim,
+                head_dim_v,
+                tile_m,
+                tile_n,
+                config.num_stages,
+                config.num_threads,
+                page_table is not None,
+            ),
         )
         # The split heuristic counts dense KV blocks; block-sparse calls split only on request.
         static_plan = resolve(
@@ -1014,8 +1083,10 @@ class Sm120ForwardHost:
         device: torch.device,
         fake_mode: bool,
         generic_heuristic: Callable[[int, int, int, int], int],
+        resident_ctas_per_sm: int,
     ) -> int:
         num_splits = requested_num_splits
+        hardware = None
         if num_splits < 1:
             is_hd256_paged_decode = (
                 head_dim == 256
@@ -1050,6 +1121,7 @@ class Sm120ForwardHost:
                         max_splits,
                     )
                 else:
+                    hardware = _get_decode_hardware(device, num_sms)
                     num_splits = _select_decode_num_splits(
                         head_dim=head_dim,
                         head_dim_v=head_dim_v,
@@ -1059,7 +1131,7 @@ class Sm120ForwardHost:
                         tile_n=tile_n,
                         total_mblocks=total_mblocks,
                         num_n_blocks=num_n_blocks,
-                        hardware=_get_decode_hardware(device, num_sms),
+                        hardware=hardware,
                     )
             else:
                 num_splits = generic_heuristic(
@@ -1067,6 +1139,23 @@ class Sm120ForwardHost:
                     num_sms,
                     num_n_blocks,
                     128,
+                )
+            if (
+                not fake_mode
+                and packed_q_rows <= tile_m
+                and not (is_low_hd_paged_decode and tile_m == 16)
+            ):
+                num_splits = _split_past_partial_wave(
+                    num_splits=num_splits,
+                    total_mblocks=total_mblocks,
+                    packed_q_rows=packed_q_rows,
+                    num_n_blocks=num_n_blocks,
+                    tile_n=tile_n,
+                    head_dim=head_dim,
+                    head_dim_v=head_dim_v,
+                    element_size=element_size,
+                    resident_ctas_per_sm=resident_ctas_per_sm,
+                    hardware=hardware or _get_decode_hardware(device, num_sms),
                 )
 
         if num_splits <= 1 or num_n_blocks == 0:
