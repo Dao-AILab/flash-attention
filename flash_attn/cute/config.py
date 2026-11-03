@@ -153,6 +153,8 @@ class FwdHeuristicInputs(NamedTuple):
     seqlen_k_capacity: int | None = None
     requires_grad: bool = False  # any input, aux tensors included
     has_aux_scalars: bool = False
+    # MXFP8 block-scaled forward: "qk" (e4m3 Q/K with block scales, BF16 V); None otherwise.
+    mxfp8_path: str | None = None
 
     @property
     def device_capacity(self) -> int:
@@ -435,6 +437,7 @@ _SM_STATS_CROSS_STAGE = {
     ("fp8", 64, True, False): ("sm_100",),
     ("fp8", 96, False, False): ("sm_100",),
     ("fp8", 96, True, False): ("sm_100",),
+    ("mxfp8_qk", 64, True, False): ("sm_103", "sm_107"),
 }
 # === END SM100 TUNING KNOBS ===
 
@@ -456,16 +459,25 @@ def sm100_arch_family(device_arch: int) -> str:
     return "sm_103" if sm100_is_sm103_family(device_arch) else "sm_100"
 
 
-def dtype_path(dtype: str) -> str:
-    """Tuning-table dtype path of a torch dtype string."""
+def tuning_path(inputs: FwdHeuristicInputs) -> str:
+    """Tuning-table path: the MXFP8 path, else the dtype."""
+    if inputs.mxfp8_path is not None:
+        return f"mxfp8_{inputs.mxfp8_path}"
+    dtype = inputs.dtype
     return "fp8" if "float8" in dtype else "fp16" if dtype == "torch.float16" else "bf16"
+
+
+def has_fp8_pv(inputs: FwdHeuristicInputs) -> bool:
+    """Whether P and V are FP8. The FP8 register splits and exp2 tuning follow V: MXFP8 QK keeps
+    BF16 V and P."""
+    return "float8" in inputs.dtype and inputs.mxfp8_path != "qk"
 
 
 def select_sm_stats_cross_stage(inputs: FwdHeuristicInputs, *, use_s_ping_pong: bool) -> bool:
     """See NOTE [softmax stats release order]."""
     if inputs.device_capacity not in (10, 11) or use_s_ping_pong:
         return False
-    key = (dtype_path(inputs.dtype), inputs.head_dim_padded, inputs.causal, inputs.is_varlen_q)
+    key = (tuning_path(inputs), inputs.head_dim_padded, inputs.causal, inputs.is_varlen_q)
     return sm100_arch_family(inputs.device_arch) in _SM_STATS_CROSS_STAGE.get(key, ())
 
 
@@ -480,7 +492,7 @@ def select_sm100_registers(
         head_dim_padded,
         sm100_is_sm103_family(inputs.device_arch),
     )
-    is_fp8 = "float8" in inputs.dtype
+    is_fp8 = has_fp8_pv(inputs)
     if head_dim_padded < 96:
         small = SM100_FP8_SMALL_HDIM_REGISTERS if is_fp8 else SM100_SMALL_HDIM_REGISTERS
         return small[paged_kv_non_tma]
@@ -518,7 +530,7 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
     is_sm103 = sm100_is_sm103_family(inputs.device_arch)
     key = (use_2cta_instrs, inputs.causal, head_dim_padded, is_sm103)
     tune = SM100_TUNING.get(key, {})
-    fp8_tune = SM100_FP8_TUNING.get(key, {}) if "float8" in inputs.dtype else {}
+    fp8_tune = SM100_FP8_TUNING.get(key, {}) if has_fp8_pv(inputs) else {}
     if "ex2_emu_freq" in fp8_tune:
         tune = {**tune, **fp8_tune}
     start_frg = tune.get("ex2_emu_start_frg", 1)
@@ -743,6 +755,7 @@ def can_use_s_ping_pong(
         and not inputs.has_mask_mod
         and not inputs.use_block_sparsity
         and not inputs.has_learnable_sink
+        and inputs.mxfp8_path is None
     )
 
 
@@ -761,6 +774,8 @@ def is_2cta_eligible(
     )
     return (
         num_splits == 1
+        # The MXFP8 kernel is 1CTA only.
+        and inputs.mxfp8_path is None
         and (not inputs.has_cu_seqlens_q or (inputs.is_hdim256 and hd256_2cta_varlen_ok(inputs)))
         and not inputs.has_seqused_q
         and not inputs.use_block_sparsity
@@ -825,17 +840,17 @@ def can_use_clc(
 
 # NOTE [causal CLC]
 # CLC amortizes CTA setup across tiles while preserving L2-swizzled LPT order
-# (clc_late_claim). The benefit depends on dtype, head dimension, and architecture, so this
-# table enables it by default only for benchmark-validated combinations: <=0.5% loss per
-# shape, >1% gain on at least one shape. A cell may carry a measured register split that
-# runs faster under CLC; None keeps the default split; missing entries leave CLC off by
-# default. Timing candidates: see benchmarks/clc_bench.py --summary.
+# (clc_late_claim). The benefit depends on dtype or MXFP8 path, head dimension, and
+# architecture, so this table enables it by default only for benchmark-validated combinations:
+# <=0.5% loss per shape, >1% gain on at least one shape. A cell may carry a measured register
+# split that runs faster under CLC; None keeps the default split; missing entries leave CLC off
+# by default. Timing candidates: see benchmarks/clc_bench.py --summary.
 # hd256 runs one Q tile per 2CTA cluster, and its CLC launch takes tiles in grid order, head by
 # head (only 1CTA reuses the L2-swizzled LPT order), so with few (batch, launched head) slices
 # the longest tiles of the last heads start late. hd256 cells therefore need at least
 # _HD256_CLC_MIN_HEAD_SLICES slices: on B200, CLC measured 1.006-1.148x on all 24 shapes with 32
 # or more, and 0.83-1.04x (20 of 28 shapes slower) below.
-# (dtype path, head_dim_padded) -> {arch family: register override}.
+# (tuning path, head_dim_padded) -> {arch family: register override}; see tuning_path.
 _CAUSAL_CLC_DEFAULT = {
     ("bf16", 64): {"sm_100": None},
     ("bf16", 96): {"sm_100": None, "sm_103": None, "sm_107": None},
@@ -849,6 +864,8 @@ _CAUSAL_CLC_DEFAULT = {
     ("fp16", 256): {"sm_100": None},
     ("fp8", 64): {"sm_100": None, "sm_103": None, "sm_107": None},
     ("fp8", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
+    ("mxfp8_qk", 64): {"sm_100": None},
+    ("mxfp8_qk", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
 }
 _HD256_CLC_MIN_HEAD_SLICES = 32
 
@@ -883,7 +900,7 @@ def causal_clc_policy(
     ):
         return False, None
     family = sm100_arch_family(inputs.device_arch)
-    row = _CAUSAL_CLC_DEFAULT.get((dtype_path(inputs.dtype), inputs.head_dim_padded), {})
+    row = _CAUSAL_CLC_DEFAULT.get((tuning_path(inputs), inputs.head_dim_padded), {})
     return family in row, row.get(family)
 
 
@@ -989,6 +1006,8 @@ def sm100_fwd_buffer_bytes(
 ) -> tuple[int, int, int, int]:
     """Per-CTA (sQ, sO, K stage, V stage) bytes of the SM100 forward kernel."""
     element_bytes = 1 if "float8" in inputs.dtype else 2
+    # QK MXFP8 keeps V in BF16.
+    v_element_bytes = 2 if inputs.mxfp8_path == "qk" else element_bytes
     is_split_kv = num_splits > 1
     # SplitKV stores fp32 partials; FP8 inputs produce bf16 output.
     o_bytes = 4 if is_split_kv else 2
@@ -1000,8 +1019,20 @@ def sm100_fwd_buffer_bytes(
     # 2CTA splits each K/V tile across the cluster.
     cta_group_size = 2 if use_2cta_instrs else 1
     k = tile_n * inputs.head_dim_padded * element_bytes // cta_group_size
-    v = tile_n * inputs.head_dim_v_padded * element_bytes // cta_group_size
+    v = tile_n * inputs.head_dim_v_padded * v_element_bytes // cta_group_size
     return q, o, k, v
+
+
+def sm100_fwd_scale_bytes(inputs: FwdHeuristicInputs, *, q_stage: int) -> tuple[int, int]:
+    """Per-CTA (sSFQ, sSFK per K/V stage) bytes of the MXFP8 forward's UE8M0 block scales.
+
+    tcgen05.cp copies whole 128-row x 4-scale chunks, one per 128 channels of head_dim
+    (padding hd64 to a full chunk); other forwards have no scale buffers.
+    """
+    if inputs.mxfp8_path is None:
+        return 0, 0
+    chunk_bytes = 128 * 4 * ceil_div(inputs.head_dim, 128)
+    return q_stage * chunk_bytes, chunk_bytes
 
 
 def select_sm100_smem_layout(
@@ -1039,8 +1070,10 @@ def select_sm100_smem_layout(
         num_splits=num_splits,
         use_2cta_instrs=use_2cta_instrs,
     )
-    q_o = max(q, o) if overlap_sO_sQ else q + o
-    kv_stage = min((_SM100_KV_STAGE_BUDGET_BYTES - q_o) // max(k, v), SM100_MAX_KV_STAGE)
+    # MXFP8 Q scales count with sQ, and each K/V stage holds its scales.
+    sfq, sfkv = sm100_fwd_scale_bytes(inputs, q_stage=q_stage)
+    q_o = max(q + sfq, o) if overlap_sO_sQ else q + sfq + o
+    kv_stage = min((_SM100_KV_STAGE_BUDGET_BYTES - q_o) // (max(k, v) + sfkv), SM100_MAX_KV_STAGE)
     # 1CTA hd192/128 fits a third stage with the uneven [K, V, K] layout.
     if sm100_uneven_kv_smem(head_dim_padded, head_dim_v_padded, kv_stage + 1, use_2cta_instrs):
         kv_stage = 3
@@ -1054,6 +1087,9 @@ def sm100_fwd_smem_bytes(config: FwdConfig, inputs: FwdHeuristicInputs) -> int:
     dynamic_persistent = config.use_clc_scheduler or inputs.has_varlen_q_semaphore
     # Int64 mbarriers: load Q and KV, four S/P/O pipelines, O epilogue, load epilogue,
     # S0/S1 sequence, TMEM dealloc.
+    # MXFP8 with two Q stages: QK_i's scales alias the other stage's S in TMEM, guarded by
+    # four more mbarriers.
+    sf_overlap = inputs.mxfp8_path is not None and q_stage == 2
     num_mbarriers = (
         2 * q_stage
         + 2 * kv_stage
@@ -1061,6 +1097,7 @@ def sm100_fwd_smem_bytes(config: FwdConfig, inputs: FwdHeuristicInputs) -> int:
         + 2 * q_stage
         + (2 if config.overlap_sO_sQ else 0)
         + 2 * 2
+        + (4 if sf_overlap else 0)
         + 1
     )
     header = 8 * num_mbarriers + 4  # Int32 TMEM holding buffer
@@ -1087,6 +1124,10 @@ def sm100_fwd_smem_bytes(config: FwdConfig, inputs: FwdHeuristicInputs) -> int:
     total = round_up(header, align)
     for buffer in (o, q, kv_bytes):
         total = round_up(total + buffer, align)
+    # MXFP8 scale buffers follow sK, 128-byte aligned.
+    sfq, sfkv = sm100_fwd_scale_bytes(inputs, q_stage=q_stage)
+    if sfq:
+        total = round_up(round_up(total + sfq, 128) + kv_stage * sfkv, align)
     return total
 
 
@@ -1204,6 +1245,7 @@ class SwapABPolicy:
             and not (inputs.has_max_seqlen_q_hint and inputs.max_seqlen_q == 1),
             "single query token per sequence": is_dense_q and inputs.total_q != inputs.batch_size,
             "dtype": inputs.dtype not in ("torch.float16", "torch.bfloat16"),
+            "MXFP8 block scales": inputs.mxfp8_path is not None,
             "head dimensions": not self.supports_head_dims(inputs.head_dim, inputs.head_dim_v),
             "GQA ratio": inputs.qhead_per_kvhead > self.max_qhead_per_kvhead,
             f"page size must be a multiple of {self.page_multiple}": (
@@ -1492,7 +1534,8 @@ def _select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
             validate_fwd_config(config, inputs)
             return config
     pack_gqa = default_pack_gqa(inputs) if inputs.pack_gqa is None else inputs.pack_gqa
-    if inputs.sparse_mask_per_head:
+    # MXFP8 scale chunks are token-major, so GQA uses separate Q heads.
+    if inputs.sparse_mask_per_head or inputs.mxfp8_path is not None:
         pack_gqa = False
     inputs = inputs._replace(pack_gqa=pack_gqa)
     device_capacity = inputs.device_capacity
@@ -1512,8 +1555,8 @@ def _select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     num_n_blocks = ceil_div(seqlen_k_loaded, tile_n)
     if inputs.requested_num_splits is not None:
         num_splits = max(1, inputs.requested_num_splits)
-    elif not is_sm100_family:
-        # Only SM100/SM110 implement SplitKV.
+    elif not is_sm100_family or inputs.mxfp8_path is not None:
+        # Only SM100/SM110 implement SplitKV, and MXFP8 forward is unsplit.
         num_splits = 1
     else:
         num_splits = num_splits_heuristic(total_mblocks, inputs.num_sms, num_n_blocks, 128)
@@ -1829,6 +1872,8 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         raise ValueError(f"seqlen_k_per_split must be divisible by tile_n={config.tile_n}")
 
     capacity = inputs.device_capacity
+    if inputs.mxfp8_path is not None and capacity != 10:
+        raise ValueError(f"MXFP8 forward requires SM10x, got SM{capacity}")
     if capacity != 9 and any(
         getattr(config, name) != value for name, value in _FWD_SM90_ONLY_NEUTRAL_FIELDS.items()
     ):
@@ -1868,6 +1913,11 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         raise ValueError(f"SM100 q_stage must be 1 or 2, got {config.q_stage}")
     if 2 * config.tile_n + config.q_stage * inputs.head_dim_v_padded > 512:
         raise ValueError("S and O accumulators exceed the 512 TMEM columns")
+
+    if inputs.mxfp8_path is not None and (
+        config.tile_n != 128 or config.num_splits != 1 or config.pack_gqa
+    ):
+        raise ValueError("MXFP8 forward requires 128 x 128 tiles, one split, and no PackGQA")
 
     if config.num_splits > 1:
         if inputs.head_dim_v_padded >= 192 and inputs.head_dim_v != 256:
