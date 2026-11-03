@@ -1907,6 +1907,11 @@ def can_use_mla_kb64(inputs: MlaFwdHeuristicInputs) -> bool:
     )
 
 
+def mla_2cta_pads_dense_qheads(nheads_per_kv: int, num_heads_kv: int) -> bool:
+    """Whether dense 2CTA MLA pads Q heads to its 128-row tile: MQA with 65 to 127 heads."""
+    return num_heads_kv == 1 and 64 < nheads_per_kv < 128
+
+
 def mla_tiles_sparse_heads(inputs: MlaFwdHeuristicInputs) -> bool:
     """Sparse MLA below 128 heads tiles one token's heads (pack_gqa) padded to the kernel tile."""
     return inputs.is_topk_gather and inputs.nheads_per_kv < 128
@@ -1961,8 +1966,8 @@ def select_mla_fwd_config(inputs: MlaFwdHeuristicInputs) -> MlaFwdConfig:
     kernel: MlaKernel = (
         "2cta" if not use_1cta else "1cta_kb64" if can_use_mla_kb64(inputs) else "1cta"
     )
-    # Q rows per token. The provisional route fixes the padding: dense never pads and sparse
-    # never re-routes.
+    # Q rows per token. The provisional route fixes the padding: sparse never re-routes, and the
+    # dense 2CTA head padding (mla_2cta_pads_dense_qheads) leaves the 2CTA tiles unchanged.
     qhead_tile = inputs.nheads_per_kv
     if mla_tiles_sparse_heads(inputs):
         min_tile = MLA_2CTA_SPARSE_HEAD_TILE if kernel == "2cta" else MLA_1CTA_SPARSE_HEAD_TILE
@@ -2064,11 +2069,18 @@ def validate_mla_fwd_config(config: MlaFwdConfig, inputs: MlaFwdHeuristicInputs)
             f"The MLA kernels need 1 to 128 Q heads per KV head, got {inputs.nheads_per_kv}"
         )
     if kernel == "2cta":
-        # Sparse heads are padded to 128; dense packed heads must divide the cluster tile.
-        if config.pack_gqa and not inputs.is_topk_gather and 128 % inputs.nheads_per_kv != 0:
+        # Sparse heads are padded to 128, as are some dense MQA head counts
+        # (mla_2cta_pads_dense_qheads); other dense packed heads must divide the cluster tile.
+        if (
+            config.pack_gqa
+            and not inputs.is_topk_gather
+            and 128 % inputs.nheads_per_kv != 0
+            and not mla_2cta_pads_dense_qheads(inputs.nheads_per_kv, fwd.num_heads_kv)
+        ):
             raise ValueError(
-                "The 2CTA MLA kernel with pack_gqa=True needs Q heads per KV head to divide "
-                f"128, got {inputs.nheads_per_kv}"
+                "The 2CTA MLA kernel with pack_gqa=True needs Q heads per KV head that divide "
+                "128, or a single KV head with 65 to 127 Q heads, got "
+                f"{inputs.nheads_per_kv} Q heads per KV head and {fwd.num_heads_kv} KV heads"
             )
         if inputs.is_fp8 or inputs.has_descale or config.num_splits > 1:
             raise ValueError(

@@ -24,7 +24,7 @@ from flash_attn.cute.pack_gqa import (
     qheads_first_tma_view,
     regroup_padded_qheads,
 )
-from flash_attn.cute.config import sparse_mla_qhead_tile
+from flash_attn.cute.config import mla_2cta_pads_dense_qheads, sparse_mla_qhead_tile
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute import utils as fa_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -86,11 +86,14 @@ class FlashAttentionMLAForwardSm100:
         self.is_local = False
         self.pack_gqa = pack_gqa
         assert 0 < qhead_per_kvhead <= 128
-        # qhead_per_kvhead is the real head count. Sparse MLA (MQA) pads it to the tile:
-        # see pack_gqa.qheads_first_tma_view.
+        # qhead_per_kvhead is the real head count. Sparse MLA (MQA) pads it to the tile, as do
+        # some dense MQA head counts (config.mla_2cta_pads_dense_qheads): see
+        # pack_gqa.qheads_first_tma_view.
         self.qhead_per_kvhead_valid = qhead_per_kvhead
         if is_topk_gather:
             assert pack_gqa
+            qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead)
+        elif pack_gqa and mla_2cta_pads_dense_qheads(qhead_per_kvhead, nheads_kv):
             qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead)
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pad_qheads = qhead_per_kvhead != self.qhead_per_kvhead_valid
