@@ -896,48 +896,44 @@ class Sm120ForwardHost:
         tile_n: int,
         sparse_block_size: tuple[int, int],
         exact_q: bool = False,
+        paged_kv: bool = False,
     ) -> tuple[int, int]:
         """A sparse block spans whole tiles (q_subtile_factor = Bq / tile_m, kv_subtile_factor =
-        Bk / tile_n): keep the selected tile when it divides the block, else take the largest
-        divisor the kernel runs (the block itself first, e.g. Bk 112), within the SMEM. Varlen
-        lists count Q blocks per batch, so there tile_m is Bq itself (exact_q)."""
-        wide = max(head_dim, head_dim_v) > 128
-        limit_m, limit_n = (64, 64) if wide else (128, 128)
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
+        Bk / tile_n): keep the selected tile when it divides the block, else take the first tile
+        the kernel runs (can_implement) that does, the block's own sizes first (e.g. Bk 112).
+        Varlen lists count Q blocks per batch, so there tile_m is Bq itself (exact_q). Tiles
+        other than the selected one stay within 128 (64 above hd 128)."""
+        limit = 64 if max(head_dim, head_dim_v) > 128 else 128
+        size_m, size_n = sparse_block_size
 
-        def fits(m: int, n: int) -> bool:
+        def runs(m: int, n: int) -> bool:
             return (
-                FlashAttentionForwardSm120.smem_bytes(
+                (m == tile_m or m <= limit)
+                and (n == tile_n or n <= limit)
+                and FlashAttentionForwardSm120.can_implement(
                     cutlass.BFloat16,
                     head_dim,
                     head_dim_v,
                     m,
                     n,
                     1,
-                    FlashAttentionForwardSm120.get_fwd_num_threads(head_dim, head_dim_v, m, n),
+                    FlashAttentionForwardSm120.get_fwd_num_threads(
+                        head_dim, head_dim_v, m, n, paged_kv=paged_kv
+                    ),
                     False,
+                    paged_kv=paged_kv,
                 )
-                <= smem_capacity
             )
 
-        def fit(size: int, tile: int, limit: int, other: int, is_m: bool) -> int:
-            if size % tile == 0:
-                return tile
-            for t in (size, 128, 112, 96, 80, 64, 48, 32, 16):
-                if t <= limit and size % t == 0 and fits(*((t, other) if is_m else (other, t))):
-                    return t
-            raise ValueError(f"SM120 block sparsity: no forward tile divides {size}")
-
-        tile_n = fit(sparse_block_size[1], tile_n, limit_n, tile_m, False)
-        if exact_q:
-            tile_m = sparse_block_size[0]
-            if tile_m > limit_m or not fits(tile_m, tile_n):
-                raise ValueError(
-                    f"SM120 varlen block sparsity runs Q tiles of the sparse block ({tile_m})"
-                )
-        else:
-            tile_m = fit(sparse_block_size[0], tile_m, limit_m, tile_n, True)
-        return tile_m, tile_n
+        sizes = (128, 112, 96, 80, 64, 48, 32, 16)
+        ms = (size_m,) if exact_q else (tile_m, size_m, *sizes)
+        for n in (tile_n, size_n, *sizes):
+            if size_n % n:
+                continue
+            for m in ms:
+                if size_m % m == 0 and runs(m, n):
+                    return m, n
+        raise ValueError(f"SM120 block sparsity: no forward tile divides {sparse_block_size}")
 
     @staticmethod
     @lru_cache(maxsize=None)
@@ -1007,7 +1003,13 @@ class Sm120ForwardHost:
             )
             if sparse_block_size is not None:
                 tile_m, tile_n = Sm120ForwardHost._fit_tile_to_sparse_block(
-                    head_dim, head_dim_v, tile_m, tile_n, sparse_block_size, exact_q=sparse_varlen
+                    head_dim,
+                    head_dim_v,
+                    tile_m,
+                    tile_n,
+                    sparse_block_size,
+                    exact_q=sparse_varlen,
+                    paged_kv=paged_kv,
                 )
         else:
             tile_m, tile_n = tile_mn

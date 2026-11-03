@@ -3,7 +3,9 @@
 
 import math
 import os
+from functools import partial
 
+import cutlass
 import cutlass.cute as cute
 import pytest
 import torch
@@ -241,6 +243,53 @@ def test_sm120_decode_splits_past_partial_wave(
         # Every split owns KV blocks.
         per_split = -(-num_n_blocks // num_splits)
         assert (num_splits - 1) * per_split < num_n_blocks
+
+
+@pytest.mark.parametrize(
+    "head_dim, tile, block, exact_q, paged_kv, expected",
+    [
+        pytest.param(128, (128, 64), (128, 128), False, False, (128, 64), id="selected-divides"),
+        pytest.param(256, (128, 64), (64, 48), False, False, (64, 48), id="block-sizes-first"),
+        pytest.param(128, (128, 64), (64, 112), False, False, (64, 112), id="kv-112"),
+        pytest.param(64, (64, 64), (16, 16), False, False, None, id="no-runnable-divisor"),
+        pytest.param(64, (64, 64), (64, 64), True, False, (64, 64), id="varlen-q-block"),
+        # The 16-row paged decode tile runs only with the paged layout's thread count.
+        pytest.param(128, (16, 64), (64, 64), False, True, (16, 64), id="paged-decode-tile"),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_sm120_sparse_tile_fit(head_dim, tile, block, exact_q, paged_kv, expected):
+    from flash_attn.cute.sm120.flash_fwd import FlashAttentionForwardSm120
+
+    fit = partial(
+        Sm120ForwardHost._fit_tile_to_sparse_block,
+        head_dim,
+        head_dim,
+        *tile,
+        block,
+        exact_q,
+        paged_kv,
+    )
+    if expected is None:
+        with pytest.raises(ValueError, match="no forward tile divides"):
+            fit()
+        return
+    tile_m, tile_n = fit()
+    assert (tile_m, tile_n) == expected
+    assert block[0] % tile_m == 0 and block[1] % tile_n == 0
+    assert FlashAttentionForwardSm120.can_implement(
+        cutlass.BFloat16,
+        head_dim,
+        head_dim,
+        tile_m,
+        tile_n,
+        1,
+        FlashAttentionForwardSm120.get_fwd_num_threads(
+            head_dim, head_dim, tile_m, tile_n, paged_kv=paged_kv
+        ),
+        False,
+        paged_kv=paged_kv,
+    )
 
 
 @cute.jit
@@ -2048,6 +2097,84 @@ def _check_fwd_block_sparse(
     torch.testing.assert_close(lse[visible], ref_lse[visible], atol=0.05, rtol=0)
     assert torch.isneginf(lse[~visible]).all()
     assert (out.permute(0, 2, 1, 3)[~visible] == 0).all()
+
+
+def _varlen_causal_sparse(lengths_q, lengths_k, block_size):
+    """Block-sparse lists of a bottom-right causal mask over varlen Q / K: every KV block a Q
+    block can see is a partial block (the mask_mod decides each element), listed in order."""
+    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+    block_m, block_n = block_size
+    counts, indices, cu_m, cu_idx = [], [], [0], [0]
+    for len_q, len_k in zip(lengths_q, lengths_k):
+        num_m, num_n = -(-len_q // block_m), -(-len_k // block_n)
+        for m in range(num_m):
+            last_row = min((m + 1) * block_m, len_q) - 1
+            visible = min(num_n, (last_row + len_k - len_q) // block_n + 1)
+            counts.append(visible)
+            indices += list(range(visible)) + [0] * (num_n - visible)
+        cu_m.append(cu_m[-1] + num_m)
+        cu_idx.append(cu_idx[-1] + num_m * num_n)
+
+    def tensor(values):
+        return torch.tensor([values], device="cuda", dtype=torch.int32)
+
+    return BlockSparseTensorsTorch(
+        mask_block_cnt=tensor(counts),
+        mask_block_idx=tensor(indices),
+        full_block_cnt=tensor([0] * len(counts)),
+        full_block_idx=tensor(indices),
+        block_size=block_size,
+        cu_total_m_blocks=tensor(cu_m)[0],
+        cu_block_idx_offsets=tensor(cu_idx)[0],
+    )
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "block"), [(64, (16, 64)), (128, (32, 64)), (256, (16, 32))]
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_sm120_fwd_block_sparse_varlen_paged(head_dim, block):
+    """Varlen Q with block-sparse lists over a paged cache of ragged lengths (last pages part
+    full): the Q tile is the sparse block's rows, run with the paged layout's tile."""
+    from mask_mod_definitions import cute_causal_mask
+
+    lengths_q, lengths_k, page_size = [1, 37, 130], [700, 69, 1301], 64
+    heads, heads_kv = 8, 2
+    torch.manual_seed(0)
+    k_cache, v_cache, page_table, pages = _paged_cache(lengths_k, page_size, heads_kv, head_dim)
+    q = torch.randn(sum(lengths_q), heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    cu_seqlens_q = torch.tensor(
+        [sum(lengths_q[:i]) for i in range(len(lengths_q) + 1)], device="cuda", dtype=torch.int32
+    )
+    out, lse = _flash_attn_fwd(
+        q,
+        k_cache,
+        v_cache,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=torch.tensor(lengths_k, device="cuda", dtype=torch.int32),
+        max_seqlen_q=max(lengths_q),
+        max_seqlen_k=max(lengths_k),
+        mask_mod=cute_causal_mask,
+        block_sparse_tensors=_varlen_causal_sparse(lengths_q, lengths_k, block),
+        return_lse=True,
+    )[:2]
+    if is_fake_mode():
+        return
+    first = 0
+    for batch_idx, (len_q, len_k) in enumerate(zip(lengths_q, lengths_k)):
+        k, v = (
+            cache[page_table[batch_idx, : pages[batch_idx]].long()].flatten(0, 1)[:len_k]
+            for cache in (k_cache, v_cache)
+        )
+        rows = torch.arange(len_q, device="cuda")[:, None]
+        keep = torch.arange(len_k, device="cuda")[None, :] <= rows + len_k - len_q
+        rows_q = slice(first, first + len_q)
+        ref_out, ref_lse = _block_sparse_reference(q[None, rows_q], k[None], v[None], keep)
+        assert (out[rows_q].float() - ref_out[0]).abs().max() <= 0.02 * ref_out.abs().max()
+        torch.testing.assert_close(lse[:, rows_q], ref_lse[0], atol=0.05, rtol=0)
+        first += len_q
 
 
 if __name__ == "__main__":
