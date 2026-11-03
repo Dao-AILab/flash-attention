@@ -617,6 +617,7 @@ def test_flash_attn_forced_split_config_reuses_specializations():
         ex2_emu_start_frg=0,
         overlap_sO_sQ=False,
         kv_stage=11,
+        sm_stats_cross_stage=False,
     )
     out_2 = _flash_attn_fwd(q, k, v, config=config_2)[0]
     main_keys = set(_flash_attn_fwd.compile_cache.cache)
