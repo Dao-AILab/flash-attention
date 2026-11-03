@@ -3180,6 +3180,11 @@ def test_mla_sink_precision_vs_fp64(seqlen_q, seqlen_k, causal):
     the kernel against an exact reference. The kernel (bf16 in, fp32 accumulate) must stay
     within 3x the error of an fp32 eager evaluation of the same bf16 inputs, after rounding
     the eager result to the kernel's output dtype.
+
+    dSink additionally gets the bf16-P floor: dsink = -sum_rows exp(sink - lse) * dpsum cancels
+    heavily, and the kernel's dpsum comes from an O whose PV operand P is bf16 (the rounding
+    residual `o_lo` restores the output rounding, not the operand rounding). That shift is
+    estimated in fp64 from the same inputs and allowed on top of the 3x eager error.
     """
     device = "cuda"
     dtype = torch.bfloat16
@@ -3192,16 +3197,35 @@ def test_mla_sink_precision_vs_fp64(seqlen_q, seqlen_k, causal):
     sink = torch.randn(nheads, device=device, dtype=dtype)
     g = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
 
-    def reference(q, v, sink):
-        """softmax over [sink, scores] per row; the sink column has no value vector."""
+    def attention_probs(q, v, sink):
+        """softmax over [sink, scores] per row: (sink probability, key probabilities)."""
         scores = torch.einsum("bthd,bsd->bhts", q / math.sqrt(d), v[:, :, 0])
         if causal:
             row_idx = torch.arange(seqlen_q, device=device)[:, None]
             col_idx = torch.arange(seqlen_k, device=device)[None, :]
             scores = scores.masked_fill(col_idx > row_idx + (seqlen_k - seqlen_q), float("-inf"))
         sink_logit = sink.view(1, nheads, 1, 1).expand(batch_size, nheads, seqlen_q, 1)
-        attn = torch.softmax(torch.cat([sink_logit, scores], dim=-1), dim=-1)[..., 1:]
+        attn = torch.softmax(torch.cat([sink_logit, scores], dim=-1), dim=-1)
+        return attn[..., 0], attn[..., 1:]
+
+    def reference(q, v, sink):
+        """the sink column has no value vector."""
+        _, attn = attention_probs(q, v, sink)
         return torch.einsum("bhts,bsd->bthd", attn, v[:, :, 0])
+
+    def dsink_bf16_p_floor(q, v, sink, g):
+        """|dSink shift| per head, in fp64, from rounding the forward PV operand P to bf16.
+
+        dpsum = rowsum(dO * O) enters dsink = -sum_rows p_sink * dpsum with heavy cancellation,
+        and the kernel's O is accumulated from a bf16 P. Everything else stays exact here, so
+        this is the part of the kernel's dSink error that no fp32 arithmetic can remove.
+        """
+        p_sink, attn = attention_probs(q, v, sink)
+        vk = v[:, :, 0]
+        o_exact = torch.einsum("bhts,bsd->bthd", attn, vk)
+        o_bf16_p = torch.einsum("bhts,bsd->bthd", attn.to(dtype).to(attn.dtype), vk)
+        dpsum_shift = (g * (o_bf16_p - o_exact)).sum(-1)  # (b, t, h)
+        return (p_sink.permute(0, 2, 1) * dpsum_shift).sum(dim=(0, 1)).abs()
 
     inputs_64 = [t.double().requires_grad_() for t in (q, v, sink)]
     inputs_32 = [t.float().requires_grad_() for t in (q, v, sink)]
@@ -3221,6 +3245,8 @@ def test_mla_sink_precision_vs_fp64(seqlen_q, seqlen_k, causal):
     out_32 = reference(*inputs_32)
     grads_64 = torch.autograd.grad(out_64, inputs_64, g.double())
     grads_32 = torch.autograd.grad(out_32, inputs_32, g.float())
+    with torch.no_grad():
+        dsink_floor = dsink_bf16_p_floor(*(t.detach() for t in inputs_64), g.double()).max().item()
 
     for name, exact, eager, kern in zip(
         ("out", "dQ", "dV", "dSink"), (out_64, *grads_64), (out_32, *grads_32), (out_kern, *grads_kern)
@@ -3229,8 +3255,15 @@ def test_mla_sink_precision_vs_fp64(seqlen_q, seqlen_k, causal):
         # storage-precision cost and the ratio isolates the kernel's arithmetic error.
         eager_err = (eager.to(kern.dtype).double() - exact).abs().max().item()
         kern_err = (kern.double() - exact).abs().max().item()
-        print(f"[causal={causal}, sq={seqlen_q}, sk={seqlen_k}] {name}: kernel {kern_err:.3e} vs eager fp32 {eager_err:.3e}")
-        assert kern_err <= 3 * eager_err + 1e-6, f"{name}: kernel error {kern_err:.3e} > 3x eager fp32 {eager_err:.3e}"
+        floor = dsink_floor if name == "dSink" else 0.0
+        print(
+            f"[causal={causal}, sq={seqlen_q}, sk={seqlen_k}] {name}: kernel {kern_err:.3e} vs "
+            f"eager fp32 {eager_err:.3e}" + (f" (bf16-P floor {floor:.3e})" if floor else "")
+        )
+        assert kern_err <= 3 * eager_err + floor + 1e-6, (
+            f"{name}: kernel error {kern_err:.3e} > 3x eager fp32 {eager_err:.3e}"
+            + (f" + bf16-P floor {floor:.3e}" if floor else "")
+        )
 
 
 def _sparse_mla_fp64_reference(q, k, v, qv, gather_kv_indices, softmax_scale, causal, g):
