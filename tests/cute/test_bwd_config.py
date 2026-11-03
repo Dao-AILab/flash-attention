@@ -409,6 +409,22 @@ def test_invalid_configs_are_rejected(inputs, changes, error):
         validate_bwd_config(replace(config, **changes), inputs)
 
 
+def test_mxfp8_backward_runs_on_the_dedicated_hd256_kernels():
+    inputs = make_inputs(head_dim=256, head_dim_v=256, mxfp8=True)
+    config = select_bwd_config(inputs)
+    assert config.use_dedicated_hd256_kernel and config.tile_n == 128
+    # FLASH_ATTENTION_HD256_GENERIC_BWD moves BF16 to the generic kernel, never MXFP8.
+    generic = inputs._replace(hd256_generic=True)
+    assert select_bwd_config(generic) == config
+    bf16_generic = select_bwd_config(generic._replace(mxfp8=False))
+    assert not bf16_generic.use_dedicated_hd256_kernel
+    with pytest.raises(ValueError, match="MXFP8 backward runs only"):
+        validate_bwd_config(bf16_generic, generic)
+    for other in (make_inputs(mxfp8=True), make_inputs(device_arch=90, mxfp8=True)):
+        with pytest.raises(ValueError, match="MXFP8 backward runs only"):
+            select_bwd_config(other)
+
+
 # Interface: these run on CPU with fake tensors and stop at the compile-cache lookup.
 torch = pytest.importorskip("torch")
 
