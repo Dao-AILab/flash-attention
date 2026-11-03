@@ -1,5 +1,6 @@
 """MXFP8 hdim-256 backward (NOTE [MXFP8 hd256 backward]) and its autograd entry point (NOTE [MXFP8 hd256
-attention]): gradients against the FP64 mirrored reference, determinism, causal leakage, fused prep identity."""
+attention]): gradients against the FP64 mirrored reference, determinism, causal leakage, fused prep identity;
+the MX dS mode (NOTE [MXFP8 hd256 dS for dQ]) against exact mode and an emulation of its dQ."""
 
 import math
 
@@ -11,6 +12,7 @@ pytest.importorskip("cutlass.utils.blockscaled_layout")
 from flash_attn.cute import blockscaled_utils as bsu  # noqa: E402
 from flash_attn.cute import mxfp8_hd256_attention as attn  # noqa: E402
 from flash_attn.cute import mxfp8_hd256_prep as prep  # noqa: E402
+from flash_attn.cute.config import mxds_slice_bytes  # noqa: E402
 from flash_attn.cute.interface import (  # noqa: E402
     BlockScales,
     MxHd256BwdOperands,
@@ -150,6 +152,48 @@ def mirrored_reference(qh, kh, vh, v, out, dout, stats, mode, causal):
     return [g.transpose(1, 2) for g in grads]
 
 
+def mxds_dq_emulation(qh, kh, vh, v, out, dout, stats, mode, causal):
+    """dQ of the MX dS mode in FP64 from the kernels' operands: dS x 2^8 = P~ (dP'' - D'') with
+    dO'' = 2^8 dO / L and V-hat (+ the band residual R) in MXFP8 along head_dim, in E4M3 with one
+    ceil-rule scale per 32 x 32 block (NOTE [MXFP8 hd256 dS for dQ]), times K-hat requantized along keys;
+    BF16."""
+    d64 = torch.float64
+    c = float(torch.tensor(DIM**-0.5 * math.log2(math.e), dtype=torch.float32))
+
+    def mx_d(x):  # MXFP8 along head_dim, dequantized
+        x8, _, sx = bsu.quantize_to_fp8_with_sf(x)
+        return bsu.dequantize_fp8_with_sf(x8, sx)
+
+    kt8, _, skt = bsu.quantize_v_to_fp8_with_sf(kh)  # K-hat along keys
+    do2 = mx_d(dout.float() * (256.0 / stats[..., 1]).transpose(1, 2).unsqueeze(-1))
+    vd = mx_d(vh)
+    qh, kh, vd, do2, out = (t.to(d64).transpose(1, 2) for t in (qh, kh, vd, do2, out))
+    m = (stats[..., 0] * c).to(d64)[..., None]
+    p = torch.exp2(qh @ kh.transpose(-1, -2) * c - (m - MAX_OFFSET[mode]))
+    dp = do2 @ vd.transpose(-1, -2)
+    i, j = torch.arange(p.shape[-2], device="cuda")[:, None], torch.arange(p.shape[-1], device="cuda")[None, :]
+    if causal:
+        p = p.masked_fill(j > i, 0.0)
+        r = mx_d(v.float() - vd.transpose(1, 2).float()).to(d64).transpose(1, 2)
+        band = (j >= 256 * (i // 256)) & (j <= i)
+        dp = torch.where(band, dp + do2 @ r.transpose(-1, -2), dp)
+    ds = p * (dp - (do2 * out).sum(-1, keepdim=True))  # dS x 2^8
+    b, h, sq, sk = ds.shape
+    blocks = ds.float().reshape(b, h, sq // 32, 32, sk // 32, 32)
+    amax = blocks.abs().amax(dim=(3, 5), keepdim=True)
+    mantissa, exponent = torch.frexp(amax)
+    exponent = torch.where(amax == 0, 0, (exponent - 9 + (mantissa > 0.875)).clamp(-127, 127))
+    scale = torch.exp2(exponent.float())
+    ds_hat = ((blocks / scale).to(torch.float8_e4m3fn).float() * scale / 256).reshape(b, h, sq, sk)
+    kt = bsu.dequantize_v_fp8_with_sf(kt8, skt).transpose(1, 2)
+    return (DIM**-0.5 * ds_hat.double() @ kt.double()).transpose(1, 2).bfloat16()
+
+
+def with_mxds(ops, workspace_bytes=None):
+    """The MX dS mode's operands from exact-mode MxHd256BwdOperands."""
+    return ops._replace(sfdo=None, mxds=prep.kt_operands(ops.k, ops.sfk, DIM**-0.5, workspace_bytes))
+
+
 def rel(a, b):
     return ((a.double() - b.double()).norm() / b.double().norm()).item()
 
@@ -256,3 +300,123 @@ def test_autograd_gradients(causal, mode):
         # the fused prep's operands are byte-identical to the eager ones except D'' (FP32 sum order)
         assert rel(g, e) < 1e-2
         assert rel(g, r.grad.transpose(1, 2)) < 0.2  # MXFP8 gradients vs FP32 attention: ~0.1
+
+
+# ---------------------------------------------------------------- MX dS mode (bwd_mode="mxds")
+@pytest.mark.parametrize("shape,causal", [
+    ((1, 1024, 2), False), ((1, 1024, 2), True), ((2, 2048, 3), False), ((2, 2048, 3), True),
+])
+@pytest.mark.parametrize("mode", ["exact", "fast"])
+def test_mxds_matches_exact_dkdv_and_emulated_dq(shape, causal, mode):
+    q, k, v, do = inputs(*shape, seed=2)
+    out, lse, stats, (qh, kh, vh), (q8, sfq, k8, sfk, _, _) = eager_forward(q, k, v, causal, mode)
+    ops, k_hat = eager_operands(q8, sfq, k8, sfk, qh, kh, vh, v, out, do, stats, mode, causal)
+    exact = _flash_attn_bwd(k_hat, k_hat, k_hat, out, do, lse, causal=causal, mx_hd256=ops)[:3]
+    dq, dk, dv = _flash_attn_bwd(k_hat, k_hat, k_hat, out, do, lse, causal=causal, mx_hd256=with_mxds(ops))[:3]
+    # dK / dV come from the same dK / dV kernel; causal includes the band dV
+    assert torch.equal(dk, exact[1]) and torch.equal(dv, exact[2])
+    ref = mirrored_reference(qh, kh, vh, v, out, do, stats, mode, causal)
+    assert torch.isfinite(dq.float()).all()
+    # E4M3 rounding of dS computed in FP32 (kernel) vs FP64 (emulation)
+    assert rel(dq, mxds_dq_emulation(qh, kh, vh, v, out, do, stats, mode, causal)) < 2e-3
+    # the second dS quantization: ~0.038 vs exact mode's ~0.027 on these inputs
+    assert rel(dq, ref[0]) < 0.06
+
+
+def test_mxds_k_requantization_matches_eager():
+    q, k, v, do = inputs(2, 512, 3, seed=9)
+    _, _, _, (qh, kh, vh), (q8, sfq, k8, sfk, _, _) = eager_forward(q, k, v, False, "exact")
+    kt = prep.kt_operands(k8, bsu.interleave_sf(sfk).reshape(-1), DIM**-0.5)
+    kt8, sfkt, _ = bsu.quantize_v_to_fp8_with_sf(kh)
+    assert kt.alpha == 1.0  # 256^-0.5 = 2^-4 rides in the scales
+    assert torch.equal(kt.kt.view(torch.uint8), kt8.view(torch.uint8))
+    assert torch.equal(kt.sfkt.view(torch.uint8), sfkt.reshape(-1).view(torch.uint8) - 4)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_mxds_is_deterministic_and_chunk_invariant(causal):
+    # 32 (batch, head) slices: the default budget runs one chunk spanning both batches, a budget of 4 (1)
+    # slices runs 8 (32) chunks within a batch
+    b, s, h = 2, 4096, 16
+    q, k, v, do = inputs(b, s, h, seed=1)
+    out, lse, stats, (qh, kh, vh), (q8, sfq, k8, sfk, _, _) = eager_forward(q, k, v, causal, "exact")
+    ops, k_hat = eager_operands(q8, sfq, k8, sfk, qh, kh, vh, v, out, do, stats, "exact", causal)
+
+    def backward(workspace_bytes=None):
+        mx = with_mxds(ops, workspace_bytes)
+        return _flash_attn_bwd(k_hat, k_hat, k_hat, out, do, lse, causal=causal, mx_hd256=mx)[:3]
+
+    first = backward()
+    for _ in range(4):
+        assert all(torch.equal(a, b) for a, b in zip(first, backward()))
+    for slices_per_chunk in (4, 1):
+        chunked = backward(slices_per_chunk * mxds_slice_bytes(s, s))
+        assert all(torch.equal(a, b) for a, b in zip(first, chunked))
+
+
+@pytest.mark.parametrize("t0", [1088, 1101])
+def test_mxds_causal_dq_rows_before_the_key_group_do_not_see_future_keys(t0):
+    # K-hat's scales along keys are shared by 32-key groups: keys >= t0 may change the dQ rows in
+    # [32 floor(t0 / 32), t0) (accuracy, NOTE [MXFP8 hd256 dS for dQ]); rows below are bitwise unaffected
+    q, k, v, do = inputs(1, 2048, 2, seed=4)
+    k2, v2 = k.clone(), v.clone()
+    k2[:, t0:] *= 16
+    v2[:, t0:] *= 16
+    dqs = []
+    for kk, vv in ((k, v), (k2, v2)):
+        leaves = [t.clone().requires_grad_() for t in (q, kk, vv)]
+        attn.mxfp8_hd256_attn_func(*leaves, causal=True, bwd_mode="mxds").backward(do)
+        dqs.append(leaves[0].grad)
+    t_safe = 32 * (t0 // 32)
+    assert torch.equal(dqs[0][:, :t_safe], dqs[1][:, :t_safe])
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_mxds_autograd(causal):
+    q, k, v, do = inputs(1, 1024, 2, seed=6)
+    grads = {}
+    for bwd_mode in ("exact", "mxds"):
+        leaves = [t.clone().requires_grad_() for t in (q, k, v)]
+        attn.mxfp8_hd256_attn_func(*leaves, causal=causal, bwd_mode=bwd_mode).backward(do)
+        grads[bwd_mode] = [t.grad for t in leaves]
+    _, _, saved = attn.mxfp8_hd256_forward(q, k, v, causal=causal, bwd_mode="mxds")
+    halves = attn.mxfp8_hd256_backward(saved, do)
+    assert all(torch.equal(a, b) for a, b in zip(grads["mxds"], halves))
+    assert torch.equal(grads["mxds"][1], grads["exact"][1]) and torch.equal(grads["mxds"][2], grads["exact"][2])
+    assert rel(grads["mxds"][0], grads["exact"][0]) < 0.06
+    with pytest.raises(NotImplementedError, match="256"):
+        attn.mxfp8_hd256_attn_func(*(t[:, :544] for t in (q, k, v)), bwd_mode="mxds")
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_mxds_non_power_of_two_softmax_scale(causal):
+    # softmax_scale 0.1 = 1.6 * 2^-4: 2^-4 rides in the K-hat scales, 1.6 is the GEMM epilogue's multiplier
+    q, k, v, do = inputs(1, 1024, 2, seed=10)
+    grads = {}
+    for bwd_mode in ("exact", "mxds"):
+        leaves = [t.clone().requires_grad_() for t in (q, k, v)]
+        attn.mxfp8_hd256_attn_func(*leaves, causal=causal, softmax_scale=0.1, bwd_mode=bwd_mode).backward(do)
+        grads[bwd_mode] = [t.grad for t in leaves]
+    assert torch.equal(grads["mxds"][1], grads["exact"][1]) and torch.equal(grads["mxds"][2], grads["exact"][2])
+    # the two dQ errors vs the oracle (~0.027, ~0.038) are mostly independent: ~0.03 apart
+    assert rel(grads["mxds"][0], grads["exact"][0]) < 0.05
+
+
+def test_mxds_operands_are_validated():
+    q, k, v, do = inputs(1, 544, 2, seed=11)
+    out, lse, stats, (qh, kh, vh), (q8, sfq, k8, sfk, _, _) = eager_forward(q, k, v, False, "exact")
+    ops, k_hat = eager_operands(q8, sfq, k8, sfk, qh, kh, vh, v, out, do, stats, "exact", False)
+    with pytest.raises(ValueError, match="256"):
+        _flash_attn_bwd(k_hat, k_hat, k_hat, out, do, lse, mx_hd256=with_mxds(ops))
+    q, k, v, do = inputs(1, 512, 2, seed=11)
+    out, lse, stats, (qh, kh, vh), (q8, sfq, k8, sfk, _, _) = eager_forward(q, k, v, False, "exact")
+    ops, k_hat = eager_operands(q8, sfq, k8, sfk, qh, kh, vh, v, out, do, stats, "exact", False)
+    mx = with_mxds(ops)
+    bad_cases = (
+        (dict(sfkt=mx.mxds.sfkt[:-16]), "mxds.sfkt"),
+        (dict(workspace_bytes=0), "workspace_bytes"),
+        (dict(workspace_bytes=mxds_slice_bytes(512, 512) - 1), "needs at least"),
+    )
+    for bad, match in bad_cases:
+        with pytest.raises(ValueError, match=match):
+            _flash_attn_bwd(k_hat, k_hat, k_hat, out, do, lse, mx_hd256=mx._replace(mxds=mx.mxds._replace(**bad)))

@@ -106,8 +106,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         window_size_right: int | None,
         use_clc_scheduler: bool = False,
         mxfp8: bool = False,
+        mxds: bool = False,
     ):
-        """Initialization. mxfp8: NOTE [MXFP8 hd256 backward] in sm100_hd256_2cta_fmha_backward.py."""
+        """Initialization. mxfp8: NOTE [MXFP8 hd256 backward] in sm100_hd256_2cta_fmha_backward.py.
+        mxds: also write dS in MXFP8 for the dQ GEMM, NOTE [MXFP8 hd256 dS for dQ]."""
+        assert mxfp8 or not mxds
         self.acc_dtype = acc_dtype
         self.cta_tiler = cta_tiler
         self.use_clc_scheduler = use_clc_scheduler
@@ -115,8 +118,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # causal MXFP8: the dP residual on the forward's BF16 band (NOTE [MXFP8 hd256 backward])
         self.band_residual = mxfp8 and is_causal
         # MXFP8: launched as the dQ kernel's programmatic dependent (no data dependency); each CTA
-        # waits for the dQ kernel before it exits, so this kernel's completion still implies dQ's
-        self.pdl_secondary = mxfp8
+        # waits for the dQ kernel before it exits, so this kernel's completion still implies dQ's.
+        # mxds runs no dQ kernel.
+        self.pdl_secondary = mxfp8 and not mxds
+        self.mxds = mxds
+        # mxds: non-causal dS tiles go out by TMA from an SMEM stage that the empty warp drains;
+        # causal has no SMEM left for the stage and stores directly
+        self.ds_staged = mxds and not is_causal
         assert not (mxfp8 and use_clc_scheduler)
         # MXFP8 on sm_107: the dS^T descale fused into its E4M3 convert (cvt.rn.satfinite.scaled,
         # which sm_100a / sm_103a do not have)
@@ -271,8 +279,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         SFV_mx: cute.Tensor | None = None,
         dO_mx: cute.Tensor | None = None,
         SFdO_mx: cute.Tensor | None = None,
+        dS_ws: cute.Tensor | None = None,
+        dS_sf: cute.Tensor | None = None,
+        bh_base: Int32 | None = None,
+        bh_count: Int32 | None = None,
     ):
         """Host function to launch CuTeDSL kernel.
+
+        mxds (NOTE [MXFP8 hd256 dS for dQ]): this launch covers the (batch, head) slices
+        [bh_base, bh_base + bh_count) and writes their dS to dS_ws (E4M3 (slices, keys, queries))
+        and dS_sf (compact UE8M0 block scales).
 
         mxfp8: the *_mx operands of NOTE [MXFP8 hd256 backward] (E4M3 (b, s, h_k, h_r, d) copies and
         raw UE8M0 scale buffers); the BF16 Q / K / V / dO only provide shapes, except that causal
@@ -435,6 +451,27 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 mxu.sf_gmem_tensor(sf, t.shape[0], t.shape[1], h_r, h_k, b)
                 for sf, t in ((SFQT_mx, QT), (SFdOT_mx, dOT))
             ]
+
+        # mxds: the (slices, keys, queries) workspace as (keys, queries, slices), queries contiguous
+        # (the dQ GEMM's M-major A); non-causal stores it by TMA from a 64 x 128 SMEM stage
+        mWS = tma_atom_ws = tma_tensor_ws = None
+        if cutlass.const_expr(self.mxds):
+            assert dS_ws is not None and dS_sf is not None
+            mWS = cute.make_tensor(
+                dS_ws.iterator,
+                cute.make_layout(
+                    (dS_ws.shape[1], dS_ws.shape[2], dS_ws.shape[0]),
+                    stride=(
+                        cute.assume(dS_ws.stride[1], divby=256),
+                        1,
+                        cute.assume(dS_ws.stride[0], divby=256),
+                    ),
+                ),
+            )
+        if cutlass.const_expr(self.ds_staged):
+            tma_atom_ws, tma_tensor_ws = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(), mWS, self.ds_stage_layout(), (64, 128)
+            )
 
         mSFQ_tma = mSFK_tma = mSFV_tma = mSFdO_tma = None
         if cutlass.const_expr(self.mxfp8):
@@ -996,6 +1033,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sfa_sdp_size = 1024 if cutlass.const_expr(self.mxfp8) else 0
         sfv_sdp_size = sfa_sdp_size * (2 if cutlass.const_expr(self.band_residual) else 1)
         sfb_sdp_size = 1024 * self.load_mma_Q_stage if cutlass.const_expr(self.mxfp8) else 0
+        ds_stage_size = 8192 if cutlass.const_expr(self.ds_staged) else 0
+        ds_sf_size = 16 if cutlass.const_expr(self.ds_staged) else 0
+        ds_mbar_count = 2 if cutlass.const_expr(self.ds_staged) else 0
 
         @cute.struct
         class SharedStorage:
@@ -1087,6 +1127,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sSFV: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfv_sdp_size], 128]
             sSFQ: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfb_sdp_size], 128]
             sSFdO: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfb_sdp_size], 128]
+            if cutlass.const_expr(self.ds_staged):
+                # mxds: the dS TMA stage (1024 B aligned for its 128B swizzle), the block-scale
+                # bytes, and the stage's full / empty barriers
+                sDSW: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, ds_stage_size], 1024]
+                sDSF: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, ds_sf_size], 16]
+                ds_mbar_ptr: cute.struct.MemRange[cutlass.Int64, ds_mbar_count]
 
         self.shared_storage = SharedStorage
         # an SMEM layout past the per-block limit does not always fail the launch
@@ -1130,6 +1176,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     cute.size(H_K),
                     cute.size(B),
                 )
+                if cutlass.const_expr(self.mxds):
+                    # one launch per workspace chunk of bh_count (batch, head) slices
+                    bwd_grid = (cute.ceil_div(K_val, self.cta_tiler[1]), bh_count, 1)
                 bwd_grid = cute.round_up(bwd_grid, self.cluster_shape_mnk)
 
         self.dkdv_bwd(
@@ -1206,6 +1255,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tma_tensor_dOT_band,
             P_band_smem_layout,
             dOT_band_smem_layout,
+            mWS,
+            dS_sf,
+            bh_base,
+            tma_atom_ws,
+            tma_tensor_ws,
         ).launch(
             grid=bwd_grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1299,6 +1353,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dOT_band_in: cute.Tensor | None = None,
         P_band_smem_layout: cute.ComposedLayout | None = None,
         dOT_band_smem_layout: cute.ComposedLayout | None = None,
+        # mxds
+        mWS: cute.Tensor | None = None,
+        mDSF: cute.Tensor | None = None,
+        bh_base: Int32 | None = None,
+        tma_atom_ws: cute.CopyAtom | None = None,
+        tma_tensor_ws: cute.Tensor | None = None,
     ):
         """Core CuTeDSL backward kernel."""
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -1539,6 +1599,27 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # wait for tmem allocation and retrieve the pointer
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+        sDSW = sDSF = ds_full = ds_empty = None
+        if cutlass.const_expr(self.ds_staged):
+            ds_full = storage.ds_mbar_ptr.data_ptr()
+            ds_empty = ds_full + 1
+            sDSF = storage.sDSF.get_tensor(cute.make_layout(16))
+            # (the TMA store's 128B swizzle follows address bits [7, 10): 1024 B alignment)
+            sDSW = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Uint8,
+                    Int32(storage.sDSW.data_ptr().toint()),
+                    cute.AddressSpace.smem,
+                    assumed_align=1024,
+                ),
+                self.ds_stage_layout(),
+            )
+            if warp_idx == self.empty_warp_id:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(ds_full, self.num_compute_warps)
+                    cute.arch.mbarrier_init(ds_empty, 1)
+                cute.arch.mbarrier_init_fence()
 
         # Cluster arrive after barrier init
         # is_relaxed=False has memory consistency guarantee
@@ -2048,6 +2129,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             else:
                 is_valid_tile = cutlass.Boolean(True)
                 blk_coord_k, blk_coord_h_k, blk_coord_b = bidx, bidy, bidz
+                if cutlass.const_expr(self.mxds):
+                    # (batch, head) slice bh_base + bidy of the workspace chunk
+                    n_heads = problem_shape[3][0][1]
+                    blk_coord_h_k = (bh_base + bidy) % n_heads
+                    blk_coord_b = (bh_base + bidy) // n_heads
             blk_coord = (
                 Int32(0),
                 blk_coord_k,
@@ -2307,6 +2393,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     sdV_epi_layout,
                     sSFdS=sSFdS,
                     sP_band=sP_band,
+                    ws=None if mWS is None else mWS[None, None, bidy],
+                    wsf=mDSF,
+                    ws_slice=bidy,
+                    sDSW=sDSW,
+                    sDSF=sDSF,
+                    ds_full=ds_full,
+                    ds_empty=ds_empty,
                 )
 
                 cute.arch.barrier(
@@ -2334,6 +2427,23 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                             tma_atom_SFdOT,
                             mSFdOT,
                             sSFdOT,
+                        )
+                if cutlass.const_expr(self.ds_staged):
+                    if warp_idx == self.empty_warp_id:
+                        self.mx_ds_stage_drain(
+                            tma_atom_ws,
+                            tma_tensor_ws,
+                            sDSW,
+                            sDSF,
+                            ds_full,
+                            ds_empty,
+                            mDSF,
+                            bidy,
+                            blk_coord_k,
+                            iter_start,
+                            iter_count,
+                            seqlen_q_cur_batch,
+                            seqlen_k_cur_batch,
                         )
 
         cute.arch.cluster_arrive()
@@ -3763,8 +3873,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sdV_epi_layout: cute.ComposedLayout,
         sSFdS: cute.Tensor | None = None,
         sP_band: cute.Tensor | None = None,
+        ws: cute.Tensor | None = None,
+        wsf: cute.Tensor | None = None,
+        ws_slice: Int32 | None = None,
+        sDSW: cute.Tensor | None = None,
+        sDSF: cute.Tensor | None = None,
+        ds_full: cute.Pointer | None = None,
+        ds_empty: cute.Pointer | None = None,
     ):
-        """CuTeDSL kernel for recomputing softmax and producing dk and dv."""
+        """CuTeDSL kernel for recomputing softmax and producing dk and dv.
+
+        ws / wsf / ws_slice (mxds): this (batch, head)'s (keys, queries) E4M3 dS slice, the flat
+        block-scale buffer, and the slice index in it; sDSW / sDSF / ds_full / ds_empty: the
+        non-causal TMA stage (mx_ds_stage)."""
         tidx, _, _ = cute.arch.thread_idx()
         Q, K, _, _ = problem_shape
         _, blk_coord_k, _, _ = blk_coord
@@ -3832,6 +3953,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         is_residual_k = blk_coord_k * self.tile_shape_K + self.tile_shape_K > K
         last_iter = iter_end - 1
 
+        ds_stage_first = cutlass.Boolean(True)
+        ds_phase = Int32(0)
         while iter_count > 0:
             s_handle = mma_compute_S_consumer.wait_and_advance()
             p_handle = None
@@ -4028,6 +4151,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 # queries; the scale byte drops the 2^8
                 tTR_rdST = cute.make_rmem_tensor(tTR_rdPT.shape, mxu.MX_DTYPE)
                 sf_ds, inv_scale_ds = mxu.mx_scale(tTR_rdPT)
+                if cutlass.const_expr(self.mxds):
+                    # (before mx_apply, which scales tTR_rdPT in place)
+                    ds_words, ds_sf = self.mx_ds_block_quant(tTR_rdPT, sf_ds)
                 if cutlass.const_expr(self.fused_scaled_cvt):
                     words = cute.recast_tensor(tTR_rdST, Int32)
                     for h in cutlass.range_constexpr(2):
@@ -4070,6 +4196,35 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             ds_handle.commit()
             sum_odo_handle.release()
+            if cutlass.const_expr(self.mxds):
+                if cutlass.const_expr(self.ds_staged):
+                    ds_phase = self.mx_ds_stage(
+                        sDSW,
+                        sDSF,
+                        ds_full,
+                        ds_empty,
+                        ds_phase,
+                        ds_stage_first,
+                        ds_words,
+                        ds_sf,
+                        mx_key,
+                        mx_group,
+                    )
+                    ds_stage_first = cutlass.Boolean(False)
+                else:
+                    self.mx_ds_store(
+                        ws,
+                        wsf,
+                        ws_slice,
+                        ds_words,
+                        ds_sf,
+                        blk_coord_k,
+                        iter_index,
+                        mx_key,
+                        mx_group,
+                        Q,
+                        K,
+                    )
 
             iter_count -= 1
             iter_index += 1
@@ -4115,6 +4270,134 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             compute_mma_dS_consumer,
             mma_compute_dKdV_consumer,
         )
+
+    @cute.jit
+    def mx_ds_block_quant(self, x: cute.Tensor, sf_ds: Int32):
+        """mxds: this warp's 32 x 32 dS block (keys = lanes, 32 queries = registers, FP32 x 2^8) in
+        E4M3 with one UE8M0 scale for the whole block, which is the dQ GEMM's scale of each of its
+        32 (query, 32 keys) groups. The block scale is the ceil-rule scale of the block max, i.e.
+        the max over the lanes of the dS^T scales sf_ds (biased exponents of each key's max over the
+        same 32 queries): one redux. Returns this lane's 32 query bytes (8 words) and the block's
+        biased exponent."""
+        sf_blk = mxu.redux_max_u32(sf_ds)
+        words = []
+        if cutlass.const_expr(self.fused_scaled_cvt):
+            for h in cutlass.range_constexpr(2):
+                words += mxu.cvt_e4m3x16_scaled([x[16 * h + i] for i in range(16)], sf_blk)
+        else:
+            inv = mxu.e8m0_reciprocal(sf_blk)
+            for w in cutlass.range_constexpr(8):
+                a01 = cute.arch.mul_packed_f32x2((x[4 * w], x[4 * w + 1]), (inv, inv))
+                a23 = cute.arch.mul_packed_f32x2((x[4 * w + 2], x[4 * w + 3]), (inv, inv))
+                words.append(mxu.cvt_e4m3x4(a01[0], a01[1], a23[0], a23[1]))
+        return words, sf_blk
+
+    def ds_stage_layout(self):
+        """mxds: the 64 keys x 128 queries dS TMA stage, 128B swizzle (host and kernel)."""
+        return cute.make_composed_layout(
+            cute.make_swizzle(3, 4, 3), 0, cute.make_layout((64, 128), stride=(128, 1))
+        )
+
+    @cute.jit
+    def mx_ds_stage(
+        self, sDSW, sDSF, ds_full, ds_empty, phase, first, words, sf_blk, mx_key, mx_group
+    ):
+        """mxds, non-causal: write this lane's 32 dS bytes (row mx_key, queries 32 mx_group..) into
+        the 64 x 128 TMA stage (128B swizzle: 16 B chunk c of row r at c ^ (r % 8)) and the warp's
+        block-scale byte into sDSF, then arrive on the stage's full barrier; the empty warp stores
+        both (mx_ds_stage_drain). Waits until the previous step's TMA store has read the stage.
+        Returns the empty barrier's next phase."""
+        if not first:
+            cute.arch.mbarrier_wait(ds_empty, phase)
+            phase = phase ^ 1
+        base = Int32(sDSW.iterator.toint()) + mx_key * 128
+        for h in cutlass.range_constexpr(2):
+            chunk = (2 * mx_group + h) ^ (mx_key % 8)
+            mxu.st_shared_v4_b32(base + chunk * 16, [words[4 * h + i] for i in range(4)])
+        if cute.arch.lane_idx() == 0:
+            sDSF[4 * mx_group + (mx_key // 32)] = cutlass.Uint8(cutlass.max(sf_blk - 8, Int32(0)))
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+        if cute.arch.lane_idx() == 0:
+            cute.arch.mbarrier_arrive(ds_full)
+        return phase
+
+    @cute.jit
+    def mx_ds_stage_drain(
+        self,
+        tma_atom_ws,
+        tma_tensor_ws,
+        sDSW,
+        sDSF,
+        ds_full,
+        ds_empty,
+        wsf,
+        ws_slice,
+        blk_coord_k,
+        iter_start,
+        n_steps,
+        Q,
+        K,
+    ):
+        """mxds, non-causal, empty warp: per step, wait for the 8 compute warps' dS bytes in the
+        stage, TMA-store the CTA's 64 x 128 tile, store its 8 block-scale bytes (4 x 2 adjacent
+        bytes of the compact row: this CTA's key groups 2 (blk_coord_k % 2) + {0, 1}), and free the
+        stage once the TMA store has read it."""
+        lane = cute.arch.lane_idx()
+        kt = blk_coord_k // 2
+        c = blk_coord_k % 2
+        phase = Int32(0)
+        it = iter_start
+        for _ in cutlass.range(n_steps, unroll=1):
+            cute.arch.mbarrier_wait(ds_full, phase)
+            phase = phase ^ 1
+            if lane == 0:
+                gWS = cute.local_tile(
+                    tma_tensor_ws[None, None, ws_slice], (64, 128), (blk_coord_k, it)
+                )
+                tS, tG = cpasync.tma_partition(
+                    tma_atom_ws,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sDSW, 0, 2),
+                    cute.group_modes(gWS, 0, 2),
+                )
+                cute.copy(tma_atom_ws, tS, tG)
+                cute.arch.cp_async_bulk_commit_group()
+            if lane < 4:
+                v = Int32(sDSF[4 * lane]) | (Int32(sDSF[4 * lane + 1]) << 8)
+                off = ((ws_slice * (Q // 128) + it) * (K // 128) + kt) * 16 + 4 * lane + 2 * c
+                mxu.st_global_u16(wsf.iterator + off, v)
+            if lane == 0:
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            cute.arch.sync_warp()
+            if lane == 0:
+                cute.arch.mbarrier_arrive(ds_empty)
+            it += 1
+        if lane == 0:
+            cute.arch.cp_async_bulk_wait_group(0, read=False)
+
+    @cute.jit
+    def mx_ds_store(
+        self, ws, wsf, ws_slice, words, sf_blk, blk_coord_k, iter_index, mx_key, mx_group, Q, K
+    ):
+        """mxds, causal: store this lane's 32 dS bytes (its key, 32 queries: one full sector) into
+        the (keys, queries) slice and the block's scale byte into the compact scale buffer: 16 B
+        per (slice, q // 128, k // 128) tile at 4 ((q // 32) % 4) + (k // 32) % 4, the first row of
+        that tile's BlockScaledBasicChunk (whose 32 rows are equal for block scales;
+        sm100_hd256_dq_gemm expands it). The byte drops the dS's 2^8 (P shift)."""
+        key = blk_coord_k * self.tile_shape_K + mx_key
+        q0 = iter_index * self.tile_shape_Q + mx_group * 32
+        if key < K and q0 < Q:
+            mxu.st_global_v8_b32(ws.iterator + (key * ws.stride[0] + q0), words)
+            # every lane stores the same byte to the same address (one sector, no branch)
+            kg = key // 32
+            sf_off = (
+                ((ws_slice * (Q // 128) + iter_index) * (K // 128) + kg // 4) * 16
+                + 4 * mx_group
+                + kg % 4
+            )
+            mxu.st_global_u8(wsf.iterator + sf_off, cutlass.max(sf_blk - 8, Int32(0)))
 
     @cute.jit
     def causal_zero_ds(self, tTR_rdPT, tTR_cdPT, iter_index, blk_coord_k, Q, K):

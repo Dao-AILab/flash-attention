@@ -33,6 +33,7 @@ from flash_attn.cute.config import (
     select_bwd_config,
     select_fwd_config,
     select_mla_fwd_config,
+    select_mxds_chunk,
     sparse_mla_qhead_tile,
     SWAPAB,
     needs_split_metadata,
@@ -484,6 +485,20 @@ class BlockScales(NamedTuple):
     stats_out: torch.Tensor | None = None
 
 
+class MxHd256DsOperands(NamedTuple):
+    """The dQ GEMM's operands of the MXFP8 hdim-256 backward's MX dS mode (`bwd_mode="mxds"`,
+    NOTE [MXFP8 hd256 dS for dQ] in sm100_hd256_dq_gemm.py): K-hat requantized along keys, E4M3
+    (batch, seqlen, nheads, 256) with UE8M0 scales in the interleave_sf layout (MN = channels,
+    K = keys) that carry softmax_scale's power of two; alpha = softmax_scale / that power of two
+    (the GEMM epilogue's multiplier); the dS workspace budget in bytes (None: 4 GiB; at least one
+    (batch, head) slice, config.mxds_slice_bytes)."""
+
+    kt: torch.Tensor
+    sfkt: torch.Tensor
+    alpha: float
+    workspace_bytes: int | None = None
+
+
 class MxHd256BwdOperands(NamedTuple):
     """Operands of the MXFP8 hdim-256 backward (`_flash_attn_bwd(mx_hd256=...)`), built from an
     MXFP8 forward's payloads and stats_out (NOTE [MXFP8 hd256 backward] in
@@ -494,7 +509,8 @@ class MxHd256BwdOperands(NamedTuple):
     sfv_dkdv hold V-hat (keys [0, s)) followed by the band residual R (keys [s, 2s)), and do_band
     holds dO / L in BF16 (the band's dV operand); non-causal leaves do_band None. The (batch, nheads,
     seqlen) FP32 rows: lse_log2 = M - offset + 8 (dQ kernel), lse_log2_dkdv = M - offset, and
-    dpsum = D''.
+    dpsum = D''. mxds selects the MX dS mode, whose dQ GEMM replaces the dQ kernel; sfdo (read only
+    by the dQ kernel) may then be None.
     """
 
     q: torch.Tensor  # the forward's Q payload, scales along head_dim
@@ -507,7 +523,7 @@ class MxHd256BwdOperands(NamedTuple):
     sfv: torch.Tensor
     sfv_dkdv: torch.Tensor
     do: torch.Tensor  # dO'' along head_dim
-    sfdo: torch.Tensor
+    sfdo: torch.Tensor | None
     sfdo_dkdv: torch.Tensor
     qt: torch.Tensor  # Q-hat requantized along queries
     sfqt: torch.Tensor
@@ -517,6 +533,7 @@ class MxHd256BwdOperands(NamedTuple):
     lse_log2_dkdv: torch.Tensor
     dpsum: torch.Tensor
     do_band: torch.Tensor | None = None  # causal: dO / L in BF16
+    mxds: MxHd256DsOperands | None = None
 
 
 def _validate_mx_hd256_operands(mx: MxHd256BwdOperands, k: torch.Tensor, causal: bool) -> None:
@@ -542,8 +559,18 @@ def _validate_mx_hd256_operands(mx: MxHd256BwdOperands, k: torch.Tensor, causal:
         "sfk_dkdv": pair_tiles(s, 64), "sfv_dkdv": pair_tiles(s_v, 64),
         "lse_log2": (b, h, s), "lse_log2_dkdv": (b, h, s), "dpsum": (b, h, s),
     }
+    if mx.mxds is not None:
+        if s % 256:
+            raise ValueError("mx_hd256.mxds needs seqlen a multiple of 256")
+        if mx.mxds.workspace_bytes is not None and mx.mxds.workspace_bytes <= 0:
+            raise ValueError("mx_hd256.mxds.workspace_bytes must be positive")
+        expected["mxds.kt"], expected["mxds.sfkt"] = payload, interleaved(d, s)
+        if mx.sfdo is None:
+            del expected["sfdo"]
     for name, want in expected.items():
-        t = getattr(mx, name)
+        t = getattr(mx.mxds, name[5:]) if name.startswith("mxds.") else getattr(mx, name)
+        if t is None:
+            raise ValueError(f"mx_hd256.{name} must be set")
         if isinstance(want, int):
             dtype, ok = torch.float8_e8m0fnu, t.numel() == want
         else:
@@ -2215,8 +2242,8 @@ def _flash_attn_bwd(
 
     mx_hd256: run the dedicated hdim-256 kernels in MXFP8 on these operands, which replace the
     preprocess's LSE / dPsum (NOTE [MXFP8 hd256 backward] in sm100_hd256_2cta_fmha_backward.py). The
-    K slot must then hold the BF16 K-hat (the dQ kernel's dQ = dS K); Q, V, and dout only provide
-    shapes.
+    K slot must then hold the BF16 K-hat (the dQ kernel's dQ = dS K; with mx_hd256.mxds, only its
+    shape); Q, V, and dout only provide shapes.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
@@ -2288,6 +2315,7 @@ def _flash_attn_bwd(
         has_score_mod=score_mod is not None, has_mask_mod=mask_mod is not None,
         has_learnable_sink=learnable_sink is not None,
         mxfp8=mx_hd256 is not None,
+        mxds=mx_hd256 is not None and mx_hd256.mxds is not None,
     )
     if config is None:
         config = select_bwd_config(inputs)
@@ -2687,6 +2715,15 @@ def _flash_attn_bwd(
     )
     if mx_hd256 is not None:
         compile_key = compile_key + ("mx_hd256",)
+        if mx_hd256.mxds is not None:
+            compile_key = compile_key + ("mxds",)
+
+    mxds_ws = None
+    if mx_hd256 is not None and mx_hd256.mxds is not None:
+        mxds_ws = _mxds_workspace(
+            mx_hd256.mxds.workspace_bytes, batch_size * num_head, num_head, seqlen_q, seqlen_k,
+            device,
+        )
 
     # SM90 / SM100 bound the K/V TMA loads of varlen / seqused_k calls by rewriting per-CTA
     # copies of the K, V (and 2-CTA Kt) descriptors on device (see FlashAttentionBackwardSm100 /
@@ -2820,6 +2857,7 @@ def _flash_attn_bwd(
                     tile_n_dkdv=dkdv_tile_mn[1],
                     mxfp8=mx_hd256 is not None,
                     dq_reverse=config.hd256_dq_reverse,
+                    mxds=mx_hd256 is not None and mx_hd256.mxds is not None,
                 )
             else:
                 fa_bwd_obj = FlashAttentionBackwardSm100(
@@ -2896,6 +2934,16 @@ def _flash_attn_bwd(
                 )
             )
             compile_args.extend(_hd256_mx_cute_args(hd256_mx_args))
+            # the MX dS mode's workspace and (batch, head) slice range; every dedicated call passes
+            # these slots, since a TVM-FFI function loaded from the disk cache takes every
+            # parameter positionally
+            if mxds_ws is not None:
+                ws, ws_sf = mxds_ws
+                compile_args.extend((
+                    to_cute_tensor(ws, assumed_align=256), to_cute_tensor(ws_sf), Int32(0), Int32(1)
+                ))
+            else:
+                compile_args.extend((None,) * 4)
         compile_args.append(current_stream)
 
         # TODO: check @can_implement
@@ -2956,7 +3004,12 @@ def _flash_attn_bwd(
                 t.view(torch.uint8) if t is not None and t.element_size() == 1 else t
                 for t in hd256_mx_args
             )
-        compiled_bwd(*call_args)
+        if mxds_ws is not None:
+            _hd256_bwd_mxds(compiled_bwd, call_args, mx_hd256.mxds, mxds_ws, dq, causal)
+        else:
+            if use_dedicated_hd256_kernel:
+                call_args.extend((None,) * 4)  # the MX dS mode's slots, see compile_args
+            compiled_bwd(*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
     if not use_dedicated_hd256_kernel:
@@ -3024,6 +3077,31 @@ _HD256_MX_KERNEL_FIELDS = (
     "q", "sfq", "sfq_dkdv", "k", "sfk", "sfk_dkdv",
     "v", "sfv", "sfv_dkdv", "do", "sfdo", "sfdo_dkdv",
 )
+
+
+def _mxds_workspace(budget, n_slices, n_heads, seqlen_q, seqlen_k, device):
+    """(E4M3 dS workspace (chunk, keys, queries) as bytes, compact UE8M0 block scales: 16 B per
+    (slice, 128-query, 128-key) tile), NOTE [MXFP8 hd256 dS for dQ]. The chunk's budget also
+    covers the expanded scales that expand_ds_sf allocates per chunk (mxds_slice_bytes)."""
+    chunk = select_mxds_chunk(n_slices, n_heads, seqlen_q, seqlen_k, budget)
+    ws = torch.empty(chunk, seqlen_k, seqlen_q, device=device, dtype=torch.uint8)
+    n_sf = chunk * (seqlen_q // 128) * (seqlen_k // 128) * 16
+    return ws, torch.empty(n_sf, device=device, dtype=torch.uint8)
+
+
+def _hd256_bwd_mxds(
+    fn, call_args: list, mxds: MxHd256DsOperands, mxds_ws: tuple, dq: torch.Tensor, causal: bool
+) -> None:
+    """NOTE [MXFP8 hd256 dS for dQ]: per workspace chunk, the dK / dV kernel then the dQ GEMM."""
+    from flash_attn.cute.sm100_hd256_dq_gemm import mxds_dq_gemm
+
+    ws, ws_sf = mxds_ws
+    chunk = ws.shape[0]
+    n_slices = dq.shape[0] * dq.shape[2]
+    for base in range(0, n_slices, chunk):
+        n = min(chunk, n_slices - base)
+        fn(*call_args, ws, ws_sf, base, n)
+        mxds_dq_gemm(ws, ws_sf, mxds.kt, mxds.sfkt, dq, base, n, causal, mxds.alpha)
 
 
 def _hd256_mx_cute_args(args: tuple) -> list:
