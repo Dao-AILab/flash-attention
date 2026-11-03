@@ -22,7 +22,6 @@ from cutlass.pipeline import (
     CooperativeGroup,
     PipelineAsync,
     PipelineState,
-    PipelineTmaAsync,
     pipeline_init_arrive,
     pipeline_init_wait,
 )
@@ -1946,7 +1945,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         qk_group = CooperativeGroup(Agent.Thread, self.num_qk_threads // cute.arch.WARP_SIZE)
         pv_group = CooperativeGroup(Agent.Thread, self.num_mma_threads // cute.arch.WARP_SIZE)
         if const_expr(mPageTable is None or self.paged_tma):
-            pipeline_k = PipelineTmaAsync.create(
+            pipeline_k = pipeline_custom.PipelineTmaAsyncGenericConsumer.create(
                 num_stages=self._num_k_stages(),
                 producer_group=tma_group,
                 consumer_group=qk_group,
@@ -1954,7 +1953,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 barrier_storage=storage.mbar_K.data_ptr(),
                 defer_sync=True,
             )
-            pipeline_v = PipelineTmaAsync.create(
+            pipeline_v = pipeline_custom.PipelineTmaAsyncGenericConsumer.create(
                 num_stages=self._num_v_stages(),
                 producer_group=tma_group,
                 consumer_group=pv_group,
