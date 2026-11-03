@@ -918,7 +918,8 @@ def test_mxfp8_kv_stages_fit_the_scales(mxfp8_path, head_dim, causal, device_arc
     rows = config.q_stage * 128
     q_o = rows * head_dim + config.q_stage * 512 + rows * head_dim * 2
     q_o += 512 if mxfp8_path == "pv" else 0
-    kv_stage_bytes = 128 * head_dim * (2 if mxfp8_path == "qk" else 1) + 512
+    bf16_v = mxfp8_path == "qk" or causal  # causal native PV: BF16 diagonal V blocks
+    kv_stage_bytes = 128 * head_dim * (2 if bf16_v else 1) + 512
     assert config.kv_stage == min((224 * 1024 - q_o) // kv_stage_bytes, 32)
     for has_lse in (False, True):
         assert sm100_fwd_smem_bytes(config, inputs._replace(has_lse=has_lse)) <= SM100_SMEM_BYTES
@@ -942,6 +943,44 @@ def test_mxfp8_pv_register_splits():
         select_fwd_config(pv._replace(device_arch=107, mxfp8_path=None, pack_gqa=False,
                                       disable_2cta=True)).registers
     )
+    # Causal native PV without CLC runs a single-tile scheduler, so sm_103 keeps the sm_100
+    # split, and sm_107 hd64 keeps the FP8 one.
+    causal_103 = pv._replace(device_arch=103, causal=True)
+    no_clc = derive_fwd_config(select_fwd_config(causal_103), causal_103, use_clc_scheduler=False)
+    assert astuple(no_clc.registers) == (184, 80, 64)
+    assert registers(device_arch=107, head_dim=64, head_dim_v=64, causal=True) == (168, 96, 80)
+
+
+_MXFP8_CAUSAL = dict(dtype="torch.float8_e4m3fn", causal=True)
+_MXFP8_CLC_HD128 = Sm100Registers(softmax=168, correction=88, other=88)
+_MXFP8_CLC_HD64 = Sm100Registers(softmax=184, correction=64, other=80)
+
+
+@pytest.mark.parametrize(
+    ("changes", "clc", "registers"),
+    [
+        # QK-only MXFP8 keeps its own rows, all with the default split.
+        ({"mxfp8_path": "qk", "device_arch": 100}, True, None),
+        ({"mxfp8_path": "qk", "device_arch": 103}, False, None),
+        ({"mxfp8_path": "qk", "device_arch": 103, **_HD128}, True, None),
+        # Native PV's default splits spill once persistent; those cells name their own.
+        ({"mxfp8_path": "pv", "device_arch": 100, **_HD128}, True, _MXFP8_CLC_HD128),
+        ({"mxfp8_path": "pv", "device_arch": 103, **_HD128}, True, _MXFP8_CLC_HD128),
+        ({"mxfp8_path": "pv", "device_arch": 107, **_HD128}, True, None),
+        ({"mxfp8_path": "pv", "device_arch": 100}, True, None),
+        ({"mxfp8_path": "pv", "device_arch": 103}, True, _MXFP8_CLC_HD64),
+        ({"mxfp8_path": "pv", "device_arch": 107}, False, None),
+    ],
+)
+def test_causal_mxfp8_clc_cells(changes, clc, registers):
+    inputs = make_inputs(**_MXFP8_CAUSAL, **changes)
+    config = select_fwd_config(inputs)
+
+    assert config.use_clc_scheduler is clc
+    if clc:
+        # A cell without its own split keeps the one the nonpersistent grid uses.
+        grid = derive_fwd_config(config, inputs, use_clc_scheduler=False)
+        assert config.registers == (grid.registers if registers is None else registers)
 
 
 def test_mxfp8_pv_keeps_hardware_exp2():
