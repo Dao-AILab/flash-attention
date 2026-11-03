@@ -85,6 +85,8 @@ class FwdConfig:
     ex2_emu_start_frg: int
     overlap_sO_sQ: bool
     kv_stage: int
+    # SM100 softmax stats release order; see NOTE [softmax stats release order].
+    sm_stats_cross_stage: bool
     use_swapab: bool = False
     lpt_global: bool = False
 
@@ -385,6 +387,48 @@ SM100_FP8_SMALL_HDIM_REGISTERS = {
     False: Sm100Registers(softmax=168, correction=96, other=80),
     True: Sm100Registers(softmax=152, correction=96, other=112),
 }
+# NOTE [softmax stats release order]
+# The SM100 correction warpgroup frees softmax stage s's pipeline_sm_stats slot in either order:
+# - Same-stage (default): right after reading scale[s].
+# - Cross-stage (FwdConfig.sm_stats_cross_stage): after rescaling the other stage's O (its own O
+#   when q_stage == 1).
+# Both are correct: one release per acquire, with O guarded by pipeline_s_p_o.
+# Only the schedule changes.
+#
+# Cross-stage keeps the two softmax warpgroups about half a step apart, so their
+# exp2 bursts alternate on the MUFU they share per SM sub-partition. Near the
+# MUFU throughput limit, aligned bursts stall on MUFU.
+# _SM_STATS_CROSS_STAGE lists configs where cross-stage measured faster;
+# everything else uses same-stage.
+# Explicit pacing via s0_s1_barrier was slower, so cross-stage provides the pacing.
+# S ping-pong keeps its own order (same slot, after the O rescale).
+# Table key: (path, head_dim_padded, is_causal, is_varlen_q) -> arch families.
+_SM_STATS_CROSS_STAGE = {
+    ("bf16", 64, False, False): ("sm_100",),
+    ("bf16", 64, True, False): ("sm_103", "sm_107"),
+    ("bf16", 64, True, True): ("sm_100",),
+    ("bf16", 96, False, False): ("sm_100", "sm_103", "sm_107"),
+    ("bf16", 96, False, True): ("sm_100", "sm_107"),
+    ("bf16", 128, False, False): ("sm_100",),
+    ("bf16", 128, False, True): ("sm_100",),
+    ("bf16", 128, True, True): ("sm_100",),
+    ("bf16", 192, False, True): ("sm_100",),
+    ("bf16", 192, True, True): ("sm_100",),
+    ("fp16", 64, False, False): ("sm_100",),
+    ("fp16", 64, True, False): ("sm_100", "sm_103", "sm_107"),
+    ("fp16", 96, False, False): ("sm_103", "sm_107"),
+    ("fp16", 96, False, True): ("sm_103",),
+    ("fp16", 96, True, False): ("sm_107",),
+    ("fp16", 96, True, True): ("sm_103",),
+    ("fp16", 128, False, True): ("sm_100",),
+    ("fp16", 128, True, True): ("sm_100",),
+    ("fp16", 192, False, False): ("sm_100",),
+    ("fp16", 192, False, True): ("sm_100",),
+    ("fp8", 64, False, False): ("sm_100",),
+    ("fp8", 64, True, False): ("sm_100",),
+    ("fp8", 96, False, False): ("sm_100",),
+    ("fp8", 96, True, False): ("sm_100",),
+}
 # === END SM100 TUNING KNOBS ===
 
 # 16 warps: two softmax, correction, MMA, load, epilogue, and an empty warp group.
@@ -396,6 +440,26 @@ SM100_LAUNCH_REGISTERS = 65536 // SM100_THREADS_PER_CTA
 def sm100_is_sm103_family(device_arch: int) -> bool:
     """Match the kernel's ``Arch.is_family_of(sm_103f)``: SM10x with minor version >= 3."""
     return device_arch // 10 == 10 and device_arch % 10 >= 3
+
+
+def sm100_arch_family(device_arch: int) -> str:
+    """Tuning-table arch family: "sm_107", "sm_103", or "sm_100" (also SM110)."""
+    if device_arch // 10 == 10 and device_arch % 10 >= 7:
+        return "sm_107"
+    return "sm_103" if sm100_is_sm103_family(device_arch) else "sm_100"
+
+
+def dtype_path(dtype: str) -> str:
+    """Tuning-table dtype path of a torch dtype string."""
+    return "fp8" if "float8" in dtype else "fp16" if dtype == "torch.float16" else "bf16"
+
+
+def select_sm_stats_cross_stage(inputs: FwdHeuristicInputs, *, use_s_ping_pong: bool) -> bool:
+    """See NOTE [softmax stats release order]."""
+    if inputs.device_capacity not in (10, 11) or use_s_ping_pong:
+        return False
+    key = (dtype_path(inputs.dtype), inputs.head_dim_padded, inputs.causal, inputs.is_varlen_q)
+    return sm100_arch_family(inputs.device_arch) in _SM_STATS_CROSS_STAGE.get(key, ())
 
 
 def select_sm100_registers(
@@ -800,11 +864,8 @@ def causal_clc_policy(
         or inputs.has_mask_mod
     ):
         return False, None
-    minor = inputs.device_arch % 10
-    family = "sm_107" if minor >= 7 else "sm_103" if minor >= 3 else "sm_100"
-    dtype = inputs.dtype
-    dtype_path = "fp8" if "float8" in dtype else "fp16" if dtype == "torch.float16" else "bf16"
-    row = _CAUSAL_CLC_DEFAULT.get((dtype_path, inputs.head_dim_padded), {})
+    family = sm100_arch_family(inputs.device_arch)
+    row = _CAUSAL_CLC_DEFAULT.get((dtype_path(inputs.dtype), inputs.head_dim_padded), {})
     return family in row, row.get(family)
 
 
@@ -879,8 +940,7 @@ _SM100_SMEM_ALIGN_BYTES = 1024
 
 def sm100_smem_capacity(device_arch: int) -> int:
     """Per-CTA shared memory the SM100-family forward may use: more on sm_107."""
-    is_sm107 = device_arch // 10 == 10 and device_arch % 10 >= 7
-    return SM107_SMEM_BYTES if is_sm107 else SM100_SMEM_BYTES
+    return SM107_SMEM_BYTES if sm100_arch_family(device_arch) == "sm_107" else SM100_SMEM_BYTES
 
 
 def sm100_uneven_kv_smem(
@@ -1224,6 +1284,7 @@ class SwapABPolicy:
             ex2_emu_start_frg=0,
             overlap_sO_sQ=False,
             kv_stage=0,
+            sm_stats_cross_stage=False,
             use_swapab=True,
         )
 
@@ -1488,6 +1549,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         overlap_sO_sQ=overlap_sO_sQ,
         kv_stage=kv_stage,
         lpt_global=lpt_global,
+        sm_stats_cross_stage=select_sm_stats_cross_stage(inputs, use_s_ping_pong=use_s_ping_pong),
     )
     validate_fwd_config(config, inputs)
     return config
@@ -1496,9 +1558,9 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
 def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) -> FwdConfig:
     """Apply changes to base and re-derive the fields the selector computes from them.
 
-    registers, the exp2 emulation, the SM100 SMEM layout (overlap_sO_sQ, kv_stage), and
-    lpt_global are recomputed for the changed tile, stage, split, 2CTA, PackGQA, and
-    scheduler choices unless changes sets them. The result is validated.
+    registers, the exp2 emulation, the SM100 SMEM layout (overlap_sO_sQ, kv_stage), the softmax
+    stats release order, and lpt_global are recomputed for the changed tile, stage, split, 2CTA,
+    S ping-pong, PackGQA, and scheduler choices unless changes sets them. The result is validated.
     """
     config = replace(base, **changes)
     resolved = inputs._replace(pack_gqa=config.pack_gqa)
@@ -1506,7 +1568,12 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
         # registers=None: the SwapAB kernel owns its fixed per-role budgets (64/120/208 at
         # tile_hq=32) and its SMEM stages; it keeps hardware exp2.
         derived = dict(
-            registers=None, ex2_emu_freq=0, ex2_emu_start_frg=0, overlap_sO_sQ=False, kv_stage=0
+            registers=None,
+            ex2_emu_freq=0,
+            ex2_emu_start_frg=0,
+            overlap_sO_sQ=False,
+            kv_stage=0,
+            sm_stats_cross_stage=False,
         )
     else:
         ex2_emu_freq, ex2_emu_start_frg = select_ex2_emu(
@@ -1532,6 +1599,9 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
             ex2_emu_start_frg=ex2_emu_start_frg,
             overlap_sO_sQ=overlap_sO_sQ,
             kv_stage=kv_stage,
+            sm_stats_cross_stage=select_sm_stats_cross_stage(
+                resolved, use_s_ping_pong=config.use_s_ping_pong
+            ),
             lpt_global=select_lpt_global(
                 resolved,
                 tile_m=config.tile_m,
@@ -1596,6 +1666,7 @@ _FWD_SM100_ONLY_NEUTRAL_FIELDS = dict(
     overlap_sO_sQ=False,
     kv_stage=0,
     lpt_global=False,
+    sm_stats_cross_stage=False,
 )
 
 
@@ -1730,6 +1801,8 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         inputs, tile_m=config.tile_m, tile_n=config.tile_n, q_stage=config.q_stage
     ):
         raise ValueError("S ping-pong is not supported for this forward problem")
+    if config.use_s_ping_pong and config.sm_stats_cross_stage:
+        raise ValueError("S ping-pong keeps its own softmax stats release order")
     if config.use_2cta_instrs and not is_2cta_eligible(
         inputs,
         tile_m=config.tile_m,
