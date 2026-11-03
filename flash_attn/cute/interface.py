@@ -463,11 +463,15 @@ class BlockScales(NamedTuple):
     q/k: E4M3 Q/K, scaled in 32-element head_dim blocks.
     v: optional E4M3 V scales for native PV, in 32-key blocks
        (MN=head_dim_v, K=seqlen_k). Without v, V is BF16.
+    v_bf16: the original BF16 V (same shape as V), required exactly for causal native PV.
+       A V scale is shared by 32 keys, so KV blocks on a query tile's diagonal use BF16 P
+       and v_bf16 instead of the quantized V to keep future keys out of earlier rows.
     """
 
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor | None = None
+    v_bf16: torch.Tensor | None = None
 
 
 def _check_shared_kv_scales(scales) -> None:
@@ -531,6 +535,7 @@ def _validate_block_scales(
     window_size_right: int | None,
     num_splits: int,
     softcap: float | None,
+    softmax_scale: float | None,
     gather_kv_indices: torch.Tensor | None,
     layout_inputs: tuple,
     pv_unsupported: tuple,
@@ -539,9 +544,16 @@ def _validate_block_scales(
 
     layout_inputs groups unsupported varlen, paged, and block-sparse inputs.
     pv_unsupported groups sinks, modifiers, and auxiliary data rejected by native PV.
+    Causal native PV requires scales.v_bf16.
     """
     pv = scales.v is not None
+    v_bf16 = scales.v_bf16
+    if v_bf16 is not None and not pv:
+        raise ValueError("v_bf16 requires native MXFP8 PV (scales.v)")
     mode = "Native MXFP8 PV" if pv else "QK MXFP8"
+    if softmax_scale is not None and not softmax_scale > 0:
+        # Masked scores are -inf; a zero or negative scale turns them into NaN or +inf.
+        raise ValueError(f"{mode} requires softmax_scale > 0, got {softmax_scale}")
     if scales.q is None or scales.k is None:
         raise ValueError(f"{mode} requires both scales.q and scales.k")
     if qv is not None or q is None or k is None:
@@ -550,8 +562,17 @@ def _validate_block_scales(
         pv_causal, pv_local, _, _ = _resolve_causal_local_window(
             causal, window_size_left, window_size_right
         )
-        if pv_causal or pv_local:
-            raise NotImplementedError("Native MXFP8 PV supports only noncausal, nonlocal attention")
+        if pv_local:
+            raise NotImplementedError("Native MXFP8 PV does not support local attention")
+        if pv_causal:
+            if v_bf16 is None:
+                raise ValueError("Causal native MXFP8 PV requires original v_bf16")
+        elif v_bf16 is not None:
+            raise ValueError("v_bf16 is only used by causal native MXFP8 PV")
+        if v_bf16 is not None and (
+            v_bf16.dtype != torch.bfloat16 or v_bf16.shape != v.shape or v_bf16.device != v.device
+        ):
+            raise ValueError("v_bf16 must be BF16 with the same shape and device as V")
         layout_inputs += (gather_kv_indices,)
     if any(t is not None for t in layout_inputs) or num_splits != 1:
         raise NotImplementedError(f"{mode} supports only dense, unsplit attention")
@@ -567,7 +588,7 @@ def _validate_block_scales(
                          else "QK MXFP8 requires e4m3 Q/K and bf16 V")
     if q.shape[-1] not in (64, 128) or v.shape[-1] not in (64, 128):
         raise NotImplementedError(f"{mode} supports head dimensions 64 and 128")
-    if requires_grad:
+    if requires_grad or (v_bf16 is not None and v_bf16.requires_grad):
         raise NotImplementedError(f"{mode} is forward-only")
     # (scales, operand, name, MN extent, K extent); K is the scaled (reduction) axis.
     sf_layouts = [
@@ -588,7 +609,8 @@ def _validate_block_scales(
                 f"K={k_extent} ({expected} elements)"
             )
     # Flatten physical chunks; the kernel constructs their logical operand views.
-    return BlockScales(*(t if t is None else maybe_contiguous(t.reshape(-1)) for t in scales))
+    sfq, sfk, sfv = (t if t is None else maybe_contiguous(t.reshape(-1)) for t in scales[:3])
+    return scales._replace(q=sfq, k=sfk, v=sfv, v_bf16=maybe_contiguous(v_bf16))
 
 
 def _flash_attn_fwd(
@@ -651,7 +673,7 @@ def _flash_attn_fwd(
         scales: Dequantization scales of low-precision Q/K/V (see TensorwiseScales and
             BlockScales). BlockScales give BF16 output and support only dense, unsplit,
             forward-only attention. BlockScales.v selects native MXFP8 PV with e4m3 V, which
-            is also noncausal and unmodified.
+            is also nonlocal and unmodified; causal native PV also needs BlockScales.v_bf16.
         config: Fully resolved forward config, or None for the default: an MlaFwdConfig with qv,
             else a FwdConfig.
     """
@@ -704,7 +726,8 @@ def _flash_attn_fwd(
             block_scales = _validate_block_scales(
                 scales, q, k, v, qv, requires_grad=requires_grad, causal=causal,
                 window_size_left=window_size_left, window_size_right=window_size_right,
-                num_splits=num_splits, softcap=softcap, gather_kv_indices=gather_kv_indices,
+                num_splits=num_splits, softcap=softcap, softmax_scale=softmax_scale,
+                gather_kv_indices=gather_kv_indices,
                 layout_inputs=(cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table,
                                block_sparse_tensors),
                 pv_unsupported=(learnable_sink, score_mod, mask_mod, aux_tensors, aux_scalars),
@@ -719,6 +742,7 @@ def _flash_attn_fwd(
     sf_operands = (
         (block_scales.q, block_scales.k, block_scales.v) if qk_blockscaled else (None, None, None)
     )
+    v_bf16 = block_scales.v_bf16 if qk_blockscaled else None
     if cu_seqlens_k is None:
         if page_table is None:
             assert k is None or k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -1293,7 +1317,8 @@ def _flash_attn_fwd(
     )
 
     if qk_blockscaled:
-        compile_key += ("mxfp8_qk", v.dtype, pv_blockscaled)
+        compile_key += ("mxfp8_qk", v.dtype, pv_blockscaled,
+                        get_broadcast_dims(v_bf16) if v_bf16 is not None else None)
 
     if _needs_compile(_flash_attn_fwd.compile_cache, compile_key):
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1611,6 +1636,7 @@ def _flash_attn_fwd(
                         if t is not None:
                             t.element_type = cutlass.Float8E8M0FNU
                     compile_args.extend(sf_tensors)
+                    compile_args.append(to_cute_tensor(v_bf16) if v_bf16 is not None else None)
             elif arch // 10 in [8, 9, 12]:
                 compile_args.extend([
                     cu_total_m_blocks_tensor,
@@ -1706,6 +1732,7 @@ def _flash_attn_fwd(
                 ])
                 if not use_swapab:
                     call_args.extend(t.view(torch.uint8) if t is not None else None for t in sf_operands)
+                    call_args.append(v_bf16)
             elif arch // 10 in [8, 9, 12]:
                 call_args.extend([
                     cu_total_m_blocks,
@@ -3850,9 +3877,11 @@ def flash_attn_func(
         (FP8 then uses descale 1).
         - TensorwiseScales: FP8 Q/K/V.
         - BlockScales(q, k): MXFP8 Q/K with BF16 V.
-        - BlockScales(q, k, v): native, noncausal MXFP8 PV with e4m3 V. v is the contiguous
-          UE8M0 buffer from quantize_v_to_fp8_with_sf (MN=V channels, K=key positions, groups
-          of 32 keys). Local and modified attention are not supported.
+        - BlockScales(q, k, v): native MXFP8 PV with e4m3 V. v is the contiguous UE8M0 buffer
+          from quantize_v_to_fp8_with_sf (MN=V channels, K=key positions, groups of 32 keys).
+        - BlockScales(q, k, v, v_bf16): causal native MXFP8 PV; v_bf16 is the original BF16 V
+          (see BlockScales).
+        Native MXFP8 PV does not support local or modified attention.
         BlockScales return BF16 output and optional FP32 LSE, and support only dense, unsplit
         attention.
     """
