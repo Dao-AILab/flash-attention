@@ -133,10 +133,8 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
         )
         legacy["registers"] = legacy_sm90_kernel_registers(384, legacy["single"])
     else:
-        n = 128
-        hd256_generic = head_dim == 256 and head_dim_v == 256 and inputs.hd256_generic
-        if hd256_generic:
-            n = 64
+        is_hdim256 = head_dim == 256 and head_dim_v == 256
+        n = 64 if is_hdim256 else 128
 
         def subtile(n_block_size):
             if not inputs.use_block_sparsity or block_size is None:
@@ -165,7 +163,7 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
             n = 64
         needs_2cta = (
             "SM100 backward with head_dim=256"
-            if hd256_generic
+            if is_hdim256
             else (
                 "SM100 block-sparse backward with head_dim=192"
                 if inputs.use_block_sparsity and head_dim == 192
@@ -183,7 +181,6 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
             )
             raise ValueError(f"{needs_2cta} requires 2CTA; {reason}.")
         cluster_size = 2 if use_2cta else 1
-        dedicated = head_dim == 256 and head_dim_v == 256 and not inputs.hd256_generic
         legacy = dict(
             m=128,
             n=n,
@@ -192,24 +189,20 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
             NdKV=1,
             MdQ=1,
             cluster_size=cluster_size,
-            use_2cta=use_2cta or dedicated,
-            dedicated=dedicated,
+            use_2cta=use_2cta,
             kv_subtile=kv_subtile_factor,
             # The legacy sweep is MHA, which never packs.
             pack_factor=1,
             head_loop=False,
         )
-        if dedicated:
-            legacy["registers"] = None
-        else:
-            # The old kernel derived its stages and register split itself.
-            legacy.update(
-                Q=1 if use_2cta else 2,
-                dO=1,
-                registers=legacy_sm100_kernel_registers(
-                    causal, local, inputs.deterministic, use_2cta, cluster_size, head_dim
-                ),
-            )
+        # The old kernel derived its stages and register split itself.
+        legacy.update(
+            Q=1 if use_2cta else 2,
+            dO=1,
+            registers=legacy_sm100_kernel_registers(
+                causal, local, inputs.deterministic, use_2cta, cluster_size, head_dim
+            ),
+        )
         spt_given = inputs.use_block_sparsity and inputs.sparse_spt is not None
         legacy["spt"] = (
             inputs.sparse_spt and inputs.deterministic
@@ -223,7 +216,7 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
             f"tile_m={m}; got {sparse_q}."
         )
     legacy["q_subtile"] = sparse_q // m if sparse_q is not None else 2
-    generic_sm100 = arch // 10 in (10, 11) and not legacy["dedicated"]
+    generic_sm100 = arch // 10 in (10, 11)
     if generic_sm100 and -(-head_dim // 32) * 32 in (192, 256) and not legacy["use_2cta"]:
         raise LegacyKernelAssert
     return legacy
@@ -246,7 +239,6 @@ _CONFIG_FIELDS = dict(
     num_threads="num_threads",
     cluster_size="cluster_size",
     use_2cta="use_2cta_instrs",
-    dedicated="use_dedicated_hd256_kernel",
     spt="spt",
     registers="registers",
     pack_factor="pack_factor",
@@ -281,12 +273,10 @@ _SPARSE = [  # (use_block_sparsity, block_size, spt)
     (True, (64, 64), None),
     (True, (128, 192), None),
 ]
-_ENVS = [  # (disable_2cta, hd256_generic, requested_tile_n)
-    (False, False, None),
-    (True, False, None),
-    (False, True, None),
-    (True, True, None),
-    (False, False, 64),
+_ENVS = [  # (disable_2cta, requested_tile_n)
+    (False, None),
+    (True, None),
+    (False, 64),
 ]
 
 
@@ -301,7 +291,7 @@ def test_selection_matches_the_legacy_policy(device_arch):
         _ENVS,
     ):
         use_block_sparsity, block_size, spt = sparse
-        disable_2cta, hd256_generic, tile_n = env
+        disable_2cta, tile_n = env
         inputs = make_inputs(
             device_arch=device_arch,
             head_dim=d,
@@ -316,7 +306,6 @@ def test_selection_matches_the_legacy_policy(device_arch):
             requested_V_in_regs=mask == "none",
             requested_tile_n=tile_n,
             disable_2cta=disable_2cta,
-            hd256_generic=hd256_generic,
         )
         try:
             expected = outcome(lambda: legacy_bwd_policy(inputs))
@@ -345,7 +334,7 @@ def test_pack_gqa_explicit_configs():
     # A pack of 2 / 4 query heads per tile and the hdim 256 head loop over the rest by request.
     assert select_bwd_config(make_inputs(**_GQA8, requested_pack_gqa=4)).pack_factor == 4
     loop = make_inputs(
-        **_GQA8, head_dim=256, head_dim_v=256, hd256_generic=True, requested_pack_gqa=2,
+        **_GQA8, head_dim=256, head_dim_v=256, requested_pack_gqa=2,
         requested_head_loop=True,
     )
     assert (select_bwd_config(loop).pack_factor, select_bwd_config(loop).head_loop) == (2, True)
@@ -413,8 +402,8 @@ def test_pack_gqa_explicit_configs():
         ),
         (
             make_inputs(**_GQA8, head_dim=256, head_dim_v=256),
-            {"pack_factor": 8},
-            "query-head folds",
+            {"tile_n": 128},
+            "head_dim=256 needs tile_n=64",
         ),
         (make_inputs(**_GQA8, device_arch=90), {"pack_factor": 8}, "2CTA or query-head fold"),
         (make_inputs(**_GQA8, device_arch=120), {"pack_factor": 8}, "2CTA or query-head fold"),
@@ -458,7 +447,6 @@ def choose_fold(
         has_cu_seqlens=varlen,
         causal=causal,
         deterministic=deterministic,
-        hd256_generic=True,
         requested_pack_gqa=pack_gqa_override,
         requested_head_loop=head_loop_override,
     )
@@ -468,7 +456,6 @@ def choose_fold(
             tile_m=m_block_size,
             tile_n=n_block_size,
             cluster_size=cluster_size,
-            use_dedicated_hd256_kernel=False,
         )
     )
 
@@ -773,7 +760,7 @@ def _identity_score_mod(score, b, h, q_idx, kv_idx, aux_tensors):
 
 @pytest.mark.parametrize(
     ("head_dim", "score_mod", "can_pack"),
-    [(128, None, True), (256, None, False), (128, _identity_score_mod, False)],
+    [(128, None, True), (256, None, True), (128, _identity_score_mod, False)],
     ids=["pack_gqa", "hdim256", "score_mod"],
 )
 def test_cross_compiled_gqa_backward_needs_num_sms_only_to_pack(
