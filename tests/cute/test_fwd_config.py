@@ -942,6 +942,25 @@ def test_causal_mxfp8_clc_cells(changes, clc, registers):
         assert config.registers == (grid.registers if registers is None else registers)
 
 
+def test_mxfp8_hd256_pv_policy():
+    pv = make_inputs(dtype="torch.float8_e4m3fn", **_HD256, mxfp8_path="pv")
+
+    def policy(**changes):
+        config = select_fwd_config(pv._replace(**changes))
+        assert config.use_2cta_instrs and config.use_s_ping_pong
+        return astuple(config.registers), (config.ex2_emu_freq, config.ex2_emu_start_frg)
+
+    # S ping-pong has one softmax warpgroup; sm_100 gives it more registers in both recipes.
+    assert policy() == ((208, 64, 120), (0, 0))
+    assert policy(causal=True) == ((208, 64, 120), (0, 0))
+    # "fast" emulates exp2 from fragment 1 on sm_100.
+    assert policy(mxfp8_path="pv_fast", causal=True) == ((208, 64, 120), (8, 1))
+    # sm_103: non-causal "fast" takes the same split; "exact" keeps the native-PV splits.
+    assert policy(device_arch=103, mxfp8_path="pv_fast") == ((208, 64, 120), (0, 0))
+    assert policy(device_arch=103, mxfp8_path="pv_fast", causal=True) == ((184, 80, 64), (0, 0))
+    assert policy(device_arch=103) == ((168, 96, 80), (0, 0))
+
+
 def test_mxfp8_pv_keeps_hardware_exp2():
     # FP8 hd128 emulates exp2 on SM100; native PV must not, so PV consumes the reference P.
     pv = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128, mxfp8_path="pv")
@@ -997,18 +1016,26 @@ def test_sm107_native_pv_schedule_follows_its_table(mxfp8_path, causal, head_dim
             validate_fwd_config(replace(other_config, sm_stats_early=True), other)
 
 
+@pytest.mark.parametrize("mxfp8_path", ["qk", "pv", "pv_fast"])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("device_arch", [100, 103, 107])
-def test_mxfp8_hd256_kv_stages_fit_the_scales(causal, device_arch):
+def test_mxfp8_hd256_kv_stages_fit_the_scales(mxfp8_path, causal, device_arch):
     inputs = make_inputs(dtype="torch.float8_e4m3fn", **_HD256, causal=causal,
-                         device_arch=device_arch, mxfp8_path="qk")
+                         device_arch=device_arch, mxfp8_path=mxfp8_path)
     config = select_fwd_config(inputs)
     assert config.use_2cta_instrs and config.use_s_ping_pong and config.q_stage == 1
     # Persistent 2CTA hd256 keeps a separate sO; causal (single-tile LPT) aliases it with sQ.
     assert config.overlap_sO_sQ == (not config.is_static_persistent)
-    # The kernel's previous K/V stage formula: e4m3 Q plus two 512-byte scale chunks, BF16 O, and
-    # per stage half of a BF16 V tile plus all of K's scale chunks.
+    # The kernel's previous K/V stage formula: e4m3 Q plus two 512-byte scale chunks, BF16 O,
+    # native PV's P-scale chunk and ("exact") ones tiles, and per stage half of a V tile (BF16
+    # for QK MXFP8 and causal PV) plus all of K's (and V's) scale chunks.
     q, o = 128 * 256 + 1024, 128 * 256 * 2
     q_o = max(q, o) if config.overlap_sO_sQ else q + o
-    assert config.kv_stage == min((224 * 1024 - q_o) // (128 * 256 + 1024), 32)
+    if mxfp8_path != "qk":
+        q_o += 512
+    if mxfp8_path == "pv":
+        q_o += 2048 + (4096 if causal else 0) + 2048 if device_arch == 107 else 2048 + 1024
+    v_bytes = 2 if mxfp8_path == "qk" or causal else 1
+    kv_stage_bytes = max(128 * 256, 128 * 256 * v_bytes) // 2 + 1024
+    assert config.kv_stage == min((224 * 1024 - q_o) // kv_stage_bytes, 32)
     assert sm100_fwd_smem_bytes(config, inputs) <= sm100_smem_capacity(device_arch)
