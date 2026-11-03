@@ -487,6 +487,75 @@ class BlockScales(NamedTuple):
     stats_out: torch.Tensor | None = None
 
 
+class MxHd256BwdOperands(NamedTuple):
+    """Operands of the MXFP8 hdim-256 backward (`_flash_attn_bwd(mx_hd256=...)`), built from an
+    MXFP8 forward's payloads and stats_out (NOTE [MXFP8 hd256 backward] in
+    sm100_hd256_2cta_fmha_backward.py).
+
+    E4M3 copies are (batch, seqlen, nheads, 256). Scale buffers are flat UE8M0: `sf<x>` in the
+    interleave_sf layout, `sf<x>_dkdv` in the dK / dV kernel's pair tiles. The (batch, nheads,
+    seqlen) FP32 rows: lse_log2 = M - offset + 8 (dQ kernel), lse_log2_dkdv = M - offset, and
+    dpsum = D''.
+    """
+
+    q: torch.Tensor  # the forward's Q payload, scales along head_dim
+    sfq: torch.Tensor
+    sfq_dkdv: torch.Tensor
+    k: torch.Tensor  # the forward's K payload, scales along head_dim
+    sfk: torch.Tensor
+    sfk_dkdv: torch.Tensor
+    v: torch.Tensor  # V-hat requantized along head_dim
+    sfv: torch.Tensor
+    sfv_dkdv: torch.Tensor
+    do: torch.Tensor  # dO'' along head_dim
+    sfdo: torch.Tensor
+    sfdo_dkdv: torch.Tensor
+    qt: torch.Tensor  # Q-hat requantized along queries
+    sfqt: torch.Tensor
+    dot: torch.Tensor  # dO'' along queries
+    sfdot: torch.Tensor
+    lse_log2: torch.Tensor
+    lse_log2_dkdv: torch.Tensor
+    dpsum: torch.Tensor
+
+
+def _validate_mx_hd256_operands(mx: MxHd256BwdOperands, k: torch.Tensor) -> None:
+    """Check MxHd256BwdOperands against the BF16 K-hat (batch, seqlen, nheads, 256) in the K slot:
+    dtypes, shapes, scale-buffer sizes, contiguity, and device. The kernels size their TMA loads from
+    the payloads, so a short scale buffer would be read out of bounds."""
+    b, s, h, d = k.shape
+
+    def interleaved(mn, k_extent):  # interleave_sf: 512 scales per 128 MN x 128 K tile
+        return b * h * math.ceil(mn / 128) * math.ceil(k_extent / 128) * 512
+
+    def pair_tiles(n, rows):  # 1024 B per tile of `rows` tokens
+        return b * h * math.ceil(n / rows) * 1024
+
+    payload = (b, s, h, d)
+    expected = {
+        "q": payload, "k": payload, "v": payload,
+        "do": payload, "qt": payload, "dot": payload,
+        "sfq": interleaved(s, d), "sfk": interleaved(s, d), "sfv": interleaved(s, d),
+        "sfdo": interleaved(s, d), "sfqt": interleaved(d, s), "sfdot": interleaved(d, s),
+        "sfq_dkdv": pair_tiles(s, 128), "sfdo_dkdv": pair_tiles(s, 128),
+        "sfk_dkdv": pair_tiles(s, 64), "sfv_dkdv": pair_tiles(s, 64),
+        "lse_log2": (b, h, s), "lse_log2_dkdv": (b, h, s), "dpsum": (b, h, s),
+    }
+    for name, want in expected.items():
+        t = getattr(mx, name)
+        if isinstance(want, int):
+            dtype, ok = torch.float8_e8m0fnu, t.numel() == want
+        else:
+            dtype = torch.float32 if len(want) == 3 else torch.float8_e4m3fn
+            ok = tuple(t.shape) == want
+        if t.dtype != dtype or not ok or not t.is_contiguous() or t.device != k.device:
+            raise ValueError(
+                f"mx_hd256.{name} must be a contiguous {dtype} tensor of "
+                f"{'numel' if isinstance(want, int) else 'shape'} {want} on {k.device}; got "
+                f"{t.dtype} {tuple(t.shape)}"
+            )
+
+
 def _check_shared_kv_scales(scales) -> None:
     """Reject distinct K / V descales when one tensor is both K and V.
 
@@ -2164,11 +2233,17 @@ def _flash_attn_bwd(
     learnable_sink: Optional[torch.Tensor] = None,
     *,
     config: BwdConfig | None = None,
+    mx_hd256: Optional[MxHd256BwdOperands] = None,
 ) -> Tuple[torch.Tensor, ...]:
     """Attention backward. ``config`` replaces the selected BwdConfig and is validated.
 
     The legacy tile, stage, MMA-layout, thread-count, and pack_gqa arguments are ignored:
     BwdConfig owns them. V_in_regs is the only one still read, as the SM90 request.
+
+    mx_hd256: run the dedicated hdim-256 kernels in MXFP8 on these operands, which replace the
+    preprocess's LSE / dPsum (NOTE [MXFP8 hd256 backward] in sm100_hd256_2cta_fmha_backward.py). The
+    K slot must then hold the BF16 K-hat (the dQ kernel's dQ = dS K); Q, V, and dout only provide
+    shapes.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
@@ -2254,6 +2329,7 @@ def _flash_attn_bwd(
         has_softcap=softcap != 0.0, zero_softmax_scale=softmax_scale == 0.0,
         has_mask_mod=mask_mod is not None,
         has_learnable_sink=learnable_sink is not None,
+        mxfp8=mx_hd256 is not None,
     )
     if config is None:
         config = select_bwd_config(inputs)
@@ -2296,6 +2372,13 @@ def _flash_attn_bwd(
         or seqused_q is not None
         or seqused_k is not None
     )
+    if mx_hd256 is not None:
+        # The config runs MXFP8 on the dedicated hdim-256 kernels (validate_bwd_config).
+        assert not is_varlen and num_head == num_head_kv and q.dtype == torch.bfloat16
+        assert not local and score_mod is None and mask_mod is None and dlse is None
+        assert not causal, "mx_hd256 is non-causal"
+        assert seqlen_k == seqlen_q and k.dtype == torch.bfloat16
+        _validate_mx_hd256_operands(mx_hd256, k)
 
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink = [
         maybe_contiguous(t)
@@ -2537,21 +2620,39 @@ def _flash_attn_bwd(
 
     dsink = torch.empty_like(learnable_sink) if learnable_sink is not None else None
 
-    # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
-    # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
-    _bwd_preprocess(
-        out, dout, dpsum, lse, lse_log2, dq_accum,
-        cu_seqlens_q, seqused_q, dlse,
-        dtype, head_dim, head_dim_v, tile_m,
-        # NOTE [bwd pack_gqa]: packed views of the per-head O / dO / LSE; dPsum / LSElog2 /
-        # dQaccum are per KV head in packed row order
-        pack_gqa=PackGQA.PACKED_ROW_OUTPUTS if bwd_pack_gqa else PackGQA.OFF,
-        qhead_per_kvhead=bwd_pack_factor,
-        nheads_kv=num_head // bwd_pack_factor if bwd_pack_gqa else 1,
-        cu_total_m_blocks=cu_total_m_blocks_q,
-        fake_mode=fake_mode,
-        hdim_multiple_of=hdim_multiple_of,
-    )
+    hd256_mx_args = (None,) * len(_HD256_MX_KERNEL_FIELDS)
+    if mx_hd256 is not None:
+        # The operands carry the LSE / dPsum slots (the dedicated kernels have no dQ accumulator
+        # to zero, so the preprocess is skipped); they are the scratch buffers when S needs no
+        # padding.
+        def as_scratch(t):
+            if t.shape == lse_log2.shape and t.is_contiguous():
+                return t
+            buf = torch.zeros_like(lse_log2)
+            buf[..., :seqlen_q].copy_(t)
+            return buf
+
+        lse_log2, dpsum = as_scratch(mx_hd256.lse_log2), as_scratch(mx_hd256.dpsum)
+        hd256_mx_args = (
+            as_scratch(mx_hd256.lse_log2_dkdv),
+            *(getattr(mx_hd256, name) for name in _HD256_MX_KERNEL_FIELDS[1:]),
+        )
+    else:
+        # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
+        # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
+        _bwd_preprocess(
+            out, dout, dpsum, lse, lse_log2, dq_accum,
+            cu_seqlens_q, seqused_q, dlse,
+            dtype, head_dim, head_dim_v, tile_m,
+            # NOTE [bwd pack_gqa]: packed views of the per-head O / dO / LSE; dPsum / LSElog2 /
+            # dQaccum are per KV head in packed row order
+            pack_gqa=PackGQA.PACKED_ROW_OUTPUTS if bwd_pack_gqa else PackGQA.OFF,
+            qhead_per_kvhead=bwd_pack_factor,
+            nheads_kv=num_head // bwd_pack_factor if bwd_pack_gqa else 1,
+            cu_total_m_blocks=cu_total_m_blocks_q,
+            fake_mode=fake_mode,
+            hdim_multiple_of=hdim_multiple_of,
+        )
     # Backward kernel: compute dk, dv, dq_accum.
     score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
     score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
@@ -2630,6 +2731,8 @@ def _flash_attn_bwd(
         use_dedicated_hd256_kernel and cu_seqlens_q is not None and max_seqlen_q is None,
         use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
     )
+    if mx_hd256 is not None:
+        compile_key = compile_key + ("mx_hd256",)
 
     # SM90 / SM100 bound the K/V TMA loads of varlen / seqused_k calls by rewriting per-CTA
     # copies of the K, V (and 2-CTA Kt) descriptors on device (see FlashAttentionBackwardSm100 /
@@ -2761,6 +2864,7 @@ def _flash_attn_bwd(
                     tile_n_dq=dq_tile_mn[1],
                     tile_m_dkdv=dkdv_tile_mn[0],
                     tile_n_dkdv=dkdv_tile_mn[1],
+                    mxfp8=mx_hd256 is not None,
                 )
             else:
                 fa_bwd_obj = FlashAttentionBackwardSm100(
@@ -2838,6 +2942,7 @@ def _flash_attn_bwd(
                     else None,
                 )
             )
+            compile_args.extend(_hd256_mx_cute_args(hd256_mx_args))
         compile_args.append(current_stream)
 
         # TODO: check @can_implement
@@ -2893,6 +2998,10 @@ def _flash_attn_bwd(
                     if cu_seqlens_k is not None
                     else None,
                 )
+            )
+            call_args.extend(
+                t.view(torch.uint8) if t is not None and t.element_size() == 1 else t
+                for t in hd256_mx_args
             )
         compiled_bwd(*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
@@ -2954,6 +3063,29 @@ def _flash_attn_bwd(
 
 
 _flash_attn_bwd.compile_cache = get_jit_cache("bwd")
+
+
+# MxHd256BwdOperands fields in the order of the dedicated kernels' MXFP8 arguments
+_HD256_MX_KERNEL_FIELDS = (
+    "lse_log2_dkdv", "qt", "sfqt", "dot", "sfdot",
+    "q", "sfq", "sfq_dkdv", "k", "sfk", "sfk_dkdv",
+    "v", "sfv", "sfv_dkdv", "do", "sfdo", "sfdo_dkdv",
+)
+
+
+def _hd256_mx_cute_args(args: tuple) -> list:
+    """Compile-time cute tensors of the MXFP8 arguments (UE8M0 buffers as raw bytes)."""
+    out = []
+    for t in args:
+        if t is None:
+            out.append(None)
+        elif t.dtype == torch.float8_e8m0fnu:
+            sf = to_cute_tensor(t.view(torch.uint8), leading_dim=0)
+            sf.element_type = cutlass.Float8E8M0FNU
+            out.append(sf)
+        else:
+            out.append(to_cute_tensor(t))
+    return out
 
 
 def _bwd_dsink_reduce(
