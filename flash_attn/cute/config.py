@@ -2765,6 +2765,9 @@ class BwdHeuristicInputs(NamedTuple):
     hd256_generic: bool = False
     # MXFP8 operands (_flash_attn_bwd(mx_hd256=...)): NOTE [MXFP8 hd256 backward].
     mxfp8: bool = False
+    # Their MX dS mode (mx_hd256.mxds): a dQ GEMM replaces the dQ kernel (NOTE [MXFP8 hd256 dS
+    # for dQ] in sm100_hd256_dq_gemm.py).
+    mxds: bool = False
 
     @property
     def device_capacity(self) -> int:
@@ -3226,8 +3229,8 @@ _HD256_DQ_REVERSE_MAX_WAVES = 5
 
 
 def select_hd256_dq_reverse_reads_num_sms(inputs: BwdHeuristicInputs) -> bool:
-    """Whether select_hd256_dq_reverse reads num_sms: SM100 causal MXFP8 hdim 256."""
-    return inputs.device_capacity in (10, 11) and inputs.mxfp8 and inputs.causal
+    """Whether select_hd256_dq_reverse reads num_sms: SM100 causal MXFP8 with the dQ kernel."""
+    return inputs.device_capacity in (10, 11) and inputs.mxfp8 and inputs.causal and not inputs.mxds
 
 
 def select_hd256_dq_reverse(inputs: BwdHeuristicInputs) -> bool:
@@ -3236,6 +3239,37 @@ def select_hd256_dq_reverse(inputs: BwdHeuristicInputs) -> bool:
         return False
     num_dq_ctas = 2 * ceil_div(inputs.max_seqlen_q, 256) * inputs.num_heads * inputs.batch_size
     return num_dq_ctas <= _HD256_DQ_REVERSE_MAX_WAVES * inputs.num_sms
+
+
+MXDS_WORKSPACE_BYTES = 4 << 30
+
+
+def mxds_slice_bytes(seqlen_q: int, seqlen_k: int) -> int:
+    """MX dS workspace bytes per (batch, head) slice (NOTE [MXFP8 hd256 dS for dQ]): the E4M3 dS
+    (keys x queries), its compact UE8M0 block scales (16 B per 128-query x 128-key tile), and the
+    dQ GEMM's expanded A scales (512 B per tile)."""
+    return seqlen_q * seqlen_k + (seqlen_q // 128) * (seqlen_k // 128) * (16 + 512)
+
+
+def select_mxds_chunk(
+    n_slices: int, n_heads: int, seqlen_q: int, seqlen_k: int, budget: int | None
+) -> int:
+    """(batch, head) slices per MX dS workspace chunk: the largest count whose workspace fits the
+    budget (None: MXDS_WORKSPACE_BYTES) that divides the head count, or is a multiple of it that
+    divides the slice count, so that every chunk's (head, batch) index has fixed strides for the dQ
+    GEMM. Raises ValueError if one slice exceeds the budget."""
+    budget = MXDS_WORKSPACE_BYTES if budget is None else int(budget)
+    slice_bytes = mxds_slice_bytes(seqlen_q, seqlen_k)
+    if slice_bytes > budget:
+        raise ValueError(
+            f"mxds workspace budget {budget} B is below one (batch, head) slice: seqlen_q "
+            f"{seqlen_q} x seqlen_k {seqlen_k} needs at least {slice_bytes} B"
+        )
+    cands = [c for c in range(1, n_heads + 1) if n_heads % c == 0]
+    cands += [
+        n_heads * m for m in range(2, n_slices // n_heads + 1) if n_slices % (n_heads * m) == 0
+    ]
+    return max(c for c in cands if c * slice_bytes <= budget)
 
 
 # fmt: off
@@ -3586,6 +3620,8 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
         raise ValueError("The MXFP8 backward runs only on the dedicated SM100 hdim-256 kernels")
     if config.hd256_dq_reverse and not config.use_dedicated_hd256_kernel:
         raise ValueError("hd256_dq_reverse needs the dedicated SM100 hdim-256 kernels")
+    if inputs.mxds and (not inputs.mxfp8 or config.hd256_dq_reverse):
+        raise ValueError("The MX dS mode is MXFP8-only and runs no dQ kernel to reorder")
     sm100_only = [
         name for name, value in _SM100_ONLY_NEUTRAL_FIELDS.items() if getattr(config, name) != value
     ]

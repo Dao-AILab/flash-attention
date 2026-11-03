@@ -11,8 +11,10 @@ from flash_attn.cute.config import (
     bwd_q_subtile_factor,
     bwd_selection_reads_num_sms,
     config_kv_subtile_factor,
+    mxds_slice_bytes,
     select_bwd_config,
     select_bwd_fold,
+    select_mxds_chunk,
     validate_bwd_config,
 )
 
@@ -823,6 +825,8 @@ def test_mxfp8_backward_runs_on_the_dedicated_hd256_kernels():
         ({"batch_size": 1}, True),
         ({"batch_size": 1, "causal": False}, False),
         ({"batch_size": 1, "mxfp8": False}, False),
+        # The MX dS mode replaces the dQ kernel.
+        ({"batch_size": 1, "mxds": True}, False),
     ],
 )
 def test_causal_mxfp8_hd256_dq_order_follows_the_wave_count(changes, reverse):
@@ -830,12 +834,33 @@ def test_causal_mxfp8_hd256_dq_order_follows_the_wave_count(changes, reverse):
                          max_seqlen_q=4096, max_seqlen_k=4096)._replace(**changes)
     config = select_bwd_config(inputs)
     assert config.hd256_dq_reverse is reverse
-    assert bwd_selection_reads_num_sms(inputs) == (inputs.mxfp8 and inputs.causal)
+    dq_kernel = inputs.mxfp8 and inputs.causal and not inputs.mxds
+    assert bwd_selection_reads_num_sms(inputs) == dq_kernel
     # An explicit config may choose either order on the dedicated kernel, not elsewhere.
-    validate_bwd_config(replace(config, hd256_dq_reverse=not reverse), inputs)
+    if not inputs.mxds:
+        validate_bwd_config(replace(config, hd256_dq_reverse=not reverse), inputs)
+    else:
+        with pytest.raises(ValueError, match="no dQ kernel"):
+            validate_bwd_config(replace(config, hd256_dq_reverse=True), inputs)
     generic = make_inputs(head_dim=256, head_dim_v=256, hd256_generic=True)
     with pytest.raises(ValueError, match="hd256_dq_reverse needs"):
         validate_bwd_config(replace(select_bwd_config(generic), hd256_dq_reverse=True), generic)
+
+
+def test_mxds_chunk_fits_the_whole_workspace_in_the_budget():
+    s, heads = 4096, 16
+    one = mxds_slice_bytes(s, s)
+    # dS payload + compact scales (16 B per 128 x 128 tile) + expanded scales (512 B per tile)
+    assert one == s * s + (s // 128) ** 2 * (16 + 512)
+    assert select_mxds_chunk(2 * heads, heads, s, s, one) == 1
+    # chunks divide the head count or are multiples of it that divide the slice count
+    assert select_mxds_chunk(2 * heads, heads, s, s, 4 * one) == 4
+    assert select_mxds_chunk(2 * heads, heads, s, s, 4 * one - 1) == 2
+    assert select_mxds_chunk(2 * heads, heads, s, s, 32 * one) == 32
+    # default budget (4 GiB): both batches in one chunk
+    assert select_mxds_chunk(2 * heads, heads, s, s, None) == 32
+    with pytest.raises(ValueError, match=f"needs at least {one} B"):
+        select_mxds_chunk(2 * heads, heads, s, s, one - 1)
 
 
 # Interface: these run on CPU with fake tensors and stop at the compile-cache lookup.

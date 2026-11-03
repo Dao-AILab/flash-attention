@@ -77,6 +77,8 @@ from flash_attn.cute.utils import AuxData, as_bshkrd_tensor, as_shhb_tensor
 # first 64 columns) and the dP scales in the tail of S, so QK(i) also waits for the dP(i-1) release;
 # sm_107 gives them dedicated columns of its 576-column allocation.
 # Scope: MHA, dense (no varlen / seqused), seqlen_q = seqlen_k, static scheduler.
+# The opt-in MX dS mode (`mxds`) runs the dK / dV kernel alone, which also writes dS in MXFP8, and
+# computes dQ with a block-scaled GEMM (NOTE [MXFP8 hd256 dS for dQ] in sm100_hd256_dq_gemm.py).
 
 
 class BlackwellFusedMultiHeadAttentionBackward:
@@ -107,9 +109,11 @@ class BlackwellFusedMultiHeadAttentionBackward:
         use_clc_scheduler: bool = False,
         mxfp8: bool = False,
         dq_reverse: bool = False,
+        mxds: bool = False,
     ):
         """Initialization. mxfp8: NOTE [MXFP8 hd256 backward]. dq_reverse: the dQ kernel runs each
-        head's query pairs from the end (causal: the longest first)."""
+        head's query pairs from the end (causal: the longest first). mxds: the dK / dV kernel alone,
+        also writing dS in MXFP8 for the caller's dQ GEMM (NOTE [MXFP8 hd256 dS for dQ])."""
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim == 256 and head_dim_v == 256, (
             "SM100 dedicated backward kernel only supports (head_dim, head_dim_v) = (256, 256)"
@@ -146,6 +150,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
         self.tile_n_dkdv = tile_n_dkdv
         self.use_clc_scheduler = use_clc_scheduler
         self.mxfp8 = mxfp8
+        self.mxds = mxds
 
         self.dq_kernel = BlackwellFusedMultiHeadAttentionBackwardDQKernel(
             self.acc_dtype,
@@ -167,6 +172,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             self.window_size_right,
             use_clc_scheduler=self.use_clc_scheduler,
             mxfp8=mxfp8,
+            mxds=mxds,
         )
 
     @cute.jit
@@ -215,6 +221,12 @@ class BlackwellFusedMultiHeadAttentionBackward:
         dO_mx: cute.Tensor | None = None,
         SFdO_mx: cute.Tensor | None = None,
         SFdO_dkdv: cute.Tensor | None = None,
+        # NOTE [MXFP8 hd256 dS for dQ] (mxds): the (batch, head) slices [bh_base, bh_base +
+        # bh_count) of this launch and their MXFP8 dS workspace
+        dS_ws: cute.Tensor | None = None,
+        dS_sf: cute.Tensor | None = None,
+        bh_base: Int32 | None = None,
+        bh_count: Int32 | None = None,
         stream: cuda.CUstream = None,
     ):
         """Host function to launch CuTeDSL kernel."""
@@ -283,31 +295,32 @@ class BlackwellFusedMultiHeadAttentionBackward:
                 as_bshkrd_tensor(assume_tensor_aligned(t), h_k, 1, varlen) for t in (K_mx, V_mx)
             ]
 
-        # Keep original order: dQ first, then dKdV.
-        self.dq_kernel(
-            Q,
-            K,
-            V,
-            dQ,
-            dO,
-            scaled_LSE,
-            sum_OdO,
-            cumulative_s_q,
-            cumulative_s_k,
-            seqused_q,
-            seqused_k,
-            scale_softmax,
-            max_seqlen_q,
-            stream,
-            Q_mx,
-            SFQ_mx,
-            K_mx,
-            SFK_mx,
-            V_mx,
-            SFV_mx,
-            dO_mx,
-            SFdO_mx,
-        )
+        # Keep original order: dQ first, then dKdV (mxds: no dQ kernel).
+        if cutlass.const_expr(not self.mxds):
+            self.dq_kernel(
+                Q,
+                K,
+                V,
+                dQ,
+                dO,
+                scaled_LSE,
+                sum_OdO,
+                cumulative_s_q,
+                cumulative_s_k,
+                seqused_q,
+                seqused_k,
+                scale_softmax,
+                max_seqlen_q,
+                stream,
+                Q_mx,
+                SFQ_mx,
+                K_mx,
+                SFK_mx,
+                V_mx,
+                SFV_mx,
+                dO_mx,
+                SFdO_mx,
+            )
         self.dkdv_kernel(
             Q,
             K,
@@ -336,4 +349,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
             SFV_dkdv,
             dO_mx,
             SFdO_dkdv,
+            dS_ws,
+            dS_sf,
+            bh_base,
+            bh_count,
         )

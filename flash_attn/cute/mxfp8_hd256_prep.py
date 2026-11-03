@@ -11,7 +11,9 @@ hd256 backward] in sm100_hd256_2cta_fmha_backward.py).
          causal adds the band residual R = MX(V - rq(V-hat)) as keys [s, 2s) of the same buffers.
   backward (`backward_operands`), one pass over dO: dO'' = 2^8 dO / L along head_dim and along queries,
     D'' = rowsum(dequant(dO''_d) * O), and the two LSE slots M - off + 8 and M - off; causal adds
-    dO / L in BF16 (the band's dV operand).
+    dO / L in BF16 (the band's dV operand). The MX dS mode (NOTE [MXFP8 hd256 dS for dQ]) skips what
+    only the dQ kernel reads (the BF16 K-hat, the interleaved along-d scales of dO'') and adds `kt_operands`,
+    one pass over K's payload: K-hat requantized along keys.
 For finite inputs, payloads and scales are byte-identical to blockscaled_utils' eager quantizers (same ceil scale
 rule, exact power-of-two scaling, round-to-nearest-even E4M3, no FMA contraction where the eager path rounds twice);
 D'' is an FP32 sum in a different order.
@@ -24,7 +26,8 @@ import torch
 import triton
 import triton.language as tl
 
-from flash_attn.cute.interface import MxHd256BwdOperands
+from flash_attn.cute.interface import MxHd256BwdOperands, MxHd256DsOperands
+from flash_attn.cute.sm100_hd256_dq_gemm import alpha_split
 
 # the exp2 offset of each native PV softmax recipe (BlockScales.stats_out)
 MAX_OFFSET = {"exact": 8.0, "fast": 4.0}
@@ -80,14 +83,26 @@ def _il_off(bh, m, g, rest_m, rest_k):
 
 
 @triton.jit
-def _store_sf_d(e, bh, t, n_tok, il_ptr, dk_ptr, DK: tl.constexpr, G0=0, NG: tl.constexpr = 8):
+def _store_sf_d(
+    e,
+    bh,
+    t,
+    n_tok,
+    il_ptr,
+    dk_ptr,
+    DK: tl.constexpr,
+    G0=0,
+    NG: tl.constexpr = 8,
+    IL: tl.constexpr = True,
+):
     """Store along-d exponents e (ROWS, NG) of tokens t (ROWS,) (batch-head bh, n_tok tokens) and groups
-    [G0, G0 + NG) into the interleave_sf buffer and the dK / dV kernel's pair tiles (DK 1: the queries' lane-halves
-    tile of 128, 2: the keys' duplicated tile of 64)."""
+    [G0, G0 + NG) into the interleave_sf buffer (if IL) and the dK / dV kernel's pair tiles (DK 1: the queries'
+    lane-halves tile of 128, 2: the keys' duplicated tile of 64)."""
     g = G0 + tl.arange(0, NG)[None, :]
     byte = (e + 127).to(tl.uint8)
     tt = t[:, None]
-    tl.store(il_ptr + _il_off(bh, tt, g, tl.cdiv(n_tok, 128), 2), byte)
+    if IL:
+        tl.store(il_ptr + _il_off(bh, tt, g, tl.cdiv(n_tok, 128), 2), byte)
     if DK == 1:
         n = tt % 128
         dst = 16 * (n % 32) + 4 * ((n % 64) // 32) + 512 * (n // 64) + g % 4 + 8 * (g // 4)
@@ -129,8 +144,8 @@ def _q_kernel(x_ptr, x8_ptr, il_ptr, dk_ptr, qt8_ptr, qt_il_ptr, S, H):
 
 
 @triton.jit
-def _k_kernel(x_ptr, x8_ptr, il_ptr, dk_ptr, kb_ptr, S, H):
-    """K tile: E4M3 + UE8M0 along head_dim (interleaved, duplicated pair tiles) and K-hat in BF16."""
+def _k_kernel(x_ptr, x8_ptr, il_ptr, dk_ptr, kb_ptr, S, H, KB: tl.constexpr):
+    """K tile: E4M3 + UE8M0 along head_dim (interleaved, duplicated pair tiles) and, if KB, K-hat in BF16."""
     pid_g, pid_bh = tl.program_id(0), tl.program_id(1)
     b, h = pid_bh // H, pid_bh % H
     t = pid_g * 32 + tl.arange(0, 32)
@@ -139,7 +154,25 @@ def _k_kernel(x_ptr, x8_ptr, il_ptr, dk_ptr, kb_ptr, S, H):
     q, e = _quant_d(tl.load(x_ptr + offs).to(tl.float32), 32)
     tl.store(x8_ptr + offs, q)
     _store_sf_d(e, pid_bh, t, S, il_ptr, dk_ptr, 2)
-    tl.store(kb_ptr + offs, _deq_d(q, e, 32).to(tl.bfloat16))
+    if KB:
+        tl.store(kb_ptr + offs, _deq_d(q, e, 32).to(tl.bfloat16))
+
+
+@triton.jit
+def _kt_kernel(k8_ptr, il_ptr, kt8_ptr, kt_il_ptr, S, H, E_ADD):
+    """K-hat tile (b, 32 keys, h) from K's payload and interleaved along-d scales, requantized along keys
+    (E4M3 + UE8M0 per (32 keys, channel), interleaved MN = channels) with E_ADD added to the scale exponents."""
+    pid_g, pid_bh = tl.program_id(0), tl.program_id(1)
+    b, h = pid_bh // H, pid_bh % H
+    t = pid_g * 32 + tl.arange(0, 32)
+    offs = ((b * S + t) * H + h)[:, None] * 256 + tl.arange(0, 256)[None, :]
+    g = tl.arange(0, 8)[None, :]
+    e = tl.load(il_ptr + _il_off(pid_bh, t[:, None], g, tl.cdiv(S, 128), 2)).to(tl.int32) - 127
+    kh = _deq_d(tl.load(k8_ptr + offs).to(tl.float32), e, 32)
+    et = _mx_exp(tl.max(tl.abs(kh), axis=0))
+    tl.store(kt8_ptr + offs, _e4m3(kh, et[None, :]))
+    # (the clamp only binds for groups within 2^|E_ADD| of the E8M0 range ends, i.e. |K| near 2^-118 or 2^123)
+    _store_sf_t(tl.minimum(tl.maximum(et + E_ADD, -127), 127), pid_bh, pid_g, S, kt_il_ptr)
 
 
 @triton.jit
@@ -192,10 +225,12 @@ def _dout_kernel(
     c_log2,
     off,
     BAND: tl.constexpr,
+    IL: tl.constexpr,
 ):
     """One (b, 32-query group, h) tile: dO'' = (256 / L) dO along head_dim and along queries (E4M3 + UE8M0),
     D'' = rowsum(dequant(dO''_d) O), the LSE slots M - off + 8 / M - off with M = m c; per-row outputs
-    (B, H, S). BAND (causal): also dO'' / 256 = dO / L in BF16."""
+    (B, H, S). BAND (causal): also dO'' / 256 = dO / L in BF16. IL: the interleaved along-d scales of dO''
+    (the dQ kernel's)."""
     pid_g, pid_bh = tl.program_id(0), tl.program_id(1)
     b, h = pid_bh // H, pid_bh % H
     t = pid_g * 32 + tl.arange(0, 32)
@@ -210,7 +245,7 @@ def _dout_kernel(
         tl.store(dob_ptr + offs, (x * (1.0 / 256.0)).to(tl.bfloat16))
     q, e = _quant_d(x, 32)
     tl.store(do8_ptr + offs, q)
-    _store_sf_d(e, pid_bh, t, S, sfdo_il_ptr, sfdo_dk_ptr, 1)
+    _store_sf_d(e, pid_bh, t, S, sfdo_il_ptr, sfdo_dk_ptr, 1, IL=IL)
     et = _mx_exp(tl.max(tl.abs(x), axis=0))
     tl.store(dot8_ptr + offs, _e4m3(x, et[None, :]))
     _store_sf_t(et, pid_bh, pid_g, S, sfdot_il_ptr)
@@ -275,7 +310,7 @@ class ForwardOnlyOperands(NamedTuple):
 
 class ForwardOperands(NamedTuple):
     """quantize_forward's outputs: the forward's E4M3 payloads with their BlockScales buffers, the backward's
-    forward-only operands, and the BF16 K-hat (the dQ kernel's K)."""
+    forward-only operands, and the BF16 K-hat (the dQ kernel's K; None with k_hat=False)."""
 
     q8: torch.Tensor
     k8: torch.Tensor
@@ -284,13 +319,14 @@ class ForwardOperands(NamedTuple):
     sfk: torch.Tensor
     sfv: torch.Tensor
     bwd: ForwardOnlyOperands
-    k_hat: torch.Tensor
+    k_hat: torch.Tensor | None
 
 
 def quantize_forward(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool, k_hat: bool = True
 ) -> ForwardOperands:
-    """Contiguous BF16 (B, S, H, 256) Q / K / V, S a multiple of 32 -> ForwardOperands, one pass per input."""
+    """Contiguous BF16 (B, S, H, 256) Q / K / V, S a multiple of 32 -> ForwardOperands, one pass per input.
+    k_hat=False (the MX dS mode, which has no dQ kernel) skips the BF16 K-hat."""
     b, s, h, d = q.shape
     assert d == 256 and s % 32 == 0 and all(t.is_contiguous() for t in (q, k, v))
     dev = q.device
@@ -301,10 +337,10 @@ def quantize_forward(
     sfq_dk = _bytes(b * h * triton.cdiv(s, 128) * 1024, dev, s, 128)
     _q_kernel[grid](q, q8, sfq, sfq_dk, qt8, sfqt, s, h, num_warps=4)
     k8 = torch.empty_like(k, dtype=torch.float8_e4m3fn)
-    k_hat = torch.empty_like(k)
+    kb = torch.empty_like(k) if k_hat else None
     sfk = _bytes(n_il_d, dev, s, 128)
     sfk_dk = _bytes(b * h * triton.cdiv(s, 64) * 1024, dev, s, 64)
-    _k_kernel[grid](k, k8, sfk, sfk_dk, k_hat, s, h, num_warps=4)
+    _k_kernel[grid](k, k8, sfk, sfk_dk, kb, s, h, KB=k_hat, num_warps=4)
     s_v = 2 * s if causal else s
     v8 = torch.empty_like(v, dtype=torch.float8_e4m3fn)
     sfv = _bytes(n_il_t, dev, s, 128)
@@ -337,7 +373,7 @@ def quantize_forward(
         qt=qt8,
         sfqt=_e8(sfqt),
     )
-    return ForwardOperands(q8, k8, v8, _e8(sfq), _e8(sfk), _e8(sfv), bwd, k_hat)
+    return ForwardOperands(q8, k8, v8, _e8(sfq), _e8(sfk), _e8(sfv), bwd, kb)
 
 
 def backward_operands(
@@ -347,16 +383,20 @@ def backward_operands(
     stats: torch.Tensor,
     softmax_scale: float,
     pv_softmax: Literal["exact", "fast"],
+    mxds: MxHd256DsOperands | None = None,
 ) -> MxHd256BwdOperands:
     """The backward's operands: the forward-only ones `fwd` (ForwardOperands.bwd) plus one pass over dO with the
-    forward's contiguous O and stats_out (B, H, S, 2)."""
+    forward's contiguous O and stats_out (B, H, S, 2). mxds (`kt_operands`) selects the MX dS mode, which skips
+    the interleaved along-d scales of dO'' (sfdo None)."""
     b, s, h, _ = out.shape
     assert dout.shape == out.shape and stats.shape == (b, h, s, 2)
     assert all(t.is_contiguous() for t in (out, dout, stats))
     dev = out.device
     do8, dot8 = (torch.empty_like(dout, dtype=torch.float8_e4m3fn) for _ in range(2))
-    sfdo = _bytes(_il_d_bytes(b, h, s), dev, s, 128)
     sfdo_dk = _bytes(b * h * triton.cdiv(s, 128) * 1024, dev, s, 128)
+    sfdo = (
+        sfdo_dk if mxds is not None else _bytes(_il_d_bytes(b, h, s), dev, s, 128)
+    )  # (unwritten if mxds)
     sfdot = _bytes(_il_t_bytes(b, h, s), dev, s, 128)
     dpsum, lse, lse_dkdv = (torch.empty(b, h, s, dtype=torch.float32, device=dev) for _ in range(3))
     band = fwd.v.shape[1] == 2 * s  # causal: the V copy carries the band residual
@@ -381,12 +421,13 @@ def backward_operands(
         c,
         MAX_OFFSET[pv_softmax],
         BAND=band,
+        IL=mxds is None,
         num_warps=4,
     )
     return MxHd256BwdOperands(
         **fwd._asdict(),
         do=do8,
-        sfdo=_e8(sfdo),
+        sfdo=None if mxds is not None else _e8(sfdo),
         sfdo_dkdv=_e8(sfdo_dk),
         dot=dot8,
         sfdot=_e8(sfdot),
@@ -394,4 +435,19 @@ def backward_operands(
         lse_log2_dkdv=lse_dkdv,
         dpsum=dpsum,
         do_band=dob,
+        mxds=mxds,
     )
+
+
+def kt_operands(
+    k8: torch.Tensor, sfk: torch.Tensor, softmax_scale: float, workspace_bytes: int | None = None
+) -> MxHd256DsOperands:
+    """The MX dS mode's dQ GEMM operands (NOTE [MXFP8 hd256 dS for dQ]) from K's E4M3 payload (B, S, H, 256) and
+    its interleaved along-d scales (ForwardOnlyOperands.k / sfk): K-hat requantized along keys, with
+    softmax_scale's power of two added to the scale exponents (exact) and the residual as alpha."""
+    b, s, h, _ = k8.shape
+    e, alpha = alpha_split(softmax_scale)
+    kt8 = torch.empty_like(k8)
+    sfkt = _bytes(_il_t_bytes(b, h, s), k8.device, s, 128)
+    _kt_kernel[(s // 32, b * h)](k8, sfk.view(torch.uint8), kt8, sfkt, s, h, e, num_warps=4)
+    return MxHd256DsOperands(kt8, _e8(sfkt), alpha, workspace_bytes)
