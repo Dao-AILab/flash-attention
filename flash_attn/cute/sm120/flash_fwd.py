@@ -8,7 +8,7 @@ import math
 import operator
 from functools import lru_cache, partial
 from types import SimpleNamespace
-from typing import Callable, Optional
+from typing import Callable, Optional, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -529,38 +529,6 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         # hd 192: N64, the configuration without spills.
         return 64
 
-    @staticmethod
-    def _smem_usage_in_bytes(
-        head_dim,
-        head_dim_v,
-        tile_m,
-        tile_n,
-        num_stages,
-    ) -> int:
-        """Return SMEM usage after padding head dimensions to kernel alignment."""
-        head_dim = math.ceil(head_dim / 16) * 16
-        head_dim_v = math.ceil(head_dim_v / 16) * 16
-        element_size = 2
-        # The O epilogue tile reuses the Q buffer.
-        smem_usage_Q = tile_m * max(head_dim, head_dim_v) * element_size
-        smem_usage_K = tile_n * head_dim * num_stages * element_size
-        smem_usage_V = tile_n * head_dim_v * num_stages * element_size
-        smem_usage = smem_usage_Q + smem_usage_V + smem_usage_K
-        if (head_dim, head_dim_v, tile_m, tile_n) in (
-            (256, 256, 16, 64),
-            (256, 256, 16, 80),
-            (256, 256, 32, 64),
-            (256, 256, 48, 64),
-            (256, 256, 64, 48),
-            (256, 256, 64, 64),
-        ):
-            # Q is copied to QK registers before the mainloop, so its allocation
-            # can hold both P stages and later the O epilogue tile.  Four FP32
-            # rows hold the per-stage rescale values and final scale/LSE.
-            smem_usage += 4 * tile_m * 4
-        # Q/K/V/P/final full-empty mbarriers and conservative field alignment.
-        return smem_usage + 2048
-
     # Schedule model of a dense grid per kernel configuration (tile_hdim, tile_m, CTAs per SM):
     # SM cycles of one 64-column K / V block on one CTA slot, and a tile's prologue / epilogue
     # in blocks. Fitted per configuration on MQA (K / V stay in L2: no K / V DRAM traffic) at
@@ -964,7 +932,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             (config[2], config[3], 1)
             for config in FlashAttentionForwardSm120._lpt_cost_by_config
             if config[:2] == shape
-            and FlashAttentionForwardSm120._smem_usage_in_bytes(*config, 1) <= smem_capacity
+            and FlashAttentionForwardSm120.smem_bytes(
+                cutlass.BFloat16,
+                *config,
+                1,
+                FlashAttentionForwardSm120.get_fwd_num_threads(*config, paged_kv=paged_kv),
+                paged_kv,
+            )
+            <= smem_capacity
         )
         can_model_lpt = (
             len(model_candidates) >= 2
@@ -1112,12 +1087,17 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             candidates = ((128, 64, 1),) + candidates
         for tile_m, tile_n, num_stages in candidates:
             if (
-                FlashAttentionForwardSm120._smem_usage_in_bytes(
+                FlashAttentionForwardSm120.smem_bytes(
+                    cutlass.BFloat16,
                     head_dim,
                     head_dim_v,
                     tile_m,
                     tile_n,
                     num_stages,
+                    FlashAttentionForwardSm120.get_fwd_num_threads(
+                        head_dim, head_dim_v, tile_m, tile_n, paged_kv=paged_kv
+                    ),
+                    paged_kv,
                 )
                 <= smem_capacity
             ):
@@ -1296,12 +1276,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             head_dim, head_dim_v, tile_m, tile_n, paged_kv=paged_kv
         ):
             return False
-        smem_usage = FlashAttentionForwardSm120._smem_usage_in_bytes(
-            head_dim,
-            head_dim_v,
-            tile_m,
-            tile_n,
-            num_stages,
+        smem_usage = FlashAttentionForwardSm120.smem_bytes(
+            dtype, head_dim, head_dim_v, tile_m, tile_n, num_stages, num_threads, paged_kv
         )
         if smem_usage > utils_basic.get_smem_capacity_in_bytes("sm_120"):
             return False
@@ -1427,57 +1403,87 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         )
         return tiled_mma_qk, tiled_mma_pv
 
-    def _get_shared_storage_cls(self):
-        # The O epilogue tile reuses the Q buffer, which is wider when head_dim_v > head_dim.
-        sQ_struct, sK_struct, sV_struct = [
-            cute.struct.Align[cute.struct.MemRange[self.dtype, cosize], 1024]
-            for cosize in (
-                max(cute.cosize(self.sQ_layout), cute.cosize(self.sO_layout)),
-                cute.cosize(self.sK_layout),
-                cute.cosize(self.sV_layout),
-            )
-        ]
-        mbar_Q_struct = cute.struct.MemRange[cutlass.Int64, 2]
-        mbar_K_struct = cute.struct.MemRange[cutlass.Int64, self._num_k_stages() * 2]
-        mbar_V_struct = cute.struct.MemRange[cutlass.Int64, self._num_v_stages() * 2]
-        mbar_P_struct = cute.struct.MemRange[
-            cutlass.Int64,
-            2 * self._num_p_stages() if self._uses_split_pv_warps() else 0,
-        ]
-        mbar_final_struct = cute.struct.MemRange[
-            cutlass.Int64, 2 if self._uses_split_pv_warps() else 0
-        ]
-        num_stats = (
-            self._num_softmax_stat_rows() * self.tile_m if self._uses_split_pv_warps() else 0
-        )
-        softmax_stats_struct = cute.struct.MemRange[Float32, num_stats]
-        num_p_elements = (
-            0
-            if self._q_in_regs_pipeline() or not self._uses_split_pv_warps()
-            else cute.cosize(self.sP_layout)
-        )
-        sP_struct = cute.struct.Align[
-            cute.struct.MemRange[
+    def _shared_storage_fields(self) -> list:
+        """(name, element type, element count, alignment) of the shared storage, in order: the
+        barriers and softmax statistics, then the P, V, Q and K buffers at 1024 bytes. The O
+        epilogue tile reuses the Q buffer, which is wider when head_dim_v > head_dim."""
+        split_pv = self._uses_split_pv_warps()
+        p_in_smem = split_pv and not self._q_in_regs_pipeline()
+        return [
+            ("mbar_Q", cutlass.Int64, 2, 0),
+            ("mbar_K", cutlass.Int64, 2 * self._num_k_stages(), 0),
+            ("mbar_V", cutlass.Int64, 2 * self._num_v_stages(), 0),
+            ("mbar_P", cutlass.Int64, 2 * self._num_p_stages() if split_pv else 0, 0),
+            ("mbar_final", cutlass.Int64, 2 if split_pv else 0, 0),
+            (
+                "softmax_stats",
+                Float32,
+                self._num_softmax_stat_rows() * self.tile_m if split_pv else 0,
+                0,
+            ),
+            (
+                "sP",
                 self.dtype,
-                num_p_elements,
-            ],
-            1024,
+                self.tile_m * self.tile_n * self._num_p_stages() if p_in_smem else 0,
+                1024,
+            ),
+            ("sV", self.dtype, self.tile_hdimv * self.tile_n * self._num_v_stages(), 1024),
+            ("sQ", self.dtype, self.tile_m * max(self.tile_hdim, self.tile_hdimv), 1024),
+            ("sK", self.dtype, self.tile_n * self.tile_hdim * self._num_k_stages(), 1024),
         ]
 
-        @cute.struct
-        class SharedStorage:
-            mbar_Q: mbar_Q_struct
-            mbar_K: mbar_K_struct
-            mbar_V: mbar_V_struct
-            mbar_P: mbar_P_struct
-            mbar_final: mbar_final_struct
-            softmax_stats: softmax_stats_struct
-            sP: sP_struct
-            sV: sV_struct
-            sQ: sQ_struct
-            sK: sK_struct
+    def shared_storage_bytes(self) -> int:
+        offset = 0
+        for _, dtype, count, align in self._shared_storage_fields():
+            align = max(align, dtype.width // 8)
+            offset = -(-offset // align) * align + count * dtype.width // 8
+        return offset
 
-        return SharedStorage
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def smem_bytes(
+        dtype: Type[cutlass.Numeric],
+        head_dim: int,
+        head_dim_v: int,
+        tile_m: int,
+        tile_n: int,
+        num_stages: int,
+        num_threads: int,
+        paged_kv: bool,
+    ) -> int:
+        """shared_storage_bytes of a configuration's kernel."""
+        return FlashAttentionForwardSm120(
+            dtype,
+            head_dim,
+            head_dim_v,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            num_stages=num_stages,
+            num_threads=num_threads,
+            paged_kv=paged_kv,
+        ).shared_storage_bytes()
+
+    def _get_shared_storage_cls(self):
+        fields = self._shared_storage_fields()
+        counts = {name: count for name, _, count, _ in fields}
+        layouts = {
+            "sQ": (self.sQ_layout, self.sO_layout),
+            "sK": (self.sK_layout,),
+            "sV": (self.sV_layout,),
+            "sP": (self.sP_layout,) if counts["sP"] else (),
+        }
+        for name, buffer_layouts in layouts.items():
+            for layout in buffer_layouts:
+                assert cute.cosize(layout) <= counts[name], (
+                    name,
+                    cute.cosize(layout),
+                    counts[name],
+                )
+        annotations = {}
+        for name, dtype, count, align in fields:
+            field = cute.struct.MemRange[dtype, count]
+            annotations[name] = cute.struct.Align[field, align] if align else field
+        return cute.struct(type("SharedStorage", (), {"__annotations__": annotations}))
 
     @cute.jit
     def __call__(

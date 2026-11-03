@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from functools import lru_cache, partial
 from typing import Callable, Optional
 
+import cutlass
 import cutlass.utils as utils_basic
 import torch
 
@@ -837,7 +838,16 @@ class Sm120ForwardHost:
 
         def fits(m: int, n: int) -> bool:
             return (
-                FlashAttentionForwardSm120._smem_usage_in_bytes(head_dim, head_dim_v, m, n, 1)
+                FlashAttentionForwardSm120.smem_bytes(
+                    cutlass.BFloat16,
+                    head_dim,
+                    head_dim_v,
+                    m,
+                    n,
+                    1,
+                    FlashAttentionForwardSm120.get_fwd_num_threads(head_dim, head_dim_v, m, n),
+                    False,
+                )
                 <= smem_capacity
             )
 
@@ -859,6 +869,28 @@ class Sm120ForwardHost:
         else:
             tile_m = fit(sparse_block_size[0], tile_m, limit_m, tile_n, True)
         return tile_m, tile_n
+
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def resident_ctas_per_sm(
+        dtype: type[cutlass.Numeric],
+        head_dim: int,
+        head_dim_v: int,
+        tile_m: int,
+        tile_n: int,
+        num_stages: int,
+        num_threads: int,
+        paged_kv: bool,
+    ) -> int:
+        """CTAs of a forward configuration that one SM holds at once. The SM's shared memory
+        is the per-CTA maximum plus one 1 KB reservation, and every CTA reserves 1 KB."""
+        if num_threads >= 256:
+            return 1
+        smem = FlashAttentionForwardSm120.smem_bytes(
+            dtype, head_dim, head_dim_v, tile_m, tile_n, num_stages, num_threads, paged_kv
+        )
+        sm_smem = utils_basic.get_smem_capacity_in_bytes("sm_120") + 1024
+        return max(1, min(2, sm_smem // (smem + 1024)))
 
     @staticmethod
     def select_config(
@@ -926,11 +958,16 @@ class Sm120ForwardHost:
             and seqlen_k is not None
             and total_q_rows == num_batch * seqlen_q * num_head_kv * qhead_per_kvhead
         ):
-            smem = FlashAttentionForwardSm120._smem_usage_in_bytes(
-                head_dim, head_dim_v, tile_m, tile_n, 1
+            ctas_per_sm = Sm120ForwardHost.resident_ctas_per_sm(
+                cutlass.BFloat16,
+                head_dim,
+                head_dim_v,
+                tile_m,
+                tile_n,
+                FlashAttentionForwardSm120.get_fwd_num_stages(head_dim, head_dim_v, tile_m, tile_n),
+                num_threads,
+                False,
             )
-            capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
-            ctas_per_sm = 1 if num_threads >= 256 or 2 * smem > capacity else 2
             lpt_order = FlashAttentionForwardSm120.use_lpt_order(
                 num_sms,
                 head_dim,
