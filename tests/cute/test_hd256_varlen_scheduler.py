@@ -1,12 +1,11 @@
 """HD256 varlen API, cache, and CUDA-graph regression tests on SM100/SM110.
 
-None and fresh CUDA scalar maxima must share a device-driven specialization
-without host reads; Python integers retain rectangular scheduling in the backward.
+None, fresh CUDA scalar maxima and Python integers must share one device-driven
+specialization per kernel, without host reads.
 Set FLASH_ATTENTION_HD256_STRESS=1 for additional randomized cases.
 """
 
 import os
-from functools import partial
 from unittest.mock import Mock
 
 import pytest
@@ -77,7 +76,12 @@ def make_inputs(q_lens, k_lens, dtype, num_heads_q=4, num_heads_kv=1):
     return q, k, v, dout
 
 
-def run_varlen(q, k, v, dout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal):
+def run_varlen(
+    q, k, v, dout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
+    deterministic=False,
+):
+    # Bit-equality checks pass deterministic=True for a fixed dQ / dK / dV reduction order;
+    # the reference comparisons keep the default non-deterministic kernel.
     out, _ = flash_attn_varlen_func(
         q,
         k,
@@ -87,6 +91,7 @@ def run_varlen(q, k, v, dout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seql
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         causal=causal,
+        deterministic=deterministic,
     )
     dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
     return out.detach(), dq, dk, dv
@@ -106,7 +111,7 @@ def test_hd256_varlen_maxima(q_lens, k_lens, dtype, max_mode, causal):
 
     def run():
         max_q, max_k = make_maxima(max_mode, q_lens, k_lens, cu_q, cu_k)
-        return run_varlen(q, k, v, dout, cu_q, cu_k, max_q, max_k, causal)
+        return run_varlen(q, k, v, dout, cu_q, cu_k, max_q, max_k, causal, deterministic=True)
 
     first = run()  # may compile
     with RejectHostScalarExtraction():
@@ -198,8 +203,60 @@ def test_hd256_seqused_backward(
     )
 
 
+@pytest.mark.parametrize("used", ["q", "k"])
+@pytest.mark.parametrize("batch_size", [256, 257])
+@CAUSAL
+def test_hd256_seqused_one_side_large_batch(used, batch_size, causal):
+    """Dense Q / K with lengths on one side only, around the BIN_BATCH_SEARCH_THRESH boundary.
+
+    Above the threshold the backward builds a cu_total_m_blocks table per side; a side without
+    cu_seqlens / seqused has no lengths to build it from and must be skipped.
+    """
+    torch.manual_seed(SEED)
+    dtype = torch.bfloat16
+    q_capacity, k_capacity = 128, 256  # every K length stays >= its Q length (causal)
+    q_lens = (
+        tuple((65, 128, 1, 100)[i % 4] for i in range(batch_size))
+        if used == "q"
+        else (q_capacity,) * batch_size
+    )
+    k_lens = (
+        tuple((129, 256, 200, 128)[i % 4] for i in range(batch_size))
+        if used == "k"
+        else (k_capacity,) * batch_size
+    )
+    used_q = torch.tensor(q_lens, device="cuda", dtype=torch.int32) if used == "q" else None
+    used_k = torch.tensor(k_lens, device="cuda", dtype=torch.int32) if used == "k" else None
+    q = torch.randn(batch_size, q_capacity, 2, HEAD_DIM, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(batch_size, k_capacity, 1, HEAD_DIM, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    dout = torch.randn_like(q)
+
+    out, _ = flash_attn_varlen_func(
+        q, k, v, seqused_q=used_q, seqused_k=used_k, causal=causal,
+    )
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+    torch.cuda.synchronize()
+
+    def compact(t, lengths):
+        return torch.cat([batch[:length] for batch, length in zip(t.unbind(0), lengths)])
+
+    actual = (compact(out.detach(), q_lens), compact(dq, q_lens), compact(dk, k_lens), compact(dv, k_lens))
+    check_against_reference(
+        actual,
+        compact(q, q_lens),
+        compact(k, k_lens),
+        compact(v, k_lens),
+        compact(dout, q_lens),
+        q_lens,
+        k_lens,
+        causal,
+        dtype,
+    )
+
+
 # ---------------------------------------------------------------------------
-# Compile-key behaviour: none/cuda share one specialization; int adds a backward one.
+# Compile-key behaviour: none/cuda/int all share one specialization per kernel.
 # ---------------------------------------------------------------------------
 
 
@@ -212,7 +269,7 @@ def test_hd256_varlen_maxima_compile_keys(causal, monkeypatch):
 
     def run(max_mode):
         max_q, max_k = make_maxima(max_mode, q_lens, k_lens, cu_q, cu_k)
-        return run_varlen(q, k, v, dout, cu_q, cu_k, max_q, max_k, causal)
+        return run_varlen(q, k, v, dout, cu_q, cu_k, max_q, max_k, causal, deterministic=True)
 
     fwd_cache, bwd_cache = JITCache(), JITCache()
     monkeypatch.setattr(_flash_attn_fwd, "compile_cache", fwd_cache)
@@ -233,10 +290,10 @@ def test_hd256_varlen_maxima_compile_keys(causal, monkeypatch):
 
     by_mode["int"] = run("int")
     torch.cuda.synchronize()
-    # The forward reads lengths on device and does not specialize on the maxima; the hd256
-    # backward still selects a separate specialization for explicit int maxima.
-    assert (len(fwd_cache.cache), len(bwd_cache.cache)) == (1, 2), (
-        "explicit int maxima should select a distinct backward specialization only"
+    # Neither kernel specializes on the maxima: the forward reads lengths on device and the
+    # backward derives its grid from cu_seqlens, so explicit int maxima reuse both keys.
+    assert (len(fwd_cache.cache), len(bwd_cache.cache)) == (1, 1), (
+        "explicit int maxima should not select a distinct specialization"
     )
     assert all(
         not torch.is_tensor(value)
@@ -263,9 +320,10 @@ GRAPH_REPLAYS = [
 ]
 
 
+@pytest.mark.parametrize("deterministic", [False, True], ids=["nondet", "det"])
 @pytest.mark.parametrize("max_mode", ["none", "cuda"], ids=["max_none", "max_cuda"])
 @CAUSAL
-def test_hd256_varlen_cuda_graph_replay(max_mode, causal):
+def test_hd256_varlen_cuda_graph_replay(max_mode, causal, deterministic):
     dtype = torch.bfloat16
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -285,7 +343,7 @@ def test_hd256_varlen_cuda_graph_replay(max_mode, causal):
             max_k = (cu_k[1:] - cu_k[:-1]).max()
         else:
             max_q = max_k = None
-        return run_varlen(q, k, v, dout, cu_q, cu_k, max_q, max_k, causal)
+        return run_varlen(q, k, v, dout, cu_q, cu_k, max_q, max_k, causal, deterministic)
 
     with torch.cuda.stream(side):
         for _ in range(2):  # compile + warm outside capture
@@ -534,22 +592,6 @@ def test_hd256_paged_maximum_uses_table_extent(max_mode, num_splits):
         False,
         dtype,
     )
-
-
-def test_hd256_clc_requires_host_maximum(monkeypatch):
-    monkeypatch.setattr(_flash_attn_bwd, "compile_cache", JITCache())
-    monkeypatch.setattr(
-        interface,
-        "BlackwellFusedMultiHeadAttentionBackward",
-        partial(interface.BlackwellFusedMultiHeadAttentionBackward, use_clc_scheduler=True),
-    )
-    q, k, v, dout = make_inputs((128, 256), (128, 256), torch.bfloat16)
-    cu = make_cu_seqlens((128, 256))
-    with pytest.raises(
-        Exception, match="SM100 hd256 varlen dQ requires max_seqlen_q for grid sizing"
-    ):
-        run_varlen(q, k, v, dout, cu, cu, None, None, False)
-    torch.cuda.synchronize()
 
 
 # ---------------------------------------------------------------------------

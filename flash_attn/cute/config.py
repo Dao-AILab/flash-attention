@@ -2361,7 +2361,7 @@ class Sm100BwdRegisters:
     empty: int
 
 
-# None for kernels that do not split registers by role (SM120, dedicated SM100 hdim 256).
+# None for kernels that do not split registers by role (SM120).
 BwdRegisters = Sm90BwdRegisters | Sm100BwdRegisters | None
 
 
@@ -2370,20 +2370,17 @@ class BwdConfig:
     """Fully resolved backward launch configuration.
 
     tile_m / tile_n are the main kernel's Q and KV tiles, which also size the preprocess,
-    postprocess, and accumulators. The dedicated SM100 hdim-256 kernels run fixed internal
-    tiles; its config records the 128x128 tiles the surrounding kernels use. SM90-only MMA
-    options (PdS stages, SdP_swapAB / AtomLayoutMSdP, dQ_single_wg) hold neutral values on
-    other architectures. cluster_size differs from use_2cta_instrs only for the dedicated
-    hdim-256 kernel, which always uses 2CTA instructions. pack_factor (SM100 generic kernel
-    only, 1 = off) query heads of a KV head share the Q tile rows (NOTE [bwd pack_gqa] in
+    postprocess, and accumulators. SM90-only MMA options (PdS stages, SdP_swapAB /
+    AtomLayoutMSdP, dQ_single_wg) hold neutral values on other architectures. cluster_size is
+    2 exactly with use_2cta_instrs. pack_factor (SM100 only, 1 = off) query heads of a KV head
+    share the Q tile rows (NOTE [bwd pack_gqa] in
     pack_gqa.py); the preprocess then writes LSE_log2 / dPsum / dQaccum per scratch head
     (num_heads / pack_factor) in packed row order and the postprocess reads them that way. A
     KV head's remaining qhead_per_kvhead / pack_factor sub-groups are separate tiles whose
-    dK / dV go through the fp32 accumulate + postprocess, or, with head_loop (hdim 256 on the
-    generic kernel), the passes of one tile per KV head that keeps K / V resident and dK / dV
-    in TMEM. fold_LSE_dPsum (SM100 generic kernel only) folds the
-    LSE / dPsum subtractions into the S / dP MMAs (NOTE [hdim64 LSE / dPsum fold into the S / dP
-    MMA] in flash_bwd_sm100.py).
+    dK / dV go through the fp32 accumulate + postprocess, or, with head_loop (hdim 256), the
+    passes of one tile per KV head that keeps K / V resident and dK / dV in TMEM.
+    fold_LSE_dPsum folds the LSE / dPsum subtractions into the S / dP MMAs (NOTE [hdim64 LSE /
+    dPsum fold into the S / dP MMA] in flash_bwd_sm100.py).
     """
 
     device_capacity: int
@@ -2404,7 +2401,6 @@ class BwdConfig:
     use_2cta_instrs: bool
     cluster_size: int
     spt: bool
-    use_dedicated_hd256_kernel: bool
     pack_factor: int
     head_loop: bool
     fold_LSE_dPsum: bool
@@ -2469,8 +2465,6 @@ class BwdHeuristicInputs(NamedTuple):
     # to the heuristic.
     requested_head_loop: bool | None = None
     disable_2cta: bool = False
-    # FLASH_ATTENTION_HD256_GENERIC_BWD: SM100 hdim 256 on FlashAttentionBackwardSm100.
-    hd256_generic: bool = False
 
     @property
     def device_capacity(self) -> int:
@@ -2483,11 +2477,6 @@ class BwdHeuristicInputs(NamedTuple):
     @property
     def is_hdim256(self) -> bool:
         return self.head_dim == 256 and self.head_dim_v == 256
-
-    @property
-    def uses_dedicated_hd256_kernel(self) -> bool:
-        """SM100 hdim 256 runs the dedicated kernels unless FLASH_ATTENTION_HD256_GENERIC_BWD."""
-        return self.is_hdim256 and not self.hd256_generic
 
 
 def bwd_sparse_q_block_size(inputs: BwdHeuristicInputs) -> int | None:
@@ -2540,7 +2529,7 @@ def bwd_tile_hdim(head_dim: int) -> int:
 
 
 def can_use_bwd_2cta(inputs: BwdHeuristicInputs, *, tile_n: int) -> bool:
-    """Whether the SM100 generic backward supports 2CTA instructions for this problem."""
+    """Whether the SM100 backward supports 2CTA instructions for this problem."""
     # 2CTA tiles pair adjacent KV tiles, so a sparse KV block must cover an even count.
     sparse_ok = (
         not inputs.use_block_sparsity
@@ -2550,7 +2539,7 @@ def can_use_bwd_2cta(inputs: BwdHeuristicInputs, *, tile_n: int) -> bool:
 
 
 def can_use_bwd_tile_n_64(inputs: BwdHeuristicInputs, *, use_2cta_instrs: bool) -> bool:
-    """Whether the SM100 generic backward supports a 64-row KV tile per CTA.
+    """Whether the SM100 backward supports a 64-row KV tile per CTA.
 
     See NOTE [M=64 accumulator layout] in flash_bwd_sm100.py: only with 2CTA, for hdim 256
     (serial schedule) or the pipelined schedule (hdim <= 128) without block sparsity, where
@@ -2569,7 +2558,7 @@ def can_use_bwd_tile_n_64(inputs: BwdHeuristicInputs, *, use_2cta_instrs: bool) 
 
 
 def bwd_needs_2cta(inputs: BwdHeuristicInputs) -> str | None:
-    """Name the SM100 generic-backward problem that only the 2CTA serial schedule supports."""
+    """Name the SM100 backward problem that only the 2CTA serial schedule supports."""
     if inputs.is_hdim256:
         return "SM100 backward with head_dim=256"
     if bwd_tile_hdim(inputs.head_dim) == 192:
@@ -2592,16 +2581,15 @@ class BwdFold(NamedTuple):
 BWD_FOLD_OFF = BwdFold(1, False)
 
 
-def can_use_bwd_fold(inputs: BwdHeuristicInputs, *, use_dedicated_hd256_kernel: bool) -> bool:
+def can_use_bwd_fold(inputs: BwdHeuristicInputs) -> bool:
     """Whether the SM100 backward supports folding the query heads of a KV head into tiles.
 
-    NOTE [bwd pack_gqa] (pack_gqa.py) scope: the generic SM100 kernel, qhead_per_kvhead > 1,
-    without block sparsity, score_mod, mask_mod, or learnable_sink. softcap does not count as
-    a score_mod here. A pack must also divide tile_m and qhead_per_kvhead (bwd_pack_fits).
+    NOTE [bwd pack_gqa] (pack_gqa.py) scope: SM100, qhead_per_kvhead > 1, without block
+    sparsity, score_mod, mask_mod, or learnable_sink. softcap does not count as a score_mod
+    here. A pack must also divide tile_m and qhead_per_kvhead (bwd_pack_fits).
     """
     return (
         inputs.device_capacity in (10, 11)
-        and not use_dedicated_hd256_kernel
         and inputs.qhead_per_kvhead > 1
         and not inputs.use_block_sparsity
         and not inputs.has_score_mod
@@ -2774,7 +2762,6 @@ def select_bwd_fold(
     tile_m: int,
     tile_n: int,
     cluster_size: int,
-    use_dedicated_hd256_kernel: bool,
 ) -> BwdFold:
     """SM100 backward query-head fold, off when FLASH_ATTENTION_BWD_TILE_N is set or the fold
     is unsupported (can_use_bwd_fold).
@@ -2797,9 +2784,7 @@ def select_bwd_fold(
     (bwd_fold_candidates, bwd_fold_forced); forced candidates skip the heuristic and the
     deterministic rules.
     """
-    if inputs.requested_tile_n is not None or not can_use_bwd_fold(
-        inputs, use_dedicated_hd256_kernel=use_dedicated_hd256_kernel
-    ):
+    if inputs.requested_tile_n is not None or not can_use_bwd_fold(inputs):
         return BWD_FOLD_OFF
     candidates = bwd_fold_candidates(inputs, tile_m=tile_m)
     if not candidates:
@@ -2885,9 +2870,7 @@ def bwd_selection_reads_num_sms(inputs: BwdHeuristicInputs) -> bool:
     The interface looks the SM count up only then, so cross-compiling other calls needs no
     FLASH_ATTENTION_NUM_SMS.
     """
-    if inputs.requested_tile_n is not None or not can_use_bwd_fold(
-        inputs, use_dedicated_hd256_kernel=inputs.uses_dedicated_hd256_kernel
-    ):
+    if inputs.requested_tile_n is not None or not can_use_bwd_fold(inputs):
         return False
     return any(
         not bwd_fold_forced(cand, inputs)
@@ -3004,7 +2987,6 @@ _SM90_ONLY_NEUTRAL_FIELDS = dict(
 _SM100_ONLY_NEUTRAL_FIELDS = dict(
     use_2cta_instrs=False,
     cluster_size=1,
-    use_dedicated_hd256_kernel=False,
     pack_factor=1,
     head_loop=False,
     fold_LSE_dPsum=False,
@@ -3057,10 +3039,9 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 else Sm90BwdRegisters(mma=240, mma_no_dq=240, producer=24)
             )
         case 10 | 11:
-            hd256_generic = inputs.is_hdim256 and inputs.hd256_generic
-            # hdim 256 on the generic kernel runs a 64-row KV tile per CTA (NOTE [M=64
-            # accumulator layout] in flash_bwd_sm100.py); the 2CTA decision sees that tile.
-            tile_n = 64 if hd256_generic else 128
+            # hdim 256 runs a 64-row KV tile per CTA (NOTE [M=64 accumulator layout] in
+            # flash_bwd_sm100.py); the 2CTA decision sees that tile.
+            tile_n = 64 if inputs.is_hdim256 else 128
             use_2cta_instrs = not inputs.disable_2cta and can_use_bwd_2cta(inputs, tile_n=tile_n)
             if (
                 inputs.requested_tile_n == 64
@@ -3068,39 +3049,26 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 and can_use_bwd_tile_n_64(inputs, use_2cta_instrs=use_2cta_instrs)
             ):
                 tile_n = 64
-            dedicated = inputs.uses_dedicated_hd256_kernel
-            # The dedicated hdim-256 kernel always uses 2CTA instructions; its cluster follows
-            # the generic 2CTA decision.
-            any_2cta = use_2cta_instrs or dedicated
             cluster_size = 2 if use_2cta_instrs else 1
             fold = select_bwd_fold(
-                inputs,
-                tile_m=SM100_BWD_TILE_M,
-                tile_n=tile_n,
-                cluster_size=cluster_size,
-                use_dedicated_hd256_kernel=dedicated,
+                inputs, tile_m=SM100_BWD_TILE_M, tile_n=tile_n, cluster_size=cluster_size
             )
             fields.update(
                 tile_m=SM100_BWD_TILE_M,
                 tile_n=tile_n,
-                num_stages_Q=1 if any_2cta else 2,
+                num_stages_Q=1 if use_2cta_instrs else 2,
                 num_stages_dO=1,
                 num_threads=SM100_BWD_THREADS_PER_CTA,
-                use_2cta_instrs=any_2cta,
+                use_2cta_instrs=use_2cta_instrs,
                 cluster_size=cluster_size,
                 spt=bwd_spt(inputs),
-                use_dedicated_hd256_kernel=dedicated,
                 pack_factor=fold.pack_factor,
                 head_loop=fold.head_loop,
                 fold_LSE_dPsum=can_fold_LSE_dPsum(
                     inputs, tile_m=SM100_BWD_TILE_M, tile_n=tile_n, cluster_size=cluster_size
                 ),
             )
-            registers = (
-                None
-                if dedicated
-                else select_sm100_bwd_registers(inputs, use_2cta_instrs=use_2cta_instrs)
-            )
+            registers = select_sm100_bwd_registers(inputs, use_2cta_instrs=use_2cta_instrs)
         case 12:
             fields = sm120_bwd_fields(inputs)
             registers = None
@@ -3116,7 +3084,7 @@ def validate_bwd_registers(config: BwdConfig) -> None:
     registers = config.registers
     if config.device_capacity == 9:
         expected = Sm90BwdRegisters
-    elif config.device_capacity in (10, 11) and not config.use_dedicated_hd256_kernel:
+    elif config.device_capacity in (10, 11):
         expected = Sm100BwdRegisters
     else:
         expected = type(None)
@@ -3293,12 +3261,10 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
             raise ValueError(f"SM100 backward launches {SM100_BWD_THREADS_PER_CTA} threads")
         if config.num_stages_Q != (1 if config.use_2cta_instrs else 2) or config.num_stages_dO != 1:
             raise ValueError("SM100 backward uses 2 Q stages (1 with 2CTA) and 1 dO stage")
-        if (config.pack_factor > 1 or config.head_loop) and not can_use_bwd_fold(
-            inputs, use_dedicated_hd256_kernel=config.use_dedicated_hd256_kernel
-        ):
+        if (config.pack_factor > 1 or config.head_loop) and not can_use_bwd_fold(inputs):
             raise ValueError(
-                "SM100 backward query-head folds (pack_factor > 1, head_loop) need the generic "
-                "kernel, qhead_per_kvhead > 1, and no block sparsity, score_mod, mask_mod, or "
+                "SM100 backward query-head folds (pack_factor > 1, head_loop) need "
+                "qhead_per_kvhead > 1 and no block sparsity, score_mod, mask_mod, or "
                 "learnable_sink"
             )
         if not bwd_pack_fits(inputs, config.pack_factor, tile_m=config.tile_m):
@@ -3308,51 +3274,38 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
             )
         if config.head_loop and not can_use_bwd_head_loop(inputs, config.pack_factor):
             raise ValueError(
-                "SM100 backward head_loop needs head_dim 256 on the generic kernel and more than "
-                "one sub-group of query heads per KV head after the pack"
+                "SM100 backward head_loop needs head_dim 256 and more than one sub-group of "
+                "query heads per KV head after the pack"
             )
-        if config.use_dedicated_hd256_kernel:
-            if not inputs.is_hdim256:
-                raise ValueError("The dedicated SM100 backward kernel requires head_dim=256")
-            if not config.use_2cta_instrs or config.cluster_size not in (1, 2):
-                raise ValueError(
-                    "The dedicated SM100 hdim-256 backward needs 2CTA instructions "
-                    "and cluster_size 1 or 2"
+        if config.cluster_size != (2 if config.use_2cta_instrs else 1):
+            raise ValueError("SM100 backward uses cluster_size=2 exactly with 2CTA")
+        if config.tile_m != 128 or config.tile_n not in (64, 128):
+            raise ValueError(
+                f"SM100 backward requires tile_m=128 and tile_n in (64, 128), "
+                f"got {(config.tile_m, config.tile_n)}"
+            )
+        config_kv_subtile_factor(config, inputs)
+        can_2cta = can_use_bwd_2cta(inputs, tile_n=config.tile_n)
+        needs_2cta = bwd_needs_2cta(inputs)
+        if needs_2cta is not None and not config.use_2cta_instrs:
+            reason = (
+                "2CTA was disabled by request"
+                if inputs.disable_2cta or can_2cta
+                else (
+                    f"sparse_block_size[1] must cover an even number of "
+                    f"tile_n={config.tile_n} tiles; got factor "
+                    f"{config_kv_subtile_factor(config, inputs)}"
                 )
-            if (config.tile_m, config.tile_n) != (128, 128):
-                raise ValueError("The dedicated SM100 hdim-256 backward uses 128x128 tiles")
-            # The dedicated kernel checks the sparse KV size against tile_n like the generic one.
-            config_kv_subtile_factor(config, inputs)
-        else:
-            if config.cluster_size != (2 if config.use_2cta_instrs else 1):
-                raise ValueError("SM100 backward uses cluster_size=2 exactly with 2CTA")
-            if config.tile_m != 128 or config.tile_n not in (64, 128):
-                raise ValueError(
-                    f"SM100 backward requires tile_m=128 and tile_n in (64, 128), "
-                    f"got {(config.tile_m, config.tile_n)}"
-                )
-            config_kv_subtile_factor(config, inputs)
-            can_2cta = can_use_bwd_2cta(inputs, tile_n=config.tile_n)
-            needs_2cta = bwd_needs_2cta(inputs)
-            if needs_2cta is not None and not config.use_2cta_instrs:
-                reason = (
-                    "2CTA was disabled by request"
-                    if inputs.disable_2cta or can_2cta
-                    else (
-                        f"sparse_block_size[1] must cover an even number of "
-                        f"tile_n={config.tile_n} tiles; got factor "
-                        f"{config_kv_subtile_factor(config, inputs)}"
-                    )
-                )
-                raise ValueError(f"{needs_2cta} requires 2CTA; {reason}.")
-            if config.use_2cta_instrs and not can_2cta:
-                raise ValueError("2CTA instructions are not supported for this backward problem")
-            if config.tile_n == 64 and not can_use_bwd_tile_n_64(
-                inputs, use_2cta_instrs=config.use_2cta_instrs
-            ):
-                raise ValueError("tile_n=64 is not supported for this SM100 backward problem")
-            if inputs.is_hdim256 and config.tile_n != 64:
-                raise ValueError("SM100 generic backward with head_dim=256 needs tile_n=64")
+            )
+            raise ValueError(f"{needs_2cta} requires 2CTA; {reason}.")
+        if config.use_2cta_instrs and not can_2cta:
+            raise ValueError("2CTA instructions are not supported for this backward problem")
+        if config.tile_n == 64 and not can_use_bwd_tile_n_64(
+            inputs, use_2cta_instrs=config.use_2cta_instrs
+        ):
+            raise ValueError("tile_n=64 is not supported for this SM100 backward problem")
+        if inputs.is_hdim256 and config.tile_n != 64:
+            raise ValueError("SM100 backward with head_dim=256 needs tile_n=64")
         if config.fold_LSE_dPsum and not can_fold_LSE_dPsum(
             inputs, tile_m=config.tile_m, tile_n=config.tile_n, cluster_size=config.cluster_size
         ):
