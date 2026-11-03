@@ -8,7 +8,7 @@ import operator
 import warnings
 from dataclasses import replace
 from functools import lru_cache
-from typing import Callable, NamedTuple, Optional, Tuple
+from typing import Callable, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -27,6 +27,7 @@ from flash_attn.cute.config import (
     FwdHeuristicInputs,
     MlaFwdConfig,
     MlaFwdHeuristicInputs,
+    PvNormalizer,
     bwd_q_subtile_factor,
     bwd_selection_reads_num_sms,
     config_kv_subtile_factor,
@@ -466,12 +467,20 @@ class BlockScales(NamedTuple):
     v_bf16: the original BF16 V (same shape as V), required exactly for causal native PV.
        A V scale is shared by 32 keys, so KV blocks on a query tile's diagonal use BF16 P
        and v_bf16 instead of the quantized V to keep future keys out of earlier rows.
+    pv_normalizer: the sum that normalizes native PV's O (requires v).
+      - "rounded_p" (default): the sum of the rounded P consumed by PV.
+      - "fp32": the FP32 sum before rounding P. It skips the rounded-P row sum but can
+        differ from the sum of P consumed by PV.
+    Both bias P by 2^8 and update the running row max at every step. LSE always uses the
+    FP32 sum. Causal diagonal blocks use BF16 P and v_bf16; other native PV blocks use E4M3 P
+    and MXFP8 V.
     """
 
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor | None = None
     v_bf16: torch.Tensor | None = None
+    pv_normalizer: Literal["rounded_p", "fp32"] = "rounded_p"
 
 
 def _check_shared_kv_scales(scales) -> None:
@@ -544,10 +553,16 @@ def _validate_block_scales(
 
     layout_inputs groups unsupported varlen, paged, and block-sparse inputs.
     pv_unsupported groups sinks, modifiers, and auxiliary data rejected by native PV.
-    Causal native PV requires scales.v_bf16.
+    Causal native PV requires scales.v_bf16; scales.pv_normalizer applies to native PV only.
     """
     pv = scales.v is not None
     v_bf16 = scales.v_bf16
+    if scales.pv_normalizer not in ("rounded_p", "fp32"):
+        raise ValueError(
+            f'BlockScales.pv_normalizer must be "rounded_p" or "fp32", got {scales.pv_normalizer!r}'
+        )
+    if scales.pv_normalizer != "rounded_p" and not pv:
+        raise ValueError("pv_normalizer requires native MXFP8 PV (scales.v)")
     if v_bf16 is not None and not pv:
         raise ValueError("v_bf16 requires native MXFP8 PV (scales.v)")
     mode = "Native MXFP8 PV" if pv else "QK MXFP8"
@@ -743,6 +758,7 @@ def _flash_attn_fwd(
         (block_scales.q, block_scales.k, block_scales.v) if qk_blockscaled else (None, None, None)
     )
     v_bf16 = block_scales.v_bf16 if qk_blockscaled else None
+    pv_normalizer = block_scales.pv_normalizer if qk_blockscaled else "rounded_p"
     if cu_seqlens_k is None:
         if page_table is None:
             assert k is None or k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -945,6 +961,7 @@ def _flash_attn_fwd(
         requires_grad=requires_grad or any(t.requires_grad for t in aux_tensors or ()),
         has_aux_scalars=aux_scalars is not None,
         mxfp8_path="pv" if pv_blockscaled else "qk" if qk_blockscaled else None,
+        pv_normalizer=PvNormalizer(pv_normalizer),
         mla=None if qv is None else dict(
             is_topk_gather=gather_kv_indices is not None,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
@@ -1318,7 +1335,7 @@ def _flash_attn_fwd(
 
     if qk_blockscaled:
         compile_key += ("mxfp8_qk", v.dtype, pv_blockscaled,
-                        get_broadcast_dims(v_bf16) if v_bf16 is not None else None)
+                        get_broadcast_dims(v_bf16) if v_bf16 is not None else None, pv_normalizer)
 
     if _needs_compile(_flash_attn_fwd.compile_cache, compile_key):
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1519,7 +1536,12 @@ def _flash_attn_fwd(
                 fwd_cls = FlashAttentionForwardSm100
                 # SwapAB never runs block scales (config.SWAPAB.rejection).
                 mxfp8_kwargs = (
-                    dict(qk_blockscaled=True, pv_blockscaled=pv_blockscaled) if qk_blockscaled else {}
+                    dict(
+                        qk_blockscaled=True, pv_blockscaled=pv_blockscaled,
+                        pv_normalizer=pv_normalizer,
+                    )
+                    if qk_blockscaled
+                    else {}
                 )
                 if use_swapab:
                     from flash_attn.cute.flash_fwd_decode_sm100 import FlashAttentionForwardSm100SwapAB
@@ -3880,6 +3902,8 @@ def flash_attn_func(
         - BlockScales(q, k, v): native MXFP8 PV with e4m3 V. v is the contiguous UE8M0 buffer
           from quantize_v_to_fp8_with_sf (MN=V channels, K=key positions, groups of 32 keys).
         - BlockScales(q, k, v, v_bf16): causal native MXFP8 PV; v_bf16 is the original BF16 V
+          (see BlockScales).
+        - BlockScales(..., pv_normalizer="fp32"): native PV normalized by the FP32 sum of P
           (see BlockScales).
         Native MXFP8 PV does not support local or modified attention.
         BlockScales return BF16 output and optional FP32 LSE, and support only dense, unsplit

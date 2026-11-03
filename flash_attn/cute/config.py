@@ -8,6 +8,7 @@ not normalized. Selection must not read tensor contents, synchronize CUDA, or
 allocate device memory.
 """
 
+import enum
 import math
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -96,6 +97,13 @@ class FwdConfig:
     lpt_global: bool = False
 
 
+class PvNormalizer(enum.Enum):
+    """The sum that normalizes native MXFP8 PV's O (BlockScales.pv_normalizer)."""
+
+    ROUNDED_P = "rounded_p"  # the sum of the rounded P consumed by PV
+    FP32 = "fp32"  # the FP32 exponential sum before rounding P
+
+
 class FwdHeuristicInputs(NamedTuple):
     """Host metadata for config selection and validation.
 
@@ -155,6 +163,8 @@ class FwdHeuristicInputs(NamedTuple):
     has_aux_scalars: bool = False
     # MXFP8: "qk" scales E4M3 Q/K with BF16 V; "pv" also scales E4M3 V; None disables it.
     mxfp8_path: str | None = None
+    # Native PV's normalizer; FP32 requires mxfp8_path == "pv".
+    pv_normalizer: PvNormalizer = PvNormalizer.ROUNDED_P
 
     @property
     def device_capacity(self) -> int:
@@ -394,6 +404,45 @@ SM100_FP8_SMALL_HDIM_REGISTERS = {
     False: Sm100Registers(softmax=168, correction=96, other=80),
     True: Sm100Registers(softmax=152, correction=96, other=112),
 }
+
+
+class PvFp32Tuning(NamedTuple):
+    """sm_100/sm_103 scheduling for native MXFP8 PV with the "fp32" normalizer."""
+
+    registers: Sm100Registers | None = None  # None: native-PV split
+    ex2_emu_freq: int = 0
+
+
+# Keyed by arch, then (head_dim_padded, is_causal); missing keys keep the defaults. sm_107 is tuned
+# in SM107_MXFP8_PV_TUNING. select_ex2_emu reads ex2_emu_freq.
+MXFP8_PV_FP32_TUNING = {
+    # Only the FP32 normalizer may emulate exp2 (see select_ex2_emu). The hd128 register splits are
+    # the spill-free ones.
+    "sm_100": {
+        (128, False): PvFp32Tuning(Sm100Registers(176, 64, 96), ex2_emu_freq=8),
+        (128, True): PvFp32Tuning(Sm100Registers(192, 64, 64), ex2_emu_freq=8),
+        (64, False): PvFp32Tuning(ex2_emu_freq=8),
+        (64, True): PvFp32Tuning(ex2_emu_freq=8),
+    },
+    # The "rounded_p" registers are already the best choice.
+    "sm_103": {},
+}
+
+
+class Sm107PvTuning(NamedTuple):
+    """sm_107 native PV (dedicated scale columns) choices; none changes the arithmetic."""
+
+    # None keeps the generic FP8 split.
+    registers: Sm100Registers | None = None
+
+
+# Keyed by (pv_normalizer, head_dim_padded, is_causal); missing keys use the defaults.
+SM107_MXFP8_PV_TUNING = {
+    (PvNormalizer.ROUNDED_P, 64, False): Sm107PvTuning(Sm100Registers(160, 96, 96)),
+    (PvNormalizer.FP32, 128, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
+    (PvNormalizer.FP32, 64, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
+    (PvNormalizer.FP32, 64, True): Sm107PvTuning(Sm100Registers(192, 64, 64)),
+}
 # NOTE [softmax stats release order]
 # The SM100 correction warpgroup frees softmax stage s's pipeline_sm_stats slot in either order:
 # - Same-stage (default): right after reading scale[s].
@@ -439,6 +488,9 @@ _SM_STATS_CROSS_STAGE = {
     ("fp8", 96, True, False): ("sm_100",),
     ("mxfp8_qk", 64, True, False): ("sm_103", "sm_107"),
     ("mxfp8_pv", 64, True, False): ("sm_100",),
+    ("mxfp8_pv_fp32", 64, False, False): ("sm_103", "sm_107"),
+    ("mxfp8_pv_fp32", 64, True, False): ("sm_107",),
+    ("mxfp8_pv_fp32", 128, False, False): ("sm_100", "sm_107"),
 }
 # === END SM100 TUNING KNOBS ===
 
@@ -461,7 +513,10 @@ def sm100_arch_family(device_arch: int) -> str:
 
 
 def tuning_path(inputs: FwdHeuristicInputs) -> str:
-    """Tuning-table path: the MXFP8 path, else the dtype."""
+    """Tuning-table path: the MXFP8 path, else the dtype. Native PV with the FP32 normalizer has
+    its own rows, "mxfp8_pv_fp32"."""
+    if inputs.pv_normalizer is PvNormalizer.FP32:
+        return "mxfp8_pv_fp32"
     if inputs.mxfp8_path is not None:
         return f"mxfp8_{inputs.mxfp8_path}"
     dtype = inputs.dtype
@@ -482,15 +537,23 @@ def select_sm_stats_cross_stage(inputs: FwdHeuristicInputs, *, use_s_ping_pong: 
     return sm100_arch_family(inputs.device_arch) in _SM_STATS_CROSS_STAGE.get(key, ())
 
 
+def mxfp8_pv_fp32_tuning(inputs: FwdHeuristicInputs) -> PvFp32Tuning:
+    """The MXFP8_PV_FP32_TUNING row of a "fp32" native-PV call; defaults otherwise."""
+    if inputs.pv_normalizer is not PvNormalizer.FP32:
+        return PvFp32Tuning()
+    family = sm100_arch_family(inputs.device_arch)
+    key = (inputs.head_dim_padded, inputs.causal)
+    return MXFP8_PV_FP32_TUNING.get(family, {}).get(key, PvFp32Tuning())
+
+
 def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs) -> Sm100Registers | None:
     """Native MXFP8 PV register split; None keeps the FP8 split."""
     family = sm100_arch_family(inputs.device_arch)
+    key = (inputs.head_dim_padded, inputs.causal)
     if family == "sm_107":
-        # Dedicated scale columns: fewer softmax registers relieve register pressure in the
-        # correction and MMA/load warps at non-causal hd64.
-        if inputs.head_dim_padded < 96 and not inputs.causal:
-            return Sm100Registers(160, 96, 96)
-        return None
+        return SM107_MXFP8_PV_TUNING.get((inputs.pv_normalizer, *key), Sm107PvTuning()).registers
+    if fp32_registers := mxfp8_pv_fp32_tuning(inputs).registers:
+        return fp32_registers
     # The MMA warp also issues the PV scale copies and the split-P wait. It spills with the
     # 48 registers of the hd128 default, and on sm_103 the persistent non-causal loop
     # needs 80 (causal uses a single-tile scheduler, or CLC with its own split).
@@ -515,7 +578,7 @@ def select_sm100_registers(
         sm100_is_sm103_family(inputs.device_arch),
     )
     is_fp8 = has_fp8_pv(inputs)
-    if inputs.mxfp8_path == "pv" and (pv_registers := select_mxfp8_pv_registers(inputs)):
+    if sm100_native_pv(inputs) and (pv_registers := select_mxfp8_pv_registers(inputs)):
         return pv_registers
     if head_dim_padded < 96:
         small = SM100_FP8_SMALL_HDIM_REGISTERS if is_fp8 else SM100_SMALL_HDIM_REGISTERS
@@ -550,10 +613,6 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
     """
     if inputs.device_capacity not in (10, 11):
         return 0, 0
-    if inputs.mxfp8_path == "pv":
-        # Keep MUFU.EX2: polynomial exp2 can cross E4M3 rounding boundaries,
-        # changing the quantized P consumed by native PV.
-        return 0, 0
     head_dim_padded = inputs.head_dim_padded
     is_sm103 = sm100_is_sm103_family(inputs.device_arch)
     key = (use_2cta_instrs, inputs.causal, head_dim_padded, is_sm103)
@@ -562,6 +621,11 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
     if "ex2_emu_freq" in fp8_tune:
         tune = {**tune, **fp8_tune}
     start_frg = tune.get("ex2_emu_start_frg", 1)
+    if sm100_native_pv(inputs):
+        # "rounded_p" keeps MUFU.EX2: polynomial exp2 can cross E4M3 rounding boundaries.
+        # "fp32" permits emulation according to its tuning row.
+        freq = mxfp8_pv_fp32_tuning(inputs).ex2_emu_freq
+        return (freq, start_frg) if freq else (0, 0)
     if "ex2_emu_freq" in tune:
         enabled = tune["ex2_emu_freq"] > 0
     else:
@@ -904,6 +968,12 @@ _CAUSAL_CLC_DEFAULT = {
         "sm_103": Sm100Registers(softmax=168, correction=88, other=88),
         "sm_107": None,
     },
+    ("mxfp8_pv_fp32", 64): {"sm_100": None, "sm_103": None, "sm_107": None},
+    ("mxfp8_pv_fp32", 128): {
+        "sm_100": Sm100Registers(softmax=184, correction=64, other=80),
+        "sm_103": Sm100Registers(softmax=184, correction=64, other=80),
+        "sm_107": None,
+    },
 }
 _HD256_CLC_MIN_HEAD_SLICES = 32
 
@@ -1068,6 +1138,19 @@ def sm100_native_pv(inputs: FwdHeuristicInputs) -> bool:
     return inputs.mxfp8_path == "pv"
 
 
+def sm100_num_softmax_stats(
+    *, native_pv: bool, has_lse: bool, fp32_normalizer: bool, dedicated_sf: bool
+) -> int:
+    """Float32 sScale statistics per row: row max, row sum, and native PV's FP32 sum for LSE.
+
+    "fp32" (fp32_normalizer) normalizes O by that FP32 sum, so it shares the row-sum slot,
+    except with dedicated scale columns (sm_107), which keep it separate to avoid
+    correction-warp spills.
+    """
+    separate_lse_sum = native_pv and has_lse and (not fp32_normalizer or dedicated_sf)
+    return 3 if separate_lse_sum else 2
+
+
 def sm100_fwd_scale_bytes(inputs: FwdHeuristicInputs, *, q_stage: int) -> tuple[int, int, int]:
     """Per-CTA (sSFQ, sSFK per K/V stage, fixed) bytes of the MXFP8 forward's UE8M0 block scales.
 
@@ -1150,8 +1233,12 @@ def sm100_fwd_smem_bytes(config: FwdConfig, inputs: FwdHeuristicInputs) -> int:
         + 1
     )
     header = 8 * num_mbarriers + 4  # Int32 TMEM holding buffer
-    # Float32 sScale: row max and row sum, and native PV's unquantized row sum for LSE.
-    num_stats = 3 if native_pv and inputs.has_lse else 2
+    num_stats = sm100_num_softmax_stats(
+        native_pv=native_pv,
+        has_lse=inputs.has_lse,
+        fp32_normalizer=inputs.pv_normalizer is PvNormalizer.FP32,
+        dedicated_sf=dedicated_sf,
+    )
     header += 4 * s_p_o_stage * config.tile_m * num_stats
     if dynamic_persistent:  # one scheduler stage: full/empty mbarriers and a 4 x Int32 response
         header = round_up(header, 8) + 2 * 8 + 4 * 4
@@ -1871,6 +1958,8 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         raise ValueError(
             f"Config targets SM{config.device_capacity}, but the problem targets SM{inputs.device_capacity}"
         )
+    if inputs.pv_normalizer is PvNormalizer.FP32 and not sm100_native_pv(inputs):
+        raise ValueError("The FP32 PV normalizer requires native MXFP8 PV")
     if config.use_swapab:
         reason = SWAPAB.rejection(inputs)
         if reason is not None:
@@ -1970,6 +2059,13 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         config.tile_n != 128 or config.num_splits != 1 or config.pack_gqa
     ):
         raise ValueError("MXFP8 forward requires 128 x 128 tiles, one split, and no PackGQA")
+    if (
+        sm100_native_pv(inputs)
+        and inputs.pv_normalizer is PvNormalizer.ROUNDED_P
+        and config.ex2_emu_freq != 0
+    ):
+        # See select_ex2_emu: the rounded-P normalizer needs the P that MUFU.EX2 produces.
+        raise ValueError('The "rounded_p" PV normalizer requires hardware exp2 (ex2_emu_freq=0)')
 
     if config.num_splits > 1:
         if inputs.head_dim_v_padded >= 192 and inputs.head_dim_v != 256:
