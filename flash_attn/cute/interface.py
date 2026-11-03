@@ -1974,14 +1974,27 @@ def _flash_attn_bwd(
         total_k = k.shape[0]
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
 
+    def heuristic_seqlen(seqlen, total, has_host_bound):
+        # The fold chooser wants the longest sequence. A bound given as a device tensor falls
+        # back to the token total; a varlen call without max_seqlen only knows the total,
+        # which as an upper bound refuses every causal fold, so it sees the mean.
+        if torch.is_tensor(seqlen):
+            return total
+        if not has_host_bound:
+            return max(1, math.ceil(total / max(batch_size, 1)))
+        return seqlen
+
     inputs = _get_bwd_inputs(
         arch=arch, device_index=q.device.index, causal=causal, local=local,
         deterministic=deterministic, head_dim=head_dim, head_dim_v=head_dim_v,
         num_heads=num_head, num_heads_kv=num_head_kv, batch_size=batch_size,
         total_q=total_q, total_k=total_k,
-        # Sequence bounds given as device tensors fall back to the token totals.
-        max_seqlen_q=total_q if torch.is_tensor(seqlen_q) else seqlen_q,
-        max_seqlen_k=total_k if torch.is_tensor(seqlen_k) else seqlen_k,
+        max_seqlen_q=heuristic_seqlen(
+            seqlen_q, total_q, cu_seqlens_q is None or max_seqlen_q is not None
+        ),
+        max_seqlen_k=heuristic_seqlen(
+            seqlen_k, total_k, cu_seqlens_k is None or max_seqlen_k is not None
+        ),
         has_cu_seqlens=cu_seqlens_q is not None or cu_seqlens_k is not None,
         block_sparse_tensors=block_sparse_tensors, V_in_regs=V_in_regs,
         # The user's score_mod: softcap becomes a score_mod only below and still packs.
