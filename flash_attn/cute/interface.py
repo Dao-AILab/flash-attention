@@ -684,7 +684,9 @@ def _flash_attn_fwd(
 
     dtype = torch2cute_dtype_map[q_dtype]
     if is_fp8:
-        assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
+        assert arch // 10 == 10 or (arch_forward_host is not None and qv is None), (
+            "FP8 is only supported on SM100 (compute capability 10.x) and SM12x for FA4 CuTe."
+        )
     use_block_sparsity = block_sparse_tensors is not None
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
@@ -1529,7 +1531,11 @@ def _flash_attn_fwd(
             elif arch_forward_host is not None:
                 compile_args.extend(
                     arch_forward_host.compile_arguments(
-                        arch_forward_plan, out=out, lse=lse, **scheduler_tensors
+                        arch_forward_plan,
+                        out=out,
+                        lse=lse,
+                        descale_tensors=descale_tensors_tensor,
+                        **scheduler_tensors,
                     )
                 )
             elif arch // 10 in [8, 9]:
@@ -1630,7 +1636,11 @@ def _flash_attn_fwd(
             elif arch_forward_host is not None:
                 call_args.extend(
                     arch_forward_host.runtime_arguments(
-                        arch_forward_plan, out=out, lse=lse, **scheduler_tensors
+                        arch_forward_plan,
+                        out=out,
+                        lse=lse,
+                        descale_tensors=descale_tensors,
+                        **scheduler_tensors,
                     )
                 )
             elif arch // 10 in [8, 9]:

@@ -3538,7 +3538,9 @@ def test_flash_attn_sm100_unused_v_cache_packed_boundary(dtype):
         )
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110 or IS_SM120), reason="SM100/SM110/SM12x nonpaged V cache"
+)
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("varlen", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
@@ -3665,7 +3667,7 @@ def test_flash_attn_paged_padding_contract(
             assert torch.isneginf(lse_bad[i]).all()
 
 
-@pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
+@pytest.mark.skipif(not (IS_SM100 or IS_SM120), reason="FP8 paged decode is SM100 / SM12x only")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_paged_decode_tile_boundary():
     """A second KV tile must not saturate e4m3 softmax probabilities."""
@@ -3683,7 +3685,7 @@ def test_flash_attn_fp8_paged_decode_tile_boundary():
     assert cosine > 0.99, f"FP8 paged decode lost accuracy at the tile boundary: {cosine=}"
 
 
-@pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
+@pytest.mark.skipif(not (IS_SM100 or IS_SM120), reason="FP8 paged decode is SM100 / SM12x only")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_paged_decode_preserves_tail_mass():
     """Collectively significant e4m3 softmax tails must not flush to zero."""
@@ -3703,7 +3705,7 @@ def test_flash_attn_fp8_paged_decode_preserves_tail_mass():
     torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.1)
 
 
-@pytest.mark.skipif(not IS_SM100, reason="FP8 descales are SM100-only")
+@pytest.mark.skipif(not (IS_SM100 or IS_SM120), reason="FP8 descales are SM100 / SM12x only")
 @pytest.mark.parametrize("present", ["q", "k", "v", "qk", "qv", "kv"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_partial_descales(present):

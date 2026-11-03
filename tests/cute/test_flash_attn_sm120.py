@@ -269,6 +269,7 @@ def test_sm120_sparse_tile_fit(head_dim, tile, block, exact_q, paged_kv, expecte
         block,
         exact_q,
         paged_kv,
+        element_size=2,
     )
     if expected is None:
         with pytest.raises(ValueError, match="no forward tile divides"):

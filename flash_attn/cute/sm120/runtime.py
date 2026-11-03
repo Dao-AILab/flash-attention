@@ -14,6 +14,8 @@ import cutlass.utils as utils_basic
 import torch
 
 from flash_attn.cute.sm120.flash_fwd import (
+    FP8_SHAPES,
+    model_dtype,
     FlashAttentionForwardSm120,
 )
 from flash_attn.cute.sm120.policy import (
@@ -557,6 +559,8 @@ class Sm120ForwardHost:
         )
         if transpose_qk_pv:
             split_qk_n = False
+        if not cls.runs_decode_dataflows(element_size):
+            split_qk_n = transpose_qk_pv = False
         if block_sparse:
             # The block-sparse lists run in the generic consumers.
             split_qk_n = transpose_qk_pv = False
@@ -625,6 +629,10 @@ class Sm120ForwardHost:
     ) -> tuple[Sm120ForwardConfig, Sm120ForwardPlan]:
         """Tile configuration and launch plan of one forward call."""
         num_sms = get_num_sms_for_selection(device.index, arch)
+        if v.element_size() == 1 and (head_dim, head_dim_v) not in FP8_SHAPES:
+            raise NotImplementedError(
+                f"SM12x fp8 forward supports (head_dim, head_dim_v) {sorted(FP8_SHAPES)}"
+            )
         config = cls.select_config(
             head_dim=head_dim,
             head_dim_v=head_dim_v,
@@ -644,6 +652,7 @@ class Sm120ForwardHost:
             paged_kv=page_table is not None,
             l2_group_bytes=l2_group_bytes(device.index),
             schedule_rates=schedule_rates(device.index),
+            element_size=v.element_size(),
             sparse_block_size=sparse_block_size,
             sparse_varlen=sparse_varlen,
         )
@@ -674,7 +683,11 @@ class Sm120ForwardHost:
             and (has_cu_seqlens_k or has_seqused_k)
             and not block_sparse
             # hd 256 paged decode splits each request by its own length in the kernel.
-            and not (head_dim == 256 and page_table is not None)
+            and not (
+                head_dim == 256
+                and page_table is not None
+                and cls.runs_decode_dataflows(v.element_size())
+            )
         )
         resolve = partial(
             cls.resolve_plan,
@@ -711,7 +724,7 @@ class Sm120ForwardHost:
             generic_heuristic=num_splits_heuristic,
             block_sparse=block_sparse,
             resident_ctas_per_sm=cls.resident_ctas_per_sm(
-                cutlass.BFloat16,
+                model_dtype(v.element_size()),
                 head_dim,
                 head_dim_v,
                 tile_m,
@@ -854,6 +867,7 @@ class Sm120ForwardHost:
         split_slot_batch: Optional[torch.Tensor],
         out: torch.Tensor,
         lse: Optional[torch.Tensor],
+        descale_tensors=None,
     ) -> tuple:
         """Extra CuTe arguments required by the selected SM120 kernel ABI."""
         o_final, lse_final = cls._final_outputs(plan, out, lse)
@@ -865,6 +879,7 @@ class Sm120ForwardHost:
             to_cute_tensor(o_final, assumed_align=16),
             to_cute_tensor(lse_final, assumed_align=4),
             to_cute_tensor(split_slot_batch, assumed_align=4, leading_dim=0),
+            descale_tensors,
         )
 
     @classmethod
@@ -878,6 +893,7 @@ class Sm120ForwardHost:
         split_slot_batch: Optional[torch.Tensor],
         out: torch.Tensor,
         lse: Optional[torch.Tensor],
+        descale_tensors=None,
     ) -> tuple:
         """Extra runtime arguments required by the selected SM120 kernel ABI."""
         return (
@@ -886,7 +902,15 @@ class Sm120ForwardHost:
             num_splits_dynamic,
             *cls._final_outputs(plan, out, lse),
             split_slot_batch,
+            descale_tensors,
         )
+
+    @staticmethod
+    def runs_decode_dataflows(element_size: int) -> bool:
+        """Whether a call can take the paged decode dataflows (N-distributed QK, transposed
+        QK / PV, per-request splits in the kernel). They round P to the input type without the
+        fp8 P offset and k32 key order, so fp8 runs the generic consumers."""
+        return element_size != 1
 
     @staticmethod
     def _fit_tile_to_sparse_block(
@@ -897,32 +921,33 @@ class Sm120ForwardHost:
         sparse_block_size: tuple[int, int],
         exact_q: bool = False,
         paged_kv: bool = False,
+        *,
+        element_size: int,
     ) -> tuple[int, int]:
         """A sparse block spans whole tiles (q_subtile_factor = Bq / tile_m, kv_subtile_factor =
         Bk / tile_n): keep the selected tile when it divides the block, else take the first tile
         the kernel runs (can_implement) that does, the block's own sizes first (e.g. Bk 112).
-        Varlen lists count Q blocks per batch, so there tile_m is Bq itself (exact_q). Tiles
-        other than the selected one stay within 128 (64 above hd 128)."""
-        limit = 64 if max(head_dim, head_dim_v) > 128 else 128
+        Varlen lists count Q blocks per batch, so there tile_m is Bq itself (exact_q). 16-bit
+        tiles other than the selected one stay within 128 (64 above hd 128)."""
+        dtype = model_dtype(element_size)
+        limit = (64 if max(head_dim, head_dim_v) > 128 else 128) if element_size == 2 else None
         size_m, size_n = sparse_block_size
 
         def runs(m: int, n: int) -> bool:
-            return (
-                (m == tile_m or m <= limit)
-                and (n == tile_n or n <= limit)
-                and FlashAttentionForwardSm120.can_implement(
-                    cutlass.BFloat16,
-                    head_dim,
-                    head_dim_v,
-                    m,
-                    n,
-                    1,
-                    FlashAttentionForwardSm120.get_fwd_num_threads(
-                        head_dim, head_dim_v, m, n, paged_kv=paged_kv
-                    ),
-                    False,
-                    paged_kv=paged_kv,
-                )
+            if limit is not None and ((m != tile_m and m > limit) or (n != tile_n and n > limit)):
+                return False
+            return FlashAttentionForwardSm120.can_implement(
+                dtype,
+                head_dim,
+                head_dim_v,
+                m,
+                n,
+                1,
+                FlashAttentionForwardSm120.get_fwd_num_threads(
+                    head_dim, head_dim_v, m, n, paged_kv=paged_kv
+                ),
+                False,
+                paged_kv=paged_kv,
             )
 
         sizes = (128, 112, 96, 80, 64, 48, 32, 16)
@@ -980,7 +1005,48 @@ class Sm120ForwardHost:
         sparse_block_size: Optional[tuple[int, int]] = None,
         sparse_varlen: bool = False,
         schedule_rates: Optional[tuple[float, float]] = None,
+        element_size: int,
     ) -> Sm120ForwardConfig:
+        is_fp8 = element_size == 1
+        packed_rows = (
+            seqlen_q * (qhead_per_kvhead if pack_gqa else 1) if seqlen_q is not None else None
+        )
+
+        def fp8_runs(m: int, n: int) -> bool:
+            return FlashAttentionForwardSm120.can_implement(
+                cutlass.Float8E4M3FN,
+                head_dim,
+                head_dim_v,
+                m,
+                n,
+                FlashAttentionForwardSm120.get_fwd_num_stages(head_dim, head_dim_v, m, n),
+                FlashAttentionForwardSm120.get_fwd_num_threads(
+                    head_dim, head_dim_v, m, n, paged_kv=paged_kv
+                ),
+                is_causal,
+                paged_kv=paged_kv,
+            )
+
+        caller_tile_mn = tile_mn
+        if (
+            tile_mn is None
+            and is_fp8
+            and head_dim == 256
+            and not paged_kv
+            # Block-sparse calls take a tile that divides the sparse block.
+            and sparse_block_size is None
+            and packed_rows is not None
+            and Sm120ForwardHost._fp8_use_128_rows(
+                is_causal,
+                is_local,
+                window_size_left,
+                window_size_right,
+                seqlen_q,
+                seqlen_k,
+                packed_rows,
+            )
+        ):
+            tile_mn = (128, 32)
         if tile_mn is None:
             tile_m, tile_n = FlashAttentionForwardSm120.get_fwd_tile_size(
                 head_dim,
@@ -1000,6 +1066,7 @@ class Sm120ForwardHost:
                 paged_kv=paged_kv,
                 l2_group_bytes=l2_group_bytes,
                 schedule_rates=schedule_rates,
+                element_size=element_size,
             )
             if sparse_block_size is not None:
                 tile_m, tile_n = Sm120ForwardHost._fit_tile_to_sparse_block(
@@ -1010,9 +1077,28 @@ class Sm120ForwardHost:
                     sparse_block_size,
                     exact_q=sparse_varlen,
                     paged_kv=paged_kv,
+                    element_size=element_size,
                 )
         else:
             tile_m, tile_n = tile_mn
+        if is_fp8:
+            if sparse_block_size is None and not fp8_runs(tile_m, tile_n):
+                # The 16-row decode tiles are not fp8 tiles. A tile fitted to a sparse block
+                # already runs, and any other tile would not divide the block.
+                tile_m, tile_n = 64, 64
+            # Rows of the M tile past a KV head's packed Q rows are MMA work on padding, which
+            # bounds decode once the KV stream no longer does (fp8 halves the stream): when the
+            # packed rows fit one 32-row tile, take it (the same CTAs, half the MMA rows). A
+            # caller's tile and a tile fitted to a sparse block stay as they are.
+            if (
+                packed_rows is not None
+                and packed_rows <= 32
+                and tile_m > 32
+                and caller_tile_mn is None
+                and sparse_block_size is None
+                and fp8_runs(32, 64)
+            ):
+                tile_m, tile_n = 32, 64
         num_threads = FlashAttentionForwardSm120.get_fwd_num_threads(
             head_dim,
             head_dim_v,
@@ -1030,7 +1116,7 @@ class Sm120ForwardHost:
             and total_q_rows == num_batch * seqlen_q * num_head_kv * qhead_per_kvhead
         ):
             ctas_per_sm = Sm120ForwardHost.resident_ctas_per_sm(
-                cutlass.BFloat16,
+                model_dtype(element_size),
                 head_dim,
                 head_dim_v,
                 tile_m,
@@ -1054,6 +1140,7 @@ class Sm120ForwardHost:
                 window_size_right,
                 l2_group_bytes,
                 schedule_rates,
+                element_size=element_size,
             )
         return Sm120ForwardConfig(
             tile_m=tile_m,
@@ -1090,12 +1177,14 @@ class Sm120ForwardHost:
         num_splits = requested_num_splits
         hardware = None
         if num_splits < 1:
+            # The decode split models describe the decode dataflows' kernels.
             is_hd256_paged_decode = (
                 head_dim == 256
                 and head_dim_v == 256
                 and paged_kv
                 and max_seqlen_q == 1
                 and has_compact_q_groups
+                and Sm120ForwardHost.runs_decode_dataflows(element_size)
             )
             is_low_hd_paged_decode = is_low_hd_paged_decode_tile(
                 head_dim=head_dim,
@@ -1333,6 +1422,42 @@ class Sm120ForwardHost:
             and (is_causal or is_local)
             and not has_score_or_mask_mod
         )
+
+    # Clock gain of the 128-row fp8 hd 256 tile at the board power cap: it halves the K / V
+    # traffic from L2 per FLOP, and the saved power raises the capped clock by this fraction.
+    fp8_128_row_clock_gain = 0.04
+
+    @classmethod
+    def _fp8_use_128_rows(
+        cls,
+        causal,
+        local,
+        window_size_left,
+        window_size_right,
+        max_seqlen_q,
+        max_seqlen_k,
+        rows_per_head,
+    ) -> bool:
+        """Whether the fp8 hd 256 forward takes the 128 x 32 tile over 64 x 64. Fewer than 128
+        Q rows per (batch, KV head) pad more of a 128-row tile. At a masked edge (causal /
+        right window, left window) a tile computes about tile_m / 2 + tile_n / 2 masked keys
+        per row: 16 more per edge for 128 x 32. That extra work, as a fraction of the keys a
+        row sees, has to stay below the tile's clock gain."""
+        if rows_per_head < 128:
+            return False
+        right = causal or (local and window_size_right is not None)
+        left = local and window_size_left is not None and window_size_left < max_seqlen_k
+        if not (right or left):
+            return True
+        offset = max(max_seqlen_k - max_seqlen_q, 0)
+        reach = 0 if causal or window_size_right is None else window_size_right
+        visible = float(max_seqlen_k)
+        if right:
+            visible = min(visible, offset + reach + (max_seqlen_q + 1) / 2)
+        if left:
+            visible = min(visible, window_size_left + reach + 1)
+        extra = 16 * (int(right) + int(left)) / max(visible, 1.0)
+        return extra < cls.fp8_128_row_clock_gain
 
     @staticmethod
     def make_kernel(
