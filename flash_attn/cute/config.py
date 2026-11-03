@@ -2697,6 +2697,9 @@ class BwdConfig:
     head_loop: bool
     fold_LSE_dPsum: bool
     registers: BwdRegisters
+    # Dedicated hdim-256 dQ kernel: run each head's query pairs from the end (causal: longest
+    # first); see select_hd256_dq_reverse.
+    hd256_dq_reverse: bool = False
 
     @property
     def pack_gqa(self) -> bool:
@@ -2715,9 +2718,10 @@ class BwdHeuristicInputs(NamedTuple):
     Holds only the facts the policy reads. dtype is str(torch.dtype) of the inputs.
     sparse_block_size_q / sparse_block_size_kv are the caller's block_size, None when unset. num_sms, batch_size, the sequence bounds, and the
     token totals feed only the SM100 query-head fold chooser (select_bwd_fold and
-    bwd_pack_gqa_heuristic); max_seqlen_q / max_seqlen_k are the mean sequence length for
-    varlen calls without a host bound (the total, as an upper bound, refuses every causal
-    fold), and num_sms is 0 where the chooser does not run (bwd_selection_reads_num_sms).
+    bwd_pack_gqa_heuristic) and the causal MXFP8 dQ order (select_hd256_dq_reverse);
+    max_seqlen_q / max_seqlen_k are the mean sequence length for varlen calls without a host
+    bound (the total, as an upper bound, refuses every causal fold), and num_sms is 0 where
+    neither runs (bwd_selection_reads_num_sms).
     """
 
     device_arch: int
@@ -3169,15 +3173,17 @@ def select_bwd_fold(
 
 
 def bwd_selection_reads_num_sms(inputs: BwdHeuristicInputs) -> bool:
-    """Whether select_bwd_config reads inputs.num_sms: only select_bwd_fold does, for SM100 calls
-    that can fold (no FLASH_ATTENTION_BWD_TILE_N) and leave a candidate to the heuristic, one
-    bwd_fold_candidates lists that the env knobs do not force (bwd_fold_forced). A call without
-    one (an odd qhead_per_kvhead off hdim 256, a forced pack) selects its config unpacked or
-    as forced.
+    """Whether select_bwd_config reads inputs.num_sms: select_hd256_dq_reverse does for causal
+    MXFP8, and select_bwd_fold for SM100 calls that can fold (no FLASH_ATTENTION_BWD_TILE_N) and
+    leave a candidate to the heuristic, one bwd_fold_candidates lists that the env knobs do not
+    force (bwd_fold_forced). A call without one (an odd qhead_per_kvhead off hdim 256, a forced
+    pack) selects its config unpacked or as forced.
 
     The interface looks the SM count up only then, so cross-compiling other calls needs no
     FLASH_ATTENTION_NUM_SMS.
     """
+    if select_hd256_dq_reverse_reads_num_sms(inputs):
+        return True
     if inputs.requested_tile_n is not None or not can_use_bwd_fold(
         inputs, use_dedicated_hd256_kernel=inputs.uses_dedicated_hd256_kernel
     ):
@@ -3212,6 +3218,24 @@ def can_fold_LSE_dPsum(
         and not (inputs.has_score_mod or inputs.has_score_mod_bwd or inputs.has_softcap)
         and not inputs.zero_softmax_scale
     )
+
+
+# The causal MXFP8 hdim-256 dQ grid (two CTAs per 256-query pair and head) runs longest-first
+# up to this many waves, where its last wave dominates; longer grids keep the natural order.
+_HD256_DQ_REVERSE_MAX_WAVES = 5
+
+
+def select_hd256_dq_reverse_reads_num_sms(inputs: BwdHeuristicInputs) -> bool:
+    """Whether select_hd256_dq_reverse reads num_sms: SM100 causal MXFP8 hdim 256."""
+    return inputs.device_capacity in (10, 11) and inputs.mxfp8 and inputs.causal
+
+
+def select_hd256_dq_reverse(inputs: BwdHeuristicInputs) -> bool:
+    """BwdConfig.hd256_dq_reverse: measured for the causal MXFP8 backward only."""
+    if not select_hd256_dq_reverse_reads_num_sms(inputs):
+        return False
+    num_dq_ctas = 2 * ceil_div(inputs.max_seqlen_q, 256) * inputs.num_heads * inputs.batch_size
+    return num_dq_ctas <= _HD256_DQ_REVERSE_MAX_WAVES * inputs.num_sms
 
 
 # fmt: off
@@ -3301,6 +3325,7 @@ _SM100_ONLY_NEUTRAL_FIELDS = dict(
     pack_factor=1,
     head_loop=False,
     fold_LSE_dPsum=False,
+    hd256_dq_reverse=False,
 )
 # The SM100 kernel launches 16 warps: dQ reduce, 2x compute, MMA, load, relay, and empty.
 SM100_BWD_THREADS_PER_CTA = 512
@@ -3383,6 +3408,7 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 cluster_size=cluster_size,
                 spt=bwd_spt(inputs),
                 use_dedicated_hd256_kernel=dedicated,
+                hd256_dq_reverse=select_hd256_dq_reverse(inputs),
                 pack_factor=fold.pack_factor,
                 head_loop=fold.head_loop,
                 fold_LSE_dPsum=can_fold_LSE_dPsum(
@@ -3558,6 +3584,8 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
         raise ValueError("Pipeline stage counts must be positive")
     if inputs.mxfp8 and not config.use_dedicated_hd256_kernel:
         raise ValueError("The MXFP8 backward runs only on the dedicated SM100 hdim-256 kernels")
+    if config.hd256_dq_reverse and not config.use_dedicated_hd256_kernel:
+        raise ValueError("hd256_dq_reverse needs the dedicated SM100 hdim-256 kernels")
     sm100_only = [
         name for name, value in _SM100_ONLY_NEUTRAL_FIELDS.items() if getattr(config, name) != value
     ]

@@ -9,6 +9,7 @@ from flash_attn.cute.config import (
     Sm100BwdRegisters,
     bwd_pack_gqa_heuristic,
     bwd_q_subtile_factor,
+    bwd_selection_reads_num_sms,
     config_kv_subtile_factor,
     select_bwd_config,
     select_bwd_fold,
@@ -812,6 +813,29 @@ def test_mxfp8_backward_runs_on_the_dedicated_hd256_kernels():
     for other in (make_inputs(mxfp8=True), make_inputs(device_arch=90, mxfp8=True)):
         with pytest.raises(ValueError, match="MXFP8 backward runs only"):
             select_bwd_config(other)
+
+
+@pytest.mark.parametrize(
+    ("changes", "reverse"),
+    [
+        # 2 * 16 query pairs * 16 heads * batch dQ CTAs against 5 waves of 148 SMs (740).
+        ({"batch_size": 4}, False),
+        ({"batch_size": 1}, True),
+        ({"batch_size": 1, "causal": False}, False),
+        ({"batch_size": 1, "mxfp8": False}, False),
+    ],
+)
+def test_causal_mxfp8_hd256_dq_order_follows_the_wave_count(changes, reverse):
+    inputs = make_inputs(head_dim=256, head_dim_v=256, mxfp8=True, causal=True, num_sms=148,
+                         max_seqlen_q=4096, max_seqlen_k=4096)._replace(**changes)
+    config = select_bwd_config(inputs)
+    assert config.hd256_dq_reverse is reverse
+    assert bwd_selection_reads_num_sms(inputs) == (inputs.mxfp8 and inputs.causal)
+    # An explicit config may choose either order on the dedicated kernel, not elsewhere.
+    validate_bwd_config(replace(config, hd256_dq_reverse=not reverse), inputs)
+    generic = make_inputs(head_dim=256, head_dim_v=256, hd256_generic=True)
+    with pytest.raises(ValueError, match="hd256_dq_reverse needs"):
+        validate_bwd_config(replace(select_bwd_config(generic), hd256_dq_reverse=True), generic)
 
 
 # Interface: these run on CPU with fake tensors and stop at the compile-cache lookup.
