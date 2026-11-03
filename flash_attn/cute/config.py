@@ -895,7 +895,8 @@ def can_use_s_ping_pong(
         and not inputs.has_mask_mod
         and not inputs.use_block_sparsity
         and not inputs.has_learnable_sink
-        and inputs.mxfp8_path is None
+        # hd256 MXFP8 runs on the BF16 hd256 schedule; hd64/hd128 MXFP8 use two Q stages.
+        and (inputs.mxfp8_path is None or inputs.is_hdim256)
     )
 
 
@@ -912,10 +913,12 @@ def is_2cta_eligible(
     hd256_decode_2cta = (
         inputs.is_hdim256 and 2 * inputs.batch_size * num_q_tiles_per_batch <= inputs.num_sms
     )
+    if inputs.mxfp8_path is not None:
+        # MXFP8 is 1CTA at hd64/hd128 and 2CTA at hd256. The interface admits only dense,
+        # unsplit MXFP8 (no varlen, seqused, paging, or block sparsity).
+        return inputs.is_hdim256 and num_splits == 1
     return (
         num_splits == 1
-        # The MXFP8 kernel is 1CTA only.
-        and inputs.mxfp8_path is None
         and (not inputs.has_cu_seqlens_q or (inputs.is_hdim256 and hd256_2cta_varlen_ok(inputs)))
         and not inputs.has_seqused_q
         and not inputs.use_block_sparsity
@@ -1262,11 +1265,16 @@ def sm100_fwd_smem_bytes(config: FwdConfig, inputs: FwdHeuristicInputs) -> int:
     dynamic_persistent = config.use_clc_scheduler or inputs.has_varlen_q_semaphore
     # Int64 mbarriers: load Q and KV, four S/P/O pipelines, O epilogue, load epilogue,
     # S0/S1 sequence, TMEM dealloc.
-    # MXFP8 with two Q stages: QK_i's scales alias the other stage's S in TMEM, guarded by
-    # four more mbarriers. sm_107 native PV gives the scales dedicated TMEM columns instead.
+    # MXFP8 with two Q stages (or hd256's two S ping-pong slots): QK's scales alias the other
+    # stage's S in TMEM, guarded by four more mbarriers. sm_107 native PV and hd256 give the
+    # scales dedicated TMEM columns instead.
     native_pv = sm100_native_pv(inputs)
-    dedicated_sf = native_pv and sm100_arch_family(inputs.device_arch) == "sm_107"
-    sf_overlap = inputs.mxfp8_path is not None and q_stage == 2 and not dedicated_sf
+    is_sm107 = sm100_arch_family(inputs.device_arch) == "sm_107"
+    mx_ping_pong = inputs.mxfp8_path is not None and config.use_s_ping_pong
+    dedicated_sf = is_sm107 and (native_pv or mx_ping_pong)
+    sf_overlap = (
+        inputs.mxfp8_path is not None and (q_stage == 2 or mx_ping_pong) and not dedicated_sf
+    )
     num_mbarriers = (
         2 * q_stage
         + 2 * kv_stage
@@ -1756,9 +1764,12 @@ def _select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         num_splits = max(num_splits, fixed_seqlen_k_num_splits(inputs))
 
     is_split_kv = num_splits > 1
+    # hd256 MXFP8 has only the 2CTA S ping-pong schedule, so the 2CTA and S ping-pong knobs
+    # (including the CUDA 12 2CTA workaround) do not apply to it.
+    mxfp8_hd256 = inputs.mxfp8_path is not None and inputs.is_hdim256
     use_2cta_instrs = (
         is_sm100_family
-        and not inputs.disable_2cta
+        and (mxfp8_hd256 or not inputs.disable_2cta)
         and is_2cta_eligible(inputs, tile_m=tile_m, q_stage=q_stage, num_splits=num_splits)
     )
 
@@ -1803,7 +1814,7 @@ def _select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     n_blocks_per_split = ceil_div(num_n_blocks, num_splits)
     use_s_ping_pong = (
         is_sm100_family
-        and not inputs.disable_s_ping_pong
+        and (mxfp8_hd256 or not inputs.disable_s_ping_pong)
         and can_use_s_ping_pong(inputs, tile_m=tile_m, tile_n=tile_n, q_stage=q_stage)
         and (
             not is_split_kv
@@ -2109,6 +2120,12 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         config.tile_n != 128 or config.num_splits != 1 or config.pack_gqa
     ):
         raise ValueError("MXFP8 forward requires 128 x 128 tiles, one split, and no PackGQA")
+    if (
+        inputs.mxfp8_path is not None
+        and inputs.is_hdim256
+        and not (config.use_2cta_instrs and config.use_s_ping_pong)
+    ):
+        raise ValueError("hd256 MXFP8 forward requires 2CTA instructions and S ping-pong")
 
     if config.num_splits > 1:
         if inputs.head_dim_v_padded >= 192 and inputs.head_dim_v != 256:

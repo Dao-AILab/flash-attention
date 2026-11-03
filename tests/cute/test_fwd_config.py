@@ -894,6 +894,28 @@ def test_mxfp8_qk_selects_a_1cta_unpacked_config():
         select_fwd_config(inputs._replace(device_arch=90))
 
 
+def test_mxfp8_hd256_runs_on_the_2cta_s_ping_pong_schedule():
+    qk = make_inputs(dtype="torch.float8_e4m3fn", **_HD256, num_heads_kv=4, mxfp8_path="qk")
+    # The 2CTA / S ping-pong knobs (FA_DISABLE_2CTA, the CUDA 12 workaround, FA_DISABLE_S_PING_PONG)
+    # have no other hd256 MXFP8 schedule to fall back to.
+    knobs = {"disable_2cta": True, "disable_s_ping_pong": True}
+    for changes in ({}, {"causal": True}, {"device_arch": 103}, {"max_seqlen_q": 1, "total_q": 2},
+                    knobs):
+        config = select_fwd_config(qk._replace(**changes))
+        assert config.use_2cta_instrs and config.use_s_ping_pong and config.q_stage == 1, changes
+        assert not config.pack_gqa, changes
+    # P stays BF16, so the BF16 hd256 registers and exp2 tuning apply.
+    config = select_fwd_config(qk)
+    bf16 = select_fwd_config(qk._replace(dtype="torch.bfloat16", mxfp8_path=None))
+    assert config.registers == bf16.registers
+    assert (config.ex2_emu_freq, config.ex2_emu_start_frg) == (
+        bf16.ex2_emu_freq, bf16.ex2_emu_start_frg,
+    )
+    for changes in ({"use_2cta_instrs": False}, {"use_s_ping_pong": False}):
+        with pytest.raises(ValueError, match="hd256 MXFP8 forward requires 2CTA instructions"):
+            validate_fwd_config(replace(config, **changes), qk)
+
+
 def test_mxfp8_qk_policy_follows_its_own_rows():
     causal_hd64 = make_inputs(dtype="torch.float8_e4m3fn", causal=True, mxfp8_path="qk")
     # Causal CLC: the "mxfp8_qk" rows, not the FP8 ones. hd64 measured faster on SM100 only.
@@ -1050,3 +1072,20 @@ def test_sm107_native_pv_schedule_follows_its_table(mxfp8_path, causal, head_dim
                     or other_config.sm_stats_early)
         with pytest.raises(ValueError, match="need sm_107 native MXFP8 PV"):
             validate_fwd_config(replace(other_config, sm_stats_early=True), other)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("device_arch", [100, 103, 107])
+def test_mxfp8_hd256_kv_stages_fit_the_scales(causal, device_arch):
+    inputs = make_inputs(dtype="torch.float8_e4m3fn", **_HD256, causal=causal,
+                         device_arch=device_arch, mxfp8_path="qk")
+    config = select_fwd_config(inputs)
+    assert config.use_2cta_instrs and config.use_s_ping_pong and config.q_stage == 1
+    # Persistent 2CTA hd256 keeps a separate sO; causal (single-tile LPT) aliases it with sQ.
+    assert config.overlap_sO_sQ == (not config.is_static_persistent)
+    # The kernel's previous K/V stage formula: e4m3 Q plus two 512-byte scale chunks, BF16 O, and
+    # per stage half of a BF16 V tile plus all of K's scale chunks.
+    q, o = 128 * 256 + 1024, 128 * 256 * 2
+    q_o = max(q, o) if config.overlap_sO_sQ else q + o
+    assert config.kv_stage == min((224 * 1024 - q_o) // (128 * 256 + 1024), 32)
+    assert sm100_fwd_smem_bytes(config, inputs) <= sm100_smem_capacity(device_arch)
