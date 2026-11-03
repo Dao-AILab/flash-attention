@@ -1,6 +1,6 @@
 import itertools
 from contextlib import nullcontext
-from dataclasses import asdict, replace
+from dataclasses import asdict, astuple, replace
 from unittest import mock
 
 import pytest
@@ -827,17 +827,50 @@ def test_mxfp8_qk_policy_follows_its_own_rows():
     assert select_fwd_config(causal_hd64._replace(device_arch=103)).sm_stats_cross_stage
 
 
+@pytest.mark.parametrize("mxfp8_path", ["qk", "pv"])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("device_arch", [100, 103, 107])
-def test_mxfp8_qk_kv_stages_fit_the_scales_and_bf16_v(head_dim, causal, device_arch):
+def test_mxfp8_kv_stages_fit_the_scales(mxfp8_path, head_dim, causal, device_arch):
     inputs = make_inputs(dtype="torch.float8_e4m3fn", head_dim=head_dim, head_dim_v=head_dim,
-                         causal=causal, device_arch=device_arch, mxfp8_path="qk")
+                         causal=causal, device_arch=device_arch, mxfp8_path=mxfp8_path)
     config = select_fwd_config(inputs)
     # The kernel's previous K/V stage formula: e4m3 Q plus one 512-byte scale chunk per Q stage,
-    # BF16 O, and per stage the larger of e4m3 K and BF16 V plus K's scale chunk.
+    # BF16 O, native PV's constant P-scale chunk, and per stage the larger of e4m3 K and V (BF16
+    # for QK MXFP8) plus K's scale chunk.
     rows = config.q_stage * 128
     q_o = rows * head_dim + config.q_stage * 512 + rows * head_dim * 2
-    kv_stage_bytes = 128 * head_dim * 2 + 512
+    q_o += 512 if mxfp8_path == "pv" else 0
+    kv_stage_bytes = 128 * head_dim * (2 if mxfp8_path == "qk" else 1) + 512
     assert config.kv_stage == min((224 * 1024 - q_o) // kv_stage_bytes, 32)
-    assert sm100_fwd_smem_bytes(config, inputs) <= SM100_SMEM_BYTES
+    for has_lse in (False, True):
+        assert sm100_fwd_smem_bytes(config, inputs._replace(has_lse=has_lse)) <= SM100_SMEM_BYTES
+
+
+def test_mxfp8_pv_register_splits():
+    pv = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128, mxfp8_path="pv")
+
+    def registers(**changes):
+        config = select_fwd_config(pv._replace(**changes))
+        assert not (config.use_2cta_instrs or config.use_s_ping_pong)
+        return astuple(config.registers)
+
+    # sm_100/sm_103: the MMA warp needs more than the hd128 FP8 default leaves it.
+    assert registers() == (184, 80, 64)
+    assert registers(head_dim=64, head_dim_v=64) == (192, 64, 64)
+    assert registers(device_arch=103) == (168, 96, 80)
+    # sm_107 has dedicated scale columns: only hd64 overrides the FP8 split.
+    assert registers(device_arch=107, head_dim=64, head_dim_v=64) == (160, 96, 96)
+    assert registers(device_arch=107) == astuple(
+        select_fwd_config(pv._replace(device_arch=107, mxfp8_path=None, pack_gqa=False,
+                                      disable_2cta=True)).registers
+    )
+
+
+def test_mxfp8_pv_keeps_hardware_exp2():
+    # FP8 hd128 emulates exp2 on SM100; native PV must not, so PV consumes the reference P.
+    pv = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128, mxfp8_path="pv")
+    fp8 = select_fwd_config(pv._replace(mxfp8_path=None, pack_gqa=False, disable_2cta=True))
+    assert fp8.ex2_emu_freq > 0
+    config = select_fwd_config(pv)
+    assert (config.ex2_emu_freq, config.ex2_emu_start_frg) == (0, 0)
