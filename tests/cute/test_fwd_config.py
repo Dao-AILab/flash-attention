@@ -872,3 +872,49 @@ def test_tuned_rule_boundaries(rule, changes, fires):
     changed = {name for name in tuned if tuned[name] != untuned[name]}
 
     assert tuned_fields <= changed if fires else not changed
+
+def test_mxfp8_qk_selects_a_1cta_unpacked_config():
+    inputs = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128,
+                         num_heads=16, num_heads_kv=4, mxfp8_path="qk")
+    config = select_fwd_config(inputs)
+    assert not (config.pack_gqa or config.use_2cta_instrs or config.use_s_ping_pong)
+    # V and P stay BF16, so the BF16 register split and exp2 tuning apply rather than the FP8 ones.
+    hd64 = inputs._replace(head_dim=64, head_dim_v=64)
+    assert select_fwd_config(hd64).registers == Sm100Registers(softmax=200, correction=64, other=48)
+    causal = select_fwd_config(inputs._replace(causal=True))
+    assert (causal.ex2_emu_freq, causal.ex2_emu_start_frg) == (16, 1)
+    with pytest.raises(ValueError, match="MXFP8 forward requires 128 x 128 tiles"):
+        validate_fwd_config(replace(config, tile_n=64), inputs)
+    decode = inputs._replace(max_seqlen_q=1, total_q=2)
+    assert not select_fwd_config(decode).use_s_ping_pong
+    # SplitKV would raise for long-KV decode, so automatic selection keeps one split.
+    assert select_fwd_config(decode._replace(requested_num_splits=None)).num_splits == 1
+    with pytest.raises(ValueError, match="MXFP8 forward requires SM10x"):
+        select_fwd_config(inputs._replace(device_arch=90))
+
+
+def test_mxfp8_qk_policy_follows_its_own_rows():
+    causal_hd64 = make_inputs(dtype="torch.float8_e4m3fn", causal=True, mxfp8_path="qk")
+    # Causal CLC: the "mxfp8_qk" rows, not the FP8 ones. hd64 measured faster on SM100 only.
+    assert select_fwd_config(causal_hd64).use_clc_scheduler
+    assert not select_fwd_config(causal_hd64._replace(device_arch=103)).use_clc_scheduler
+    assert select_fwd_config(causal_hd64._replace(device_arch=103, **_HD128)).use_clc_scheduler
+    # Softmax stats release: hd64 causal keeps cross-stage on SM103.
+    assert not select_fwd_config(causal_hd64).sm_stats_cross_stage
+    assert select_fwd_config(causal_hd64._replace(device_arch=103)).sm_stats_cross_stage
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("device_arch", [100, 103, 107])
+def test_mxfp8_qk_kv_stages_fit_the_scales_and_bf16_v(head_dim, causal, device_arch):
+    inputs = make_inputs(dtype="torch.float8_e4m3fn", head_dim=head_dim, head_dim_v=head_dim,
+                         causal=causal, device_arch=device_arch, mxfp8_path="qk")
+    config = select_fwd_config(inputs)
+    # The kernel's previous K/V stage formula: e4m3 Q plus one 512-byte scale chunk per Q stage,
+    # BF16 O, and per stage the larger of e4m3 K and BF16 V plus K's scale chunk.
+    rows = config.q_stage * 128
+    q_o = rows * head_dim + config.q_stage * 512 + rows * head_dim * 2
+    kv_stage_bytes = 128 * head_dim * 2 + 512
+    assert config.kv_stage == min((224 * 1024 - q_o) // kv_stage_bytes, 32)
+    assert sm100_fwd_smem_bytes(config, inputs) <= SM100_SMEM_BYTES
