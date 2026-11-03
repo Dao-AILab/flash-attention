@@ -114,7 +114,8 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
             use_2cta=False,
             registers=None,
             spt=False,
-            pack_gqa=False,
+            pack_factor=1,
+            head_loop=False,
         )
     elif arch // 10 == 9:
         legacy = legacy_sm90_tile(head_dim, head_dim_v, causal, local, sparse_q)
@@ -125,7 +126,8 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
             use_2cta=False,
             # The old FlashAttentionBackwardSm90.__call__ derived spt itself.
             spt=(causal or local) and inputs.deterministic,
-            pack_gqa=False,
+            pack_factor=1,
+            head_loop=False,
         )
         legacy["registers"] = legacy_sm90_kernel_registers(384, legacy["single"])
     else:
@@ -192,7 +194,8 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
             dedicated=dedicated,
             kv_subtile=kv_subtile_factor,
             # The legacy sweep is MHA, which never packs.
-            pack_gqa=False,
+            pack_factor=1,
+            head_loop=False,
         )
         if dedicated:
             legacy["registers"] = None
@@ -244,7 +247,8 @@ _CONFIG_FIELDS = dict(
     dedicated="use_dedicated_hd256_kernel",
     spt="spt",
     registers="registers",
-    pack_gqa="pack_gqa",
+    pack_factor="pack_factor",
+    head_loop="head_loop",
 )
 
 
@@ -330,17 +334,25 @@ _GQA8 = dict(num_heads=16, num_heads_kv=2, num_sms=148, max_seqlen_q=2048, max_s
 def test_pack_gqa_explicit_configs():
     inputs = make_inputs(**_GQA8, batch_size=8, total_q=8 * 2048, total_k=8 * 2048)
     config = select_bwd_config(inputs)
-    assert config.pack_gqa
-    validate_bwd_config(replace(config, pack_gqa=False), inputs)
-    off = make_inputs(**_GQA8, requested_pack_gqa=False)
-    assert not select_bwd_config(off).pack_gqa
-    validate_bwd_config(replace(select_bwd_config(off), pack_gqa=True), off)
+    assert config.pack_factor == 8 and not config.head_loop
+    validate_bwd_config(replace(config, pack_factor=1), inputs)
+    off = make_inputs(**_GQA8, requested_pack_gqa=0)
+    assert select_bwd_config(off).pack_factor == 1
+    validate_bwd_config(replace(select_bwd_config(off), pack_factor=8), off)
+    # A pack of 2 / 4 query heads per tile and the hdim 256 head loop over the rest by request.
+    assert select_bwd_config(make_inputs(**_GQA8, requested_pack_gqa=4)).pack_factor == 4
+    loop = make_inputs(
+        **_GQA8, head_dim=256, head_dim_v=256, hd256_generic=True, requested_pack_gqa=2,
+        requested_head_loop=True,
+    )
+    assert (select_bwd_config(loop).pack_factor, select_bwd_config(loop).head_loop) == (2, True)
+    validate_bwd_config(replace(select_bwd_config(loop), pack_factor=1, head_loop=True), loop)
     # One long causal MQA sequence serializes its packed tiles (bwd_pack_gqa_heuristic).
     long_mqa = make_inputs(
         num_heads=16, num_heads_kv=1, num_sms=148, max_seqlen_q=8192, max_seqlen_k=8192,
         total_q=8192, total_k=8192, causal=True,
     )
-    assert not select_bwd_config(long_mqa).pack_gqa
+    assert select_bwd_config(long_mqa).pack_factor == 1
 
 
 @pytest.mark.parametrize(
@@ -379,11 +391,13 @@ def test_pack_gqa_explicit_configs():
             "exceeds 512",
         ),
         (make_inputs(device_arch=120), {"tile_m": 128}, "SM120 backward supports one configuration"),
-        (make_inputs(), {"pack_gqa": True}, "pack_gqa needs"),
-        (make_inputs(num_heads=24, num_heads_kv=8), {"pack_gqa": True}, "pack_gqa needs"),
-        (make_inputs(**_GQA8, has_score_mod=True), {"pack_gqa": True}, "pack_gqa needs"),
-        (make_inputs(**_GQA8, has_mask_mod=True), {"pack_gqa": True}, "pack_gqa needs"),
-        (make_inputs(**_GQA8, has_learnable_sink=True), {"pack_gqa": True}, "pack_gqa needs"),
+        (make_inputs(), {"pack_factor": 2}, "query-head folds"),
+        (make_inputs(**_GQA8), {"head_loop": True}, "head_loop needs head_dim 256"),
+        (make_inputs(num_heads=24, num_heads_kv=8), {"pack_factor": 3}, "must divide"),
+        (make_inputs(**_GQA8), {"pack_factor": 16}, "must divide"),
+        (make_inputs(**_GQA8, has_score_mod=True), {"pack_factor": 8}, "query-head folds"),
+        (make_inputs(**_GQA8, has_mask_mod=True), {"pack_factor": 8}, "query-head folds"),
+        (make_inputs(**_GQA8, has_learnable_sink=True), {"pack_factor": 8}, "query-head folds"),
         (
             make_inputs(
                 **_GQA8,
@@ -391,16 +405,16 @@ def test_pack_gqa_explicit_configs():
                 sparse_block_size_q=128,
                 sparse_block_size_kv=256,
             ),
-            {"pack_gqa": True},
-            "pack_gqa needs",
+            {"pack_factor": 8},
+            "query-head folds",
         ),
         (
             make_inputs(**_GQA8, head_dim=256, head_dim_v=256),
-            {"pack_gqa": True},
-            "pack_gqa needs",
+            {"pack_factor": 8},
+            "query-head folds",
         ),
-        (make_inputs(**_GQA8, device_arch=90), {"pack_gqa": True}, "2CTA or pack_gqa options"),
-        (make_inputs(**_GQA8, device_arch=120), {"pack_gqa": True}, "2CTA or pack_gqa options"),
+        (make_inputs(**_GQA8, device_arch=90), {"pack_factor": 8}, "2CTA or query-head fold"),
+        (make_inputs(**_GQA8, device_arch=120), {"pack_factor": 8}, "2CTA or query-head fold"),
     ],
 )
 def test_invalid_configs_are_rejected(inputs, changes, error):
