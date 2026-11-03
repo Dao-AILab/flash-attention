@@ -482,5 +482,35 @@ def test_flash_attn_kvcache_output_fp8(nheads_kv, gqa_ratio, num_requests, query
                 assert ((lse_mean_ref == math.inf and lse_mean_fa3 == math.inf) or lse_mean_diff <= 1e-4)
 
 
+@pytest.mark.parametrize("causal", [True, False])
+def test_flash_attn_kvcache_seqused_q_skips_inactive_queries(causal):
+    device = "cuda"
+    q = torch.randn((2, 4, 2, 64), device=device, dtype=torch.bfloat16)
+    k_cache = torch.randn((2, 128, 2, 64), device=device, dtype=torch.bfloat16)
+    v_cache = torch.randn((2, 128, 2, 64), device=device, dtype=torch.bfloat16)
+
+    out, lse = flash_attn_interface.flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cache_seqlens=torch.tensor([32, 0], dtype=torch.int32, device=device),
+        seqused_q=torch.tensor([2, 0], dtype=torch.int32, device=device),
+        causal=causal,
+        num_splits=1,
+        return_softmax_lse=True,
+    )
+    ref_out, ref_lse = flash_attn_interface.flash_attn_with_kvcache(
+        q=q[:1, :2],
+        k_cache=k_cache[:1],
+        v_cache=v_cache[:1],
+        cache_seqlens=torch.tensor([32], dtype=torch.int32, device=device),
+        causal=causal,
+        num_splits=1,
+        return_softmax_lse=True,
+    )
+
+    torch.testing.assert_close(out[0, :2], ref_out[0], atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(lse[0, :, :2], ref_lse[0], atol=2e-3, rtol=2e-3)
+
 if __name__ == "__main__":
     main()
