@@ -1039,7 +1039,7 @@ def _flash_attn_fwd(
         dtype,
         head_dim,
         head_dim_v,
-        qhead_per_kvhead,  # the real count; sparse MLA head padding follows from the key
+        qhead_per_kvhead,  # the real count; MLA head padding follows from the key
         num_head_kv if qv is not None else None,  # MLA kernels specialize on nheads_kv
         causal,
         score_mod_hash,

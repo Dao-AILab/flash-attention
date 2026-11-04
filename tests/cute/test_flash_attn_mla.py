@@ -124,7 +124,8 @@ def test_flash_attn_mla_absorbed(
     batch_size = 12 if seqlen_q <= 512 else 3 if seqlen_q <= 2048 else 1
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # 24 heads pad to the 64-head bwd tile and exercise the sink reduction on padded dpsum.
-    nheads_vals = [128, 24] if kv_sparsity else [16, 128]
+    # Dense 96 heads pad to the 128-row 2CTA tile.
+    nheads_vals = [128, 24] if kv_sparsity else [16, 96, 128]
     seqlen_k_base = max(min(seqlen_k // 256 * 256, 1024), 256)
     gather_kv_lengths = [seqlen_k_base - 128, seqlen_k_base] if kv_sparsity else [0]
     seqlen_k_og = seqlen_k
@@ -694,6 +695,67 @@ def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(nheads, causal, mode, num_s
     _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "kb64 vs 2CTA")
 
 
+@pytest.mark.parametrize("mode", ["cu_seqlens", "seqused_q", "paged128", "paged16"])
+@pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_2cta_dense_padded_heads_varlen(causal, mode, monkeypatch):
+    """Dense 2CTA MQA with 96 heads pads each token's heads to the 128-row tile in-kernel. Varlen
+    Q (ragged lengths incl. 0 and multi-token rows, cu_seqlens / seqused_q) and paged KV (TMA
+    page 128, cp.async page 16) match the reference in O and LSE: padded rows land in neither the
+    next token's rows nor the next sequence's."""
+    if not IS_SM100:
+        pytest.skip()
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
+    device, dtype, h = "cuda", torch.bfloat16, 96
+    torch.random.manual_seed(0)
+    seqlens_q, seqlens_k = [3, 0, 1, 70, 1], [900, 257, 64, 1500, 1]
+    b, s_q_max, s_k_max = len(seqlens_q), max(seqlens_q), max(seqlens_k)
+    cu = lambda lens: torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device=device)  # noqa: E731
+    qs = [torch.randn(s, h, 64, device=device, dtype=dtype) for s in seqlens_q]
+    qvs = [torch.randn(s, h, 512, device=device, dtype=dtype) for s in seqlens_q]
+    ks = [torch.randn(s, 1, 64, device=device, dtype=dtype) for s in seqlens_k]
+    vs = [torch.randn(s, 1, 512, device=device, dtype=dtype) for s in seqlens_k]
+
+    def pad(xs, s_max):
+        out = torch.zeros(len(xs), s_max, *xs[0].shape[1:], device=device, dtype=xs[0].dtype)
+        for i, x in enumerate(xs):
+            out[i, : x.shape[0]] = x
+        return out
+
+    if mode == "cu_seqlens":
+        call = dict(q=torch.cat(qs), k=torch.cat(ks), v=torch.cat(vs), qv=torch.cat(qvs),
+                    cu_seqlens_q=cu(seqlens_q), max_seqlen_q=s_q_max,
+                    cu_seqlens_k=cu(seqlens_k), max_seqlen_k=s_k_max)
+    else:
+        call = dict(q=pad(qs, s_q_max), k=pad(ks, s_k_max), v=pad(vs, s_k_max),
+                    qv=pad(qvs, s_q_max), max_seqlen_q=s_q_max,
+                    seqused_q=torch.tensor(seqlens_q, dtype=torch.int32, device=device),
+                    seqused_k=torch.tensor(seqlens_k, dtype=torch.int32, device=device))
+    if mode.startswith("paged"):
+        ps = int(mode[len("paged"):])
+        npg = (s_k_max + ps - 1) // ps
+        page_table = torch.randperm(b * npg, device=device).to(torch.int32).view(b, npg)
+        k_cache = torch.empty(b * npg, ps, 1, 64, device=device, dtype=dtype)
+        v_cache = torch.empty(b * npg, ps, 1, 512, device=device, dtype=dtype)
+        k_cache[page_table.view(-1).long()] = pad(ks, npg * ps).view(b * npg, ps, 1, 64)
+        v_cache[page_table.view(-1).long()] = pad(vs, npg * ps).view(b * npg, ps, 1, 512)
+        call.update(k=k_cache, v=v_cache, page_table=page_table)
+    out, lse, *_ = _flash_attn_fwd(**call, causal=causal, num_splits=1, return_lse=True)
+    if is_fake_mode():
+        return
+    starts_q = list(itertools.accumulate([0] + seqlens_q))
+    for i, sq in enumerate(seqlens_q):
+        if sq == 0:
+            continue
+        if mode == "cu_seqlens":
+            rows = slice(starts_q[i], starts_q[i + 1])
+            o, l = out[rows][None], lse[rows][None]
+        else:
+            o, l = out[i: i + 1, :sq], lse[i: i + 1, :sq]
+        o_ref, l_ref = _mla_dense_ref(qs[i][None], qvs[i][None], ks[i][None], vs[i][None], causal)
+        _check_mla_vs_ref(o, l, o_ref, l_ref, f"sequence {i}")
+
+
 @pytest.mark.skipif(not MLA_1CTA, reason="learnable sink test for the 1CTA MLA kernel")
 @pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("causal", [False, True])
@@ -987,6 +1049,8 @@ def test_flash_attn_mla_explicit_config(api, kernel, monkeypatch):
         ("1", 64, 128, 1),                       # 1CTA kb64, TMA pages spanning two blocks
         ("1", 128, 128, 1), ("1", 128, 128, 3),  # 1CTA 128-key, TMA pages
         ("0", 64, 128, 1),                       # 2CTA, TMA pages
+        ("0", 96, 128, 1),                       # 2CTA, heads padded to 128, TMA pages
+        ("0", 96, 16, 1),                        # 2CTA, heads padded to 128, cp.async gather
         ("1", 64, 16, 1),                        # 1CTA kb64, cp.async gather
     ],
     ids=lambda r: f"flag{r[0]}-h{r[1]}-page{r[2]}-splits{r[3]}",
