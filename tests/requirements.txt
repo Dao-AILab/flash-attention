@@ -1,0 +1,5 @@
+# Requirements for running the tests in this directory, in addition to the
+# flash-attn package itself. torch is intentionally not listed: install the
+# build matching your CUDA/ROCm setup as described in the README.
+einops
+pytest
