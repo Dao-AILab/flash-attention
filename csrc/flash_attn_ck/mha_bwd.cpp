@@ -6,6 +6,12 @@
 
 #include "fmha_bwd.hpp"
 #include "mask.hpp"
+#ifdef FLASHATTENTION_CK_AITER_BWD
+#include "aiter_bwd_v3.hpp"
+#endif
+
+#include <cstdlib>
+#include <vector>
 
 fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
                                        std::string dtype,
@@ -320,50 +326,10 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         dv = torch::empty_like(v);
     }
 
-    const auto traits = get_ck_fmha_bwd_traits(
-        mask,
-        q_dtype_str,
-        seqlen_q,
-        seqlen_k,
-        batch_size,
-        head_size,
-        num_heads,
-        num_heads_k,
-        is_dropout,
-        alibi_slopes_.has_value(),
-        deterministic);
-    fmha_bwd_launcher launcher(traits);
-
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-
-    // Allocate device workspace
-    at::Tensor workspace;
-    void *workspace_ptr = nullptr;
-    if (launcher.workspace_size > 0) {
-        workspace = torch::empty({static_cast<int64_t>(launcher.workspace_size)},
-                                 opts.dtype(at::kByte));
-        workspace_ptr = workspace.data_ptr();
-        // Pinned host buffer allocator backed by PyTorch's CachingHostAllocator.
-        // The returned shared_ptr owns the at::Tensor; the launcher keeps it
-        // alive via a stream-tail hipLaunchHostFunc keepalive. Required when
-        // the launcher needs host-side workspace metadata (deterministic mode
-        // and/or non-trivial worker state); harmless when it doesn't.
-        auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
-            auto t = std::make_shared<at::Tensor>(torch::empty(
-                {static_cast<int64_t>(bytes)},
-                torch::TensorOptions().dtype(at::kByte).device(at::kCPU).pinned_memory(true)));
-            return std::shared_ptr<void>(t, t->data_ptr());
-        };
-        ck_tile::stream_config prep_cfg{stream};
-        launcher.prepare_workspace_async(workspace_ptr,
-                                         /*seqstart_q_dev=*/nullptr,
-                                         /*seqstart_k_dev=*/nullptr,
-                                         prep_cfg,
-                                         pinned_host_alloc);
-    }
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -374,29 +340,22 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         dv_expanded = dv;
     }
 
-    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-        gen_, at::cuda::detail::getDefaultCUDAGenerator());
-
-    int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
-    at::Tensor rng_state;
-
-    if (rng_state_.has_value()) {
-        rng_state = rng_state_.value();
-    } else if(is_dropout) {
-        rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
-        // See Note [Acquire lock when using random generators]
-        std::lock_guard<std::mutex> lock(gen->mutex_);
-        auto philox_args = gen->philox_cuda_state(counter_offset);
-        hipLaunchKernelGGL(
-            flash::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0,
-            philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
-    }
-
-    if (seqlen_q > 0) {
-        auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
-        auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
-        ck_tile::stream_config stream_config{stream};
-
+#ifdef FLASHATTENTION_CK_AITER_BWD
+    // aiter's assembly kernels beat fmha_bwd where they apply (about 1.5x at hdim 128 on gfx950);
+    // fmha_bwd covers everything else. FLASH_ATTENTION_CK_BWD_ASM=0 turns them off.
+    static const bool use_aiter_bwd = [] {
+        const char *e = std::getenv("FLASH_ATTENTION_CK_BWD_ASM");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    bool done = false;
+    if (use_aiter_bwd && seqlen_q > 0 && !is_dropout && !alibi_slopes_.has_value() && !deterministic) {
+        std::vector<at::Tensor> workspaces;  // freed after enqueueing; the caching allocator is stream-ordered
+        auto workspace_alloc = [&](size_t bytes, bool zero_init) -> void * {
+            auto size = static_cast<int64_t>(bytes);
+            workspaces.push_back(zero_init ? torch::zeros({size}, opts.dtype(at::kByte))
+                                           : torch::empty({size}, opts.dtype(at::kByte)));
+            return workspaces.back().data_ptr();
+        };
         auto args =
             get_ck_fmha_bwd_args(
                 mask,
@@ -413,22 +372,115 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
                 out,
                 softmax_lse,
                 dout,
-                workspace_ptr,
+                nullptr, // workspace, allocated through workspace_alloc instead
                 softmax_d,
                 dq,
                 dk_expanded,
                 dv_expanded,
                 softmax_scale,
-                p_dropout,
-                drop_seed_offset);
+                0.f, // p_dropout
+                {nullptr, nullptr});
+        done = flash::run_aiter_bwd_v3(args, q_dtype_str, ck_tile::stream_config{stream}, workspace_alloc);
+    }
+    if (!done)
+#endif
+    {
+        const auto traits = get_ck_fmha_bwd_traits(
+            mask,
+            q_dtype_str,
+            seqlen_q,
+            seqlen_k,
+            batch_size,
+            head_size,
+            num_heads,
+            num_heads_k,
+            is_dropout,
+            alibi_slopes_.has_value(),
+            deterministic);
+        fmha_bwd_launcher launcher(traits);
 
-        float t = launcher.run(args, stream_config);
-        TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
-    } else {
-        // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
-        dk_expanded.zero_();
-        dv_expanded.zero_();
-        softmax_d.zero_();
+        // Allocate device workspace
+        at::Tensor workspace;
+        void *workspace_ptr = nullptr;
+        if (launcher.workspace_size > 0) {
+            workspace = torch::empty({static_cast<int64_t>(launcher.workspace_size)},
+                                     opts.dtype(at::kByte));
+            workspace_ptr = workspace.data_ptr();
+            // Pinned host buffer allocator backed by PyTorch's CachingHostAllocator.
+            // The returned shared_ptr owns the at::Tensor; the launcher keeps it
+            // alive via a stream-tail hipLaunchHostFunc keepalive. Required when
+            // the launcher needs host-side workspace metadata (deterministic mode
+            // and/or non-trivial worker state); harmless when it doesn't.
+            auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
+                auto t = std::make_shared<at::Tensor>(torch::empty(
+                    {static_cast<int64_t>(bytes)},
+                    torch::TensorOptions().dtype(at::kByte).device(at::kCPU).pinned_memory(true)));
+                return std::shared_ptr<void>(t, t->data_ptr());
+            };
+            ck_tile::stream_config prep_cfg{stream};
+            launcher.prepare_workspace_async(workspace_ptr,
+                                             /*seqstart_q_dev=*/nullptr,
+                                             /*seqstart_k_dev=*/nullptr,
+                                             prep_cfg,
+                                             pinned_host_alloc);
+        }
+
+        auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+            gen_, at::cuda::detail::getDefaultCUDAGenerator());
+
+        int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
+        at::Tensor rng_state;
+
+        if (rng_state_.has_value()) {
+            rng_state = rng_state_.value();
+        } else if(is_dropout) {
+            rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+            // See Note [Acquire lock when using random generators]
+            std::lock_guard<std::mutex> lock(gen->mutex_);
+            auto philox_args = gen->philox_cuda_state(counter_offset);
+            hipLaunchKernelGGL(
+                flash::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0,
+                philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
+        }
+
+        if (seqlen_q > 0) {
+            auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+            auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
+            ck_tile::stream_config stream_config{stream};
+
+            auto args =
+                get_ck_fmha_bwd_args(
+                    mask,
+                    batch_size,
+                    seqlen_q,
+                    seqlen_k,
+                    num_heads,
+                    num_heads_k,
+                    head_size,
+                    q,
+                    k,
+                    v,
+                    alibi_slopes_,
+                    out,
+                    softmax_lse,
+                    dout,
+                    workspace_ptr,
+                    softmax_d,
+                    dq,
+                    dk_expanded,
+                    dv_expanded,
+                    softmax_scale,
+                    p_dropout,
+                    drop_seed_offset);
+
+            float t = launcher.run(args, stream_config);
+            TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
+        } else {
+            // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
+            dk_expanded.zero_();
+            dv_expanded.zero_();
+            softmax_d.zero_();
+        }
     }
 
     // For MQA/GQA we need to sum dK and dV across the groups
