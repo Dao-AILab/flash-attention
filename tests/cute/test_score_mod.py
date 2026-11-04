@@ -848,6 +848,8 @@ BWD_TEST_PAIRS_WITH_AUX = [
 BWD_TEST_PAIRS_PACK_GQA = [
     (score_mod_5, score_mod_bwd_5, times_two_eager),
     (score_mod_3, score_mod_bwd_3, relative_bias_eager),
+    # Reads h_idx: GQA must see the Q head, not a packed head index
+    (score_mod_6, score_mod_bwd_identity, alibi_bias_eager),
 ]
 
 
@@ -1236,9 +1238,6 @@ def test_cute_vs_flex_attention_backward_with_aux(
 def test_cute_vs_flex_attention_backward_pack_gqa(
     seqlen_q, seqlen_kv, dim, dtype, qhead_per_kvhead, num_kv_heads, score_mod_triple
 ):
-    if COMPUTE_CAPABILITY == 9:
-        pytest.xfail("pack_gqa backward not yet implemented on SM90")
-
     torch.random.manual_seed(42)
     cute_fwd, cute_bwd, eager_ref = score_mod_triple
 
