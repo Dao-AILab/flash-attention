@@ -764,7 +764,7 @@ def test_flash_attn_kvcache(
         else:
             qv = None
         if varlen_q:
-            query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
+            query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random", zero_lengths=True)
             q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input(q, query_padding_mask)
             output_pad_fn = lambda output_unpad: pad_input(
                 output_unpad, indices_q, batch_size, seqlen_q
@@ -778,7 +778,7 @@ def test_flash_attn_kvcache(
         # Put window_size after QKV randn so that window_size changes from test to test
         window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
-        seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_q + 1, (1,)).item()
+        seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_k + 1, (1,)).item()
         cu_seqlens_k_new = None
         key_new_padding_mask = None
         if new_kv:
@@ -811,7 +811,7 @@ def test_flash_attn_kvcache(
             0 if new_kv else 1,
             # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
             (
-                (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
+                (seqlen_k - (max(seqlen_q, seqlen_new) if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
                 if new_kv
                 else (seqlen_k + 1)
             ),

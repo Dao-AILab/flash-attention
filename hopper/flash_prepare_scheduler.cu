@@ -90,8 +90,17 @@ __global__ void prepare_varlen_num_blocks_kernel(
             seqlen = seqlen_q_static;
         }
         if(packgqa) { seqlen *= qhead_per_khead; }
-        return batch_idx < num_batch && lane < kNumBatchPerWarp
-            ? blockm_divmod.div(seqlen + blockm_divmod.divisor - 1) : 0;
+        int seqlen_new;
+        if (cu_seqlens_k_new) {
+            int cur_cu_seqlen_new = batch_idx <= num_batch ? cu_seqlens_k_new[batch_idx] : 0;
+            int next_cu_seqlen_new = __shfl_down_sync(0xffffffff, cur_cu_seqlen_new, 1);
+            seqlen_new = next_cu_seqlen_new - cur_cu_seqlen_new;
+        } else {
+            seqlen_new = seqlen_k_new_static;
+        }
+        // A sequence with new keys and no queries still gets one tile, since the tiles append the new keys
+        int num_m_blocks = std::max(blockm_divmod.div(seqlen + blockm_divmod.divisor - 1), seqlen_new > 0 ? 1 : 0);
+        return batch_idx < num_batch && lane < kNumBatchPerWarp ? num_m_blocks : 0;
     };
 
     auto get_num_n_blocks = [&](int batch_idx) {
