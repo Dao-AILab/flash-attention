@@ -215,8 +215,8 @@ def routing_cases() -> Iterator[Case]:
         dict(fp8=True, s_q=8, env="0"),  # 2CTA has no fp8: now a ValueError
         dict(s_q=2, layout="cu_q_hint", env="1"),
         dict(s_q=2, layout="cu_q_nohint", env="1"),
-        dict(heads=96),  # dense 2CTA pads 96 heads to its 128-row tile: now accepted
-        dict(heads=24),  # too few heads to pad: still a ValueError
+        dict(heads=96),  # dense 2CTA MQA pads 96 heads to 128: now accepted
+        dict(heads=24),  # and 24 heads to 64: now accepted
         dict(heads=192, heads_kv=2),  # 96 heads per KV head without MQA: still a ValueError
     ]:
         yield _DENSE._replace(**changes)
@@ -244,8 +244,9 @@ def test_selection_matches_the_legacy_interface_routing():
 
     The config records the kernels' implicit choices: 2CTA always ran CLC and kb64 always
     packed GQA. Legacy asserts become ValueErrors, including the dense 2CTA packed-head
-    divisibility check that previously happened only in the constructor, except for MQA with 65
-    to 127 heads, which the 2CTA kernel now pads to its 128-row tile. FP8 that the legacy
+    divisibility check that previously happened only in the constructor, except for MQA, whose
+    heads the 2CTA kernel now pads in-kernel; MQA with at most 32 such heads runs 1CTA instead.
+    FP8 that the legacy
     routing sent to 2CTA (FLASH_ATTENTION_MLA_1CTA=0), which has no fp8 path, is a ValueError.
     """
     mismatches = []
@@ -258,9 +259,11 @@ def test_selection_matches_the_legacy_interface_routing():
             )
         elif not legacy[0]:  # 2CTA
             ratio = c.heads // c.heads_kv
-            padded = c.heads_kv == 1 and 64 < ratio < 128
+            padded = c.heads_kv == 1 and ratio & (ratio - 1) != 0
             if c.fp8 or (not c.topk and legacy[6] and 128 % ratio != 0 and not padded):
                 ok = new[0] is ValueError
+            elif not c.topk and legacy[6] and padded and ratio <= 32:
+                ok = new[0] is True
             else:
                 ok = new == (*legacy[:7], True, legacy[8])
         elif legacy[1]:  # kb64 packs even when the legacy routing recorded False
@@ -424,7 +427,7 @@ def test_kb64_selection_resolves_packing(heads):
 
 
 @pytest.mark.parametrize(
-    ("heads", "heads_kv"), [(0, 1), (-1, 1), (129, 1), (24, 1), (192, 2)]
+    ("heads", "heads_kv"), [(0, 1), (-1, 1), (129, 1), (48, 2), (192, 2)]
 )
 def test_2cta_rejects_unsupported_head_counts(heads, heads_kv):
     inputs = mla_inputs(_DENSE._replace(heads=heads, heads_kv=heads_kv))
@@ -436,13 +439,25 @@ def test_2cta_rejects_unsupported_head_counts(heads, heads_kv):
 
 @pytest.mark.parametrize(
     ("heads", "pack_gqa", "topk"), [(1, True, False), (128, True, False), (96, True, False),
-                                     (24, False, False), (24, True, True)]
+                                     (24, True, False), (24, False, False), (24, True, True)]
 )
 def test_2cta_accepts_supported_head_counts(heads, pack_gqa, topk):
     inputs = mla_inputs(_DENSE._replace(heads=heads, pack_gqa=pack_gqa, topk=topk, env="0"))
     config = select_mla_fwd_config(inputs)
     assert config.kernel == "2cta"
     validate_mla_fwd_config(config, inputs)
+
+
+@pytest.mark.parametrize(
+    ("heads", "s_q", "is_2cta"),
+    [(3, 4096, False), (12, 4096, False), (12, 2, False), (24, 1, False), (48, 4096, True),
+     (96, 4096, True)],
+)
+def test_dense_mqa_head_padding_route(heads, s_q, is_2cta):
+    """Dense MQA heads that 2CTA would pad to more than twice their count (<= 32 -> 64 rows)
+    run 1CTA, prefill and decode alike; 48 and 96 heads keep the padded 2CTA kernel."""
+    config = select_mla_fwd_config(mla_inputs(_DENSE._replace(heads=heads, s_q=s_q)))
+    assert (config.kernel == "2cta") == is_2cta
 
 
 def test_kb64_fallback_preserves_caller_packing_preference():

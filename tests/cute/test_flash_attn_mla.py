@@ -124,8 +124,8 @@ def test_flash_attn_mla_absorbed(
     batch_size = 12 if seqlen_q <= 512 else 3 if seqlen_q <= 2048 else 1
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # 24 heads pad to the 64-head bwd tile and exercise the sink reduction on padded dpsum.
-    # Dense 96 heads pad to the 128-row 2CTA tile.
-    nheads_vals = [128, 24] if kv_sparsity else [16, 96, 128]
+    # Dense 96 and 12 heads pad in-kernel on 2CTA (to 128 and 64 rows).
+    nheads_vals = [128, 24] if kv_sparsity else [12, 16, 96, 128]
     seqlen_k_base = max(min(seqlen_k // 256 * 256, 1024), 256)
     gather_kv_lengths = [seqlen_k_base - 128, seqlen_k_base] if kv_sparsity else [0]
     seqlen_k_og = seqlen_k
@@ -489,7 +489,7 @@ def test_flash_attn_mla_1cta_dense_kb64(nheads, has_qk, causal, seqlen_q, seqlen
     with a dummy block) and split-KV (explicit, heuristic, and empty splits: s_k = 3 has one
     block for 3 splits). Checked against the fp32 reference, bitwise run to run, and against
     the 2CTA kernel (FLASH_ATTENTION_MLA_1CTA=0, unsplit: 2CTA has no MLA split-KV) under the
-    bf16-rounding contract (head counts dividing 128). Fewer than 64 heads pad the one-token tile in-kernel; with fewer
+    bf16-rounding contract. Fewer than 64 heads pad the one-token tile in-kernel; with fewer
     than 64 heads only decode (seqlen_q = 1) routes to kb64, prefill shapes run the 128-key
     mainloop."""
     if not IS_SM100:
@@ -504,18 +504,14 @@ def test_flash_attn_mla_1cta_dense_kb64(nheads, has_qk, causal, seqlen_q, seqlen
     # every variant first (fake mode compiles them all, then returns)
     out, lse, *_ = _flash_attn_fwd(**call)
     out_again, lse_again, *_ = _flash_attn_fwd(**call)
-    # the 2CTA dense kernel packs heads into its 128-row tile only for ratios dividing 128
-    vs_2cta = 128 % nheads == 0
-    if vs_2cta:
-        monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
-        out_2cta, lse_2cta, *_ = _flash_attn_fwd(**dict(call, num_splits=1))
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
+    out_2cta, lse_2cta, *_ = _flash_attn_fwd(**dict(call, num_splits=1))
     if is_fake_mode():
         return
     assert torch.equal(out, out_again) and torch.equal(lse, lse_again), "not deterministic"
     out_ref, lse_ref = _mla_dense_ref(q_r if has_qk else None, qv_r if has_qk else q_r, k_r, v_r, causal)
     _check_mla_vs_ref(out, lse, out_ref, lse_ref, "kb64 vs reference")
-    if vs_2cta:
-        _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "kb64 vs 2CTA")
+    _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "kb64 vs 2CTA")
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA dense MLA, 64-key-block mainloop")
@@ -697,16 +693,17 @@ def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(nheads, causal, mode, num_s
 
 @pytest.mark.parametrize("mode", ["cu_seqlens", "seqused_q", "paged128", "paged16"])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("h", [96, 48, 12])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_2cta_dense_padded_heads_varlen(causal, mode, monkeypatch):
-    """Dense 2CTA MQA with 96 heads pads each token's heads to the 128-row tile in-kernel. Varlen
-    Q (ragged lengths incl. 0 and multi-token rows, cu_seqlens / seqused_q) and paged KV (TMA
-    page 128, cp.async page 16) match the reference in O and LSE: padded rows land in neither the
-    next token's rows nor the next sequence's."""
+def test_flash_attn_mla_2cta_dense_padded_heads_varlen(h, causal, mode, monkeypatch):
+    """Dense 2CTA MQA pads each token's heads in-kernel (96 -> 128, 48 and 12 -> 64). Varlen Q
+    (ragged lengths incl. 0 and multi-token rows, cu_seqlens / seqused_q) and paged KV (TMA page
+    128, cp.async page 16) match the reference in O and LSE: padded rows land in neither the next
+    token's rows nor the next sequence's (cu_seqlens stores O per row)."""
     if not IS_SM100:
         pytest.skip()
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
-    device, dtype, h = "cuda", torch.bfloat16, 96
+    device, dtype = "cuda", torch.bfloat16
     torch.random.manual_seed(0)
     seqlens_q, seqlens_k = [3, 0, 1, 70, 1], [900, 257, 64, 1500, 1]
     b, s_q_max, s_k_max = len(seqlens_q), max(seqlens_q), max(seqlens_k)
@@ -1051,6 +1048,7 @@ def test_flash_attn_mla_explicit_config(api, kernel, monkeypatch):
         ("0", 64, 128, 1),                       # 2CTA, TMA pages
         ("0", 96, 128, 1),                       # 2CTA, heads padded to 128, TMA pages
         ("0", 96, 16, 1),                        # 2CTA, heads padded to 128, cp.async gather
+        ("0", 12, 16, 1),                        # 2CTA, heads padded to 64, cp.async gather
         ("1", 64, 16, 1),                        # 1CTA kb64, cp.async gather
     ],
     ids=lambda r: f"flag{r[0]}-h{r[1]}-page{r[2]}-splits{r[3]}",

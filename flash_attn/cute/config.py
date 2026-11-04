@@ -1866,6 +1866,9 @@ def mla_1cta_route(inputs: MlaFwdHeuristicInputs, *, split_kv: bool) -> bool:
 
     Heuristic (measurements: AI/SPARSE_MLA_1CTA.md "Dispatch heuristic"):
       - fp8, descales or explicit split-KV (needs_1cta; 2CTA has none) -> 1CTA.
+      - Dense MQA that 2CTA pads to more than twice its heads (<= 32 heads -> 64 rows) -> 1CTA,
+        which packs any ratio (B200 causal prefill: padded 2CTA 3.1x slower at 12 heads, 9.2x
+        at 3; at 48 heads -> 64 rows it is 1.09x faster).
       - One-wave rule: 2CTA spends 2 CTAs on each token (sparse) or batch element (dense
         decode), ctas_2cta in all; 1CTA beats it only once that exceeds one wave of num_sms.
       - Sparse -> the one-wave rule.
@@ -1881,6 +1884,13 @@ def mla_1cta_route(inputs: MlaFwdHeuristicInputs, *, split_kv: bool) -> bool:
     if not supported:
         return False
     if inputs.needs_1cta:
+        return True
+    if (
+        not inputs.is_topk_gather
+        and inputs.fwd.pack_gqa is not False
+        and mla_2cta_pads_dense_qheads(inputs.nheads_per_kv, inputs.fwd.num_heads_kv)
+        and inputs.nheads_per_kv <= 32
+    ):
         return True
     past_one_wave = inputs.ctas_2cta > inputs.fwd.num_sms
     if inputs.is_topk_gather:
@@ -1908,8 +1918,8 @@ def can_use_mla_kb64(inputs: MlaFwdHeuristicInputs) -> bool:
 
 
 def mla_2cta_pads_dense_qheads(nheads_per_kv: int, num_heads_kv: int) -> bool:
-    """Whether dense 2CTA MLA pads Q heads to its 128-row tile: MQA with 65 to 127 heads."""
-    return num_heads_kv == 1 and 64 < nheads_per_kv < 128
+    """Whether dense 2CTA MLA pads Q heads to a power of two >= 64: MQA, not a power of 2."""
+    return num_heads_kv == 1 and nheads_per_kv & (nheads_per_kv - 1) != 0
 
 
 def mla_tiles_sparse_heads(inputs: MlaFwdHeuristicInputs) -> bool:
@@ -2079,7 +2089,7 @@ def validate_mla_fwd_config(config: MlaFwdConfig, inputs: MlaFwdHeuristicInputs)
         ):
             raise ValueError(
                 "The 2CTA MLA kernel with pack_gqa=True needs Q heads per KV head that divide "
-                "128, or a single KV head with 65 to 127 Q heads, got "
+                "128, or a single KV head, got "
                 f"{inputs.nheads_per_kv} Q heads per KV head and {fwd.num_heads_kv} KV heads"
             )
         if inputs.is_fp8 or inputs.has_descale or config.num_splits > 1:
