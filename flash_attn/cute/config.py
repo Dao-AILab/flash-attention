@@ -87,6 +87,7 @@ class FwdConfig:
     kv_stage: int
     use_swapab: bool = False
     lpt_global: bool = False
+    approximate_softmax: bool = False
 
 
 class FwdHeuristicInputs(NamedTuple):
@@ -1580,6 +1581,7 @@ _FWD_SM100_ONLY_NEUTRAL_FIELDS = dict(
     overlap_sO_sQ=False,
     kv_stage=0,
     lpt_global=False,
+    approximate_softmax=False,
 )
 
 
@@ -2200,6 +2202,7 @@ class BwdConfig:
     use_dedicated_hd256_kernel: bool
     pack_gqa: bool
     registers: BwdRegisters
+    bf16_dq: bool = False
 
     @property
     def num_wg(self) -> int:

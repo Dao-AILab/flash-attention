@@ -800,6 +800,9 @@ def _flash_attn_fwd(
         block_sparse_broadcast_pattern = block_sparse_config.broadcast_pattern
         q_subtile_factor = block_sparse_config.q_subtile_factor
         kv_subtile_factor = block_sparse_config.kv_subtile_factor
+    if qv is None and config.approximate_softmax:
+        from flash_attn.cute.exp_approximation import should_use_exp_approximation
+        aux_tensors = [*(aux_tensors or ()), should_use_exp_approximation(q, k, v, softmax_scale)]
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
@@ -1612,6 +1615,7 @@ def _compile_bwd_preprocess(
     has_cu_total_m_blocks,
     hdim_multiple_of,
     has_o_lo=False,
+    bf16_dq=False,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1632,7 +1636,7 @@ def _compile_bwd_preprocess(
                 Float32, (*batch_dims, cute.sym_int(), cute.sym_int()), divisibility=4
             )
         mdQaccum = fake_tensor(Float32, (*batch_dims, cute.sym_int(), cute.sym_int()), divisibility=4)
-    mdQaccum = mdQaccum if has_dq_accum else None
+    mdQaccum = mdQ if bf16_dq else mdQaccum if has_dq_accum else None
     mRowMax = fake_tensor(Float32, mScaleP.shape, divisibility=1) if has_scaleP else None
     mScaleP = fake_tensor(Float32, mScaleP.shape, divisibility=1) if has_scaleP else None
     softmax_scale = Float32(1.0)
@@ -1713,6 +1717,7 @@ def _bwd_preprocess(
         cu_total_m_blocks is not None,
         hdim_multiple_of,
         o_lo is not None,
+        dq_accum is not None and dq_accum.dtype == torch.bfloat16,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
@@ -1793,9 +1798,11 @@ def _bwd_postprocess_convert(
     accum_order=None,
     pack_factor=1,
     *,
-    fake_mode,
+    fake_mode, bf16_dq=False,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
+    if bf16_dq:
+        return
     is_varlen = cu_seqlens is not None or seqused is not None
     if is_varlen:
         batch_size = (cu_seqlens.shape[0] - 1) if cu_seqlens is not None else seqused.shape[0]
@@ -2168,7 +2175,7 @@ def _flash_attn_bwd(
             // tile_m * tile_m
         )
         scratch_shape = (scratch_heads, total_q_rows_rounded_padded)
-    dq_accum = (
+    dq_accum = dq if config.bf16_dq else (
         None
         if use_dedicated_hd256_kernel
         else torch.empty(
@@ -2511,6 +2518,7 @@ def _flash_attn_bwd(
                     registers=config.registers,
                     Q_stage=config.num_stages_Q,
                     dO_stage=config.num_stages_dO,
+                    bf16_dq=config.bf16_dq,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -2643,7 +2651,7 @@ def _flash_attn_bwd(
                 if learnable_sink is not None
                 else None
             ),
-            fake_mode=fake_mode,
+            fake_mode=fake_mode, bf16_dq=config.bf16_dq,
             hdim_multiple_of=hdim_multiple_of,
             pack_factor=qhead_per_kvhead if bwd_pack_gqa else 1,
         )
@@ -3322,6 +3330,7 @@ class FlashAttnFunc(torch.autograd.Function):
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
         config: FwdConfig | MlaFwdConfig | None = None,
+        bwd_config: BwdConfig | None = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3356,6 +3365,7 @@ class FlashAttnFunc(torch.autograd.Function):
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
+        ctx.bwd_config = bwd_config
         ctx.shared_kv = shared_kv
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -3400,9 +3410,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 15)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 15)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3425,13 +3435,14 @@ class FlashAttnFunc(torch.autograd.Function):
                 block_sparse_tensors=ctx.block_sparse_tensors_bwd,
                 dlse=dlse,
                 learnable_sink=learnable_sink,
+                config=ctx.bwd_config,
             )
             if learnable_sink is None:
                 dq, dk, dv = bwd_result
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 15)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3688,6 +3699,7 @@ def flash_attn_func(
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
     config: FwdConfig | MlaFwdConfig | None = None,
+    bwd_config: BwdConfig | None = None,
 ):
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -3731,6 +3743,7 @@ def flash_attn_func(
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
         config,
+        bwd_config,
     )
 
 
