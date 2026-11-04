@@ -116,6 +116,23 @@ def test_compile_worker_gets_the_pickled_request_on_the_callers_gpu(monkeypatch)
     assert pickle.loads(calls["input"]) == {"config": _BASE_CONFIG, "forward_kwargs": encoded}
 
 
+@pytest.mark.parametrize(
+    ("device_arch", "target"),
+    [(80, "sm_80"), (90, "sm_90a"), (100, "sm_100a"), (103, "sm_103a"), (107, "sm_107a"),
+     (110, "sm_110a"), (120, "sm_120a")],
+)
+def test_compile_worker_targets_the_callers_architecture(monkeypatch, device_arch, target):
+    calls = {}
+    monkeypatch.setattr(subprocess, "run", lambda args, **kwargs: calls.update(kwargs))
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda device: types.SimpleNamespace(uuid="1234-ab")
+    )
+    _compile_one(_BASE_CONFIG, {"_arch": device_arch}, torch.device("cuda", 0))
+
+    assert calls["env"]["CUTE_DSL_ARCH"] == target
+    assert calls["env"]["FLASH_ATTENTION_ARCH"] == str(device_arch)
+
+
 def test_compile_barrier_identifies_the_failing_config(monkeypatch):
     bad = replace(_BASE_CONFIG, tile_m=64)
 

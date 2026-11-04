@@ -121,6 +121,12 @@ def _decode_kwargs(encoded: Mapping[str, Any], device: torch.device | str) -> di
     }
 
 
+def _cute_dsl_arch(device_arch: int) -> str:
+    """The CuTeDSL target of a GPU, as CuTeDSL's own detection names it
+    (`env_manager.detect_gpu_arch`): the arch-specific "a" variant from SM90 on."""
+    return f"sm_{device_arch}{'a' if device_arch >= 90 else ''}"
+
+
 def _compile_one(
     config: FwdConfig | None,
     encoded_kwargs: Mapping[str, Any],
@@ -131,13 +137,7 @@ def _compile_one(
     env = os.environ.copy()
     # A UUID names the caller's GPU whatever form the caller's CUDA_VISIBLE_DEVICES takes.
     env["CUDA_VISIBLE_DEVICES"] = f"GPU-{torch.cuda.get_device_properties(device).uuid}"
-    env["CUTE_DSL_ARCH"] = {
-        90: "sm_90a",
-        100: "sm_100a",
-        103: "sm_103a",
-        110: "sm_110a",
-        120: "sm_120a",
-    }.get(device_arch, f"sm_{device_arch}")
+    env["CUTE_DSL_ARCH"] = _cute_dsl_arch(device_arch)
     env["FLASH_ATTENTION_ARCH"] = str(device_arch)
     env["FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"] = "1"
     code = """
