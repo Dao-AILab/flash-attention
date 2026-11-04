@@ -14,15 +14,8 @@ int override_num_splits_if_necessary(int batch,
                                      float p_drop,
                                      int num_splits)
 {
-    int device;
-    auto status = hipGetDevice(&device);
-    if(status != hipSuccess)
-        return num_splits;
-
-    hipDeviceProp_t props{};
-    status = hipGetDeviceProperties(&props, device);
-    if(status != hipSuccess)
-        return num_splits;
+    // PyTorch caches the properties; hipGetDeviceProperties would cost every forward call.
+    const int num_cus = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
     // TODO - tile size should match the TileFmhaShape, hardcode for now
     const int kM0 = 128;
@@ -37,7 +30,7 @@ int override_num_splits_if_necessary(int batch,
     // Query heads sharing a KV head share a workgroup, so the grid is nhead_k-wide, not nhead.
     if(num_splits < 1 && p_drop == 0.0f)
         return num_splits_heuristic_ck(batch * nhead_k * num_m_blocks,
-                                       props.multiProcessorCount * 2,
+                                       num_cus * 2,
                                        num_n_blocks,
                                        kMaxSplits);
 
