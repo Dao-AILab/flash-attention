@@ -188,6 +188,7 @@ class AttentionMask:
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
+        check_q_boundary: Optional[bool] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.swap_AB)
@@ -231,9 +232,10 @@ class AttentionMask:
                 and fastdiv_mods[0] is not None
                 and fastdiv_mods[1] is not None
             )
-            wrap_aux_indices = const_expr(
-                has_fastdiv and mask_seqlen and const_expr(aux_data.tensors is not None)
-            )
+            has_aux_fastdiv = const_expr(has_fastdiv and const_expr(aux_data.tensors is not None))
+            wrap_aux_k_indices = const_expr(has_aux_fastdiv and mask_seqlen)
+            if const_expr(check_q_boundary is None):
+                check_q_boundary = mask_seqlen
 
             for r in cutlass.range_constexpr(nrow):
                 # Respect swap_AB: ROW/COL determine which coordinate component corresponds to Q/KV.
@@ -246,15 +248,16 @@ class AttentionMask:
                     head_idx_for_mod = head_idx * self.qhead_per_kvhead_packgqa + head_offset
                     row_for_mod = global_row_idx // self.qhead_per_kvhead_packgqa
                 row_for_seqlen = row_for_mod
-                if const_expr(wrap_aux_indices):
-                    _, row_for_mod = divmod(row_for_mod, fastdiv_mods[0])
+                if const_expr(has_aux_fastdiv):
+                    if check_q_boundary:
+                        _, row_for_mod = divmod(row_for_mod, fastdiv_mods[0])
 
                 for col in cutlass.range_constexpr(ncol):
                     col_idx_local = t0ScS_mn[0, col][COL]
                     # Convert to absolute column index
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
                     col_for_mod = global_col_idx
-                    if const_expr(wrap_aux_indices):
+                    if const_expr(wrap_aux_k_indices):
                         _, col_for_mod = divmod(global_col_idx, fastdiv_mods[1])
 
                     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
@@ -271,16 +274,19 @@ class AttentionMask:
                         aux_data,
                     )
                     cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
+                    acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
                     if const_expr(mask_seqlen):
-                        out_of_bounds = (row_for_seqlen >= self.seqlen_q) or (
-                            global_col_idx >= self.seqlen_k
+                        acc_S_mn[r, col] = (
+                            -cutlass.Float32.inf
+                            if global_col_idx >= self.seqlen_k
+                            else acc_S_mn[r, col]
                         )
-                        if out_of_bounds:
-                            acc_S_mn[r, col] = -cutlass.Float32.inf
-                        else:
-                            acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
-                    else:
-                        acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
+                    if check_q_boundary:
+                        acc_S_mn[r, col] = (
+                            -cutlass.Float32.inf
+                            if row_for_seqlen >= self.seqlen_q
+                            else acc_S_mn[r, col]
+                        )
 
         else:  # Causal or local
             if const_expr(not self.swap_AB):
