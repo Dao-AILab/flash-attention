@@ -70,8 +70,13 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.seqused_q
     };
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
-    int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
-    dim3 grid_m(num_m_block, params.h, params.b);
+    // For varlen, launch exactly the padded layout's block extent and recover
+    // (batch, block) in the kernel. Sizing this grid as
+    // ceil_div(max_seqlen_q, kBlockM) * b instead makes it grow with the longest
+    // sequence and with sequences that carry no work.
+    int num_m_block = !is_varlen_q ? cute::ceil_div(params.seqlen_q, kBlockM)
+                                   : cute::ceil_div(total_q_padded_rounded, kBlockM);
+    dim3 grid_m(num_m_block, params.h, !is_varlen_q ? params.b : 1);
     CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
@@ -175,12 +180,20 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
     int num_blocks_n = cutlass::ceil_div(params.seqlen_k, get<1>(TileShape_MNK{}));
     num_blocks_n = cutlass::round_up(num_blocks_n, size<1>(ClusterShape{}));
+    // Extent of the linearized padded K layout. The scheduler uses this instead of
+    // num_blocks_n * b when cu_seqlens_k is set, so its grid tracks actual work.
+    int num_blocks_n_padded_linear =
+        cutlass::ceil_div(params.total_k + params.b * get<1>(TileShape_MNK{}), get<1>(TileShape_MNK{}));
+    num_blocks_n_padded_linear = cutlass::round_up(num_blocks_n_padded_linear, size<1>(ClusterShape{}));
     typename flash::TileSchedulerArguments scheduler_args {
         num_blocks_n, params.h, params.b, 1 /*num_splits*/,
         params.h / params.h_k,
         params.seqlen_k,
         params.seqlen_q, params.d, params.dv, sizeof(Element),
-        params.tile_count_semaphore, params.cu_seqlens_k, params.seqused_k
+        params.tile_count_semaphore, params.cu_seqlens_k, params.seqused_k,
+        nullptr /*num_splits_dynamic_ptr*/, nullptr /*num_m_blocks_ptr*/,
+        nullptr /*varlen_batch_idx_ptr*/, nullptr /*num_nheads_in_l2_ptr*/,
+        num_blocks_n_padded_linear
     };
 
     int device;
@@ -235,12 +248,15 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {seqlen_q, params.d, params.h, batch_q},  // shape_dQ
         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
         params.scale_softmax,
+        params.b,
         params.cu_seqlens_q,
         params.seqused_q
     };
     typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
-    int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
-    dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
+    int num_m_block_postprocess =
+        !is_varlen_q ? cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}))
+                     : cute::ceil_div(total_q_padded_rounded, get<0>(TileShape_MK{}));
+    dim3 grid_m_postprocess(num_m_block_postprocess, params.h, !is_varlen_q ? params.b : 1);
     int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
     if (smem_size_postprocess >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
@@ -262,6 +278,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             {seqlen_k, params.d, params.h_k, batch_k},  // shape_dK
             {params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride},  // stride_dK
             1.f,
+            params.b,
             params.cu_seqlens_k,
             params.seqused_k
         };
@@ -274,12 +291,15 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             {seqlen_k, params.dv, params.h_k, batch_k},  // shape_dV
             {params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride},  // stride_dV
             1.f,
+            params.b,
             params.cu_seqlens_k,
             params.seqused_k
         };
         typename PostprocessKerneldKV::Params postprocess_dV_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dV_args);
-        int num_n_block_postprocess = cute::ceil_div(params.seqlen_k, get<0>(TileShape_NK{}));
-        dim3 grid_n_postprocess(num_n_block_postprocess, params.h_k, params.b);
+        int num_n_block_postprocess =
+            !is_varlen_k ? cute::ceil_div(params.seqlen_k, get<0>(TileShape_NK{}))
+                         : cute::ceil_div(total_k_padded_rounded, get<0>(TileShape_NK{}));
+        dim3 grid_n_postprocess(num_n_block_postprocess, params.h_k, !is_varlen_k ? params.b : 1);
         int smem_size_postprocess = PostprocessKerneldKV::SharedStorageSize;
         if (smem_size_postprocess >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
