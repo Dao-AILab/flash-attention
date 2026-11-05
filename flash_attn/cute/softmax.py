@@ -11,6 +11,7 @@ from cutlass import Float32, Boolean
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
+from flash_attn.cute.fast_math import exp2_bf16x2
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.utils import AuxData
@@ -459,6 +460,22 @@ class SoftmaxSm100(Softmax):
                         )
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+            )
+
+    @cute.jit
+    def apply_approximate_exp2_convert(self, acc_S_row: cute.Tensor, probabilities: cute.Tensor, masked: cutlass.Constexpr[bool] = False):
+        assert probabilities.element_type == cutlass.BFloat16
+        assert cute.size(acc_S_row) % 2 == 0
+        gauge = self.row_max[0]
+        gauge = Float32(0.0) if gauge == -Float32.inf else gauge
+        gauge *= self.scale_log2
+        packed = cute.make_tensor(
+            cute.recast_ptr(probabilities.iterator, dtype=cutlass.Int32),
+            cute.make_layout(cute.size(probabilities) // 2),
+        )
+        for i in cutlass.range_constexpr(0, cute.size(acc_S_row), 2):
+            packed[i // 2], acc_S_row[i], acc_S_row[i + 1] = exp2_bf16x2(
+                acc_S_row[i], acc_S_row[i + 1], self.scale_log2, gauge, masked=masked
             )
 
     @cute.jit
