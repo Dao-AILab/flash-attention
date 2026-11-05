@@ -530,7 +530,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if not os.path.exists("./build"):
             os.makedirs("build")
 
-        optdim = os.getenv("OPT_DIM", "32,64,128,256")
+        optdim = os.getenv("OPT_DIM", "32,64,128,192,256")
         archs = [arch.lower() for arch in os.getenv("GPU_ARCHS", "native").split(";")]
         validate_and_update_archs(archs)
 
