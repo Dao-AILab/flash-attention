@@ -2685,6 +2685,40 @@ def test_flash_attn_kvcache_paged_cuda_graph(append_knew):
         torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_splits", [1, 0, 2])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("leftpad", [31, 95])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 256), (256, 512)])
+def test_flash_attn_kvcache_leftpad_no_seqlens(seqlen_q, seqlen_k, d, leftpad, causal, num_splits, dtype):
+    # Regression test for issue #3075: with cache_leftpad and cache_seqlens=None, seqlen_q and
+    # seqlen_k divide the block sizes but seqlen_k - cache_leftpad[b] need not, so the kernel
+    # must not take the Is_even_MN path (which skips masking the last key block).
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size, nheads = 3, 2
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    cache_leftpad = torch.tensor([leftpad, 0, 17], device=device, dtype=torch.int32)
+    arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
+    key_padding_mask = arange >= rearrange(cache_leftpad, "b -> b 1")
+    out = flash_attn_with_kvcache(
+        q, k_cache, v_cache, cache_leftpad=cache_leftpad, causal=causal, num_splits=num_splits
+    )
+    out_ref, _ = attention_ref(
+        q, k_cache, v_cache, None, key_padding_mask, causal=causal, key_leftpad=cache_leftpad
+    )
+    out_pt, _ = attention_ref(
+        q, k_cache, v_cache, None, key_padding_mask, causal=causal, upcast=False, reorder_ops=True,
+        key_leftpad=cache_leftpad,
+    )
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
+
+
 @pytest.mark.parametrize("mode", ["dense", "varlen", "kvcache"])
 def test_flash_attn_cuda_graph_replay(mode):
     """Capture one call of each entry point in a CUDA graph and replay it with new inputs.

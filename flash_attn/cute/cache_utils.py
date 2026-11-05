@@ -163,6 +163,10 @@ class JITCache:
     def __contains__(self, key: CompileKeyType) -> bool:
         return key in self.cache
 
+    def get(self, key: CompileKeyType) -> CallableFunction | None:
+        """The compiled function for key, or None; hashes key once (`in` then `[]` hash twice)."""
+        return self.cache.get(key)
+
     def clear(self) -> None:
         """
         Clear in-memory cache of compiled functions
@@ -194,6 +198,12 @@ class JITPersistentCache(JITCache):
         # Use __contains__ to try populating in-memory cache with persistent storage
         self.__contains__(key)
         return JITCache.__getitem__(self, key)
+
+    def get(self, key: CompileKeyType) -> CallableFunction | None:
+        fn = JITCache.get(self, key)
+        if fn is None and self._try_load_from_storage(key):
+            fn = self.cache[key]
+        return fn
 
     def __contains__(self, key: CompileKeyType) -> bool:
         # Checks in-memory cache first, then tries loading from storage.

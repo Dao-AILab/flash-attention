@@ -147,9 +147,10 @@ class DynamicPersistentSchedulerState(SchedulerState):
 #
 # The SM100 forward passes logical M work tiles in num_block with use_cluster_idx = (C > 1).
 # SingleTileLPTScheduler's CLC grid has grid_x = num_block * C; clc_work_to_coords divides
-# claimed_x by C and optionally reverses M for LPT. StaticPersistentTileScheduler takes
-# num_block as a cluster count, caps the grid at the SM count rounded down to whole clusters,
-# and strides over work by the launched cluster count. Varlen metadata units and the backward/MLA contracts are
+# claimed_x by C and optionally reverses M for LPT, while unsplit 1CTA grids use the
+# L2-swizzled static mapping. StaticPersistentTileScheduler takes num_block as a cluster
+# count, caps the grid at the SM count rounded down to whole clusters, and strides over work
+# by the launched cluster count. Varlen metadata units and the backward/MLA contracts are
 # separate. Row mapping: NOTE [SM100 forward coordinate spaces] in flash_fwd_sm100.py.
 
 
@@ -196,7 +197,7 @@ class TileSchedulerProtocol(Protocol):
         """Producer-side prefetch of next work tile (no-op for static schedulers).
 
         For dynamic schedulers: producer acquire (+ issue CLC query) + producer state advance.
-        Only called by the scheduler warp.
+        Called by the scheduler warp, or the load warp for late CLC claims.
         """
         ...
 
@@ -231,6 +232,8 @@ class TileSchedulerArguments(ParamsBase):
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
+    # SingleTileLPTScheduler: one L2 section over the whole problem; see NOTE [global LPT].
+    lpt_global: cutlass.Constexpr[bool] = False
     num_splits_dynamic_ptr: Optional[cute.Tensor] = None
     num_m_blocks_ptr: Optional[cute.Tensor] = None
     virtual_batch_idx_ptr: Optional[cute.Tensor] = None
@@ -240,6 +243,10 @@ class TileSchedulerArguments(ParamsBase):
     blocks_to_batch_idx_ptr: Optional[cute.Tensor] = None
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistent_cta_multiplier: cutlass.Constexpr[int] = 1
+    # SingleTileScheduler: launch splits as the slowest grid mode, so with per-batch split counts
+    # every batch's first splits launch before the excess splits, which exit at once. Cluster
+    # shape (1, 1) only.
+    split_major: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -254,6 +261,7 @@ class SingleTileScheduler:
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         use_cluster_idx: cutlass.Constexpr[bool] = False
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None
+        num_head_divmod: Optional[FastDivmodDivisorV2] = None  # split-major grid
 
         @staticmethod
         def create(
@@ -269,6 +277,7 @@ class SingleTileScheduler:
                 args.cluster_shape_mn,
                 args.use_cluster_idx,
                 args.num_splits_dynamic_ptr,
+                FastDivmodDivisorV2(args.num_head) if args.split_major else None,
             )
 
     def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
@@ -288,6 +297,9 @@ class SingleTileScheduler:
     ) -> Params:
         assert scheduling_mode == SchedulingMode.STATIC, (
             f"SingleTileScheduler only supports STATIC, got {scheduling_mode!r}"
+        )
+        assert not args.split_major or args.cluster_shape_mn == (1, 1), (
+            "split_major folds the heads into grid X, which clusters span"
         )
         return SingleTileScheduler.Params.create(args, loc=loc, ip=ip)
 
@@ -316,6 +328,11 @@ class SingleTileScheduler:
             grid_x = params.num_block * params.cluster_shape_mn[0]
         else:
             grid_x = cute.round_up(params.num_block, params.cluster_shape_mn[0])
+        if const_expr(params.num_head_divmod is not None):
+            # Split-major: heads vary fastest, then batches, then splits. Only the splits sit in
+            # grid Z, since batch * num_splits can pass the 65535 grid Y/Z limit (num_batch
+            # alone shares that limit with the default layout).
+            return (grid_x * params.num_head, params.num_batch, params.num_splits)
         return (
             grid_x,
             params.num_head * params.num_splits,
@@ -325,7 +342,12 @@ class SingleTileScheduler:
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         block_idx, head_idx, batch_idx = self._blk_coord
         is_valid = self._is_first_block
-        if const_expr(self.params.is_split_kv):
+        if const_expr(self.params.num_head_divmod is not None):
+            # Grid (block * head, batch, split); see get_grid_shape.
+            split_idx = batch_idx
+            batch_idx = head_idx
+            block_idx, head_idx = divmod(block_idx, self.params.num_head_divmod)
+        elif const_expr(self.params.is_split_kv):
             head_idx, split_idx = divmod(head_idx, self.params.num_splits_divmod)
         else:
             split_idx = Int32(0)
@@ -532,6 +554,8 @@ class SingleTileLPTScheduler:
             swizzle = (
                 1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
             )
+            if const_expr(args.lpt_global):
+                swizzle = Int32(args.num_head * args.num_batch)
             # If we're in the last section (called residual), we don't want to divide by
             # swizzle. Instead we want to divide by the remainder.
             num_hb_quotient = (args.num_head * args.num_batch) // swizzle
@@ -647,10 +671,15 @@ class SingleTileLPTScheduler:
     def clc_work_to_coords(self, work) -> WorkTileInfo:
         """Convert CLC response (block, head, batch_split) to WorkTileInfo.
 
-        CLC returns raw grid coordinates — no L2 swizzle (hardware decides order).
+        Unsplit 1CTA grids reuse the static L2-swizzled LPT mapping.
         Clustered grids use one m block per cluster; num_block counts clusters. Both CTAs
         of a cluster decode the same logical tile; see NOTE [SM100 forward work coordinates].
         """
+        if const_expr(self.params.cluster_shape_m == 1 and not self.params.is_split_kv):
+            tile_idx = work.tile_idx[0] + self.params.num_block * (
+                work.tile_idx[1] + self.params.num_head * work.tile_idx[2]
+            )
+            return WorkTileInfo(self._static_coords(tile_idx).tile_idx, work.is_valid_tile)
         assert self.params.cluster_shape_m == 1 or self.params.use_cluster_idx, (
             "CLC with clusters requires use_cluster_idx"
         )
@@ -681,10 +710,14 @@ class SingleTileLPTScheduler:
             work = self._ctx.get_current_work()
             self._tile_idx = work.tile_idx[0]
             return self.clc_work_to_coords(work)
-        # Static path: L2-swizzled coordinate mapping
+        return self._static_coords(self._tile_idx)
+
+    @cute.jit
+    def _static_coords(self, tile_idx: Int32) -> WorkTileInfo:
+        # L2-swizzled coordinate mapping (static grid, or unsplit 1CTA CLC)
         params = self.params
         # Implement LPT scheduling coordinate calculation
-        bidhb, l2_mod = divmod(self._tile_idx, params.l2_major_divmod)
+        bidhb, l2_mod = divmod(tile_idx, params.l2_major_divmod)
         # If we're in the last section (called residual), we don't want to divide by
         # swizzle. Instead we want to divide by the remainder.
         block, bidhb_residual = 0, 0
@@ -697,7 +730,7 @@ class SingleTileLPTScheduler:
         # Longest-processing-time-first
         if const_expr(params.lpt):
             block = params.num_block - 1 - block
-        is_valid = self._tile_idx < params.total_blocks
+        is_valid = tile_idx < params.total_blocks
         split_idx = self._split_idx
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
         if const_expr(params.is_split_kv and params.num_splits_dynamic_ptr is not None):

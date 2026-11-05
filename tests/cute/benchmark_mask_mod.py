@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+from flash_attn.cute.config import SM90_TMA_REGISTERS
 from mask_mod_definitions import (
     get_mask_pair,
     random_doc_id_tensor,
@@ -332,6 +333,7 @@ class FlashAttentionBenchmark:
             mask_mod=self.mask_mod_cute,
             Q_in_regs=False,
             has_aux_tensors=config.has_aux_tensors,
+            registers=SM90_TMA_REGISTERS[config.tile_m // 64],
         )
 
         softmax_scale = 1.0 / math.sqrt(config.headdim)

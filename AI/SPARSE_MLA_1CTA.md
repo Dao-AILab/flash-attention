@@ -11,8 +11,8 @@ rope part `q` / `k`):
   - the **64-key-block (kb64) mainloop**, `FlashAttentionMLAForward1CtaKb64Sm100`
     (`flash_fwd_mla_1cta_kb64_sm100.py`), a subclass.
 
-`interface._mla_1cta_route` chooses between 1CTA and 2CTA (see "Dispatch heuristic").
-`interface._mla_fwd_plan` then picks the 1CTA mainloop and its tile and split count.
+`config.mla_1cta_route` chooses between 1CTA and 2CTA (see "Dispatch heuristic").
+`config.select_mla_fwd_config` then picks the 1CTA mainloop and its tile and split count.
 `FLASH_ATTENTION_MLA_1CTA=1` / `0` forces the 1CTA kernel wherever it is supported / the 2CTA
 kernel.
 
@@ -158,8 +158,9 @@ the second planning pass costs about 12 us of host time.
   fp8 halves every byte and spends the room on a 4-stage V ring (two blocks resident): 17-29%
   on decode. Deeper K and P rings measured neutral or worse.
 - **CLC.** Sparse always uses the persistent CLC scheduler: its tiles have uniform cost, and CLC
-  overlaps a tile's epilogue with the next tile's gather (about 10% at 64 heads). Dense follows
-  the global `FA_CLC` default (`use_clc`).
+  overlaps a tile's epilogue with the next tile's gather (about 10% at 64 heads). Dense runs
+  without it (`select_mla_fwd_config`); an explicit `MlaFwdConfig(use_clc_scheduler=True)` turns
+  it on.
 - **ptxas `-O2`** (`ptxas_options`). See "ptxas levels".
 
 ### fp8: S ahead of PV
@@ -174,7 +175,7 @@ stages keep the block parity, so the softmax is unchanged, and the output is bit
 to the in-order issue.
 
 S-ahead costs the loads their one-block look-ahead, since both resident blocks are then held
-by the MMAs. So it is on only when the tensor core is the bottleneck (`use_s_ahead`): fp8 with
+by the MMAs. So it is on only when the tensor core is the bottleneck (`MlaFwdConfig.s_ahead`): fp8 with
 `seqlen_q x heads >= 512`, at least 8 tiles sharing one L2-resident KV stream. Varlen without a
 `max_seqlen_q` hint stays in order.
 
@@ -188,7 +189,7 @@ by the MMAs. So it is on only when the tensor core is the bottleneck (`use_s_ahe
 ## kb64 mainloop
 
 The 64-key-block mainloop serves 16-bit calls with at most 64 heads per KV head
-(`Kb64.can_implement`): sparse at any such count, and dense at 64 heads, or with fewer on
+(`config.can_use_mla_kb64`): sparse at any such count, and dense at 64 heads, or with fewer on
 decode. It is a port of PR #2914's 64-head sparse forward mainloop into the 1CTA kernel.
 
 Why it is faster: the 128-key mainloop keeps one key block's V in both V stages, so it
@@ -242,7 +243,7 @@ blocks and issues S(n) before PV(n-1).
 
 **Dense split-KV.** fp32 O / LSE partials go out with 256-bit stores; the sink applies on
 split 0 only; the existing combine kernel merges. The split heuristic gives each split at least 4
-key blocks (`MIN_BLOCKS_PER_SPLIT`; an explicit `num_splits` may leave splits empty, which the
+key blocks (`config.MLA_KB64_MIN_BLOCKS_PER_SPLIT`; an explicit `num_splits` may leave splits empty, which the
 epilogue and combine handle): one block per split was 30% slower at b 1, s_k 8K, from per-split Q
 loads, 128 KB fp32 partials and combine work.
 
@@ -259,7 +260,7 @@ loader are. Dense prefill with fewer than 64 heads stays on the 128-key mainloop
 at 16 heads and 0.66-0.81x at 32).
 
 **CLC.** Sparse always. Dense on prefill / extend (`seqlen_q` hint > 1): +2-10% there,
-neutral on decode (`use_clc`).
+neutral on decode (`select_mla_fwd_config`).
 
 ## Performance
 

@@ -13,6 +13,33 @@ from cutlass.cute import FastDivmodDivisorV2
 import math
 
 
+@cute.jit
+def resolve_paged_token(
+    page_table_row: cute.Tensor,
+    token_index: Int32,
+    page_size: int | Int32 | FastDivmodDivisorV2,
+    valid=True,
+    leftpad=0,
+):
+    """Map a logical token to (physical page, in-page token offset).
+
+    ``valid`` guards the page-table read, not the offset calculation. Invalid
+    tokens return page zero and retain their offset, matching the gather path.
+    Left padding is applied before division; validity is the caller's logical
+    sequence/tile predicate. No MMA geometry or transfer extent is implied.
+    """
+    logical_token = token_index + leftpad
+    if const_expr(isinstance(page_size, FastDivmodDivisorV2)):
+        # One fast divmod computes both quotient and remainder.
+        page_idx, page_offset = divmod(logical_token, page_size)
+    else:
+        # Dynamic CuTe Int32 supports // and %, but not Python's divmod protocol.
+        page_idx = logical_token // page_size
+        page_offset = logical_token % page_size
+    page = page_table_row[page_idx] if valid else 0
+    return page, page_offset
+
+
 @dataclass
 class PagedKVManager(ParamsBase):
     mPageTable: cute.Tensor
@@ -145,12 +172,12 @@ class PagedKVManager(ParamsBase):
             )
             row_idx = n_block * self.n_block_size + row
 
-            page_idx, page_offset = divmod(row_idx + self.leftpad_k, self.page_size_divmod)
-
             is_valid = (
                 (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
             ) and row_idx < self.seqlen_k
-            page = self.mPageTable[page_idx] if is_valid else 0
+            page, page_offset = resolve_paged_token(
+                self.mPageTable, row_idx, self.page_size_divmod, is_valid, self.leftpad_k
+            )
 
             self.tPrPage[i] = page
             self.tPrPageOffset[i] = page_offset

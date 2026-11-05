@@ -9,6 +9,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr, Float32
 from cutlass.cute import FastDivmodDivisorV2
+from cutlass.cutlass_dsl import Arch, BaseDSL
 import flash_attn.cute.utils as utils
 
 
@@ -30,6 +31,42 @@ class SchedulerMetadataTensorsTorch(NamedTuple):
     blocks_to_batch_idx: Optional[torch.Tensor] = None
 
 
+@cute.jit
+def num_splits_for_sequence(
+    num_n_blocks: Int32,
+    total_blocks: Int32,
+    num_sm: Int32 | int,
+    nheads_computed: int | Int32,
+    num_splits_static: Int32,
+    zfill_padded_output: cutlass.Constexpr[bool] = False,
+    ctas_per_sm: cutlass.Constexpr[int] = 1,
+    min_blocks_floor: cutlass.Constexpr = None,
+) -> Int32:
+    """Split count of one sequence with num_n_blocks KV blocks, at most num_splits_static.
+
+    total_blocks sums num_m_blocks * num_n_blocks over the batch; each of its nheads_computed
+    heads is a tile. The one-wave rule gives each split blocks_per_sm blocks, so the batch fills
+    about ctas_per_sm * num_sm / sm_margin CTAs. min_blocks_floor = (low_ctas, min_blocks) raises
+    blocks_per_sm to min(ceil(tiles / low_ctas), min_blocks): small batches then aim at low_ctas
+    CTAs, and splits keep at least min_blocks blocks until the batch fills the one-wave target.
+    """
+    sm_margin = max(Float32(num_sm) / 128 + 0.001, 1.1)  # e.g. 148/128 = 1.15625
+    target_ctas = Float32(num_sm) * ctas_per_sm
+    blocks_per_sm = cutlass.max(
+        Int32((Float32(total_blocks) * sm_margin * Float32(nheads_computed) / target_ctas)),
+        Int32(1),
+    )
+    # blocks_per_sm = cute.ceil_div(total_blocks * nheads_computed, num_sm)
+    if const_expr(min_blocks_floor is not None):
+        low_ctas, min_blocks = min_blocks_floor
+        floor = cute.ceil_div(total_blocks * nheads_computed, low_ctas)
+        blocks_per_sm = cutlass.max(blocks_per_sm, cutlass.min(floor, Int32(min_blocks)))
+    num_splits_dynamic = cutlass.min(cute.ceil_div(num_n_blocks, blocks_per_sm), num_splits_static)
+    if const_expr(zfill_padded_output):
+        num_splits_dynamic = cutlass.max(num_splits_dynamic, Int32(1))
+    return num_splits_dynamic
+
+
 class FlashPrepareScheduler:
     def __init__(
         self,
@@ -44,6 +81,8 @@ class FlashPrepareScheduler:
         packgqa: bool = False,
         sort: bool = False,
         zfill_padded_output: bool = False,
+        ctas_per_sm: int = 1,
+        min_blocks_floor: Optional[Tuple[int, int]] = None,
     ):
         self.num_warps = num_warps
         self.is_causal = is_causal
@@ -58,6 +97,10 @@ class FlashPrepareScheduler:
         self.k_num_batch_per_warp = 31
         self.k_smem_size = 1
         self.zfill_padded_output = zfill_padded_output
+        # Split-rule options of num_splits_for_sequence; the defaults are the one-wave rule.
+        self.ctas_per_sm = ctas_per_sm
+        self.min_blocks_floor = min_blocks_floor
+        self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
 
         # for pack gqa, query heads per kv head is combined with seqlen_q
         self.nheads_computed = nheads if not self.packgqa else nheads_kv
@@ -175,6 +218,10 @@ class FlashPrepareScheduler:
         n_blocks_per_split: Optional[Int32],
     ):
         bidx, _, _ = cute.arch.block_idx()
+        # Let a PDL-launched consumer (SwapAB) start while this kernel runs; it waits for the
+        # results. A no-op when the next grid is not PDL-launched.
+        if const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
         tidx, _, _ = cute.arch.thread_idx()
         grid_dimx, _, _ = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
@@ -241,24 +288,16 @@ class FlashPrepareScheduler:
 
                 total_blocks = total_blocks_smem[0]
 
-                sm_margin = max(Float32(num_sm) / 128 + 0.001, 1.1)  # e.g. 148/128 = 1.15625
-                blocks_per_sm = cutlass.max(
-                    Int32(
-                        (
-                            Float32(total_blocks)
-                            * sm_margin
-                            * Float32(self.nheads_computed)
-                            / Float32(num_sm)
-                        )
-                    ),
-                    Int32(1),
+                num_splits_dynamic = num_splits_for_sequence(
+                    num_n_blocks,
+                    total_blocks,
+                    num_sm,
+                    self.nheads_computed,
+                    num_splits_static,
+                    zfill_padded_output=self.zfill_padded_output,
+                    ctas_per_sm=self.ctas_per_sm,
+                    min_blocks_floor=self.min_blocks_floor,
                 )
-                # blocks_per_sm = cute.ceil_div(total_blocks * self.nheads_computed, num_sm)
-                num_splits_dynamic = cutlass.min(
-                    cute.ceil_div(num_n_blocks, blocks_per_sm), num_splits_static
-                )
-                if const_expr(self.zfill_padded_output):
-                    num_splits_dynamic = cutlass.max(num_splits_dynamic, Int32(1))
                 if num_splits_dynamic > 0:
                     num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
 

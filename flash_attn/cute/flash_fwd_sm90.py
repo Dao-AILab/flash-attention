@@ -48,6 +48,7 @@ from cutlass.cute import FastDivmodDivisorV2
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
 from flash_attn.cute.utils import AuxData
+from flash_attn.cute.config import Sm90Registers
 
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
@@ -57,9 +58,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
+        registers: Sm90Registers,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.num_mma_regs, self.num_producer_regs = registers.mma, registers.producer
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
         self.buffer_align_bytes = 1024
@@ -218,9 +221,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.num_producer_threads = 32
         self.num_Q_load_threads = self.num_threads_per_warp_group  # If not TMA_Q
         self.num_epilogue_threads = self.num_mma_threads
-        self.num_mma_regs, self.num_producer_regs = {1: (256, 56), 2: (240, 24), 3: (160, 32)}[
-            self.num_wg_mma
-        ]
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
 
         self.use_scheduler_barrier = (
@@ -232,9 +232,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
         self.use_tma_O = self.use_tma_Q
-        # Producer needs more registers when doing cp.async Q or KV loads
-        if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
-            self.num_mma_regs, self.num_producer_regs = 224, 40
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes

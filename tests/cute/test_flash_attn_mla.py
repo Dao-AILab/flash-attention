@@ -124,7 +124,8 @@ def test_flash_attn_mla_absorbed(
     batch_size = 12 if seqlen_q <= 512 else 3 if seqlen_q <= 2048 else 1
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # 24 heads pad to the 64-head bwd tile and exercise the sink reduction on padded dpsum.
-    nheads_vals = [128, 24] if kv_sparsity else [16, 128]
+    # Dense 96 and 12 heads pad in-kernel on 2CTA (to 128 and 64 rows).
+    nheads_vals = [128, 24] if kv_sparsity else [12, 16, 96, 128]
     seqlen_k_base = max(min(seqlen_k // 256 * 256, 1024), 256)
     gather_kv_lengths = [seqlen_k_base - 128, seqlen_k_base] if kv_sparsity else [0]
     seqlen_k_og = seqlen_k
@@ -335,11 +336,14 @@ def test_flash_attn_mla_1cta_paged_clc_bitwise(has_qk):
     must be bitwise identical to the non-persistent one. Regression test for the sO /
     V-stage-0 overlap: the cp.async KV gather (paged, page_size != tile_n) must wait for
     the previous tile's TMA O store (sO overlays V).
-    Needs >1 tile per CTA (CLC, causal so the interface keeps CLC on) and the TMA O store
-    (dense batched Q)."""
+    Needs >1 tile per CTA (CLC, via an explicit MlaFwdConfig) and the TMA O store (dense
+    batched Q)."""
     if not IS_SM100:
         pytest.skip()
-    import flash_attn.cute.utils as fa_utils
+    from dataclasses import replace
+    from unittest import mock
+
+    from flash_attn.cute import interface
 
     torch.random.manual_seed(0)
     device, dtype = "cuda", torch.bfloat16
@@ -354,19 +358,21 @@ def test_flash_attn_mla_1cta_paged_clc_bitwise(has_qk):
     to_pages = lambda x: x.reshape(num_pages, page_size, 1, x.shape[-1])[perm.argsort()].contiguous()  # noqa: E731
     k_p, v_p = to_pages(k), to_pages(v)
     if not has_qk:
-        q, k_p, qv = qv, v_p, None  # shared_kv: interface routes it as qv-only MLA
+        q = k_p = None  # shared_kv: qv-only MLA
     seqused_k = torch.full((b,), s, dtype=torch.int32, device=device)
-    outs = []
-    saved = fa_utils._fa_clc_enabled
-    try:
-        for clc in (False, True):
-            fa_utils._fa_clc_enabled = clc
-            outs.append(flash_attn_varlen_func(
-                q, k_p, v_p, qv=qv, causal=True, page_table=page_table,
-                seqused_k=seqused_k, max_seqlen_q=s, return_lse=True,
-            ))
-    finally:
-        fa_utils._fa_clc_enabled = saved
+    kwargs = dict(qv=qv, causal=True, page_table=page_table, seqused_k=seqused_k,
+                  max_seqlen_q=s, return_lse=True)
+    selected, select = [], interface.select_mla_fwd_config
+
+    def capture(inputs):
+        selected.append(select(inputs))
+        return selected[-1]
+
+    with mock.patch.object(interface, "select_mla_fwd_config", capture):
+        out_default = _flash_attn_fwd(q, k_p, v_p, **kwargs)
+    # Run the same config with the other scheduler.
+    flipped = replace(selected[0], use_clc_scheduler=not selected[0].use_clc_scheduler)
+    outs = [out_default, _flash_attn_fwd(q, k_p, v_p, config=flipped, **kwargs)]
     if is_fake_mode():
         return
     assert torch.equal(outs[0][0], outs[1][0])
@@ -483,7 +489,7 @@ def test_flash_attn_mla_1cta_dense_kb64(nheads, has_qk, causal, seqlen_q, seqlen
     with a dummy block) and split-KV (explicit, heuristic, and empty splits: s_k = 3 has one
     block for 3 splits). Checked against the fp32 reference, bitwise run to run, and against
     the 2CTA kernel (FLASH_ATTENTION_MLA_1CTA=0, unsplit: 2CTA has no MLA split-KV) under the
-    bf16-rounding contract (head counts dividing 128). Fewer than 64 heads pad the one-token tile in-kernel; with fewer
+    bf16-rounding contract. Fewer than 64 heads pad the one-token tile in-kernel; with fewer
     than 64 heads only decode (seqlen_q = 1) routes to kb64, prefill shapes run the 128-key
     mainloop."""
     if not IS_SM100:
@@ -498,18 +504,14 @@ def test_flash_attn_mla_1cta_dense_kb64(nheads, has_qk, causal, seqlen_q, seqlen
     # every variant first (fake mode compiles them all, then returns)
     out, lse, *_ = _flash_attn_fwd(**call)
     out_again, lse_again, *_ = _flash_attn_fwd(**call)
-    # the 2CTA dense kernel packs heads into its 128-row tile only for ratios dividing 128
-    vs_2cta = 128 % nheads == 0
-    if vs_2cta:
-        monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
-        out_2cta, lse_2cta, *_ = _flash_attn_fwd(**dict(call, num_splits=1))
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
+    out_2cta, lse_2cta, *_ = _flash_attn_fwd(**dict(call, num_splits=1))
     if is_fake_mode():
         return
     assert torch.equal(out, out_again) and torch.equal(lse, lse_again), "not deterministic"
     out_ref, lse_ref = _mla_dense_ref(q_r if has_qk else None, qv_r if has_qk else q_r, k_r, v_r, causal)
     _check_mla_vs_ref(out, lse, out_ref, lse_ref, "kb64 vs reference")
-    if vs_2cta:
-        _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "kb64 vs 2CTA")
+    _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "kb64 vs 2CTA")
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="1CTA dense MLA, 64-key-block mainloop")
@@ -687,6 +689,68 @@ def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(nheads, causal, mode, num_s
         # rows past seqused_q are not written by either kernel
         out, out_2cta, lse, lse_2cta = out[vq], out_2cta[vq], lse[vq], lse_2cta[vq]
     _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "kb64 vs 2CTA")
+
+
+@pytest.mark.parametrize("mode", ["cu_seqlens", "seqused_q", "paged128", "paged16"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("h", [96, 48, 12])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_2cta_dense_padded_heads_varlen(h, causal, mode, monkeypatch):
+    """Dense 2CTA MQA pads each token's heads in-kernel (96 -> 128, 48 and 12 -> 64). Varlen Q
+    (ragged lengths incl. 0 and multi-token rows, cu_seqlens / seqused_q) and paged KV (TMA page
+    128, cp.async page 16) match the reference in O and LSE: padded rows land in neither the next
+    token's rows nor the next sequence's (cu_seqlens stores O per row)."""
+    if not IS_SM100:
+        pytest.skip()
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
+    device, dtype = "cuda", torch.bfloat16
+    torch.random.manual_seed(0)
+    seqlens_q, seqlens_k = [3, 0, 1, 70, 1], [900, 257, 64, 1500, 1]
+    b, s_q_max, s_k_max = len(seqlens_q), max(seqlens_q), max(seqlens_k)
+    cu = lambda lens: torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device=device)  # noqa: E731
+    qs = [torch.randn(s, h, 64, device=device, dtype=dtype) for s in seqlens_q]
+    qvs = [torch.randn(s, h, 512, device=device, dtype=dtype) for s in seqlens_q]
+    ks = [torch.randn(s, 1, 64, device=device, dtype=dtype) for s in seqlens_k]
+    vs = [torch.randn(s, 1, 512, device=device, dtype=dtype) for s in seqlens_k]
+
+    def pad(xs, s_max):
+        out = torch.zeros(len(xs), s_max, *xs[0].shape[1:], device=device, dtype=xs[0].dtype)
+        for i, x in enumerate(xs):
+            out[i, : x.shape[0]] = x
+        return out
+
+    if mode == "cu_seqlens":
+        call = dict(q=torch.cat(qs), k=torch.cat(ks), v=torch.cat(vs), qv=torch.cat(qvs),
+                    cu_seqlens_q=cu(seqlens_q), max_seqlen_q=s_q_max,
+                    cu_seqlens_k=cu(seqlens_k), max_seqlen_k=s_k_max)
+    else:
+        call = dict(q=pad(qs, s_q_max), k=pad(ks, s_k_max), v=pad(vs, s_k_max),
+                    qv=pad(qvs, s_q_max), max_seqlen_q=s_q_max,
+                    seqused_q=torch.tensor(seqlens_q, dtype=torch.int32, device=device),
+                    seqused_k=torch.tensor(seqlens_k, dtype=torch.int32, device=device))
+    if mode.startswith("paged"):
+        ps = int(mode[len("paged"):])
+        npg = (s_k_max + ps - 1) // ps
+        page_table = torch.randperm(b * npg, device=device).to(torch.int32).view(b, npg)
+        k_cache = torch.empty(b * npg, ps, 1, 64, device=device, dtype=dtype)
+        v_cache = torch.empty(b * npg, ps, 1, 512, device=device, dtype=dtype)
+        k_cache[page_table.view(-1).long()] = pad(ks, npg * ps).view(b * npg, ps, 1, 64)
+        v_cache[page_table.view(-1).long()] = pad(vs, npg * ps).view(b * npg, ps, 1, 512)
+        call.update(k=k_cache, v=v_cache, page_table=page_table)
+    out, lse, *_ = _flash_attn_fwd(**call, causal=causal, num_splits=1, return_lse=True)
+    if is_fake_mode():
+        return
+    starts_q = list(itertools.accumulate([0] + seqlens_q))
+    for i, sq in enumerate(seqlens_q):
+        if sq == 0:
+            continue
+        if mode == "cu_seqlens":
+            rows = slice(starts_q[i], starts_q[i + 1])
+            o, l = out[rows][None], lse[rows][None]
+        else:
+            o, l = out[i: i + 1, :sq], lse[i: i + 1, :sq]
+        o_ref, l_ref = _mla_dense_ref(qs[i][None], qvs[i][None], ks[i][None], vs[i][None], causal)
+        _check_mla_vs_ref(o, l, o_ref, l_ref, f"sequence {i}")
 
 
 @pytest.mark.skipif(not MLA_1CTA, reason="learnable sink test for the 1CTA MLA kernel")
@@ -895,8 +959,8 @@ def test_flash_attn_mla_dispatch_varlen_decode_split(max_seqlen_q, monkeypatch):
     out, *_ = _flash_attn_fwd(q, k, v, qv=qv, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                               max_seqlen_q=m, max_seqlen_k=s_k, num_splits=0)
     monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", real_cache)
-    # first two key entries: the 1CTA route and the kb64 mainloop; split KV is in the key too
-    assert keys and all(key[0] and key[1] for key in keys), keys
+    # the first key entry is the MLA codegen config: the kb64 1CTA mainloop
+    assert keys and all(key[0].kernel == "1cta_kb64" for key in keys), keys
     if is_fake_mode():
         return
     out_ref, _ = attention_ref(q.view(b, 1, h, 64), k.view(b, s_k, 1, 64), v.view(b, s_k, 1, 512),
@@ -908,6 +972,73 @@ def test_flash_attn_mla_dispatch_varlen_decode_split(max_seqlen_q, monkeypatch):
     assert err <= 2 * err_pt + 1e-3, (err, err_pt)
 
 
+@pytest.mark.parametrize("api, kernel", [("func", "1cta"), ("varlen", "2cta")])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_explicit_config(api, kernel, monkeypatch):
+    """An explicit MlaFwdConfig picks the MLA forward kernel through both public entry points,
+    ahead of FLASH_ATTENTION_MLA_1CTA, which is set to the other kernel here. As in
+    benchmarks/fwd_config_bench.py, the config starts from what config=None selects: the same
+    inputs with the route forced to the wanted kernel."""
+    if not IS_SM100:
+        pytest.skip()
+    from functools import partial
+    from unittest import mock
+
+    import flash_attn.cute.interface as fa_interface
+
+    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0" if kernel == "1cta" else "1")
+    b, s_q, s_k, h = 2, 1, 1000, 16
+    kw, _ = _mla_inputs(b, s_q, s_k, h, has_qk=True)
+    if api == "func":
+        run = partial(flash_attn_func, **kw, causal=True)
+    else:
+        cu_q = torch.arange(0, b + 1, device="cuda", dtype=torch.int32) * s_q
+        cu_k = torch.arange(0, b + 1, device="cuda", dtype=torch.int32) * s_k
+        run = partial(
+            flash_attn_varlen_func,
+            *(kw[name].flatten(0, 1) for name in ("q", "k", "v")),
+            qv=kw["qv"].flatten(0, 1), cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=s_q, max_seqlen_k=s_k, causal=True,
+        )
+    selected, select = [], fa_interface.select_mla_fwd_config
+
+    def capture(inputs):
+        selected.append((select(inputs), inputs))
+        return selected[-1][0]
+
+    with mock.patch.object(fa_interface, "select_mla_fwd_config", capture):
+        out_default, _ = run()
+    default, inputs = selected[0]
+    config = select(inputs._replace(mla_1cta_override=kernel == "1cta"))
+    assert (default.kernel == "2cta") == (kernel == "1cta"), default
+    assert (config.kernel == "2cta") == (kernel == "2cta"), config
+
+    real_cache = fa_interface._flash_attn_fwd.compile_cache
+    keys = []
+
+    class Spy:
+        def __contains__(self, key):
+            keys.append(key)
+            return key in real_cache
+
+        def __getitem__(self, key):
+            return real_cache[key]
+
+        def __setitem__(self, key, value):
+            real_cache[key] = value
+
+    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", Spy())
+    out, _ = run(config=config)
+    monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", real_cache)
+    # The compile key leads with the config the kernel specializes on.
+    codegen = fa_interface.fwd_codegen_config(config)
+    assert keys and all(key[0] == codegen for key in keys), keys
+    if is_fake_mode():
+        return
+    # The 1CTA and 2CTA kernels agree to bf16 rounding.
+    _assert_mla_fwd_close(out, out_default, what=f"{api} {kernel}")
+
+
 @pytest.mark.parametrize(
     "route",
     [
@@ -915,6 +1046,9 @@ def test_flash_attn_mla_dispatch_varlen_decode_split(max_seqlen_q, monkeypatch):
         ("1", 64, 128, 1),                       # 1CTA kb64, TMA pages spanning two blocks
         ("1", 128, 128, 1), ("1", 128, 128, 3),  # 1CTA 128-key, TMA pages
         ("0", 64, 128, 1),                       # 2CTA, TMA pages
+        ("0", 96, 128, 1),                       # 2CTA, heads padded to 128, TMA pages
+        ("0", 96, 16, 1),                        # 2CTA, heads padded to 128, cp.async gather
+        ("0", 12, 16, 1),                        # 2CTA, heads padded to 64, cp.async gather
         ("1", 64, 16, 1),                        # 1CTA kb64, cp.async gather
     ],
     ids=lambda r: f"flag{r[0]}-h{r[1]}-page{r[2]}-splits{r[3]}",
@@ -1504,7 +1638,7 @@ def test_flash_attn_mla_1cta_sparse_train_recompute_p(h, has_qk, causal, varlen,
         out_ag, _ = fn(**call, gather_bwd_recompute_p=True, **kw)
         grads = torch.autograd.grad(out_ag, grad_inputs, g)
         results[flag] = (out, lse, o_lo, grads)
-        assert spy.keys and all(key[0] == (flag == "1") for key in spy.keys), (
+        assert spy.keys and all((key[0].kernel != "2cta") == (flag == "1") for key in spy.keys), (
             f"FLASH_ATTENTION_MLA_1CTA={flag}: forward ran on the wrong kernel"
         )
     monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", real_cache)
@@ -3474,63 +3608,6 @@ def test_flash_attn_mla_sparse_topk_order_invariance(nheads, causal, dtype):
 
 
 @pytest.mark.parametrize(
-    "case",
-    [
-        # (description, kwargs for _mla_1cta_route, expected 1CTA)
-        # split: the split heuristic (num_splits < 1). Dense goes 1CTA provisionally at any shape;
-        # the interface sizes the split for the 1CTA kernel and, if it picks one split, asks
-        # again unsplit (the rows below without split)
-        ("dense decode 64 heads, split heuristic", dict(topk=False, h=64, s_q=1, split=True, ctas=16), True),
-        ("dense 64 heads x 2 tokens, split heuristic", dict(topk=False, h=64, s_q=2, split=True, ctas=16), True),
-        ("dense decode 128 heads, split heuristic", dict(topk=False, h=128, s_q=1, split=True, ctas=16), True),
-        ("dense prefill, split heuristic", dict(topk=False, h=64, s_q=4096, split=True), True),
-        # unsplit: decode shapes (seqlen_q x heads per KV head <= 64) go 1CTA only once the 2CTA
-        # kernel (2 CTAs per batch x KV head) exceeds one wave of num_sms
-        ("dense decode 64 heads, 2CTA one wave", dict(topk=False, h=64, s_q=1, ctas=144), False),
-        ("dense decode 64 heads, 2CTA two waves", dict(topk=False, h=64, s_q=1, ctas=160), True),
-        ("dense decode 16 heads x 4 tokens (64 rows), two waves", dict(topk=False, h=16, s_q=4, ctas=160), True),
-        ("dense decode 16 heads, one wave", dict(topk=False, h=16, s_q=1, ctas=128), False),
-        ("dense 64 heads x 2 tokens (128 rows), two waves", dict(topk=False, h=64, s_q=2, ctas=160), False),
-        ("dense decode 128 heads, two waves", dict(topk=False, h=128, s_q=1, ctas=160), False),
-        ("dense prefill, two waves", dict(topk=False, h=64, s_q=4096, ctas=160), False),
-        ("dense varlen without a host max_seqlen_q", dict(topk=False, h=64, s_q=None, ctas=160), False),
-        ("dense prefill fp8 (2CTA has no fp8)", dict(topk=False, h=64, s_q=4096, needs=True), True),
-        # sparse (never split): 2 CTAs per token on 2CTA; 1CTA only past one 2CTA wave
-        ("sparse 64 heads", dict(topk=True, h=64, s_q=4096), True),
-        ("sparse 24 heads decode", dict(topk=True, h=24, s_q=1), True),
-        ("sparse decode, 2CTA one wave", dict(topk=True, h=64, s_q=1, ctas=152), False),
-        ("sparse decode, 2CTA past one wave", dict(topk=True, h=64, s_q=1, ctas=160), True),
-        ("sparse decode 16 heads, one wave", dict(topk=True, h=16, s_q=1, ctas=64), False),
-        ("sparse fp8 below one wave (2CTA has no fp8)", dict(topk=True, h=64, s_q=1, ctas=64, needs=True), True),
-        ("sparse 128 heads (unsupported on 1CTA)", dict(topk=True, h=128, s_q=1), False),
-        ("sparse training, load-P (unsupported)", dict(topk=True, h=64, s_q=4096, grad=True), False),
-        ("sparse training, recompute-P", dict(topk=True, h=64, s_q=4096, grad=True, rp=True), True),
-    ],
-    ids=lambda c: c[0].replace(" ", "_"),
-)
-def test_flash_attn_mla_dispatch_heuristic(case, monkeypatch):
-    """The 1CTA / 2CTA MLA dispatch with FLASH_ATTENTION_MLA_1CTA unset: sparse -> 1CTA up to
-    64 heads once 2CTA exceeds one wave (2 CTAs per token); dense with the split heuristic ->
-    1CTA (provisionally), unsplit -> 1CTA on decode shapes (seqlen_q x heads per KV head <= 64)
-    once 2CTA exceeds one wave, 2CTA otherwise; fp8 / descales / explicit split-KV -> 1CTA.
-    The variable overrides it."""
-    from flash_attn.cute.interface import _mla_1cta_route
-    _, kw, expected = case
-    route = lambda: _mla_1cta_route(  # noqa: E731
-        kw["topk"], kw["h"], kw.get("grad", False), kw.get("rp", False),
-        seqlen_q_hint=kw["s_q"], needs_1cta=kw.get("needs", False),
-        split_kv=kw.get("split", False), ctas_2cta=kw.get("ctas"), num_sms=152,
-    )
-    monkeypatch.delenv("FLASH_ATTENTION_MLA_1CTA", raising=False)
-    assert route() == expected
-    supported = not (kw["topk"] and (kw["h"] > 64 or (kw.get("grad") and not kw.get("rp"))))
-    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "1")
-    assert route() == supported
-    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
-    assert not route()
-
-
-@pytest.mark.parametrize(
     "shape",
     ["dense_decode", "dense_decode_128h", "dense_decode_128h_few_splits", "dense_decode_unsplit",
      "dense_prefill", "dense_prefill_auto", "sparse"],
@@ -3578,7 +3655,7 @@ def test_flash_attn_mla_dispatch_heuristic_end_to_end(shape, monkeypatch):
     out, _ = flash_attn_func(**kw, **extra, **fwd_kw)
     monkeypatch.setattr(fa_interface._flash_attn_fwd, "compile_cache", real_cache)
     expect_1cta = shape in ("dense_decode", "dense_decode_128h", "sparse")
-    assert spy.keys and all(key[0] == expect_1cta for key in spy.keys), shape
+    assert spy.keys and all((key[0].kernel != "2cta") == expect_1cta for key in spy.keys), shape
     if is_fake_mode():
         return
     out_ref, _ = attention_ref(q_r, k_r, v_r, qv=qv_r, **extra)
