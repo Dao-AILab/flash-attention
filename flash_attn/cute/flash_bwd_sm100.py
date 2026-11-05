@@ -234,6 +234,7 @@ class FlashAttentionBackwardSm100:
         Q_stage: int,
         dO_stage: int,
         fold_LSE_dPsum: bool,
+        mask_seqlen: bool = True,
     ):
         # Pad head_dim to a multiple of 32 (k_block_size). Must stay a multiple of 32 so
         # that the dQ accumulator reduce (dQ_reduce_ncol up to 32) tiles evenly and matches
@@ -366,6 +367,9 @@ class FlashAttentionBackwardSm100:
         self.has_aux_tensors = has_aux_tensors
         self.q_subtile_factor = q_subtile_factor
         self.kv_subtile_factor = kv_subtile_factor
+        # False when the caller guarantees that no tile reaches past seqlen_q / seqlen_k (see
+        # _flash_attn_bwd); the per-element sequence-bound checks are then compiled out.
+        self.mask_seqlen = mask_seqlen
         assert self.kv_subtile_factor == 1 or self.kv_subtile_factor % self.cta_group_size == 0
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
@@ -4180,13 +4184,12 @@ class FlashAttentionBackwardSm100:
                     else FastDivmodDivisorV2(seqlen.seqlen_k),
                 )
             mask = AttentionMaskCls(seqlen)
-            # TODO: condition mask_seqlen
             mask_fn = partial(
                 mask.apply_mask_sm100_transposed,
                 tScS_t2r=tScS_t2r,
                 t0ScS_t2r=t0ScS_t2r,
                 n_block=work_n,
-                mask_seqlen=True,
+                mask_seqlen=self.mask_seqlen,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
                 mask_mod=self.mask_mod,
