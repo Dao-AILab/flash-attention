@@ -1,4 +1,4 @@
-"""hd256 MXFP8 forward (2CTA, S ping-pong) with BF16 V (QK-only)."""
+"""hd256 MXFP8 forward (2CTA, S ping-pong): QK-only, native PV, causal leakage."""
 
 import pytest
 import torch
@@ -8,6 +8,7 @@ from flash_attn.cute.blockscaled_utils import (
     dequantize_fp8_with_sf,
     interleave_sf,
     quantize_to_fp8_with_sf,
+    quantize_v_to_fp8_with_sf,
 )
 from flash_attn.cute.interface import BlockScales, flash_attn_func
 import test_mxfp8_pv
@@ -67,25 +68,121 @@ def test_mxfp8_hd256_qk(causal, sq, sk, hq, hk):
         torch.testing.assert_close(lse, lse_ref.float(), atol=2e-4, rtol=2e-5)
 
 
+@pytest.mark.parametrize(
+    "causal,sq,sk,hq,hk",
+    [
+        (False, 128, 128, 2, 2),
+        (False, 257, 385, 4, 1),
+        (True, 257, 385, 4, 1),
+        (True, 513, 129, 4, 1),
+        (False, 100, 1000, 2, 2),
+        (False, 256, 256, 2, 2),  # two KV blocks: the first step sums its own P
+        (False, 300, 384, 2, 1),  # three KV blocks: one sum from the ones MMA
+    ],
+)
+@pytest.mark.parametrize("pv_softmax", ["exact", "fast"])
+def test_mxfp8_hd256_pv(causal, sq, sk, hq, hk, pv_softmax):
+    requires_sm100()
+    (q, k, v, sfq, sfk, sfv), deq = test_mxfp8_pv.inputs(2, sq, sk, hq, hk, DIM)
+    v_bf16 = deq[2].bfloat16() if causal else None
+    expected, fp64, lse_ref = test_mxfp8_pv.reference(
+        *deq, pv_softmax=pv_softmax, causal=causal, v_bf16=v_bf16
+    )
+    actual, lse = flash_attn_func(
+        q, k, v, scales=BlockScales(sfq, sfk, sfv, v_bf16, pv_softmax=pv_softmax),
+        causal=causal, return_lse=True,
+    )
+    assert torch.isfinite(actual).all()
+    # Same recipe as the kernel: BF16 output rounding plus FP32 summation order.
+    assert (actual.float() - expected).norm() / expected.norm() <= 2e-3
+    assert (actual.double() - fp64).norm() <= (
+        expected.double() - fp64
+    ).norm() + 2e-3 * fp64.norm()
+    torch.testing.assert_close(lse, lse_ref.float(), atol=2e-4, rtol=2e-5, equal_nan=True)
+    ones = torch.ones_like(deq[2])
+    ones8, sfones, _ = quantize_v_to_fp8_with_sf(ones)
+    normalized, _ = flash_attn_func(
+        q, k, ones8,
+        scales=BlockScales(sfq, sfk, sfones, ones.bfloat16() if causal else None,
+                           pv_softmax=pv_softmax),
+        causal=causal,
+    )
+    # "exact" divides by the sum of the P that PV consumed; "fast" by the FP32 sum.
+    visible = normalized[:, max(sq - sk, 0):].float() if causal else normalized.float()
+    atol = 1e-5 if pv_softmax == "exact" else 2**-4
+    torch.testing.assert_close(visible, torch.ones_like(visible), atol=atol, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "sq,sk,hq,hk",
+    [
+        (257, 386, 4, 2),  # unaligned seqlen_k - seqlen_q, GQA
+        (385, 129, 2, 2),  # leading work tile fully masked
+        (1000, 2049, 4, 1),  # 17 KV blocks, unaligned offset
+        (300, 300, 2, 2),  # partial last work tile
+    ],
+)
+@pytest.mark.parametrize("pv_softmax", ["exact", "fast"])
+def test_mxfp8_hd256_causal_no_future_leakage(sq, sk, hq, hk, pv_softmax):
+    """Scaling V at future positions must leave every earlier row bitwise unchanged."""
+    requires_sm100()
+    g = torch.Generator(device="cuda").manual_seed(7)
+    q = torch.randn(1, sq, hq, DIM, generator=g, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, sk, hk, DIM, generator=g, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, sk, hk, DIM, generator=g, device="cuda", dtype=torch.bfloat16)
+    q8, sfq, _ = quantize_to_fp8_with_sf(q)
+    k8, sfk, _ = quantize_to_fp8_with_sf(k)
+    sfq, sfk = interleave_sf(sfq), interleave_sf(sfk)
+
+    def run(v_bf16):
+        v8, sfv, _ = quantize_v_to_fp8_with_sf(v_bf16)
+        return flash_attn_func(
+            q8, k8, v8, scales=BlockScales(sfq, sfk, sfv, v_bf16=v_bf16, pv_softmax=pv_softmax),
+            causal=True, return_lse=True,
+        )
+
+    out, lse = run(v)
+    assert torch.isfinite(out).all()
+    for t0 in (sk // 4 + 17, sk // 2 + 5, 3 * sk // 4 + 29, sk - 1):
+        rows = t0 - (sk - sq)  # rows [0, rows) attend only keys < t0
+        if rows <= 0 or t0 >= sk:
+            continue
+        for factor in (16.0, 1024.0):
+            v2 = v.clone()
+            v2[:, t0:] = (v2[:, t0:].float() * factor).to(torch.bfloat16)
+            out2, lse2 = run(v2)
+            assert torch.equal(out2[:, :rows].view(torch.uint8), out[:, :rows].view(torch.uint8))
+            assert torch.equal(lse2[..., :rows].view(torch.uint8), lse[..., :rows].view(torch.uint8))
+
+
 def per_head_error(actual, expected):
     """Relative L2 error per (batch, head) of (batch, seqlen, heads, dim) outputs."""
     error = (actual.double() - expected).square().sum(dim=(1, 3)).sqrt()
     return error / expected.square().sum(dim=(1, 3)).sqrt()
 
 
-def test_mxfp8_hd256_persistent_tiles():
+@pytest.mark.parametrize("mode", ["qk", "exact"])
+def test_mxfp8_hd256_persistent_tiles(mode):
     """Many work tiles per CTA (noncausal persistent): sampled rows of every tile match."""
     requires_sm100()
-    (q, k, _, sfq, sfk, _), (qd, kd, vd) = test_mxfp8_pv.inputs(4, 2048, 2049, 32, 8, DIM)
+    (q, k, v8, sfq, sfk, sfv), (qd, kd, vd) = test_mxfp8_pv.inputs(4, 2048, 2049, 32, 8, DIM)
     starts = torch.arange(0, 2048, 128, device=q.device)
     rows = torch.stack((starts, starts + 127), dim=1).flatten()
-    v = vd.bfloat16()
-    expected, _, eager = test_mxfp8_qk.reference(qd[:, rows], kd, v, causal=False)
-    # BF16 P and O roundings: compare to the eager (BF16 P) reference's own error.
-    head_bound = per_head_error(eager, expected) + 2e-3
-    total_bound = (eager.double() - expected).norm() / expected.norm() + 2e-3
+    if mode == "qk":
+        v, scales = vd.bfloat16(), BlockScales(sfq, sfk)
+        expected, _, eager = test_mxfp8_qk.reference(qd[:, rows], kd, v, causal=False)
+        # BF16 P and O roundings: compare to the eager (BF16 P) reference's own error.
+        head_bound = per_head_error(eager, expected) + 2e-3
+        total_bound = (eager.double() - expected).norm() / expected.norm() + 2e-3
+    else:
+        v, scales = v8, BlockScales(sfq, sfk, sfv)
+        expected, _, _ = test_mxfp8_pv.reference(qd[:, rows], kd, vd)
+        # A wrong or stale tile is off by O(1). Single rows can sit at an E4M3 rounding knife edge,
+        # where a 1-ulp difference in the MMA's S moves O by a few percent, so the per-(batch, head)
+        # bound has slack and the 2e-3 recipe bound applies to the whole set.
+        head_bound, total_bound = 5e-3, 2e-3
     for _ in range(3):
-        actual, _ = flash_attn_func(q, k, v, scales=BlockScales(sfq, sfk))
+        actual, _ = flash_attn_func(q, k, v, scales=scales)
         sampled = actual[:, rows].double()
         assert (per_head_error(sampled, expected) <= head_bound).all()
         assert (sampled - expected).norm() / expected.norm() <= total_bound
