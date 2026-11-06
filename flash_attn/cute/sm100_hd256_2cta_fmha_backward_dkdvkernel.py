@@ -35,6 +35,8 @@ from flash_attn.cute.tile_scheduler import (
 )
 
 import flash_attn.cute.copy_utils as fa_copy_utils
+import cutlass.utils.blockscaled_layout as blockscaled_layout
+from flash_attn.cute import sm100_hd256_mx_utils as mxu
 
 LAYOUT_RANK_CONSTANT = 3
 
@@ -103,11 +105,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         window_size_left: int | None,
         window_size_right: int | None,
         use_clc_scheduler: bool = False,
+        mxfp8: bool = False,
     ):
-        """Initialization."""
+        """Initialization. mxfp8: NOTE [MXFP8 hd256 backward] in sm100_hd256_2cta_fmha_backward.py."""
         self.acc_dtype = acc_dtype
         self.cta_tiler = cta_tiler
         self.use_clc_scheduler = use_clc_scheduler
+        self.mxfp8 = mxfp8
+        # MXFP8: launched as the dQ kernel's programmatic dependent (no data dependency); each CTA
+        # waits for the dQ kernel before it exits, so this kernel's completion still implies dQ's
+        self.pdl_secondary = mxfp8
+        assert not (mxfp8 and (use_clc_scheduler or is_causal))
         self.sched_warp_id = 10 if use_clc_scheduler else None
         # TODO: need check, not sure whether need to *2 if 2cta
         self.tile_shape_Q = cta_tiler[0]
@@ -176,6 +184,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.tmem_dV_offset = Tmemory_offset(0, cta_tiler[2] // 2)
         self.tmem_dP_offset = Tmemory_offset(0, cta_tiler[2] + cta_tiler[0] // 2)
         self.tmem_S_offset = Tmemory_offset(0, cta_tiler[2])
+        if mxfp8:
+            # scale factors in the free TMEM columns [384, 512): one 128-row x 4-group chunk
+            # (4 columns) per A operand, up to 8 columns per B operand (N = 256).
+            # dV / dK:
+            self.tmem_sfp_offset = 384
+            self.tmem_sfdot_offset = 392
+            self.tmem_sfds_offset = 400
+            self.tmem_sfqt_offset = 408
+            # S^T / dP^T: K / V (A, 8 columns each, copied once) and Q / dO (B, 8 columns)
+            self.tmem_sfk_offset = 416
+            self.tmem_sfq_offset = 424
+            self.tmem_sfv_offset = 432
+            self.tmem_sfdo_offset = 440
 
         self.num_regs_reduce = 152
         self.num_regs_compute = 128
@@ -199,6 +220,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.compute_mma_P_stage = 1
         self.compute_mma_dS_stage = 1
         self.mma_compute_dKdV_stage = 2
+        if cutlass.const_expr(self.mxfp8):
+            # E4M3 Q / Q^T / dO / dO^T tiles are half the BF16 size: double-buffer them (and LSE /
+            # dPsum) so the next query tile's loads overlap this one's MMAs
+            self.load_mma_Q_stage = 2
+            self.load_mma_QT_stage = 2
+            self.load_mma_dO_stage = 2
+            self.load_compute_LSE_stage = 2
+            self.load_compute_sum_OdO_stage = 2
 
         if cutlass.const_expr(self.use_clc_scheduler):
             self.num_clc_stage = 1
@@ -222,8 +251,24 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         scale_softmax: cutlass.Float32,
         max_seqlen_k: Int32 | None,
         stream: cuda.CUstream,
+        QT_mx: cute.Tensor | None = None,
+        SFQT_mx: cute.Tensor | None = None,
+        dOT_mx: cute.Tensor | None = None,
+        SFdOT_mx: cute.Tensor | None = None,
+        Q_mx: cute.Tensor | None = None,
+        SFQ_mx: cute.Tensor | None = None,
+        K_mx: cute.Tensor | None = None,
+        SFK_mx: cute.Tensor | None = None,
+        V_mx: cute.Tensor | None = None,
+        SFV_mx: cute.Tensor | None = None,
+        dO_mx: cute.Tensor | None = None,
+        SFdO_mx: cute.Tensor | None = None,
     ):
-        """Host function to launch CuTeDSL kernel."""
+        """Host function to launch CuTeDSL kernel.
+
+        mxfp8: the *_mx operands of NOTE [MXFP8 hd256 backward] (E4M3 (b, s, h_k, h_r, d) copies and
+        raw UE8M0 scale buffers); the BF16 Q / K / V / dO only provide shapes. scaled_LSE is the
+        dK / dV kernel's LSE slot (M - offset)."""
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
         self.use_varlen_scheduler = cumulative_s_k is not None and max_seqlen_k is None
         # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D).
@@ -356,6 +401,48 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             ),
         )
 
+        mSFQT = mSFdOT = None
+        if cutlass.const_expr(self.mxfp8):
+            assert not varlen and seqused_q is None and seqused_k is None
+            # E4M3 copies: (b, s, h_k, h_r, d) -> (d, s, ((h_r, h_k), b)), the dV / dK B
+            # operands (K = queries)
+            QT, dOT = [
+                cute.make_tensor(
+                    t.iterator,
+                    cute.make_layout(
+                        (t.shape[4], t.shape[1], hb),
+                        stride=(
+                            t.stride[4],
+                            cute.assume(t.stride[1], divby=64),
+                            ((t.stride[3], t.stride[2]), cute.assume(t.stride[0], divby=64)),
+                        ),
+                    ),
+                )
+                for t in (QT_mx, dOT_mx)
+            ]
+            mSFQT, mSFdOT = [
+                mxu.sf_gmem_tensor(sf, t.shape[0], t.shape[1], h_r, h_k, b)
+                for sf, t in ((SFQT_mx, QT), (SFdOT_mx, dOT))
+            ]
+
+        mSFQ_tma = mSFK_tma = mSFV_tma = mSFdO_tma = None
+        if cutlass.const_expr(self.mxfp8):
+            # E4M3 copies (scales along d): (b, s, h_k, h_r, d) -> (s, d, ((h_r, h_k), b)), K / V
+            # broadcast over h_r
+            Q, dO = mxu.mx_sd_view(Q_mx, hb, False), mxu.mx_sd_view(dO_mx, hb, False)
+            K, V = mxu.mx_sd_view(K_mx, hb, True), mxu.mx_sd_view(V_mx, hb, True)
+            # pair scale tiles: 1024 B per 64 keys (K, V) and per 128 queries (Q, dO), viewed as
+            # (16 B, 64 rows, tile, ((h_r, h_k), b)) for TMA
+            n64 = cute.ceil_div(K.shape[0], 64)
+            n128 = cute.ceil_div(Q.shape[0], 128)
+
+            mSFK_tma, mSFV_tma = [
+                mxu.mx_sf_tile_view(t, 64, n64, hb, h_r, h_k, True) for t in (SFK_mx, SFV_mx)
+            ]
+            mSFQ_tma, mSFdO_tma = [
+                mxu.mx_sf_tile_view(t, 64, n128, hb, h_r, h_k, False) for t in (SFQ_mx, SFdO_mx)
+            ]
+
         self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
         self.K_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
         self.dK_major_mode = utils.LayoutEnum.from_tensor(dK).mma_major_mode()
@@ -432,6 +519,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             self.dSK_mma_tiler[:2],
         )
 
+        if cutlass.const_expr(self.mxfp8):
+            KQ_tiled_mma, VdO_tiled_mma = [
+                mxu.make_mx_tiled_mma(
+                    cute.nvgpu.OperandMajorMode.K,
+                    cute.nvgpu.OperandMajorMode.K,
+                    cta_group,
+                    tiler[:2],
+                    k32=True,
+                )
+                for tiler in (self.KQ_mma_tiler, self.VdO_mma_tiler)
+            ]
         atom_thr_size = cute.size(KQ_tiled_mma.thr_id.shape)
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)  # type: ignore[assignment]
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -530,6 +628,125 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         LSE_smem_layout = cute.make_layout((self.cta_tiler[0], self.load_compute_LSE_stage))
         sum_OdO_smem_layout = cute.make_layout((self.cta_tiler[0], self.load_compute_sum_OdO_stage))
 
+        # Storage of sP / sdST / sdOT keeps the BF16 size: the dK / dV epilogue stages through it.
+        P_smem_cosize = cute.cosize(P_smem_layout_staged)
+        dST_smem_cosize = cute.cosize(dST_smem_layout_staged)
+        # (BF16 elements; the epilogue needs one BF16 stage, MXFP8 two E4M3 stages)
+        dOT_smem_cosize = cute.cosize(dOT_smem_layout_staged) // self.load_mma_dO_stage
+        self.QT_mma_dtype = Q.element_type
+        sSFA_layout = sSFB_layout = tSFA_layout = tSFB_layout = None
+        if cutlass.const_expr(self.mxfp8):
+            # NOTE [MXFP8 hd256 backward]: dV / dK as SS block-scaled MMAs
+            self.QT_mma_dtype = mxu.MX_DTYPE
+            PdO_tiled_mma, dSQ_tiled_mma = [
+                mxu.make_mx_tiled_mma(
+                    cute.nvgpu.OperandMajorMode.K,
+                    cute.nvgpu.OperandMajorMode.MN,
+                    cta_group,
+                    tiler[:2],
+                    k32=True,
+                )
+                for tiler in (self.PdO_mma_tiler, self.dSQ_mma_tiler)
+            ]
+            P_smem_layout_staged = sm100_utils.make_smem_layout_a(
+                PdO_tiled_mma, self.PdO_mma_tiler, mxu.MX_DTYPE, self.compute_mma_P_stage
+            )
+            dST_smem_layout_staged = sm100_utils.make_smem_layout_a(
+                dSQ_tiled_mma, self.dSQ_mma_tiler, mxu.MX_DTYPE, self.compute_mma_dS_stage
+            )
+            dOT_smem_layout_staged = sm100_utils.make_smem_layout_b(
+                PdO_tiled_mma, self.PdO_mma_tiler, mxu.MX_DTYPE, self.load_mma_dO_stage
+            )
+            QT_smem_layout_staged = sm100_utils.make_smem_layout_b(
+                dSQ_tiled_mma, self.dSQ_mma_tiler, mxu.MX_DTYPE, self.load_mma_QT_stage
+            )
+            # The A scales (64 keys per CTA) use the 128-row chunk of the M=256 pair MMA, each
+            # key in rows key and key + 64 (TMEM lane quadrants 0/2 and 1/3).
+            sfa_proxy_tiler = (256, self.PdO_mma_tiler[1], self.PdO_mma_tiler[2])
+            sfa_proxy_mma = mxu.make_mx_tiled_mma(
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.MN,
+                cta_group,
+                sfa_proxy_tiler[:2],
+                k32=True,
+            )
+            sSFA_layout = blockscaled_layout.make_smem_layout_sfa(
+                sfa_proxy_mma, sfa_proxy_tiler, mxu.SF_VEC, 1
+            )
+            tSFA_layout = blockscaled_layout.make_tmem_layout_sfa(
+                sfa_proxy_mma,
+                sfa_proxy_tiler,
+                mxu.SF_VEC,
+                cute.slice_(sSFA_layout, (None, None, None, 0)),
+            )
+            sSFB_layout = blockscaled_layout.make_smem_layout_sfb(
+                PdO_tiled_mma, self.PdO_mma_tiler, mxu.SF_VEC, self.load_mma_QT_stage
+            )
+            tSFB_layout = blockscaled_layout.make_tmem_layout_sfb(
+                PdO_tiled_mma,
+                self.PdO_mma_tiler,
+                mxu.SF_VEC,
+                cute.slice_(sSFB_layout, (None, None, None, 0)),
+            )
+            assert cute.cosize(sSFA_layout) == 512
+            assert cute.cosize(sSFB_layout) == 1024 * self.load_mma_QT_stage
+            assert self.load_mma_QT_stage == self.load_mma_dO_stage
+
+        self.sdp_ab_dtype = K.element_type
+        sSFA_sdp_layout = sSFB_sdp_layout = tSFA_sdp_layout = tSFB_sdp_layout = None
+        if cutlass.const_expr(self.mxfp8):
+            # NOTE [MXFP8 hd256 backward]: S^T / dP^T as SS block-scaled MMAs
+            self.sdp_ab_dtype = mxu.MX_DTYPE
+            K_smem_layout_staged = sm100_utils.make_smem_layout_a(
+                KQ_tiled_mma, self.KQ_mma_tiler, mxu.MX_DTYPE, 1
+            )
+            Q_smem_layout_staged = sm100_utils.make_smem_layout_b(
+                KQ_tiled_mma, self.KQ_mma_tiler, mxu.MX_DTYPE, self.load_mma_Q_stage
+            )
+            V_smem_layout_staged = sm100_utils.make_smem_layout_a(
+                VdO_tiled_mma, self.VdO_mma_tiler, mxu.MX_DTYPE, 1
+            )
+            dO_smem_layout_staged = sm100_utils.make_smem_layout_b(
+                VdO_tiled_mma, self.VdO_mma_tiler, mxu.MX_DTYPE, self.load_mma_dO_stage
+            )
+            # A (K / V, 64 keys per CTA): the 128-row chunk of an M=256 pair MMA (keys at rows
+            # k and k + 64); B (Q / dO, N=128): CUTLASS's TMEM layout of this MMA (queries
+            # 64..127 in lane quadrants 2/3, the second 4 groups 2 columns further), filled by one
+            # .64x128b.warpx2::01_23 copy from a matching 1024 B SMEM tile
+            K_dim = self.KQ_mma_tiler[2]
+            proxy_a = mxu.make_mx_tiled_mma(
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,
+                cta_group,
+                (256, 128),
+                k32=True,
+            )
+            sSFA_sdp_layout = blockscaled_layout.make_smem_layout_sfa(
+                proxy_a, (256, 128, K_dim), mxu.SF_VEC, 1
+            )
+            tSFA_sdp_layout = blockscaled_layout.make_tmem_layout_sfa(
+                proxy_a,
+                (256, 128, K_dim),
+                mxu.SF_VEC,
+                cute.slice_(sSFA_sdp_layout, (None, None, None, 0)),
+            )
+            tSFB_sdp_layout = blockscaled_layout.make_tmem_layout_sfb(
+                KQ_tiled_mma,
+                self.KQ_mma_tiler,
+                mxu.SF_VEC,
+                cute.slice_(
+                    blockscaled_layout.make_smem_layout_sfb(
+                        KQ_tiled_mma, self.KQ_mma_tiler, mxu.SF_VEC, 1
+                    ),
+                    (None, None, None, 0),
+                ),
+            )
+            sSFB_sdp_layout = mxu.lane_halves_smem_layout_sfb(
+                tSFB_sdp_layout, self.load_mma_Q_stage
+            )
+            assert cute.cosize(sSFA_sdp_layout) == 1024
+            assert cute.cosize(sSFB_sdp_layout) == 1024 * self.load_mma_Q_stage
+
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_reduce_op = cpasync.CopyReduceBulkTensorTileS2GOp()
 
@@ -596,6 +813,75 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.tma_copy_K_bytes = cute.size_in_bytes(K.element_type, K_smem_layout) * atom_thr_size
         self.tma_copy_V_bytes = cute.size_in_bytes(V.element_type, V_smem_layout) * atom_thr_size
         self.tma_copy_dO_bytes = cute.size_in_bytes(dO.element_type, dO_smem_layout) * atom_thr_size
+        self.tma_copy_QT_bytes = self.tma_copy_Q_bytes
+        self.tma_copy_dOT_bytes = self.tma_copy_dO_bytes
+        tma_atom_SFQ = tma_tensor_SFQ = tma_atom_SFK = tma_tensor_SFK = None
+        tma_atom_SFV = tma_tensor_SFV = tma_atom_SFdO = tma_tensor_SFdO = None
+        if cutlass.const_expr(self.mxfp8):
+            # one plain 2CTA TMA per CTA and scale tile (each CTA needs the full Q / dO scales);
+            # the copies ride on the K / V / Q / dO stages
+            sf_sl_kv = cute.make_layout((16, 64), stride=(1, 16))
+            sf_sl_qdo = cute.make_layout((16, 64), stride=(1, 16))
+            tma_atom_SFK, tma_tensor_SFK = cpasync.make_tiled_tma_atom(
+                tma_load_op, mSFK_tma, sf_sl_kv, (16, 64)
+            )
+            tma_atom_SFV, tma_tensor_SFV = cpasync.make_tiled_tma_atom(
+                tma_load_op, mSFV_tma, sf_sl_kv, (16, 64)
+            )
+            tma_atom_SFQ, tma_tensor_SFQ = cpasync.make_tiled_tma_atom(
+                tma_load_op, mSFQ_tma, sf_sl_qdo, (16, 64)
+            )
+            tma_atom_SFdO, tma_tensor_SFdO = cpasync.make_tiled_tma_atom(
+                tma_load_op, mSFdO_tma, sf_sl_qdo, (16, 64)
+            )
+            self.tma_copy_K_bytes += atom_thr_size * 1024
+            self.tma_copy_V_bytes += atom_thr_size * 1024
+            self.tma_copy_Q_bytes += atom_thr_size * 1024
+            self.tma_copy_dO_bytes += atom_thr_size * 1024
+        tma_atom_SFQT = tma_tensor_SFQT = tma_atom_SFdOT = tma_tensor_SFdOT = None
+        if cutlass.const_expr(self.mxfp8):
+            # The B scales: each CTA receives the full 256-channel scales (multicast halves),
+            # as in CUTLASS's 2CTA block-scaled GEMM; they ride on the Qt / dOt stages.
+            self.mma_tiler_sfb = (128, self.PdO_mma_tiler[1], self.PdO_mma_tiler[2])
+            tiled_mma_sfb = mxu.make_mx_tiled_mma(
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.MN,
+                tcgen05.CtaGroup.ONE,
+                self.mma_tiler_sfb[:2],
+                k32=True,
+            )
+            cluster_layout_sfb_vmnk = cute.tiled_divide(
+                cute.make_layout(self.cluster_shape_mnk), (tiled_mma_sfb.thr_id.shape,)
+            )
+            sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(
+                self.cluster_shape_mnk, PdO_tiled_mma.thr_id
+            )
+            sSFB_one = cute.select(sSFB_layout, mode=[0, 1, 2])
+            tma_atom_SFQT, tma_tensor_SFQT = cute.nvgpu.make_tiled_tma_atom_B(
+                sfb_op,
+                mSFQT,
+                sSFB_one,
+                self.mma_tiler_sfb,
+                tiled_mma_sfb,
+                cluster_layout_sfb_vmnk.shape,
+                internal_type=cutlass.Int16,
+            )
+            tma_atom_SFdOT, tma_tensor_SFdOT = cute.nvgpu.make_tiled_tma_atom_B(
+                sfb_op,
+                mSFdOT,
+                sSFB_one,
+                self.mma_tiler_sfb,
+                tiled_mma_sfb,
+                cluster_layout_sfb_vmnk.shape,
+                internal_type=cutlass.Int16,
+            )
+            sf_bytes = atom_thr_size * cute.size_in_bytes(mxu.SF_DTYPE, sSFB_one)
+            self.tma_copy_QT_bytes = (
+                cute.size_in_bytes(mxu.MX_DTYPE, QT_smem_layout) * atom_thr_size + sf_bytes
+            )
+            self.tma_copy_dOT_bytes = (
+                cute.size_in_bytes(mxu.MX_DTYPE, dOT_smem_layout) * atom_thr_size + sf_bytes
+            )
 
         # Variant 3a epilogue: TMA store atoms (S2G) for dK / dV.
         # Each compute warp group owns half the hd_v output via split_wg, so
@@ -642,6 +928,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             epi_tile_dKV,
         )
 
+        sfa_size = cute.cosize(sSFA_layout) if cutlass.const_expr(self.mxfp8) else 0
+        sfb_size = cute.cosize(sSFB_layout) if cutlass.const_expr(self.mxfp8) else 0
+        sfa_sdp_size = 1024 if cutlass.const_expr(self.mxfp8) else 0
+        sfb_sdp_size = 1024 * self.load_mma_Q_stage if cutlass.const_expr(self.mxfp8) else 0
+
         @cute.struct
         class SharedStorage:
             # Pipeline barriers
@@ -678,38 +969,38 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             clc_response: cute.struct.MemRange[Int32, 4]
             # Smem tensors
             sK: cute.struct.Align[
-                cute.struct.MemRange[K.element_type, cute.cosize(K_smem_layout_staged)],
+                cute.struct.MemRange[self.sdp_ab_dtype, cute.cosize(K_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             # only used in 2cta
             sV: cute.struct.Align[
-                cute.struct.MemRange[V.element_type, cute.cosize(V_smem_layout_staged)],
+                cute.struct.MemRange[self.sdp_ab_dtype, cute.cosize(V_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             sQ: cute.struct.Align[
-                cute.struct.MemRange[Q.element_type, cute.cosize(Q_smem_layout_staged)],
+                cute.struct.MemRange[self.sdp_ab_dtype, cute.cosize(Q_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             sQT: cute.struct.Align[
-                cute.struct.MemRange[Q.element_type, cute.cosize(QT_smem_layout_staged)],
+                cute.struct.MemRange[self.QT_mma_dtype, cute.cosize(QT_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             sdO: cute.struct.Align[
-                cute.struct.MemRange[dO.element_type, cute.cosize(dO_smem_layout_staged)],
+                cute.struct.MemRange[self.sdp_ab_dtype, cute.cosize(dO_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             sdOT: cute.struct.Align[
-                cute.struct.MemRange[dO.element_type, cute.cosize(dOT_smem_layout_staged)],
+                cute.struct.MemRange[dK.element_type, dOT_smem_cosize],
                 self.buffer_align_bytes,
             ]
             # only used in 2cta
             # dishengbin checked whether we need sP
             sP: cute.struct.Align[
-                cute.struct.MemRange[Q.element_type, cute.cosize(P_smem_layout_staged)],
+                cute.struct.MemRange[dK.element_type, P_smem_cosize],
                 self.buffer_align_bytes,
             ]
             sdST: cute.struct.Align[
-                cute.struct.MemRange[Q.element_type, cute.cosize(dST_smem_layout_staged)],
+                cute.struct.MemRange[dK.element_type, dST_smem_cosize],
                 self.buffer_align_bytes,
             ]
 
@@ -721,8 +1012,21 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 cute.struct.MemRange[self.acc_dtype, cute.cosize(sum_OdO_smem_layout)],
                 self.buffer_align_bytes,
             ]
+            # MXFP8 (zero-size and last otherwise): the constant P^T scales, the dS^T scales,
+            # and the dO_T / Q_T scale stages
+            sSFP: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfa_size], 128]
+            sSFdS: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfa_size], 128]
+            sSFdOT: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfb_size], 128]
+            sSFQT: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfb_size], 128]
+            # MXFP8: K / V (A) and Q / dO (B) scale tiles
+            sSFK: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfa_sdp_size], 128]
+            sSFV: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfa_sdp_size], 128]
+            sSFQ: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfb_sdp_size], 128]
+            sSFdO: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sfb_sdp_size], 128]
 
         self.shared_storage = SharedStorage
+        # an SMEM layout past the per-block limit does not always fail the launch
+        assert self.shared_storage.size_in_bytes() <= 232448, self.shared_storage.size_in_bytes()
 
         # =============================== bwd ===============================
         _, H_K = problem_shape[3][0]
@@ -812,6 +1116,26 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sdK_epi_layout,
             sdV_epi_layout,
             self.tile_sched_params,
+            tma_atom_SFQT,
+            tma_tensor_SFQT,
+            tma_atom_SFdOT,
+            tma_tensor_SFdOT,
+            sSFA_layout,
+            sSFB_layout,
+            tSFA_layout,
+            tSFB_layout,
+            tma_atom_SFK,
+            tma_tensor_SFK,
+            tma_atom_SFV,
+            tma_tensor_SFV,
+            tma_atom_SFQ,
+            tma_tensor_SFQ,
+            tma_atom_SFdO,
+            tma_tensor_SFdO,
+            sSFA_sdp_layout,
+            sSFB_sdp_layout,
+            tSFA_sdp_layout,
+            tSFB_sdp_layout,
         ).launch(
             grid=bwd_grid,
             block=[self.threads_per_cta, 1, 1],
@@ -819,6 +1143,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             smem=self.shared_storage.size_in_bytes(),  # type: ignore [attr-defined]
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.pdl_secondary,
         )
 
     @cute.kernel
@@ -875,6 +1200,28 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             | FmhaClcDynamicTileSchedulerParams
             | SingleTileVarlenScheduler.Params
         ),
+        # MXFP8: dV / dK scales
+        tma_atom_SFQT: cute.CopyAtom | None = None,
+        mSFQT: cute.Tensor | None = None,
+        tma_atom_SFdOT: cute.CopyAtom | None = None,
+        mSFdOT: cute.Tensor | None = None,
+        sSFA_layout: cute.Layout | None = None,
+        sSFB_layout: cute.Layout | None = None,
+        tSFA_layout: cute.Layout | None = None,
+        tSFB_layout: cute.Layout | None = None,
+        # MXFP8: S^T / dP^T scales
+        tma_atom_SFK: cute.CopyAtom | None = None,
+        mSFK: cute.Tensor | None = None,
+        tma_atom_SFV: cute.CopyAtom | None = None,
+        mSFV: cute.Tensor | None = None,
+        tma_atom_SFQ: cute.CopyAtom | None = None,
+        mSFQ: cute.Tensor | None = None,
+        tma_atom_SFdO: cute.CopyAtom | None = None,
+        mSFdO: cute.Tensor | None = None,
+        sSFA_sdp_layout: cute.Layout | None = None,
+        sSFB_sdp_layout: cute.Layout | None = None,
+        tSFA_sdp_layout: cute.Layout | None = None,
+        tSFB_sdp_layout: cute.Layout | None = None,
     ):
         """Core CuTeDSL backward kernel."""
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -890,9 +1237,38 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cpasync.prefetch_descriptor(tma_atom_V)
             cpasync.prefetch_descriptor(tma_atom_dO)
             cpasync.prefetch_descriptor(tma_atom_dOT)
+            if cutlass.const_expr(self.mxfp8):
+                cpasync.prefetch_descriptor(tma_atom_SFQT)
+                cpasync.prefetch_descriptor(tma_atom_SFdOT)
+            if cutlass.const_expr(self.mxfp8):
+                for atom in (tma_atom_SFK, tma_atom_SFV, tma_atom_SFQ, tma_atom_SFdO):
+                    cpasync.prefetch_descriptor(atom)
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+
+        sSFP = sSFdS = sSFdOT = sSFQT = None
+        if cutlass.const_expr(self.mxfp8):
+            sSFP = storage.sSFP.get_tensor(sSFA_layout, dtype=mxu.SF_DTYPE)
+            sSFdS = storage.sSFdS.get_tensor(sSFA_layout, dtype=mxu.SF_DTYPE)
+            sSFdOT = storage.sSFdOT.get_tensor(sSFB_layout, dtype=mxu.SF_DTYPE)
+            sSFQT = storage.sSFQT.get_tensor(sSFB_layout, dtype=mxu.SF_DTYPE)
+            if warp_idx == self.mma_warp_id:
+                # P^T scale 2^-8 (E8M0 0x77) for every (key, 32-query) group; read by the
+                # leader's tcgen05.cp after the pipeline-init cluster sync below
+                sSFP_u32 = cute.make_tensor(
+                    cute.recast_ptr(sSFP.iterator, dtype=cutlass.Uint32), cute.make_layout(128)
+                )
+                lane = cute.arch.lane_idx()
+                for i in cutlass.range_constexpr(4):
+                    sSFP_u32[lane * 4 + i] = cutlass.Uint32(0x77777777)
+                cute.arch.fence_view_async_shared()
+        sSFK = sSFV = sSFQ = sSFdO = None
+        if cutlass.const_expr(self.mxfp8):
+            sSFK = storage.sSFK.get_tensor(sSFA_sdp_layout, dtype=mxu.SF_DTYPE)
+            sSFV = storage.sSFV.get_tensor(sSFA_sdp_layout, dtype=mxu.SF_DTYPE)
+            sSFQ = storage.sSFQ.get_tensor(sSFB_sdp_layout, dtype=mxu.SF_DTYPE)
+            sSFdO = storage.sSFdO.get_tensor(sSFB_sdp_layout, dtype=mxu.SF_DTYPE)
 
         load_mma_Q_producer, load_mma_Q_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.load_mma_Q_stage,
@@ -925,7 +1301,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             num_stages=self.load_mma_QT_stage,
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            tx_count=self.tma_copy_Q_bytes,
+            tx_count=self.tma_copy_QT_bytes,
             barrier_storage=storage.load_mma_QT_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
@@ -943,7 +1319,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             num_stages=self.load_mma_dO_stage,
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            tx_count=self.tma_copy_dO_bytes,
+            tx_count=self.tma_copy_dOT_bytes,
             barrier_storage=storage.load_mma_dOT_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
@@ -1026,24 +1402,29 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sdO = storage.sdO.get_tensor(
             dO_smem_layout_staged.outer, swizzle=dO_smem_layout_staged.inner
         )
+
         sLSE = storage.sLSE.get_tensor(LSE_smem_layout)
         sSum_OdO = storage.sSum_OdO.get_tensor(sum_OdO_smem_layout)
         tmem_holding_buf = storage.tmem_holding_buf
         # for 2cta, QT use different mem from Q
 
+        # MXFP8: sP / sdST / sdOT / sQT hold E4M3 (BF16-sized storage, see __call__)
+        ab_dtype_dkdv = mxu.MX_DTYPE if cutlass.const_expr(self.mxfp8) else Q_ref.element_type
         sQT = storage.sQT.get_tensor(
-            QT_smem_layout_staged.outer, swizzle=QT_smem_layout_staged.inner
+            QT_smem_layout_staged.outer, swizzle=QT_smem_layout_staged.inner, dtype=ab_dtype_dkdv
         )
         sdST = storage.sdST.get_tensor(
-            dST_smem_layout_staged.outer, swizzle=dST_smem_layout_staged.inner
+            dST_smem_layout_staged.outer, swizzle=dST_smem_layout_staged.inner, dtype=ab_dtype_dkdv
         )
         tP_fake_ptr = cute.make_ptr(sQ.element_type, 0, cute.AddressSpace.tmem)
         tP = cute.make_tensor(tP_fake_ptr, P_smem_layout_staged.outer)
 
-        sP = storage.sP.get_tensor(P_smem_layout_staged.outer, swizzle=P_smem_layout_staged.inner)
+        sP = storage.sP.get_tensor(
+            P_smem_layout_staged.outer, swizzle=P_smem_layout_staged.inner, dtype=ab_dtype_dkdv
+        )
 
         sdOT = storage.sdOT.get_tensor(
-            dOT_smem_layout_staged.outer, swizzle=dOT_smem_layout_staged.inner
+            dOT_smem_layout_staged.outer, swizzle=dOT_smem_layout_staged.inner, dtype=ab_dtype_dkdv
         )
 
         # tSTrK shape : (MMA, MMA_M, MMA_K, STAGE)
@@ -1681,6 +2062,18 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     blk_coord_k,
                     blk_coord_h_k,
                     blk_coord_b,
+                    tma_atom_SFQT=tma_atom_SFQT,
+                    mSFQT=mSFQT,
+                    sSFQT=sSFQT,
+                    tma_atom_SFdOT=tma_atom_SFdOT,
+                    mSFdOT=mSFdOT,
+                    sSFdOT=sSFdOT,
+                    sf_sdp_loads=(
+                        (tma_atom_SFK, mSFK, sSFK),
+                        (tma_atom_SFV, mSFV, sSFV),
+                        (tma_atom_SFQ, mSFQ, sSFQ),
+                        (tma_atom_SFdO, mSFdO, sSFdO),
+                    ),
                 )
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1718,6 +2111,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     compute_mma_dS_consumer,
                     load_mma_QT_consumer,
                     mma_compute_dKdV_producer,
+                    sSF=(sSFP, sSFdOT, sSFdS, sSFQT),
+                    tSF_layouts=(tSFA_layout, tSFB_layout),
+                    sSF_sdp=(sSFK, sSFQ, sSFV, sSFdO),
+                    tSF_sdp_layouts=(tSFA_sdp_layout, tSFB_sdp_layout),
                 )
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1771,6 +2168,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     dV_tma,
                     sdK_epi_layout,
                     sdV_epi_layout,
+                    sSFdS=sSFdS,
                 )
 
                 cute.arch.barrier(
@@ -1787,6 +2185,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # Dealloc the tensor memory
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
+        if cutlass.const_expr(self.pdl_secondary):
+            cute.arch.griddepcontrol_wait()
 
     @cute.jit
     def get_Q_block_min_max(
@@ -1877,6 +2277,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         blk_coord_k: Int32,
         blk_coord_h_k: Int32,
         blk_coord_b: Int32,
+        tma_atom_SFQT: cute.CopyAtom | None = None,
+        mSFQT: cute.Tensor | None = None,
+        sSFQT: cute.Tensor | None = None,
+        tma_atom_SFdOT: cute.CopyAtom | None = None,
+        mSFdOT: cute.Tensor | None = None,
+        sSFdOT: cute.Tensor | None = None,
+        sf_sdp_loads: tuple = (None, None, None, None),
     ):
         """TMA load."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -1978,6 +2385,68 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cute.group_modes(tdVgdOT, 0, 3),
         )
 
+        load_SFQT = load_SFdOT = None
+        if cutlass.const_expr(self.mxfp8):
+            # the Q_T / dO_T scales ride on the Qt / dOt stages; each CTA loads half and
+            # multicasts it to both (NOTE [MXFP8 hd256 backward]). MHA only.
+            tiled_mma_sfb = mxu.make_mx_tiled_mma(
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.MN,
+                tcgen05.CtaGroup.ONE,
+                self.mma_tiler_sfb[:2],
+                k32=True,
+            )
+            cluster_layout_sfb_vmnk = cute.tiled_divide(
+                cute.make_layout(self.cluster_shape_mnk), (tiled_mma_sfb.thr_id.shape,)
+            )
+            coord_sfb = cluster_layout_sfb_vmnk.get_flat_coord(cute.arch.block_idx_in_cluster())
+            sfb_cta_layout = cute.make_layout(
+                cute.slice_(cluster_layout_sfb_vmnk, (0, None, 0, 0)).shape
+            )
+            sfb_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_sfb_vmnk, coord_sfb, mcast_mode=1
+            )
+            thr_mma_sfb = tiled_mma_sfb.get_slice(0)
+            sf_loads = []
+            for atom, mSF, sSF in ((tma_atom_SFQT, mSFQT, sSFQT), (tma_atom_SFdOT, mSFdOT, sSFdOT)):
+                gSF = cute.local_tile(
+                    mSF[None, None, (blk_coord_h, blk_coord_b)],
+                    cute.select(self.mma_tiler_sfb, mode=[1, 2]),
+                    (0, None),
+                )
+                load_SF, _, _ = fa_copy_utils.tma_get_copy_fn(
+                    atom,
+                    cta_coord=coord_sfb[1],
+                    cta_layout=sfb_cta_layout,
+                    src_tensor=thr_mma_sfb.partition_B(gSF),
+                    dst_tensor=sSF,
+                    filter_zeros=True,
+                    mcast_mask=sfb_mcast_mask,
+                )
+                sf_loads.append(load_SF)
+            load_SFQT, load_SFdOT = sf_loads
+        load_SFK = load_SFV = load_SFQ = load_SFdO = None
+        if cutlass.const_expr(self.mxfp8):
+            # the S^T / dP^T pair scale tiles: one plain TMA per CTA and tile
+            sdp_loads = []
+            for atom, mSF, sSF in sf_sdp_loads:
+                rows = cute.size(mSF, mode=[1])
+                sSF_bytes = cute.make_tensor(
+                    cute.recast_ptr(sSF.iterator, dtype=cutlass.Uint8),
+                    cute.make_layout(
+                        (16, rows, cute.size(sSF.layout, mode=[3])), stride=(1, 16, 16 * rows)
+                    ),
+                )
+                load_SF, _, _ = fa_copy_utils.tma_get_copy_fn(
+                    atom,
+                    cta_coord=0,
+                    cta_layout=cute.make_layout(1),
+                    src_tensor=mSF[None, None, None, (blk_coord_h, blk_coord_b)],
+                    dst_tensor=sSF_bytes,
+                )
+                sdp_loads.append(load_SF)
+            load_SFK, load_SFV, load_SFQ, load_SFdO = sdp_loads
+
         k_handle = load_mma_K_producer.acquire_and_advance()
         cute.copy(
             tma_atom_K,
@@ -1985,6 +2454,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tKsK[None, 0],
             tma_bar_ptr=k_handle.barrier,
         )
+        if cutlass.const_expr(self.mxfp8):
+            load_SFK(blk_coord_k, 0, tma_bar_ptr=k_handle.barrier)
 
         q_handle = load_mma_Q_producer.acquire_and_advance()
         cute.copy(
@@ -1993,6 +2464,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tQsQ[None, q_handle.index],
             tma_bar_ptr=q_handle.barrier,
         )
+        if cutlass.const_expr(self.mxfp8):
+            load_SFQ(iter_index, q_handle.index, tma_bar_ptr=q_handle.barrier)
 
         lse_handle = load_compute_LSE_producer.acquire_and_advance()
         thread_idx = tidx % self.threads_per_warp
@@ -2026,6 +2499,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tVsV[(None, 0)],
             tma_bar_ptr=v_handle.barrier,
         )
+        if cutlass.const_expr(self.mxfp8):
+            load_SFV(blk_coord_k, 0, tma_bar_ptr=v_handle.barrier)
 
         do_handle = load_mma_dO_producer.acquire_and_advance()
         cute.copy(
@@ -2034,6 +2509,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tdOsdO[(None, do_handle.index)],
             tma_bar_ptr=do_handle.barrier,
         )
+        if cutlass.const_expr(self.mxfp8):
+            load_SFdO(iter_index, do_handle.index, tma_bar_ptr=do_handle.barrier)
 
         sum_odo_handle = load_compute_sum_OdO_producer.acquire_and_advance()
         sSum_OdO_for_copy = cute.flat_divide(sSum_OdO, (1,))
@@ -2058,6 +2535,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tdOTsdOT[None, dot_handle.index],
             tma_bar_ptr=dot_handle.barrier,
         )
+        if cutlass.const_expr(self.mxfp8):
+            load_SFdOT(iter_index, dot_handle.index, tma_bar_ptr=dot_handle.barrier)
 
         qt_handle = load_mma_QT_producer.acquire_and_advance()
         cute.copy(
@@ -2066,6 +2545,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tQTsQT[None, qt_handle.index],
             tma_bar_ptr=qt_handle.barrier,
         )
+        if cutlass.const_expr(self.mxfp8):
+            load_SFQT(iter_index, qt_handle.index, tma_bar_ptr=qt_handle.barrier)
 
         iter_count -= 1
         iter_index += 1
@@ -2083,6 +2564,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 tQsQ[None, q_handle.index],
                 tma_bar_ptr=q_handle.barrier,
             )
+            if cutlass.const_expr(self.mxfp8):
+                load_SFQ(iter_index, q_handle.index, tma_bar_ptr=q_handle.barrier)
 
             lse_handle = load_compute_LSE_producer.acquire_and_advance()
             sLSE_for_copy = cute.flat_divide(sLSE, (1,))
@@ -2107,6 +2590,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 tdOsdO[None, do_handle.index],
                 tma_bar_ptr=do_handle.barrier,
             )
+            if cutlass.const_expr(self.mxfp8):
+                load_SFdO(iter_index, do_handle.index, tma_bar_ptr=do_handle.barrier)
 
             sum_odo_handle = load_compute_sum_OdO_producer.acquire_and_advance()
             sSum_OdO_for_copy = cute.flat_divide(sSum_OdO, (1,))
@@ -2133,6 +2618,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 tdOTsdOT[None, dot_handle.index],
                 tma_bar_ptr=dot_handle.barrier,
             )
+            if cutlass.const_expr(self.mxfp8):
+                load_SFdOT(iter_index, dot_handle.index, tma_bar_ptr=dot_handle.barrier)
 
             qt_handle = load_mma_QT_producer.acquire_and_advance()
             cute.copy(
@@ -2141,6 +2628,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 tQTsQT[None, qt_handle.index],
                 tma_bar_ptr=qt_handle.barrier,
             )
+            if cutlass.const_expr(self.mxfp8):
+                load_SFQT(iter_index, qt_handle.index, tma_bar_ptr=qt_handle.barrier)
 
             iter_count -= 1
             iter_index += 1
@@ -2197,8 +2686,50 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         compute_mma_dS_consumer,
         load_mma_QT_consumer,
         mma_compute_dKdV_producer,
+        sSF: tuple = (None, None, None, None),
+        tSF_layouts: tuple = (None, None),
+        sSF_sdp: tuple = (None, None, None, None),
+        tSF_sdp_layouts: tuple = (None, None),
     ):
         """CuTeDSL kernel for mma pipeline."""
+        sf_s = sf_dp = None
+        if cutlass.const_expr(self.mxfp8):
+            # S^T / dP^T: K / V scales are copied once (constant per CTA), Q / dO per iteration;
+            # the Q / dO copies broadcast two chunks to lane quadrants 0/1 and 2/3
+            sSFK, sSFQ, sSFV, sSFdO = sSF_sdp
+            tSFA_sdp_layout, tSFB_sdp_layout = tSF_sdp_layouts
+            cta_group_sdp = tcgen05.CtaGroup.TWO
+            sf_s = (
+                mxu.make_sf_s2t(sSFK, tSFA_sdp_layout, self.tmem_sfk_offset, cta_group_sdp),
+                mxu.make_sf_s2t(
+                    sSFQ, tSFB_sdp_layout, self.tmem_sfq_offset, cta_group_sdp, lane_halves=True
+                ),
+            )
+            sf_dp = (
+                mxu.make_sf_s2t(sSFV, tSFA_sdp_layout, self.tmem_sfv_offset, cta_group_sdp),
+                mxu.make_sf_s2t(
+                    sSFdO, tSFB_sdp_layout, self.tmem_sfdo_offset, cta_group_sdp, lane_halves=True
+                ),
+            )
+        sf_dv = sf_dk = None
+        if cutlass.const_expr(self.mxfp8):
+            # dV / dK: TMEM scales and their SMEM -> TMEM copies, issued right before the MMA
+            # that reads them (same-thread tcgen05.cp / tcgen05.mma issue order)
+            sSFP, sSFdOT, sSFdS, sSFQT = sSF
+            tSFA_layout, tSFB_layout = tSF_layouts
+            cta_group = tcgen05.CtaGroup.TWO
+            sf_dv = (
+                mxu.make_sf_s2t(sSFP, tSFA_layout, self.tmem_sfp_offset, cta_group),
+                mxu.make_sf_s2t(
+                    sSFdOT, tSFB_layout, self.tmem_sfdot_offset, cta_group, lane_halves=True
+                ),
+            )
+            sf_dk = (
+                mxu.make_sf_s2t(sSFdS, tSFA_layout, self.tmem_sfds_offset, cta_group),
+                mxu.make_sf_s2t(
+                    sSFQT, tSFB_layout, self.tmem_sfqt_offset, cta_group, lane_halves=True
+                ),
+            )
         load_mma_Q_releaser = load_mma_Q_consumer.clone()
         load_mma_K_releaser = load_mma_K_consumer.clone()
         load_mma_V_releaser = load_mma_V_consumer.clone()
@@ -2212,8 +2743,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             q_handle = load_mma_Q_consumer.wait_and_advance()
 
             # Compute S = K * Q
+            if cutlass.const_expr(self.mxfp8):
+                self.copy_sf(sf_s, q_handle.index)
             for k_block in cutlass.range(0, cute.size(tSTrQ, mode=[2]), unroll_full=True):
                 KQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, k_block != 0)
+                if cutlass.const_expr(self.mxfp8):
+                    self.set_sf(KQ_tiled_mma, sf_s, k_block)
                 cute.gemm(
                     KQ_tiled_mma,
                     tSTtST,
@@ -2233,7 +2768,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             # Compute dP = V * dO
             VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            if cutlass.const_expr(self.mxfp8):
+                self.copy_sf(sf_dp, do_handle.index)
             for k_block in cutlass.range(0, cute.size(tdPTrV, mode=[2]), unroll_full=True):
+                if cutlass.const_expr(self.mxfp8):
+                    self.set_sf(VdO_tiled_mma, sf_dp, k_block)
                 cute.gemm(
                     VdO_tiled_mma,
                     tdPTtdPT,
@@ -2252,7 +2791,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             # Compute dV = P * dO (First iteration)
             PdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            if cutlass.const_expr(self.mxfp8):
+                self.copy_sf(sf_dv, dot_handle.index)
             for k_block in cutlass.range(0, cute.size(tdVrP, mode=[2]), unroll_full=True):
+                if cutlass.const_expr(self.mxfp8):
+                    self.set_sf(PdO_tiled_mma, sf_dv, k_block)
                 cute.gemm(
                     PdO_tiled_mma,
                     tdVtdV,
@@ -2274,8 +2817,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 s_handle = mma_compute_S_producer.acquire_and_advance()
 
                 # Compute S = K * Q
+                if cutlass.const_expr(self.mxfp8):
+                    self.copy_sf(sf_s, q_handle.index, copy_a=False)
                 for k_block in cutlass.range(0, cute.size(tSTrQ, mode=[2]), unroll_full=True):
                     KQ_tiled_mma.set(tcgen05.Field.ACCUMULATE, k_block != 0)
+                    if cutlass.const_expr(self.mxfp8):
+                        self.set_sf(KQ_tiled_mma, sf_s, k_block)
                     cute.gemm(
                         KQ_tiled_mma,
                         tSTtST,
@@ -2291,7 +2838,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 ds_handle = compute_mma_dS_consumer.wait_and_advance()
 
                 # Compute dK = dS * QT
+                if cutlass.const_expr(self.mxfp8):
+                    self.copy_sf(sf_dk, qt_handle.index)
                 for k_block in cutlass.range(0, cute.size(tdKrdST, mode=[2]), unroll_full=True):
+                    if cutlass.const_expr(self.mxfp8):
+                        self.set_sf(dSQ_tiled_mma, sf_dk, k_block)
                     cute.gemm(
                         dSQ_tiled_mma,
                         tdKtdK,
@@ -2313,7 +2864,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 do_handle = load_mma_dO_consumer.wait_and_advance()
                 # V only produced once by load(); reuse same V (index 0) for all loop iterations
                 VdO_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                if cutlass.const_expr(self.mxfp8):
+                    self.copy_sf(sf_dp, do_handle.index, copy_a=False)
                 for k_block in cutlass.range(0, cute.size(tdPTrV, mode=[2]), unroll_full=True):
+                    if cutlass.const_expr(self.mxfp8):
+                        self.set_sf(VdO_tiled_mma, sf_dp, k_block)
                     cute.gemm(
                         VdO_tiled_mma,
                         tdPTtdPT,
@@ -2331,7 +2886,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 dot_handle = load_mma_dOT_consumer.wait_and_advance()
 
                 # Compute dV = P * dO (Loop iterations)
+                if cutlass.const_expr(self.mxfp8):
+                    self.copy_sf(sf_dv, dot_handle.index)
                 for k_block in cutlass.range(0, cute.size(tdVrP, mode=[2]), unroll_full=True):
+                    if cutlass.const_expr(self.mxfp8):
+                        self.set_sf(PdO_tiled_mma, sf_dv, k_block)
                     cute.gemm(
                         PdO_tiled_mma,
                         tdVtdV,
@@ -2362,7 +2921,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             qt_handle = load_mma_QT_consumer.wait_and_advance()
 
             # Compute dK = dS * Q
+            if cutlass.const_expr(self.mxfp8):
+                self.copy_sf(sf_dk, qt_handle.index)
             for k_block in cutlass.range(0, cute.size(tdKrdST, mode=[2]), unroll_full=True):
+                if cutlass.const_expr(self.mxfp8):
+                    self.set_sf(dSQ_tiled_mma, sf_dk, k_block)
                 cute.gemm(
                     dSQ_tiled_mma,
                     tdKtdK,
@@ -2394,6 +2957,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             compute_mma_dS_consumer,
             load_mma_QT_consumer,
         )
+
+    @cute.jit
+    def copy_sf(self, sf, B_idx: Int32, copy_a: cutlass.Constexpr[bool] = True):
+        """MXFP8: SMEM -> TMEM copies of one block-scaled MMA's A (stage 0, unless
+        copy_a is False) and B (stage B_idx) scales."""
+        (_, cp_a, src_a, dst_a), (_, copy_b, src_b, dst_b) = sf
+        if cutlass.const_expr(copy_a):
+            cute.copy(cp_a, src_a[None, None, None, None, 0], dst_a)
+        cute.copy(copy_b, src_b[None, None, None, None, B_idx], dst_b)
+
+    @cute.jit
+    def set_sf(self, tiled_mma: cute.TiledMma, sf, k_block: Int32):
+        """MXFP8: point the block-scaled MMA at k_block's A / B scales in TMEM."""
+        (tSFA, _, _, _), (tSFB, _, _, _) = sf
+        tiled_mma.set(tcgen05.Field.SFA, tSFA[None, None, k_block].iterator)
+        tiled_mma.set(tcgen05.Field.SFB, tSFB[None, None, k_block].iterator)
 
     @cute.jit
     def reg_to_smem_mma64x64(
@@ -2576,6 +3155,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dV_tma: cute.Tensor,
         sdK_epi_layout: cute.ComposedLayout,
         sdV_epi_layout: cute.ComposedLayout,
+        sSFdS: cute.Tensor | None = None,
     ):
         """CuTeDSL kernel for recomputing softmax and producing dk and dv."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2603,19 +3183,37 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         tiled_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tSTtST)
         thr_t2r = tiled_t2r.get_slice(dp_idx)
 
+        # MXFP8: contiguous chunks, so a thread holds 32 adjacent queries of its key (one
+        # aligned 1x32 scale group of dS^T)
+        split_wg_fn = mxu.split_wg_contiguous if cutlass.const_expr(self.mxfp8) else split_wg
         tTR_cST = thr_t2r.partition_D(cST)
-        tTR_cST = split_wg(tTR_cST, num_warp_groups, wg_idx)
+        tTR_cST = split_wg_fn(tTR_cST, num_warp_groups, wg_idx)
         tTR_rST = cute.make_rmem_tensor(tTR_cST.shape, self.acc_dtype)
 
         tTR_tST = thr_t2r.partition_S(tSTtST)
-        tTR_tST = split_wg(tTR_tST, num_warp_groups, wg_idx)
+        tTR_tST = split_wg_fn(tTR_tST, num_warp_groups, wg_idx)
 
         tTR_cdPT_p = thr_t2r.partition_D(cdPT)
-        tTR_cdPT = split_wg(tTR_cdPT_p, num_warp_groups, wg_idx)
+        tTR_cdPT = split_wg_fn(tTR_cdPT_p, num_warp_groups, wg_idx)
         tTR_rdPT = cute.make_rmem_tensor(tTR_cdPT.shape, self.acc_dtype)
 
         tTR_tdPT = thr_t2r.partition_S(tdPTtdPT)
-        tTR_tdPT = split_wg(tTR_tdPT, num_warp_groups, wg_idx)
+        tTR_tdPT = split_wg_fn(tTR_tdPT, num_warp_groups, wg_idx)
+
+        if cutlass.const_expr(self.mxfp8):
+            assert cute.size(tTR_rST) == 32
+            # this thread's key row and 32-query group, and (key, query) views of the E4M3 sP /
+            # sdST tiles (K-major: queries contiguous per key)
+            mx_key = cute.get(tTR_cST[0], mode=[0])
+            mx_group = cute.get(tTR_cST[0], mode=[1]) // 32
+            sP_kq = self.mx_kq_view(sP)
+            sdST_kq = self.mx_kq_view(sdST)
+            # dS^T scale bytes in the 128-row chunk order 16 * (row % 32) + 4 * (row // 32) +
+            # group, rows key and key + 64 (see __call__)
+            sSFdS_u8 = cute.make_tensor(
+                cute.recast_ptr(sSFdS.iterator, dtype=cutlass.Uint8), cute.make_layout(512)
+            )
+            sf_idx = 16 * (mx_key % 32) + 4 * (mx_key // 32) + mx_group
 
         tdVcST = PdO_tiled_mma.get_slice(0).partition_A(cST)
 
@@ -2715,21 +3313,31 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 tTR_rST[i] = cute.math.exp2(tTR_rST[i], fastmath=True)
                 tTR_rST[i + 1] = cute.math.exp2(tTR_rST[i + 1], fastmath=True)
 
-            # convert fp32 P to fp16 P which will be used in the PdO
-            tTR_rPT = self.quantize(tTR_rST, dV.element_type)  # tTR_rST is ST in fp32 in RF.
-            self.reg_to_smem_mma128x128_2cta(
-                tTR_rPT,
-                sP,
-                p_handle.index,
-                (self.tile_shape_K, self.tile_shape_Q),
-                dp_idx,
-                wg_idx,
-            )
+            if cutlass.const_expr(self.mxfp8):
+                # P * 2^8 (the LSE carries the shift) in E4M3 with the constant scale 2^-8
+                tTR_rPT = self.quantize(tTR_rST, mxu.MX_DTYPE)
+                cute.autovec_copy(
+                    self.flat32(tTR_rPT), sP_kq[mx_key, (None, mx_group), p_handle.index]
+                )
+            else:
+                # convert fp32 P to fp16 P which will be used in the PdO
+                tTR_rPT = self.quantize(tTR_rST, dV.element_type)  # tTR_rST is ST in fp32 in RF.
+                self.reg_to_smem_mma128x128_2cta(
+                    tTR_rPT,
+                    sP,
+                    p_handle.index,
+                    (self.tile_shape_K, self.tile_shape_Q),
+                    dp_idx,
+                    wg_idx,
+                )
             cute.arch.fence_view_async_shared()
-            cute.arch.barrier(
-                barrier_id=self.compute_sync_bar_id,
-                number_of_threads=self.num_compute_warps * self.threads_per_warp,
-            )
+            # The P / dS^T pipelines count every compute thread's arrival (each after its own
+            # fence), so the barrier is redundant; MXFP8 drops it, BF16 keeps its schedule.
+            if cutlass.const_expr(not self.mxfp8):
+                cute.arch.barrier(
+                    barrier_id=self.compute_sync_bar_id,
+                    number_of_threads=self.num_compute_warps * self.threads_per_warp,
+                )
 
             p_handle.commit()
 
@@ -2774,25 +3382,41 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     )
                     if pos[0] + K - Q < pos[1] or not cute.elem_less(pos, (Q, K)):
                         tTR_rdPT[i] = cutlass.Float32(0.0)
-            # convert fp32 dS to fp16 dS which will be used in the computation of dK and DQ
-            tTR_rdST = self.quantize(tTR_rdPT, dV.element_type)
+            if cutlass.const_expr(self.mxfp8):
+                # dS^T (x 2^8, see the P shift) in E4M3 with this thread's scale for its 32
+                # queries; the scale byte drops the 2^8
+                sf_ds, inv_scale_ds = mxu.mx_scale(tTR_rdPT)
+                tTR_rdST = cute.make_rmem_tensor(tTR_rdPT.shape, mxu.MX_DTYPE)
+                mxu.mx_apply(tTR_rdPT, inv_scale_ds, tTR_rdST)
+                cute.arch.fence_view_async_tmem_load()
+                dp_handle.release()
+                cute.autovec_copy(
+                    self.flat32(tTR_rdST), sdST_kq[mx_key, (None, mx_group), ds_handle.index]
+                )
+                sf_byte = cutlass.Uint8(cutlass.max(sf_ds - 8, 0))
+                sSFdS_u8[sf_idx] = sf_byte
+                sSFdS_u8[sf_idx + 8] = sf_byte
+            else:
+                # convert fp32 dS to fp16 dS which will be used in the computation of dK and DQ
+                tTR_rdST = self.quantize(tTR_rdPT, dV.element_type)
 
-            cute.arch.fence_view_async_tmem_load()
-            dp_handle.release()
+                cute.arch.fence_view_async_tmem_load()
+                dp_handle.release()
 
-            self.reg_to_smem_mma128x128_2cta(
-                tTR_rdST,
-                sdST,
-                ds_handle.index,
-                (self.tile_shape_K, self.tile_shape_Q),
-                dp_idx,
-                wg_idx,
-            )
+                self.reg_to_smem_mma128x128_2cta(
+                    tTR_rdST,
+                    sdST,
+                    ds_handle.index,
+                    (self.tile_shape_K, self.tile_shape_Q),
+                    dp_idx,
+                    wg_idx,
+                )
             cute.arch.fence_view_async_shared()
-            cute.arch.barrier(
-                barrier_id=self.compute_sync_bar_id,
-                number_of_threads=self.num_compute_warps * self.threads_per_warp,
-            )
+            if cutlass.const_expr(not self.mxfp8):  # (see the P store above)
+                cute.arch.barrier(
+                    barrier_id=self.compute_sync_bar_id,
+                    number_of_threads=self.num_compute_warps * self.threads_per_warp,
+                )
 
             ds_handle.commit()
             sum_odo_handle.release()
@@ -2841,6 +3465,25 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             compute_mma_dS_consumer,
             mma_compute_dKdV_consumer,
         )
+
+    @cute.jit
+    def mx_kq_view(self, s: cute.Tensor) -> cute.Tensor:
+        """MXFP8: (key, (32, query // 32), stage) view of an E4M3 K-major A tile whose stage
+        layout is ((64 keys, k_inst queries), 1, queries // k_inst) (k_inst = 32: the K=32 MMAs)."""
+        k_inst = cute.size(s.shape[0], mode=[1])
+        n_kb = cute.size(s, mode=[2])
+        return cute.composition(
+            s,
+            cute.make_layout(
+                (64, (32, (k_inst // 32, n_kb)), cute.size(s, mode=[3])),
+                stride=(1, (64, (64 * 32, 64 * k_inst)), 64 * k_inst * n_kb),
+            ),
+        )
+
+    @cute.jit
+    def flat32(self, t: cute.Tensor) -> cute.Tensor:
+        """Flat view of a compact 32-element register fragment (element order = query order)."""
+        return cute.make_tensor(t.iterator, cute.make_layout(32))
 
     @cute.jit
     def quantize(

@@ -700,6 +700,34 @@ def cvt_f16x2_f32(
     )
 
 
+@dsl_user_op
+def e8m0_ceil_scale(amax: Float32, *, loc=None, ip=None) -> Tuple[Int32, Float32]:
+    """MX scale of a group with absolute maximum |amax| (the sign bit is ignored):
+    2^ceil(log2(|amax| / 448)), the rule of blockscaled_utils, as the biased E8M0 exponent
+    (clamped to [0, 254]) and the FP32 reciprocal scale. |amax| = m * 2^e with m in [1, 2) gives
+    the exponent e - 8 + (m > 1.75). amax = 0 gives exponent 0 (blockscaled_utils uses scale 1);
+    the group's payload is zero either way."""
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.f32()]),
+        [Float32(amax).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .b32 b, e, m;\n\t.reg .pred p;\n\t"
+        "mov.b32 b, $2;\n\tand.b32 b, b, 0x7FFFFFFF;\n\t"
+        "shr.u32 e, b, 23;\n\tand.b32 m, b, 0x7FFFFF;\n\t"
+        "setp.gt.u32 p, m, 0x600000;\n\tselp.s32 m, 1, 0, p;\n\t"
+        "add.s32 e, e, m;\n\tsub.s32 e, e, 8;\n\t"
+        "max.s32 e, e, 0;\n\tmin.s32 e, e, 254;\n\t"
+        "mov.b32 $0, e;\n\tsub.s32 m, 254, e;\n\tshl.b32 m, m, 23;\n\tmov.b32 $1, m;\n\t}\n",
+        "=r,=f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        Int32(llvm.extractvalue(T.i32(), out, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), out, [1], loc=loc, ip=ip)),
+    )
+
+
 @overload
 def cvt_f16(src: cute.Tensor, dst: cute.Tensor) -> None: ...
 

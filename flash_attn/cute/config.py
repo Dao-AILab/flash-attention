@@ -2627,6 +2627,8 @@ class BwdHeuristicInputs(NamedTuple):
     disable_2cta: bool = False
     # FLASH_ATTENTION_HD256_GENERIC_BWD: SM100 hdim 256 on FlashAttentionBackwardSm100.
     hd256_generic: bool = False
+    # MXFP8 operands (_flash_attn_bwd(mx_hd256=...)): NOTE [MXFP8 hd256 backward].
+    mxfp8: bool = False
 
     @property
     def device_capacity(self) -> int:
@@ -2642,8 +2644,11 @@ class BwdHeuristicInputs(NamedTuple):
 
     @property
     def uses_dedicated_hd256_kernel(self) -> bool:
-        """SM100 hdim 256 runs the dedicated kernels unless FLASH_ATTENTION_HD256_GENERIC_BWD."""
-        return self.is_hdim256 and not self.hd256_generic
+        """SM100 hdim 256 runs the dedicated kernels unless FLASH_ATTENTION_HD256_GENERIC_BWD.
+
+        MXFP8 runs only there, so the knob does not apply to it.
+        """
+        return self.is_hdim256 and (self.mxfp8 or not self.hd256_generic)
 
 
 def bwd_sparse_q_block_size(inputs: BwdHeuristicInputs) -> int | None:
@@ -2982,7 +2987,7 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 else Sm90BwdRegisters(mma=240, mma_no_dq=240, producer=24)
             )
         case 10 | 11:
-            hd256_generic = inputs.is_hdim256 and inputs.hd256_generic
+            hd256_generic = inputs.is_hdim256 and not inputs.uses_dedicated_hd256_kernel
             # hdim 256 on the generic kernel runs a 64-row KV tile per CTA (NOTE [M=64
             # accumulator layout] in flash_bwd_sm100.py); the 2CTA decision sees that tile.
             tile_n = 64 if hd256_generic else 128
@@ -3183,6 +3188,8 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
         )
     if config.num_stages_Q < 1 or config.num_stages_dO < 1 or config.num_stages_PdS < 1:
         raise ValueError("Pipeline stage counts must be positive")
+    if inputs.mxfp8 and not config.use_dedicated_hd256_kernel:
+        raise ValueError("The MXFP8 backward runs only on the dedicated SM100 hdim-256 kernels")
     if capacity not in (10, 11) and any(
         getattr(config, name) != value for name, value in _SM100_ONLY_NEUTRAL_FIELDS.items()
     ):
