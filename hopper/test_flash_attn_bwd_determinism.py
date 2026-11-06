@@ -41,9 +41,6 @@ DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
 
-# deterministic mode not supported for hdim 256
-DISABLE_HDIM256 = True
-
 COMPILED_HDIMS = (
     []
     + ([64] if not DISABLE_HDIM64 else [])
@@ -114,8 +111,8 @@ def test_flash_attn_output(
         pytest.skip("V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn")
     if has_qv and (d != 64 or dtype == torch.float8_e4m3fn):
         pytest.skip("Has Qv requires hdim 64 and dtype to be float16 or bfloat16 (not float8_e4m3fn)")
-    if deterministic and d == 256:
-        pytest.skip("Deterministic mode not supported for hdim 256")
+    if deterministic and d == 256 and torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Deterministic backward for hdim 256 requires SM90")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -247,7 +244,7 @@ def test_flash_attn_output(
             dq = torch.empty_like(q)
             dk = torch.empty_like(k)
             dv = torch.empty_like(v)
-            dq, dk, dv, softmax_d = _flash_attn_backward(
+            softmax_d = _flash_attn_backward(
                 g,
                 q,
                 k,
@@ -262,7 +259,8 @@ def test_flash_attn_output(
                 dv,
                 d ** (-0.5),
                 causal,
-                window_size=window_size,
+                window_size_left=window_size[0],
+                window_size_right=window_size[1],
                 softcap=softcap,
                 deterministic=deterministic,
             )
@@ -307,7 +305,7 @@ def test_flash_attn_output(
                     dq2 = torch.empty_like(dq)
                     dk2 = torch.empty_like(dk)
                     dv2 = torch.empty_like(dv)
-                    dq2, dk2, dv2, softmax_d = _flash_attn_backward(
+                    softmax_d = _flash_attn_backward(
                         g,
                         q,
                         k,
@@ -322,7 +320,8 @@ def test_flash_attn_output(
                         dv2,
                         d ** (-0.5),
                         causal,
-                        window_size=window_size,
+                        window_size_left=window_size[0],
+                        window_size_right=window_size[1],
                         softcap=softcap,
                         deterministic=deterministic,
                     )
@@ -393,8 +392,8 @@ def test_flash_attn_varlen_output(
 ):
     if has_qv and (d != 64 or dtype == torch.float8_e4m3fn):
         pytest.skip("Has Qv requires hdim 64 and dtype to be float16 or bfloat16 (not float8_e4m3fn)")
-    if deterministic and d == 256:
-        pytest.skip("Deterministic mode not supported for hdim 256")
+    if deterministic and d == 256 and torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Deterministic backward for hdim 256 requires SM90")
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
@@ -584,7 +583,7 @@ def test_flash_attn_varlen_output(
             dq_unpad = torch.empty_like(q_unpad)
             dk_unpad = torch.empty_like(k_unpad)
             dv_unpad = torch.empty_like(v_unpad)
-            dq_unpad, dk_unpad, dv_unpad, softmax_d = _flash_attn_backward(
+            softmax_d = _flash_attn_backward(
                 g_unpad,
                 q_unpad,
                 k_unpad,
@@ -599,7 +598,8 @@ def test_flash_attn_varlen_output(
                 dv_unpad,
                 d ** (-0.5),
                 causal,
-                window_size=window_size,
+                window_size_left=window_size[0],
+                window_size_right=window_size[1],
                 softcap=softcap,
                 deterministic=deterministic,
             )
@@ -665,7 +665,7 @@ def test_flash_attn_varlen_output(
                     dq_unpad2 = torch.empty_like(q_unpad)
                     dk_unpad2 = torch.empty_like(k_unpad)
                     dv_unpad2 = torch.empty_like(v_unpad)
-                    dq_unpad2, dk_unpad2, dv_unpad2, softmax_d = _flash_attn_backward(
+                    softmax_d = _flash_attn_backward(
                         g_unpad,
                         q_unpad,
                         k_unpad,
@@ -680,7 +680,8 @@ def test_flash_attn_varlen_output(
                         dv_unpad2,
                         d ** (-0.5),
                         causal,
-                        window_size=window_size,
+                        window_size_left=window_size[0],
+                        window_size_right=window_size[1],
                         softcap=softcap,
                         deterministic=deterministic,
                     )
