@@ -78,9 +78,9 @@ from flash_attn.cute.utils import AuxData
 from flash_attn.cute.config import (
     SM100_LAUNCH_REGISTERS,
     SM100_MAX_KV_STAGE,
-    SM100_SMEM_BYTES,
     SM100_THREADS_PER_CTA,
     FwdConfig,
+    sm100_smem_capacity,
     sm100_uneven_kv_smem,
 )
 
@@ -773,8 +773,9 @@ class FlashAttentionForwardSm100:
             ]
 
         self.shared_storage = SharedStorage
-        assert SharedStorage.size_in_bytes() <= SM100_SMEM_BYTES, (
-            f"SMEM {SharedStorage.size_in_bytes()} > {SM100_SMEM_BYTES}: "
+        smem_capacity = sm100_smem_capacity(self.arch.major * 10 + self.arch.minor)
+        assert SharedStorage.size_in_bytes() <= smem_capacity, (
+            f"SMEM {SharedStorage.size_in_bytes()} > {smem_capacity}: "
             f"overlap_sO_sQ={self.overlap_sO_sQ}, kv_stage={self.kv_stage}"
         )
 

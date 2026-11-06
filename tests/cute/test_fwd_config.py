@@ -255,6 +255,18 @@ def test_smem_model_matches_measured_kernel_allocations():
         validate_fwd_config(too_wide, hd192)
 
 
+def test_sm107_layouts_may_exceed_the_sm100_smem_capacity():
+    # hd256 with 8 K/V stages places operands above 256 KiB: sm_107 only.
+    inputs = make_inputs(**_HD256, causal=True, device_arch=107)
+    selected = select_fwd_config(inputs)
+    assert selected.kv_stage < 8  # selection keeps the 224 KiB budget
+    deep = derive_fwd_config(selected, inputs, kv_stage=8)
+    assert SM100_SMEM_BYTES < sm100_fwd_smem_bytes(deep, inputs) <= 327 * 1024
+    sm100 = inputs._replace(device_arch=100)
+    with pytest.raises(ValueError, match="SM100 provides 232448"):
+        validate_fwd_config(replace(deep, registers=select_fwd_config(sm100).registers), sm100)
+
+
 def test_2cta_hd192_three_kv_stages_use_the_even_layout():
     # The [K, V, K] stage-1 offset assumes full K/V tiles; 2CTA halves them per CTA, so V at
     # stage 1 would overlap K at stage 2.
