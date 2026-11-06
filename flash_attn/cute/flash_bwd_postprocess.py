@@ -184,6 +184,12 @@ class FlashAttentionBackwardPostprocess:
                 "accum_order does not match use_2cta_instrs"
             )
         self.accum_order = accum_order
+        # Read the accumulate tile straight into registers through its storage order: the SM100
+        # 1CTA writers, and SM12x writers that store a declared order (otherwise SM12x keeps the
+        # SM80 thread-interleaved order).
+        self.use_g2r_accum = (arch // 10 in [10, 11] and not self.use_2cta_instrs) or (
+            arch // 10 == 12 and accum_order is not None
+        )
 
     @staticmethod
     def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
@@ -292,19 +298,43 @@ class FlashAttentionBackwardPostprocess:
             assert self.num_threads == 128  # TODO: currently hard-coded
             self.s2r_tiled_copy_dQaccum = None
 
-        # SM100 without 2CTA: the accumulate tile is loaded straight from GMEM into registers
+        # use_g2r_accum: the accumulate tile is loaded straight from GMEM into registers
         # in its storage order (16 B per thread per load, a warp reads 512 contiguous bytes
         # whatever the format), and the layout of the tile says which (row, 4 columns) each
         # vector is: compose the physical copy map with the inverse of the tile layout. The
         # same thread -> coordinates map then stores the converted vectors into sdQ.
         self.g2r_tiled_copy_dQaccum = None
         self.r2s_tiled_copy_dQ = None
-        if const_expr(self.arch // 10 in [10, 11] and not self.use_2cta_instrs):
+        if const_expr(self.use_g2r_accum):
             vec = universal_copy_bits // Float32.width
-            num_vec = self.tile_m * self.tile_hdim // (vec * self.num_threads)
-            physical_tv = cute.make_layout(
-                (self.num_threads, (vec, num_vec)), stride=(vec, (1, vec * self.num_threads))
+            # A flat round of a row-major tile must end on a row, or the inverse of the tile
+            # layout does not compose with it (96 columns at 256 threads); the SM100 fragment
+            # orders compose either way.
+            flat_rounds = (
+                self.accum_order != AccumTileOrder.ROW_MAJOR
+                or (vec * self.num_threads) % self.tile_hdim == 0
             )
+            if const_expr(flat_rounds):
+                num_vec = self.tile_m * self.tile_hdim // (vec * self.num_threads)
+                physical_tv = cute.make_layout(
+                    (self.num_threads, (vec, num_vec)), stride=(vec, (1, vec * self.num_threads))
+                )
+            else:
+                # 8 threads read a 128 B row chunk and step 32 columns; a pass is
+                # num_threads // 8 rows.
+                rows_per_pass = self.num_threads // 8
+                passes = self.tile_m // rows_per_pass
+                assert self.tile_hdim % (8 * vec) == 0 and self.tile_m % rows_per_pass == 0
+                val_shape = (vec, self.tile_hdim // (8 * vec))
+                val_stride = (1, 8 * vec)
+                if passes > 1:
+                    val_shape, val_stride = (
+                        (*val_shape, passes),
+                        (*val_stride, rows_per_pass * self.tile_hdim),
+                    )
+                physical_tv = cute.make_layout(
+                    ((8, rows_per_pass), val_shape), stride=((vec, self.tile_hdim), val_stride)
+                )
             layout_tv = cute.composition(
                 cute.right_inverse(self._dQaccum_tile_layout()), physical_tv
             )
@@ -321,7 +351,9 @@ class FlashAttentionBackwardPostprocess:
             # stores; the row-major tile gives a thread one vector per row (8 B stores, but a
             # warp writes whole rows).
             store_vec = (
-                2 * vec if cute.crd2idx((0, (0, 1)), layout_tv) == vec * self.tile_m else vec
+                2 * vec
+                if flat_rounds and cute.crd2idx((0, (0, 1)), layout_tv) == vec * self.tile_m
+                else vec
             )
             self.r2s_tiled_copy_dQ = cute.make_tiled_copy(
                 cute.make_copy_atom(
@@ -333,8 +365,13 @@ class FlashAttentionBackwardPostprocess:
                 tiler_mn=tiler_mn,
             )
 
-        num_copy_elems = 128 // self.dtype.width
-        threads_per_row = math.gcd(128, self.tile_hdim) // num_copy_elems
+        threads_per_row, num_copy_elems = utils.fit_row_copy(
+            self.dtype,
+            self.tile_m,
+            self.tile_hdim,
+            self.num_threads,
+            math.gcd(128, self.tile_hdim) // (128 // self.dtype.width),
+        )
         self.gmem_tiled_copy_dQ = copy_utils.tiled_copy_2d(
             self.dtype, threads_per_row, self.num_threads, num_copy_elems
         )
@@ -346,7 +383,10 @@ class FlashAttentionBackwardPostprocess:
         # We want to treat it as 64 x 48, so kBlockKSmem should be 16.
         mma_shape_n = self.tiled_mma.get_tile_size(1)
         if const_expr(self.arch // 10 in [8, 12]):
-            sdQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, mma_shape_n)
+            # The atom must also tile the head dim (a 64-wide MMA N over 96 columns: 32).
+            sdQ_layout_atom = sm80_utils.get_smem_layout_atom(
+                self.dtype, math.gcd(mma_shape_n, self.tile_hdim)
+            )
             self.sdQ_layout = cute.tile_to_shape(
                 sdQ_layout_atom, (self.tile_m, self.tile_hdim), (0, 1)
             )
@@ -696,7 +736,7 @@ class FlashAttentionBackwardPostprocess:
                 )
                 cute.arch.fence_view_async_shared()
                 cute.arch.barrier(barrier_id=8, number_of_threads=num_reduce_threads)
-            elif const_expr(self.arch // 10 in [10, 11]):
+            elif const_expr(self.use_g2r_accum):
                 # G -> R in the tile's storage order (see _setup_attributes): the partition of
                 # the (tile_m, hdim) view hands every thread its 16 B vectors, and the same
                 # thread -> (row, columns) map writes the converted vectors into sdQ.
