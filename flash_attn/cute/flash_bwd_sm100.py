@@ -67,6 +67,36 @@ from flash_attn.cute.block_sparse_utils import (
 # parity never depends on where the other pipelines flip. Perf evidence in PR #2804; the
 # aliased layout is what every other shape runs.
 
+# NOTE [hdim64 LSE / dPsum fold into the S / dP MMA]
+# With split_P_dS the compute warps compute P = exp2(S * scale_log2 - LSE) and
+# dS = P * (dP - dPsum), where LSE and dPsum are per-Q-row values that every thread reads
+# with broadcast LDS. Those LDS share the MIO queue with MUFU, and the FFMA2 / FADD2 that
+# consume them stall on them: on GB300 MHA, dropping that work (wrong output) is worth up
+# to ~10%, most of it from dPsum in the dS phase.
+# The fold moves both subtractions into the MMAs as one extra K=16 block each:
+#   * A_x (tile_n x 16) is [1, 1, 1, 0, ...] in every key row.
+#   * B_x (tile_m x 16) holds, per Q row, [hi, mid, lo, 0, ...], the bf16 3-way split of
+#     x = -LSE / softmax_scale_log2 (B_L, added to S) or x = -dPsum (B_D, added to dP).
+#   * The fp32 accumulators then hold S - LSE / scale_log2 and dP - dPsum, up to MMA
+#     rounding: the result is not bitwise equal to the unfolded kernel.
+# Warps 14 (B_L) and 15 (B_D), otherwise idle at 1-CTA, own the LSE / dPsum bulk loads
+# (issued up to 2 tiles ahead, independent of the load warp's Q / dO order) and publish
+# B_x per Q tile on pipeline_Lx / pipeline_Dx. The MMA warp waits on them right before
+# the extra block. With the LSE folded, the P phase touches no SMEM, so its
+# fence.proxy.async.shared is dropped.
+# Dispatch: BwdConfig.fold_LSE_dPsum (config.can_fold_LSE_dPsum), on for split_P_dS with bf16,
+# MHA (qhead_per_kvhead == 1), and non-deterministic runs only.
+#   * bf16: the split needs the fp32 exponent range. In fp16, |dPsum| (or LSE / scale_log2)
+#     above 65504 makes hi = inf and the MMA sum NaN, and small values lose mid / lo to
+#     subnormals.
+#   * GQA and deterministic mode measured slower: in deterministic mode the serialized dQ
+#     adds bind instead of the compute warps, and the GQA dS phase is already shorter, so
+#     the fold's fixed costs (the extra MMA on the dQ-drain -> dP chain, the builder-warp
+#     mbarriers) outweigh what it removes.
+# Also off for block sparsity (that load path issues the stats loads) and with a
+# score_mod or score_mod_bwd: score_mod sits between S and the LSE subtraction, and
+# score_mod_bwd reads the raw S.
+
 
 class CtaSchedule(enum.Enum):
     """Backward only: how a CTA (pair) issues the five GEMMs; see NOTE [2CTA schedules]."""
@@ -104,6 +134,7 @@ class FlashAttentionBackwardSm100:
         registers: Sm100BwdRegisters,
         Q_stage: int,
         dO_stage: int,
+        fold_LSE_dPsum: bool,
     ):
         # Pad head_dim to a multiple of 32 (k_block_size). Must stay a multiple of 32 so
         # that the dQ accumulator reduce (dQ_reduce_ncol up to 32) tiles evenly and matches
@@ -214,6 +245,8 @@ class FlashAttentionBackwardSm100:
         # release each one immediately instead of one m_block behind, see dQacc_reduce.
         self.delay_release_min_m_blocks = 16
         self.spt = spt
+        # See NOTE [hdim64 LSE / dPsum fold into the S / dP MMA]
+        self.fold_LSE_dPsum = fold_LSE_dPsum
 
         # Score mod and mask mod support
         self.score_mod = score_mod
@@ -426,9 +459,11 @@ class FlashAttentionBackwardSm100:
                                 )
 
     def _setup_attributes(self):
+        # fold: dPsum has its own 2-stage buffer so warp 15 can build B_D(t+1) during dP(t)
+        self.dPsum_stage = 2 if self.fold_LSE_dPsum else self.dO_stage
         self.single_stage = 1
         self.P_stage = 1 if self.split_P_dS else 0  # dedicated P pipeline, else P aliases S
-        # LSE_stage = Q_stage and dPsum_stage = dO_stage
+        # LSE_stage = Q_stage and dPsum_stage = dO_stage (2 with the fold)
         self.sdKVaccum_stage = 2
         # number of tma reduce adds per dQacc mma
         # todo: try 32/1 or 48/2 for 2cta d=192 dv=128
@@ -605,6 +640,20 @@ class FlashAttentionBackwardSm100:
         )
         self.sKt_layout = cute.slice_(sKt_layout, (None, None, None, 0))
         self.sdS_xchg_layout = cute.make_layout(shape=(self.tile_n, self.tile_m // 2))
+        # See NOTE [hdim64 LSE / dPsum fold into the S / dP MMA]
+        self.sAx_layout = self.sDx_layout = self.sLx_layout = None
+        if const_expr(self.fold_LSE_dPsum):
+            x_tiler = (self.tile_n, self.tile_m, 16)
+            sAx_layout = sm100_utils_basic.make_smem_layout_a(
+                self.tiled_mma_dP, x_tiler, self.do_dtype, 1
+            )
+            self.sAx_layout = cute.slice_(sAx_layout, (None, None, None, 0))
+            self.sDx_layout = sm100_utils_basic.make_smem_layout_b(
+                self.tiled_mma_dP, x_tiler, self.do_dtype, self.dPsum_stage
+            )
+            self.sLx_layout = sm100_utils_basic.make_smem_layout_b(
+                self.tiled_mma_S, x_tiler, self.q_dtype, self.Q_stage
+            )
 
         self.sdQaccum_layout = cute.make_layout(
             (self.tile_m * self.dQ_reduce_ncol, self.sdQaccum_stage)
@@ -613,7 +662,7 @@ class FlashAttentionBackwardSm100:
             shape=(self.tile_m, self.Q_stage), stride=(1, cute.round_up(self.tile_m, 64))
         )
         self.sdPsum_layout = cute.make_layout(
-            shape=(self.tile_m, self.dO_stage),
+            shape=(self.tile_m, self.dPsum_stage),
             stride=(1, cute.round_up(self.tile_m, 64)),
         )
         self.sdK_epi_tile = (
@@ -765,6 +814,17 @@ class FlashAttentionBackwardSm100:
             mdK_semaphore = None
             mdV_semaphore = None
 
+        # BwdConfig.fold_LSE_dPsum; see NOTE [hdim64 LSE / dPsum fold into the S / dP MMA].
+        # fold_stats indexes the stats by query head (no packed rows).
+        assert not self.fold_LSE_dPsum or (
+            self.split_P_dS
+            and self.pack_factor == 1
+            and self.q_dtype == cutlass.BFloat16
+            and self.do_dtype == cutlass.BFloat16
+            and blocksparse_tensors is None
+            and self.score_mod is None
+            and self.score_mod_bwd is None
+        ), "fold_LSE_dPsum needs split_P_dS, bf16, and no pack_gqa, block sparsity, or score_mod"
         self._setup_attributes()
         (
             self.tiled_mma_S,
@@ -1030,7 +1090,7 @@ class FlashAttentionBackwardSm100:
                 Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
                 dO_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dO_stage]
                 LSE_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
-                dPsum_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dO_stage]
+                dPsum_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dPsum_stage]
                 S_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
                 dP_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
                 dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
@@ -1111,13 +1171,16 @@ class FlashAttentionBackwardSm100:
                 ]
 
         else:
+            sAx_size = cute.cosize(self.sAx_layout) if const_expr(self.fold_LSE_dPsum) else 0
+            sDx_size = cute.cosize(self.sDx_layout) if const_expr(self.fold_LSE_dPsum) else 0
+            sLx_size = cute.cosize(self.sLx_layout) if const_expr(self.fold_LSE_dPsum) else 0
 
             @cute.struct
             class SharedStorage:
                 Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
                 dO_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dO_stage]
                 LSE_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
-                dPsum_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dO_stage]
+                dPsum_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dPsum_stage]
                 S_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
                 dP_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
                 dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
@@ -1164,6 +1227,24 @@ class FlashAttentionBackwardSm100:
                 sdQaccum: cute.struct.Align[
                     cute.struct.MemRange[self.dqaccum_dtype, cute.cosize(self.sdQaccum_layout)],
                     self.buffer_align_bytes,
+                ]
+
+                # fold buffers (zero-sized and last unless folding, so the layout of the other
+                # members never changes); see NOTE [hdim64 LSE / dPsum fold into the S / dP MMA]
+                Lx_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, 2 * self.Q_stage if self.fold_LSE_dPsum else 0
+                ]
+                Dx_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, 2 * self.dPsum_stage if self.fold_LSE_dPsum else 0
+                ]
+                sAx: cute.struct.Align[
+                    cute.struct.MemRange[self.do_dtype, sAx_size], self.buffer_align_bytes
+                ]
+                sDx: cute.struct.Align[
+                    cute.struct.MemRange[self.do_dtype, sDx_size], self.buffer_align_bytes
+                ]
+                sLx: cute.struct.Align[
+                    cute.struct.MemRange[self.q_dtype, sLx_size], self.buffer_align_bytes
                 ]
 
         self.shared_storage = SharedStorage
@@ -1256,6 +1337,9 @@ class FlashAttentionBackwardSm100:
             self.sdV_layout,
             self.tP_layout,
             self.tdS_layout,
+            self.sAx_layout,
+            self.sDx_layout,
+            self.sLx_layout,
             self.tiled_mma_S,
             self.tiled_mma_dP,
             self.tiled_mma_dV,
@@ -1344,6 +1428,9 @@ class FlashAttentionBackwardSm100:
         sdV_layout: cute.ComposedLayout | cute.Layout,
         tP_layout: cute.ComposedLayout,
         tdS_layout: cute.ComposedLayout,
+        sAx_layout: Optional[cute.ComposedLayout],
+        sDx_layout: Optional[cute.ComposedLayout],
+        sLx_layout: Optional[cute.ComposedLayout],
         tiled_mma_S: cute.TiledMma,
         tiled_mma_dP: cute.TiledMma,
         tiled_mma_dV: cute.TiledMma,
@@ -1509,6 +1596,24 @@ class FlashAttentionBackwardSm100:
             )
         else:
             pipeline_P = None
+        # B_L / B_D ready for the extra K=16 MMA blocks (one builder thread -> MMA warp)
+        pipeline_Lx = pipeline_Dx = None
+        fold_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 1)
+        if const_expr(self.fold_LSE_dPsum):
+            pipeline_Lx = cutlass.pipeline.PipelineAsyncUmma.create(
+                num_stages=self.Q_stage,
+                producer_group=fold_group,
+                consumer_group=pipeline_PdS_consumer_group,
+                barrier_storage=storage.Lx_mbar_ptr.data_ptr(),
+                cta_layout_vmnk=cluster_layout_vmnk,
+            )
+            pipeline_Dx = cutlass.pipeline.PipelineAsyncUmma.create(
+                num_stages=self.dPsum_stage,
+                producer_group=fold_group,
+                consumer_group=pipeline_PdS_consumer_group,
+                barrier_storage=storage.Dx_mbar_ptr.data_ptr(),
+                cta_layout_vmnk=cluster_layout_vmnk,
+            )
 
         # TMA producer and UMMA consumers
         pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
@@ -1522,20 +1627,24 @@ class FlashAttentionBackwardSm100:
             cutlass.pipeline.Agent.Thread,
             len(self.compute_warp_ids) * 1,
         )
+        # fold: the builder warps 14 (LSE) and 15 (dPsum) are the only stats consumers
+        stats_consumer_group = (
+            fold_group if const_expr(self.fold_LSE_dPsum) else pipeline_consumer_group_compute
+        )
         pipeline_LSE = cutlass.pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.LSE_mbar_ptr.data_ptr(),
             num_stages=self.Q_stage,
             producer_group=pipeline_producer_group,
-            consumer_group=pipeline_consumer_group_compute,
+            consumer_group=stats_consumer_group,
             tx_count=self.tma_copy_bytes["LSE"],
             # cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
         pipeline_dPsum = cutlass.pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.dPsum_mbar_ptr.data_ptr(),
-            num_stages=self.dO_stage,
+            num_stages=self.dPsum_stage,
             producer_group=pipeline_producer_group,
-            consumer_group=pipeline_consumer_group_compute,
+            consumer_group=stats_consumer_group,
             tx_count=self.tma_copy_bytes["dPsum"],
             # cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
@@ -1634,6 +1743,11 @@ class FlashAttentionBackwardSm100:
 
         sLSE = storage.sLSE.get_tensor(sLSE_layout)
         sdPsum = storage.sdPsum.get_tensor(sdPsum_layout)
+        sAx = sDx = sLx = None
+        if const_expr(self.fold_LSE_dPsum):
+            sAx = storage.sAx.get_tensor(sAx_layout.outer, swizzle=sAx_layout.inner)
+            sDx = storage.sDx.get_tensor(sDx_layout.outer, swizzle=sDx_layout.inner)
+            sLx = storage.sLx.get_tensor(sLx_layout.outer, swizzle=sLx_layout.inner)
         if const_expr(self.use_2cta_instrs):
             if const_expr(not self.dKV_postprocess):
                 sdV = storage.sV.get_tensor(
@@ -1727,14 +1841,50 @@ class FlashAttentionBackwardSm100:
         #  EMPTY
         # (15)
         if warp_idx == self.empty_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_empty)
+            if const_expr(self.fold_LSE_dPsum):
+                # B_D builder, see NOTE [hdim64 LSE / dPsum fold into the S / dP MMA]
+                cute.arch.setmaxregister_decrease(self.num_regs_load)
+                self.fold_stats(
+                    mdPsum,
+                    sdPsum,
+                    sAx,
+                    sDx,
+                    pipeline_dPsum,
+                    pipeline_Dx,
+                    self.dPsum_stage,
+                    Float32(-1.0),
+                    False,
+                    block_info,
+                    SeqlenInfoCls,
+                    TileSchedulerCls,
+                )
+            else:
+                cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         #  RELAY
         # (14)
         if warp_idx == self.relay_warp_id:
-            cute.arch.setmaxregister_decrease(
-                self.num_regs_mma if self.use_2cta_instrs else self.num_regs_empty
-            )
+            if const_expr(self.fold_LSE_dPsum):
+                # B_L builder (1-CTA has no relay work)
+                cute.arch.setmaxregister_decrease(self.num_regs_load)
+                self.fold_stats(
+                    mLSE,
+                    sLSE,
+                    sAx,
+                    sLx,
+                    pipeline_LSE,
+                    pipeline_Lx,
+                    self.Q_stage,
+                    -Float32(1.0) / softmax_scale_log2,
+                    True,
+                    block_info,
+                    SeqlenInfoCls,
+                    TileSchedulerCls,
+                )
+            else:
+                cute.arch.setmaxregister_decrease(
+                    self.num_regs_mma if self.use_2cta_instrs else self.num_regs_empty
+                )
             if const_expr(self.use_2cta_instrs):
                 self.relay(
                     dS_cluster_full_mbar_ptr,
@@ -1853,6 +2003,11 @@ class FlashAttentionBackwardSm100:
                 TileSchedulerCls,
                 is_leader_cta,
                 blocksparse_tensors,
+                sAx=sAx,
+                sDx=sDx,
+                sLx=sLx,
+                pipeline_Lx=pipeline_Lx,
+                pipeline_Dx=pipeline_Dx,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -2435,16 +2590,17 @@ class FlashAttentionBackwardSm100:
                             load_Q(first_m_block, producer_state=producer_state_Q_LSE)
                             pipeline_Q.producer_commit(producer_state_Q_LSE)
 
-                            # LSE
-                            pipeline_LSE.producer_acquire(producer_state_Q_LSE)
-                            with cute.arch.elect_one():
-                                copy_stats(
-                                    gLSE[None, first_m_block],
-                                    sLSE[None, producer_state_Q_LSE.index],
-                                    mbar_ptr=pipeline_LSE.producer_get_barrier(
-                                        producer_state_Q_LSE
-                                    ),
-                                )
+                            # LSE (fold: warp 14 loads it)
+                            if const_expr(not self.fold_LSE_dPsum):
+                                pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gLSE[None, first_m_block],
+                                        sLSE[None, producer_state_Q_LSE.index],
+                                        mbar_ptr=pipeline_LSE.producer_get_barrier(
+                                            producer_state_Q_LSE
+                                        ),
+                                    )
                             producer_state_Q_LSE.advance()
 
                         if const_expr(should_load_dO):
@@ -2464,16 +2620,17 @@ class FlashAttentionBackwardSm100:
                                 load_dOt(first_m_block, producer_state=producer_state_dO_dPsum)
                             pipeline_dO.producer_commit(producer_state_dO_dPsum)
 
-                            # dPsum
-                            pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-                            with cute.arch.elect_one():
-                                copy_stats(
-                                    gdPsum[None, first_m_block],
-                                    sdPsum[None, producer_state_dO_dPsum.index],
-                                    mbar_ptr=pipeline_dPsum.producer_get_barrier(
-                                        producer_state_dO_dPsum
-                                    ),
-                                )
+                            # dPsum (fold: warp 15 loads it)
+                            if const_expr(not self.fold_LSE_dPsum):
+                                pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gdPsum[None, first_m_block],
+                                        sdPsum[None, producer_state_dO_dPsum.index],
+                                        mbar_ptr=pipeline_dPsum.producer_get_barrier(
+                                            producer_state_dO_dPsum
+                                        ),
+                                    )
                             producer_state_dO_dPsum.advance()
 
                         if const_expr(self.use_2cta_instrs):
@@ -2495,16 +2652,17 @@ class FlashAttentionBackwardSm100:
                                 load_Q(m_block, producer_state=producer_state_Q_LSE)
                                 pipeline_Q.producer_commit(producer_state_Q_LSE)
 
-                                # LSE
-                                pipeline_LSE.producer_acquire(producer_state_Q_LSE)
-                                with cute.arch.elect_one():
-                                    copy_stats(
-                                        gLSE[None, m_block],
-                                        sLSE[None, producer_state_Q_LSE.index],
-                                        mbar_ptr=pipeline_LSE.producer_get_barrier(
-                                            producer_state_Q_LSE
-                                        ),
-                                    )
+                                # LSE (fold: warp 14 loads it)
+                                if const_expr(not self.fold_LSE_dPsum):
+                                    pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+                                    with cute.arch.elect_one():
+                                        copy_stats(
+                                            gLSE[None, m_block],
+                                            sLSE[None, producer_state_Q_LSE.index],
+                                            mbar_ptr=pipeline_LSE.producer_get_barrier(
+                                                producer_state_Q_LSE
+                                            ),
+                                        )
                                 producer_state_Q_LSE.advance()
 
                             if const_expr(should_load_dO):
@@ -2519,16 +2677,17 @@ class FlashAttentionBackwardSm100:
                                     load_dOt(m_block, producer_state=producer_state_dO_dPsum)
                                 pipeline_dO.producer_commit(producer_state_dO_dPsum)
 
-                                # dPsum
-                                pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-                                with cute.arch.elect_one():
-                                    copy_stats(
-                                        gdPsum[None, m_block],
-                                        sdPsum[None, producer_state_dO_dPsum.index],
-                                        mbar_ptr=pipeline_dPsum.producer_get_barrier(
-                                            producer_state_dO_dPsum
-                                        ),
-                                    )
+                                # dPsum (fold: warp 15 loads it)
+                                if const_expr(not self.fold_LSE_dPsum):
+                                    pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                                    with cute.arch.elect_one():
+                                        copy_stats(
+                                            gdPsum[None, m_block],
+                                            sdPsum[None, producer_state_dO_dPsum.index],
+                                            mbar_ptr=pipeline_dPsum.producer_get_barrier(
+                                                producer_state_dO_dPsum
+                                            ),
+                                        )
                                 producer_state_dO_dPsum.advance()
 
                         #### Tail ####
@@ -2540,12 +2699,14 @@ class FlashAttentionBackwardSm100:
                                 producer_state_Qt.advance()
 
                             pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
-                            pipeline_LSE.producer_tail(producer_state_Q_LSE)
+                            if const_expr(not self.fold_LSE_dPsum):
+                                pipeline_LSE.producer_tail(producer_state_Q_LSE)
                             if const_expr(load_Qt is not None):
                                 pipeline_Qt.producer_tail(producer_state_Qt)
                         if const_expr(should_load_dO):
                             pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
-                            pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
+                            if const_expr(not self.fold_LSE_dPsum):
+                                pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
 
             else:
                 assert blocksparse_tensors is not None
@@ -2679,6 +2840,11 @@ class FlashAttentionBackwardSm100:
         TileSchedulerCls: Callable,
         is_leader_cta: cutlass.Boolean,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        sAx: Optional[cute.Tensor] = None,
+        sDx: Optional[cute.Tensor] = None,
+        sLx: Optional[cute.Tensor] = None,
+        pipeline_Lx: Optional[PipelineAsync] = None,
+        pipeline_Dx: Optional[PipelineAsync] = None,
     ):
         # [2025-10-21] For reasons I don't understand, putting these partitioning in the main
         # kernel (before warp specialization) is a lot slower tha putting them here.
@@ -2742,6 +2908,36 @@ class FlashAttentionBackwardSm100:
             tA_addr=None if const_expr(self.acc_m64) else self.tmem_P_offset,
             cta_group=self.cta_group_size,
         )
+        # The extra K=16 blocks, see NOTE [hdim64 LSE / dPsum fold into the S / dP MMA]
+        if const_expr(self.fold_LSE_dPsum):
+            mma_qkx_fn = partial(
+                gemm_ptx_w_idx,
+                tiled_mma_S,
+                tStS,
+                tiled_mma_S.make_fragment_A(sAx),
+                tiled_mma_S.make_fragment_B(sLx),
+                sA=sAx,
+                sB=sLx,
+                zero_init=False,
+                cta_group=self.cta_group_size,
+            )
+            consumer_state_Lx = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
+            )
+            mma_dovx_fn = partial(
+                gemm_ptx_w_idx,
+                tiled_mma_dP,
+                tdPtdP,
+                tiled_mma_dP.make_fragment_A(sAx),
+                tiled_mma_dP.make_fragment_B(sDx),
+                sA=sAx,
+                sB=sDx,
+                zero_init=False,
+                cta_group=self.cta_group_size,
+            )
+            consumer_state_Dx = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Consumer, self.dPsum_stage
+            )
         num_unroll_groups = 2 if const_expr(self.use_2cta_instrs) else 1
         mma_dsk_fn = partial(
             gemm_w_idx,
@@ -3055,7 +3251,13 @@ class FlashAttentionBackwardSm100:
                         pipeline_S_P.sync_object_empty.wait(0, producer_phase_S)
                     else:
                         pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                    if const_expr(self.fold_LSE_dPsum):
+                        pipeline_Lx.consumer_wait(consumer_state_Lx)
                     mma_qk_fn(B_idx=handle_Q.index)
+                    if const_expr(self.fold_LSE_dPsum):
+                        mma_qkx_fn(B_idx=consumer_state_Lx.index)
+                        pipeline_Lx.consumer_release(consumer_state_Lx)
+                        consumer_state_Lx.advance()
                     pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
                     if const_expr(self.split_P_dS):
                         producer_phase_S ^= 1
@@ -3064,7 +3266,13 @@ class FlashAttentionBackwardSm100:
                     pipeline_dO.consumer_wait(consumer_state_dO)
                     pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
                     pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
+                    if const_expr(self.fold_LSE_dPsum):
+                        pipeline_Dx.consumer_wait(consumer_state_Dx)
                     mma_dov_fn(B_idx=consumer_state_dO.index)
+                    if const_expr(self.fold_LSE_dPsum):
+                        mma_dovx_fn(B_idx=consumer_state_Dx.index)
+                        pipeline_Dx.consumer_release(consumer_state_Dx)
+                        consumer_state_Dx.advance()
                     pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
                     producer_phase_acc ^= 1
@@ -3102,7 +3310,13 @@ class FlashAttentionBackwardSm100:
                             # S empty means "S_t loaded", not "P_t stored", so this QK
                             # overlaps the softmax of tile t.
                             pipeline_S_P.sync_object_empty.wait(0, producer_phase_S)
+                        if const_expr(self.fold_LSE_dPsum):
+                            pipeline_Lx.consumer_wait(consumer_state_Lx)
                         mma_qk_fn(B_idx=handle_Q_next.index)
+                        if const_expr(self.fold_LSE_dPsum):
+                            mma_qkx_fn(B_idx=consumer_state_Lx.index)
+                            pipeline_Lx.consumer_release(consumer_state_Lx)
+                            consumer_state_Lx.advance()
                         pipeline_S_P.sync_object_full.arrive(
                             0, pipeline_S_P.producer_mask, cta_group
                         )
@@ -3133,7 +3347,13 @@ class FlashAttentionBackwardSm100:
                         # (4) dP.T = V @ dO.T
                         pipeline_dO.consumer_wait(consumer_state_dO)
                         pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
+                        if const_expr(self.fold_LSE_dPsum):
+                            pipeline_Dx.consumer_wait(consumer_state_Dx)
                         mma_dov_fn(B_idx=consumer_state_dO.index)
+                        if const_expr(self.fold_LSE_dPsum):
+                            mma_dovx_fn(B_idx=consumer_state_Dx.index)
+                            pipeline_Dx.consumer_release(consumer_state_Dx)
+                            consumer_state_Dx.advance()
                         pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
                         # (5) dV += P.T @ dO   (split_P_dS: done at (1b) of the next trip)
@@ -3358,6 +3578,123 @@ class FlashAttentionBackwardSm100:
         )
 
     @cute.jit
+    def fold_stats(
+        self,
+        mStat: cute.Tensor,
+        sStat: cute.Tensor,
+        sAx: cute.Tensor,
+        sBx: cute.Tensor,
+        pipeline_stat: PipelineAsync,
+        pipeline_x: PipelineAsync,
+        num_stages: cutlass.Constexpr[int],
+        scale: Float32,
+        write_Ax: cutlass.Constexpr[bool],
+        block_info: BlockInfo,
+        SeqlenInfoCls: Callable,
+        TileSchedulerCls: Callable,
+    ):
+        """Builder warp of NOTE [hdim64 LSE / dPsum fold into the S / dP MMA].
+
+        Per Q tile, writes B_x = [hi, mid, lo, 0, ...] per Q row, the bf16 3-way split of
+        x = scale * stat (stat = LSE or dPsum). With write_Ax (the B_L builder) it first writes
+        A_x = [1, 1, 1, 0, ...] in every row; the MMA warp waits on B_L(0) before its first fold
+        MMA (S(0) precedes dP(0) in its program order), so that commit also publishes A_x to
+        the B_D block. This warp is the only producer and consumer of sStat: it issues the
+        stat bulk loads up to num_stages tiles ahead. The MMA operand layouts are
+        ((rows, 16), 1, 1[, stage]), so the flat index row + rows * k (+ rows * 16 * stage)
+        addresses (row, k).
+        """
+        lane = cute.arch.lane_idx()
+        n_el = self.tile_m * 16
+        copy_stats = partial(cute.copy, cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32))
+        state_load = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, num_stages
+        )
+        state_stat = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, num_stages
+        )
+        state_x = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, num_stages
+        )
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            m_block_min, m_block_max = block_info.get_m_block_min_max(
+                seqlen, n_block // self.cluster_shape_mnk[0]
+            )
+            mStat_cur = seqlen.offset_batch_Q(mStat, batch_idx, dim=2, padded=True)[None, head_idx]
+            gStat = cute.local_tile(mStat_cur, (self.tile_m,), (None,))
+            count = m_block_max - m_block_min
+            for i in cutlass.range_constexpr(num_stages):
+                if i < count:
+                    pipeline_stat.producer_acquire(state_load)
+                    with cute.arch.elect_one():
+                        copy_stats(
+                            gStat[None, m_block_min + i],
+                            sStat[None, state_load.index],
+                            mbar_ptr=pipeline_stat.producer_get_barrier(state_load),
+                        )
+                    state_load.advance()
+            # Zero the operand buffers while the first stat loads are in flight: every K column
+            # is read by the MMA but only hi / mid / lo are rewritten per tile. This runs per
+            # work tile, which is only safe because a CTA gets one (is_persistent is not
+            # supported); with several, the MMA could still be reading the previous tile's B_x.
+            self._zero_smem(sBx, n_el * num_stages, lane)
+            if const_expr(write_Ax):
+                self._zero_smem(sAx, self.tile_n * 16, lane)
+                cute.arch.sync_warp()
+                for j in cutlass.range(3 * self.tile_n // 32, unroll=1):
+                    sAx[lane + 32 * j] = sAx.element_type(1.0)
+            cute.arch.sync_warp()
+            for it in cutlass.range(count, unroll=1):
+                pipeline_stat.consumer_wait(state_stat)
+                pipeline_x.producer_acquire(state_x)
+                for r in cutlass.range_constexpr(self.tile_m // 32):
+                    row = lane + 32 * r
+                    x = sStat[row, state_stat.index] * scale
+                    hi = sBx.element_type(x)
+                    rem = x - Float32(hi)
+                    rem = Float32(0.0) if rem != rem else rem  # x = +-inf
+                    mid = sBx.element_type(rem)
+                    lo = sBx.element_type(rem - Float32(mid))
+                    idx = row + n_el * state_x.index
+                    sBx[idx] = hi
+                    sBx[idx + self.tile_m] = mid
+                    sBx[idx + 2 * self.tile_m] = lo
+                cute.arch.fence_view_async_shared()
+                cute.arch.sync_warp()
+                pipeline_stat.consumer_release(state_stat)
+                with cute.arch.elect_one():
+                    pipeline_x.producer_commit(state_x)
+                state_stat.advance()
+                state_x.advance()
+                if it + num_stages < count:
+                    pipeline_stat.producer_acquire(state_load)
+                    with cute.arch.elect_one():
+                        copy_stats(
+                            gStat[None, m_block_min + it + num_stages],
+                            sStat[None, state_load.index],
+                            mbar_ptr=pipeline_stat.producer_get_barrier(state_load),
+                        )
+                    state_load.advance()
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
+
+    @cute.jit
+    def _zero_smem(self, t: cute.Tensor, n: cutlass.Constexpr[int], lane: Int32):
+        """Zero the n elements of SMEM behind t, 16 B per store by one warp (t's layout ignored)."""
+        ptr = cute.make_ptr(
+            t.element_type, t.iterator.toint(), cute.AddressSpace.smem, assumed_align=16
+        )
+        chunks = cute.flat_divide(cute.make_tensor(ptr, cute.make_layout(n)), (8,))
+        zeros = cute.make_rmem_tensor((8,), t.element_type)
+        zeros.fill(0.0)
+        for j in cutlass.range(n // (8 * 32), unroll=1):
+            cute.autovec_copy(zeros, chunks[None, lane + 32 * j])
+
+    @cute.jit
     def compute_loop(
         self,
         thr_mma_S: cute.ThrMma,
@@ -3415,7 +3752,11 @@ class FlashAttentionBackwardSm100:
         sdPsum_2D = cute.make_tensor(
             sdPsum.iterator,
             cute.make_layout(
-                (self.tile_m, self.cluster_tile_n if self.acc_m64 else self.tile_n, self.dO_stage),
+                (
+                    self.tile_m,
+                    self.cluster_tile_n if self.acc_m64 else self.tile_n,
+                    self.dPsum_stage,
+                ),
                 stride=(1, 0, cute.round_up(self.tile_m, 64)),
             ),
         )
@@ -3581,7 +3922,7 @@ class FlashAttentionBackwardSm100:
             cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
         )
         consumer_state_dPsum = pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
+            cutlass.pipeline.PipelineUserType.Consumer, self.dPsum_stage
         )
 
         tile_scheduler = TileSchedulerCls()
@@ -3675,8 +4016,9 @@ class FlashAttentionBackwardSm100:
                         m_block_max=m_block_max,
                     )
                     m_block_oob = m_block >= m_block_max
-                # Prefetch 1 stage of LSE
-                pipeline_LSE.consumer_wait(consumer_state_LSE)
+                # Prefetch 1 stage of LSE (fold: S already holds S - LSE / scale_log2)
+                if const_expr(not self.fold_LSE_dPsum):
+                    pipeline_LSE.consumer_wait(consumer_state_LSE)
                 tSrLSE_s2r = cute.make_rmem_tensor(tScS_t2r[None, 0, 0, 0].shape, Float32)
                 if const_expr(prefetch_LSE and not self.shuffle_LSE):
                     cute.autovec_copy(tSsLSE[None, 0, 0, 0, consumer_state_LSE.index], tSrLSE_s2r)
@@ -3750,26 +4092,33 @@ class FlashAttentionBackwardSm100:
                     tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
-                    tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
-                    if const_expr(not self.shuffle_LSE):
-                        if const_expr(stage > 0 or not prefetch_LSE):
-                            cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
-                        tSrLSE = tSrLSE_s2r
-                    else:
-                        tSrLSE = tSsLSE_cur[lane_idx]
-                    for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
+                    if const_expr(not self.fold_LSE_dPsum):
+                        tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
                         if const_expr(not self.shuffle_LSE):
-                            lse_pair = (tSrLSE[2 * v], tSrLSE[2 * v + 1])
+                            if const_expr(stage > 0 or not prefetch_LSE):
+                                cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
+                            tSrLSE = tSrLSE_s2r
                         else:
-                            lse_pair = (
-                                utils.shuffle_sync(tSrLSE, offset=2 * v),
-                                utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
+                            tSrLSE = tSsLSE_cur[lane_idx]
+                    for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
+                        if const_expr(self.fold_LSE_dPsum):
+                            tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
+                                (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
+                                (softmax_scale_log2, softmax_scale_log2),
                             )
-                        tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
-                            ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
-                            (softmax_scale_log2, softmax_scale_log2),
-                            (-lse_pair[0], -lse_pair[1]),
-                        )
+                        else:
+                            if const_expr(not self.shuffle_LSE):
+                                lse_pair = (tSrLSE[2 * v], tSrLSE[2 * v + 1])
+                            else:
+                                lse_pair = (
+                                    utils.shuffle_sync(tSrLSE, offset=2 * v),
+                                    utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
+                                )
+                            tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
+                                ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
+                                (softmax_scale_log2, softmax_scale_log2),
+                                (-lse_pair[0], -lse_pair[1]),
+                            )
                         tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
                         tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
                     if const_expr(self.acc_m64):
@@ -3797,7 +4146,9 @@ class FlashAttentionBackwardSm100:
 
                 if const_expr(not self.acc_m64):
                     cute.arch.fence_view_async_tmem_store()
-                cute.arch.fence_view_async_shared()
+                # fold: P goes to TMEM and the LSE is not read, so this phase touched no SMEM
+                if const_expr(not self.fold_LSE_dPsum):
+                    cute.arch.fence_view_async_shared()
                 # The P (or S_P) and LSE mbarriers expect one arrival per compute warp
                 if const_expr(self.split_P_dS):
                     cute.arch.sync_warp()
@@ -3814,12 +4165,14 @@ class FlashAttentionBackwardSm100:
                         # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
                 # Normally we'd need syncwarp here since only 1 thread will signal in
                 # consumer_release, but we already have the barrier or sync_warp before this
-                pipeline_LSE.consumer_release(consumer_state_LSE)
-                consumer_state_LSE.advance()
+                if const_expr(not self.fold_LSE_dPsum):
+                    pipeline_LSE.consumer_release(consumer_state_LSE)
+                    consumer_state_LSE.advance()
                 # ---------------------------------------------
-                # dS.T = P.T * (dP.T - D)
+                # dS.T = P.T * (dP.T - D)   (fold: dP already holds dP - D)
                 # ---------------------------------------------
-                pipeline_dPsum.consumer_wait(consumer_state_dPsum)
+                if const_expr(not self.fold_LSE_dPsum):
+                    pipeline_dPsum.consumer_wait(consumer_state_dPsum)
                 pipeline_dP.consumer_wait(consumer_state_S_P_dP)
                 # pipeline_dP.sync_object_full.wait(0, consumer_phase_S_P_dP)
                 ### Now delayed to after loop
@@ -3836,23 +4189,25 @@ class FlashAttentionBackwardSm100:
                         self.compute_sync_barrier.arrive_and_wait()
                     tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
-                    tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
-                    if const_expr(not self.shuffle_dPsum):
-                        tSrdPsum = cute.make_fragment_like(tSsdPsum_cur, Float32)
-                        cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
-                    else:
-                        tSrdPsum = tSsdPsum_cur[lane_idx]
-                    for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
+                    if const_expr(not self.fold_LSE_dPsum):
+                        tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
                         if const_expr(not self.shuffle_dPsum):
-                            dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
+                            tSrdPsum = cute.make_fragment_like(tSsdPsum_cur, Float32)
+                            cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
                         else:
-                            dPsum_pair = (
-                                utils.shuffle_sync(tSrdPsum, offset=2 * v),
-                                utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
+                            tSrdPsum = tSsdPsum_cur[lane_idx]
+                    for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
+                        if const_expr(not self.fold_LSE_dPsum):
+                            if const_expr(not self.shuffle_dPsum):
+                                dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
+                            else:
+                                dPsum_pair = (
+                                    utils.shuffle_sync(tSrdPsum, offset=2 * v),
+                                    utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
+                                )
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.sub_packed_f32x2(
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
                             )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.sub_packed_f32x2(
-                            (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
-                        )
                         tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
                             (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
                             (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
@@ -3948,8 +4303,9 @@ class FlashAttentionBackwardSm100:
                     self.compute_sync_barrier.arrive_and_wait()
                 # Normally we'd need syncwarp here since only 1 thread will signal in
                 # consumer_release, but we already have the barrier or sync_warp before this
-                pipeline_dPsum.consumer_release(consumer_state_dPsum)
-                consumer_state_dPsum.advance()
+                if const_expr(not self.fold_LSE_dPsum):
+                    pipeline_dPsum.consumer_release(consumer_state_dPsum)
+                    consumer_state_dPsum.advance()
                 # pipelined 2CTA schedule: pipeline_dS also signals S tmem load completion so is deferred
                 if const_expr(self.cta_schedule != CtaSchedule.TWO_CTA_PIPELINED):
                     with cute.arch.elect_one():
