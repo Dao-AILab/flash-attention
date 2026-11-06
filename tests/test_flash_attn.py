@@ -56,16 +56,22 @@ def attn_bias_from_alibi_slopes(
         return -slopes * relative_pos.to(dtype=slopes.dtype)
 
 
-def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random"):
+def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", zero_lengths=False):
     assert mode in ["full", "random", "third"]
     if mode == "full":
         lengths = torch.full((batch_size, 1), max_seqlen, device=device, dtype=torch.int32)
     elif mode == "random":
         lengths = torch.randint(
-            max(1, max_seqlen - 20), max_seqlen + 1, (batch_size, 1), device=device
+            max(0 if zero_lengths else 1, max_seqlen - 20), max_seqlen + 1, (batch_size, 1), device=device
         )
     elif mode == "third":
         lengths = torch.randint(max_seqlen // 3, max_seqlen + 1, (batch_size, 1), device=device)
+    if zero_lengths:
+        # Generate zero-lengths every 5 batches and the last batch.
+        for i in range(batch_size):
+            if i % 5 == 0:
+                lengths[i] = 0
+        lengths[-1] = 0
     padding_mask = (
         repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size) < lengths
     )
@@ -230,6 +236,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     key_leftpad=None,
+    return_lse=False,
 ):
     """
     Arguments:
@@ -302,6 +309,9 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    if return_lse:  # a row without keys has an infinite LSE, as in FlashAttention
+        lse = torch.logsumexp(scores, dim=-1)
+        return output.to(dtype=dtype_og), attention.to(dtype=dtype_og), lse.masked_fill(lse == float("-inf"), float("inf"))
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
@@ -319,6 +329,7 @@ def attention_kvpacked_ref(
     upcast=True,
     reorder_ops=False,
     key_leftpad=None,
+    return_lse=False,
 ):
     return attention_ref(
         q,
@@ -335,6 +346,7 @@ def attention_kvpacked_ref(
         softcap=softcap,
         reorder_ops=reorder_ops,
         key_leftpad=key_leftpad,
+        return_lse=return_lse,
     )
 
 
@@ -1623,7 +1635,7 @@ def test_flash_attn_varlen_causal(
             seqlen_k, paged_kv_block_size, batch_size, nheads, d, device, dtype
         )
     query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
-    key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random")
+    key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random", zero_lengths=True)
     (
         q_unpad,
         k_unpad,
@@ -1639,7 +1651,7 @@ def test_flash_attn_varlen_causal(
         dq_pad_fn,
         dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
-    out_unpad = flash_attn_varlen_func(
+    out_unpad, lse, _ = flash_attn_varlen_func(
         q_unpad,
         k_unpad if paged_kv_block_size is None else k_cache_paged,
         v_unpad if paged_kv_block_size is None else v_cache_paged,
@@ -1651,9 +1663,10 @@ def test_flash_attn_varlen_causal(
         causal=causal,
         window_size=window_size,
         block_table=block_table,
+        return_attn_probs=True,
     )
     out = output_pad_fn(out_unpad)
-    out_ref, attn_ref = attention_ref(
+    out_ref, attn_ref, lse_ref = attention_ref(
         q,
         k,
         v,
@@ -1664,6 +1677,7 @@ def test_flash_attn_varlen_causal(
         None,
         causal=causal,
         window_size=window_size,
+        return_lse=True,
     )
     out_pt, attn_pt = attention_ref(
         q,
@@ -1684,6 +1698,9 @@ def test_flash_attn_varlen_causal(
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+    lse_ref = rearrange(lse_ref, "b h s -> b s h")[query_padding_mask].T  # (nheads, total_q), as softmax_lse
+    print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+    assert torch.allclose(lse, lse_ref, rtol=0, atol=1e-3)
 
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
