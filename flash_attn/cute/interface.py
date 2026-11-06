@@ -1949,7 +1949,7 @@ def _flash_attn_bwd(
 
     window_size = [window_size_left, window_size_right]
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
-        causal, window_size_left, window_size_right
+        causal, window_size_left, window_size_right, mask_mod
     )
 
     if arch // 10 == 12:
@@ -3885,7 +3885,7 @@ def flash_attn_varlen_func(
 def _compile_fwd_combine(
     _arch, dtype, dtype_partial, head_dim, num_head, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, has_lse, has_virtual_batch_idx,
-    has_num_splits_dynamic, has_semaphore_to_reset,
+    has_num_splits_dynamic, has_semaphore_to_reset, skip_single_split=False,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -3899,6 +3899,7 @@ def _compile_fwd_combine(
         tile_m=tile_m,
         k_block_size=k_block_size,
         log_max_splits=log_max_splits,
+        skip_single_split=skip_single_split,
     )
     if not fa_combine.can_implement(
         dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
@@ -3966,6 +3967,7 @@ def _flash_attn_fwd_combine(
     virtual_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
     *,
+    skip_single_split: bool = False,
     _arch: Optional[int] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
@@ -4030,6 +4032,7 @@ def _flash_attn_fwd_combine(
         virtual_batch_idx is not None,
         num_splits_dynamic_ptr is not None,
         semaphore_to_reset is not None,
+        skip_single_split,
     )
     if _needs_compile(_flash_attn_fwd_combine.compile_cache, compile_key):
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
@@ -4165,6 +4168,8 @@ def _get_scheduler_metadata(
     use_clc_scheduler: bool = False,
     ctas_per_sm: int = 1,
     min_blocks_floor: Optional[Tuple[int, int]] = None,
+    max_n_blocks_per_split: Optional[int] = None,
+    max_extra_splits: Optional[int] = None,
 ) -> SchedulerMetadataTensorsTorch:
     device = None
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
@@ -4210,6 +4215,23 @@ def _get_scheduler_metadata(
         tile_count_semaphore = (
             torch.empty(1, dtype=torch.int32, device=device) if not use_clc_scheduler else None
         )
+        # Compact split layout: the prepare kernel bounds the extra splits and maps each
+        # (m block, split) slot to its batch, which needs every batch in its single CTA.
+        split_slot_batch = None
+        if max_extra_splits is not None:
+            if seqlen_k_per_split is not None:
+                # A fixed split length sets every batch's split count, which the bound on the
+                # extra splits would have to coarsen.
+                raise ValueError("max_extra_splits does not apply with seqlen_k_per_split")
+            assert FlashPrepareScheduler.get_grid_shape(num_batch)[0] == 1, (
+                "max_extra_splits needs a batch that fits one prepare CTA"
+            )
+            rows_q = max_seqlen_q * (nheads // nheads_kv if pack_gqa else 1)
+            split_slot_batch = torch.empty(
+                ((rows_q + tile_m - 1) // tile_m) * (num_batch + max_extra_splits),
+                dtype=torch.int32,
+                device=device,
+            )
 
         num_warps = min((num_batch + 30) // 31, 32)
         num_warps = 1 << (num_warps - 1).bit_length()
@@ -4238,6 +4260,8 @@ def _get_scheduler_metadata(
             num_nheads_in_l2 is not None,
             tile_count_semaphore is not None,
             n_blocks_per_split is not None,
+            max_n_blocks_per_split is not None,
+            max_extra_splits is not None,
             zfill_padded_output,
             ctas_per_sm,
             min_blocks_floor,
@@ -4250,6 +4274,7 @@ def _get_scheduler_metadata(
                 virtual_batch_idx_cute,
                 num_nheads_in_l2_cute,
                 tile_count_semaphore_cute,
+                split_slot_batch_cute,
                 cu_seqlens_q_cute,
                 cu_seqlens_k_cute,
                 cu_seqlens_k_new_cute,
@@ -4264,6 +4289,7 @@ def _get_scheduler_metadata(
                     virtual_batch_idx,
                     num_nheads_in_l2,
                     tile_count_semaphore,
+                    split_slot_batch,
                     cu_seqlens_q,
                     cu_seqlens_k,
                     cu_seqlens_k_new,
@@ -4306,6 +4332,9 @@ def _get_scheduler_metadata(
                 virtual_batch_idx_cute,
                 num_nheads_in_l2_cute,
                 n_blocks_per_split,
+                max_n_blocks_per_split,
+                max_extra_splits,
+                split_slot_batch_cute,
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             )
@@ -4329,8 +4358,12 @@ def _get_scheduler_metadata(
                 virtual_batch_idx,
                 num_nheads_in_l2,
                 n_blocks_per_split,
+                max_n_blocks_per_split,
+                max_extra_splits,
+                split_slot_batch,
             )
     else:
+        split_slot_batch = None
         num_m_blocks = None
         num_splits_dynamic = None
         virtual_batch_idx = None
@@ -4346,6 +4379,7 @@ def _get_scheduler_metadata(
         has_varlen_info
         and num_batch > BIN_BATCH_SEARCH_THRESH
         and tile_count_semaphore is None
+        and split_slot_batch is None
     )
     if needs_compute_tile_cumsum:
         cu_total_m_blocks, cu_total_splits_m_blocks = _compute_tile_cumsum(
@@ -4383,6 +4417,7 @@ def _get_scheduler_metadata(
         cu_total_m_blocks=cu_total_m_blocks,
         cu_total_splits_m_blocks=cu_total_splits_m_blocks,
         blocks_to_batch_idx=blocks_to_batch_idx,
+        split_slot_batch=split_slot_batch,
     )
 
 

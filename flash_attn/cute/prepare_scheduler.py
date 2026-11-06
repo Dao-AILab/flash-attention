@@ -29,6 +29,9 @@ class SchedulerMetadataTensorsTorch(NamedTuple):
     cu_total_m_blocks: Optional[torch.Tensor] = None
     cu_total_splits_m_blocks: Optional[torch.Tensor] = None
     blocks_to_batch_idx: Optional[torch.Tensor] = None
+    # Compact split layout (max_extra_splits): (batch << 16) | (split * num_m_blocks + m_block)
+    # per (m block, split) slot, batches in order, -1 past the last batch.
+    split_slot_batch: Optional[torch.Tensor] = None
 
 
 @cute.jit
@@ -41,6 +44,8 @@ def num_splits_for_sequence(
     zfill_padded_output: cutlass.Constexpr[bool] = False,
     ctas_per_sm: cutlass.Constexpr[int] = 1,
     min_blocks_floor: cutlass.Constexpr = None,
+    max_n_blocks_per_split: Int32 | None = None,
+    share_scale: Int32 | int = 1,
 ) -> Int32:
     """Split count of one sequence with num_n_blocks KV blocks, at most num_splits_static.
 
@@ -49,6 +54,7 @@ def num_splits_for_sequence(
     about ctas_per_sm * num_sm / sm_margin CTAs. min_blocks_floor = (low_ctas, min_blocks) raises
     blocks_per_sm to min(ceil(tiles / low_ctas), min_blocks): small batches then aim at low_ctas
     CTAs, and splits keep at least min_blocks blocks until the batch fills the one-wave target.
+    max_n_blocks_per_split caps the share; share_scale then multiplies it (coarser splits).
     """
     sm_margin = max(Float32(num_sm) / 128 + 0.001, 1.1)  # e.g. 148/128 = 1.15625
     target_ctas = Float32(num_sm) * ctas_per_sm
@@ -61,6 +67,9 @@ def num_splits_for_sequence(
         low_ctas, min_blocks = min_blocks_floor
         floor = cute.ceil_div(total_blocks * nheads_computed, low_ctas)
         blocks_per_sm = cutlass.max(blocks_per_sm, cutlass.min(floor, Int32(min_blocks)))
+    if const_expr(max_n_blocks_per_split is not None):
+        blocks_per_sm = cutlass.min(blocks_per_sm, max_n_blocks_per_split)
+    blocks_per_sm = blocks_per_sm * share_scale
     num_splits_dynamic = cutlass.min(cute.ceil_div(num_n_blocks, blocks_per_sm), num_splits_static)
     if const_expr(zfill_padded_output):
         num_splits_dynamic = cutlass.max(num_splits_dynamic, Int32(1))
@@ -148,6 +157,9 @@ class FlashPrepareScheduler:
         virtual_batch_idx_ptr: Optional[cute.Tensor],
         num_nheads_in_l2_ptr: Optional[cute.Tensor],
         n_blocks_per_split: Optional[int],  # overrides heuristic
+        max_n_blocks_per_split: Optional[int],  # caps the heuristic's per-split share
+        max_extra_splits: Optional[int],  # bounds sum(num_splits_dynamic - 1); one CTA only
+        split_slot_batch_ptr: Optional[cute.Tensor],  # compact split layout; one CTA only
         stream: cuda.CUstream,
     ):
         tile_m_divmod = FastDivmodDivisorV2(self.tile_m)
@@ -156,6 +168,8 @@ class FlashPrepareScheduler:
         @cute.struct
         class SharedStorage:
             total_blocks_smem: cute.struct.MemRange[Int32, self.k_smem_size]
+            # Per-warp totals for the split prefix sum, then the extra-split count.
+            scan_smem: cute.struct.MemRange[Int32, self.num_warps + 1]
 
         self.shared_storage = SharedStorage
 
@@ -186,6 +200,9 @@ class FlashPrepareScheduler:
             virtual_batch_idx_ptr,
             num_nheads_in_l2_ptr,
             n_blocks_per_split,
+            max_n_blocks_per_split,
+            max_extra_splits,
+            split_slot_batch_ptr,
         ).launch(
             grid=grid,
             block=block,
@@ -216,6 +233,9 @@ class FlashPrepareScheduler:
         virtual_batch_idx_ptr: Optional[cute.Tensor],
         num_nheads_in_l2_ptr: Optional[cute.Tensor],
         n_blocks_per_split: Optional[Int32],
+        max_n_blocks_per_split: Optional[Int32] = None,
+        max_extra_splits: Optional[Int32] = None,
+        split_slot_batch_ptr: Optional[cute.Tensor] = None,
     ):
         bidx, _, _ = cute.arch.block_idx()
         # Let a PDL-launched consumer (SwapAB) start while this kernel runs; it waits for the
@@ -230,6 +250,7 @@ class FlashPrepareScheduler:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         total_blocks_smem = storage.total_blocks_smem.get_tensor((1,))
+        scan_smem = storage.scan_smem.get_tensor((self.num_warps + 1,))
 
         if tidx == 0:
             total_blocks_smem[0] = Int32(0)
@@ -278,6 +299,14 @@ class FlashPrepareScheduler:
         else:
             if grid_dimx > 1 or num_splits_static == 1:
                 num_splits_dynamic = Int32(1)
+                if const_expr(max_n_blocks_per_split is not None):
+                    num_splits_dynamic = cutlass.max(
+                        cutlass.min(
+                            cute.ceil_div(num_n_blocks, max_n_blocks_per_split), num_splits_static
+                        ),
+                        Int32(1),
+                    )
+                    num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
             else:
                 total_blocks = num_m_blocks * num_n_blocks
                 total_blocks = utils.warp_reduce(total_blocks, operator.add)
@@ -297,7 +326,32 @@ class FlashPrepareScheduler:
                     zfill_padded_output=self.zfill_padded_output,
                     ctas_per_sm=self.ctas_per_sm,
                     min_blocks_floor=self.min_blocks_floor,
+                    max_n_blocks_per_split=max_n_blocks_per_split,
                 )
+                if const_expr(max_extra_splits is not None):
+                    # The grid holds max_extra_splits splits beyond one per batch: coarsen the
+                    # per-split share until the batches fit.
+                    share_scale = Int32(1)
+                    extra = self._block_sum(
+                        cutlass.max(num_splits_dynamic - 1, Int32(0)), scan_smem, tidx
+                    )
+                    while extra > max_extra_splits:
+                        share_scale = share_scale * 2
+                        num_splits_dynamic = num_splits_for_sequence(
+                            num_n_blocks,
+                            total_blocks,
+                            num_sm,
+                            self.nheads_computed,
+                            num_splits_static,
+                            zfill_padded_output=self.zfill_padded_output,
+                            ctas_per_sm=self.ctas_per_sm,
+                            min_blocks_floor=self.min_blocks_floor,
+                            max_n_blocks_per_split=max_n_blocks_per_split,
+                            share_scale=share_scale,
+                        )
+                        extra = self._block_sum(
+                            cutlass.max(num_splits_dynamic - 1, Int32(0)), scan_smem, tidx
+                        )
                 if num_splits_dynamic > 0:
                     num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
 
@@ -313,6 +367,44 @@ class FlashPrepareScheduler:
             if const_expr(num_nheads_in_l2_ptr is not None):
                 nheads_in_l2 = self.get_num_nheads_in_l2(num_n_blocks)
                 num_nheads_in_l2_ptr[batch_idx] = nheads_in_l2
+
+        if const_expr(split_slot_batch_ptr is not None):
+            # Compact split layout: slot t holds (batch << 16) | local, local = split * m + m_block
+            # over the batch's num_m_blocks * num_splits slots, batches in order; slots past
+            # the last batch hold -1. Slots start at the exclusive prefix of the counts (one CTA
+            # covers every batch: lane l of warp w holds batch 31 w + l, lane 31 none).
+            has_batch = batch_idx < num_batch and lane_idx < self.k_num_batch_per_warp
+            count = num_m_blocks * num_splits_dynamic if has_batch else Int32(0)
+            inclusive = utils.warp_prefix_sum(count, lane_idx)
+            cute.arch.sync_threads()
+            if lane_idx == cute.arch.WARP_SIZE - 1:
+                scan_smem[warp_idx] = inclusive
+            cute.arch.sync_threads()
+            total = Int32(0)
+            for w in cutlass.range(self.num_warps, unroll=1):
+                if w < warp_idx:
+                    inclusive += scan_smem[w]
+                total += scan_smem[w]
+            if has_batch:
+                start = inclusive - count
+                for j in cutlass.range(count, unroll=1):
+                    split_slot_batch_ptr[start + j] = (batch_idx << 16) | j
+            num_slots = cute.size(split_slot_batch_ptr)
+            for t in cutlass.range(total + tidx, num_slots, self.num_warps * 32, unroll=1):
+                split_slot_batch_ptr[t] = Int32(-1)
+
+    @cute.jit
+    def _block_sum(self, val: Int32, scan_smem: cute.Tensor, tidx: Int32) -> Int32:
+        """Sum of val over the CTA, returned to every thread."""
+        val = utils.warp_reduce(val, operator.add)
+        cute.arch.sync_threads()
+        if tidx == 0:
+            scan_smem[self.num_warps] = Int32(0)
+        cute.arch.sync_threads()
+        if cute.arch.lane_idx() == 0:
+            utils.atomic_add_i32(val, scan_smem.iterator + self.num_warps)
+        cute.arch.sync_threads()
+        return scan_smem[self.num_warps]
 
     @cute.jit
     def get_num_m_blocks_and_seqlen(

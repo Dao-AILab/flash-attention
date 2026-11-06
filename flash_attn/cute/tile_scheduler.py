@@ -241,6 +241,9 @@ class TileSchedulerArguments(ParamsBase):
     cu_total_m_blocks_ptr: Optional[cute.Tensor] = None
     cu_total_splits_m_blocks_ptr: Optional[cute.Tensor] = None
     blocks_to_batch_idx_ptr: Optional[cute.Tensor] = None
+    # Compact split layout: batch and local slot of each (m block, split) slot, see
+    # SchedulerMetadataTensorsTorch.split_slot_batch.
+    split_slot_batch_ptr: Optional[cute.Tensor] = None
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistent_cta_multiplier: cutlass.Constexpr[int] = 1
     # SingleTileScheduler: launch splits as the slowest grid mode, so with per-batch split counts
