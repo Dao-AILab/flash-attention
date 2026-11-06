@@ -1,4 +1,6 @@
-"""hd256 MXFP8 forward (2CTA, S ping-pong): QK-only, native PV, causal leakage."""
+"""hd256 MXFP8 forward (2CTA, S ping-pong): QK-only, native PV, causal leakage, stats_out."""
+
+import math
 
 import pytest
 import torch
@@ -154,6 +156,60 @@ def test_mxfp8_hd256_causal_no_future_leakage(sq, sk, hq, hk, pv_softmax):
             assert torch.equal(out2[:, :rows].view(torch.uint8), out[:, :rows].view(torch.uint8))
             assert torch.equal(lse2[..., :rows].view(torch.uint8), lse[..., :rows].view(torch.uint8))
 
+
+@pytest.mark.parametrize("dim", [64, 128, DIM])
+@pytest.mark.parametrize("sq,sk,hq,hk", [(385, 513, 4, 2), (513, 129, 4, 1)])
+@pytest.mark.parametrize("mode", ["qk", "exact", "fast"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_mxfp8_stats_out(mode, causal, sq, sk, hq, hk, dim):
+    """stats_out leaves O and LSE bitwise unchanged and reproduces them from (m, L), at every
+    MXFP8 head dim. Causal 513 x 129 has rows without a visible key."""
+    requires_sm100()
+    (q, k, v8, sfq, sfk, sfv), (qd, kd, vd) = test_mxfp8_pv.inputs(2, sq, sk, hq, hk, dim)
+    if mode == "qk":
+        v, scales = vd.bfloat16(), BlockScales(sfq, sfk)
+    else:
+        v, scales = v8, BlockScales(sfq, sfk, sfv, vd.bfloat16() if causal else None, pv_softmax=mode)
+    out, lse = flash_attn_func(q, k, v, scales=scales, causal=causal, return_lse=True)
+    stats = torch.full((2, hq, sq, 2), math.nan, device="cuda")
+    out2, lse2 = flash_attn_func(
+        q, k, v, scales=scales._replace(stats_out=stats), causal=causal, return_lse=True
+    )
+    assert torch.equal(out.view(torch.uint8), out2.view(torch.uint8))
+    assert torch.equal(lse.view(torch.uint8), lse2.view(torch.uint8))
+    c = torch.tensor(math.log2(math.e) / math.sqrt(dim), device="cuda")
+    m, normalizer = stats[..., 0] * c, stats[..., 1]
+    visible = torch.isfinite(lse)
+    assert torch.isneginf(m[~visible]).all() and (normalizer[~visible] == 0).all()
+    # The true row max in log2 units; BF16 P keeps a stale max up to 8 below it (lazy rescale).
+    rep = hq // hk
+    scores = torch.einsum("bqhd,bkhd->bhqk", qd.double(), kd.repeat_interleave(rep, dim=2).double())
+    if causal:
+        qpos = torch.arange(sq, device="cuda")[:, None] + sk - sq
+        scores = scores.masked_fill(torch.arange(sk, device="cuda")[None, :] > qpos, -math.inf)
+    true_max = scores.amax(-1) * c.double()
+    lag = (true_max - m.double())[visible]
+    max_lag = {"qk": 8.0, "exact": 0.0, "fast": 4.0}[mode]
+    assert lag.min() >= -1e-3 and lag.max() <= max_lag + 1e-3
+    # LSE uses the FP32 sum, which is L except for "exact" (the E4M3 sum normalizes O there).
+    offset = {"qk": 0, "exact": 8, "fast": 4}[mode]
+    lse_from_stats = (m + torch.log2(normalizer) - offset) * math.log(2)
+    tol = 2e-2 if mode == "exact" else 2e-5
+    torch.testing.assert_close(lse_from_stats[visible], lse[visible], atol=tol, rtol=0)
+
+
+
+def test_mxfp8_stats_out_without_keys():
+    """With no keys the forward returns before any launch; stats_out still gets (-inf, 0)."""
+    requires_sm100()
+    q = torch.zeros(2, 128, 4, 64, dtype=torch.float8_e4m3fn, device="cuda")
+    k = torch.zeros(2, 0, 2, 64, dtype=torch.float8_e4m3fn, device="cuda")
+    v = torch.zeros(2, 0, 2, 64, dtype=torch.bfloat16, device="cuda")
+    sfq = torch.ones(2 * 4 * 512, device="cuda").to(torch.float8_e8m0fnu)
+    sfk = torch.ones(0, device="cuda").to(torch.float8_e8m0fnu)
+    stats = torch.full((2, 4, 128, 2), math.nan, device="cuda")
+    flash_attn_func(q, k, v, scales=BlockScales(sfq, sfk, stats_out=stats))
+    assert torch.isneginf(stats[..., 0]).all() and (stats[..., 1] == 0).all()
 
 def per_head_error(actual, expected):
     """Relative L2 error per (batch, head) of (batch, seqlen, heads, dim) outputs."""
