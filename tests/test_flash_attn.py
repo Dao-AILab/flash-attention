@@ -2647,6 +2647,30 @@ def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block
     assert not out.isnan().any()
 
 
+@pytest.mark.skipif(USE_TRITON_ROCM, reason="the length check is only in the CUDA extension")
+def test_flash_attn_kvcache_cache_batch_idx_length():
+    # Regression test for issue #3097. The split-KV kernel reads cache_batch_idx[b] for every
+    # b < batch_size, so mha_fwd_kvcache must reject a cache_batch_idx whose length is not
+    # batch_size instead of reading past its end.
+    device = "cuda"
+    dtype = torch.float16
+    batch_size, seqlen_k, nheads, d = 4, 256, 2, 64
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    # Slices of one buffer, as in the issue: the memory right after a short slice holds valid indices.
+    buf = torch.tensor([1, 0, 3, 2, 3], device=device, dtype=torch.int32)
+
+    for cache_batch_idx in (buf[:2], buf):  # 2 and 5 indices for 4 sequences
+        with pytest.raises(RuntimeError, match="cache_batch_idx must have shape"):
+            flash_attn_with_kvcache(q, k_cache, v_cache, cache_batch_idx=cache_batch_idx)
+
+    # Positive control: one index per sequence must NOT raise.
+    out = flash_attn_with_kvcache(q, k_cache, v_cache, cache_batch_idx=buf[:batch_size])
+    assert out.shape == (batch_size, 1, nheads, d)
+    assert not out.isnan().any()
+
+
 @pytest.mark.parametrize("append_knew", [False, True])
 def test_flash_attn_kvcache_paged_cuda_graph(append_knew):
     torch.manual_seed(0)
