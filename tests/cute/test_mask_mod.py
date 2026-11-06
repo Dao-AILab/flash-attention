@@ -380,10 +380,15 @@ def _run_mask_test(
         *_,
     ) = bm.as_tuple()
 
-    # SM90 block-sparse backward expects BlockMask granularity (128, 128) regardless of fwd tiling.
+    # The SM90 and SM12x block-sparse backwards expect BlockMask granularity (128, 128) regardless
+    # of fwd tiling.
     sparse_tile_m_bwd = sparse_tile_m
     tile_n_bwd = tile_n
-    if COMPUTE_CAPABILITY == 9 and use_block_sparsity and (sparse_tile_m, tile_n) != (128, 128):
+    if (
+        COMPUTE_CAPABILITY in (9, 12)
+        and use_block_sparsity
+        and (sparse_tile_m, tile_n) != (128, 128)
+    ):
         bm_bwd = create_block_mask(
             mask_mod_flex,
             batch_size,
@@ -591,6 +596,25 @@ def test_mask_mod_ima_partial_block():
         use_block_sparsity=True,
         needs_backward=True,
     )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (9, 10, 11, 12), reason="mask_mod backward")
+def test_mask_mod_bwd_ignores_causal_like_fwd():
+    """A mask_mod replaces causal masking: the forward drops causal, so the backward must as
+    well, or its gradients belong to a different attention than the output."""
+    torch.manual_seed(0)
+    q, k, v = [
+        torch.randn(1, 256, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        for _ in range(3)
+    ]
+    grad_out = torch.randn(1, 256, 2, 64, device="cuda", dtype=torch.bfloat16)
+    mask_mod_cute, _ = get_mask_pair("prefix_lm")
+    grads = []
+    for causal in (False, True):
+        out, _ = flash_attn_func(q, k, v, causal=causal, mask_mod=mask_mod_cute)
+        grads.append(torch.autograd.grad(out, (q, k, v), grad_out))
+    for grad, grad_ref in zip(grads[1], grads[0]):
+        assert torch.equal(grad, grad_ref)
 
 
 # Q boundary seqlens: NOT multiples of tile_m (128)
