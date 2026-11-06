@@ -384,6 +384,20 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
+// Ring-attention: run the forward kernel with Split forced true so it writes an
+// fp32 partial (oaccum + lseaccum) for ONE K/V block, and NO combine. Used by
+// mha_fwd's `skip_combine` path (dense; num_splits is caller-chosen and may be 1 for a
+// non-causal ring block -- Split is still forced so we get the fp32 partial).
+void run_mha_fwd_ring(Flash_fwd_params &params, cudaStream_t stream) {
+    TORCH_CHECK(params.num_splits >= 1);
+    ARCH_SWITCH(params.arch, Arch, [&] {
+        SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
+            // Split=true always enables PackGQA; no paged-KV for ring partials.
+            run_mha_fwd_constexpr<Arch, /*Split=*/true, /*PagedKVNonTMA=*/false, /*PackGQA=*/true, Has_softcap>(params, stream);
+        });
+    });
+}
+
 void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl=false) {
     #ifndef FLASHATTENTION_DISABLE_SPLIT
     // If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
@@ -704,7 +718,15 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        // Ring / context-parallel forward, folded in. skip_combine == false (default) is
+        // the standard forward, byte-identical to before. When skip_combine == true the
+        // Split kernel is forced on (even for num_splits==1) so it writes the fp32
+        // normalized partial + fp32 LSE into the CALLER-OWNED out_accum/lse_accum, and the
+        // combine is skipped (no bf16 round-trip). The ring driver merges partials in fp32.
+        bool skip_combine,
+        std::optional<at::Tensor> out_accum_,
+        std::optional<at::Tensor> lse_accum_
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -983,6 +1005,13 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    if (skip_combine) {
+        TORCH_CHECK(out_accum_.has_value() && lse_accum_.has_value(),
+                    "skip_combine (ring forward) requires out_accum and lse_accum");
+        TORCH_CHECK(!paged_KV && !k_new_.has_value() && !q_v_.has_value(),
+                    "ring forward (skip_combine) does not support paged-KV / appendKV / q_v");
+        params.pack_gqa = true;  // the forced-Split ring path always uses PackGQA
+    }
 
     // This needs to be set after get_num_splits
     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
@@ -1091,9 +1120,26 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
     at::Tensor out_accum, softmax_lse_accum;
     auto outaccum_type = at::ScalarType::Float;
-    if (params.num_splits > 1) {
+    if (params.num_splits > 1 || skip_combine) {
         TORCH_CHECK(params.num_splits <= 256, "num_splits > 256 not supported");
-        if (!is_varlen_q) {
+        if (out_accum_.has_value()) {
+            // Ring: caller owns the fp32 partial buffers; skip_combine writes into them.
+            out_accum = out_accum_.value();
+            softmax_lse_accum = lse_accum_.value();
+            TORCH_CHECK(out_accum.scalar_type() == at::kFloat && softmax_lse_accum.scalar_type() == at::kFloat,
+                        "out_accum/lse_accum must be fp32");
+            TORCH_CHECK(out_accum.stride(-1) == 1, "out_accum must have contiguous last dimension");
+            TORCH_CHECK(softmax_lse_accum.stride(-1) == 1, "lse_accum must have contiguous last dimension");
+            if (!is_varlen_q) {
+                CHECK_SHAPE(out_accum, (int)params.num_splits, batch_size, num_heads, seqlen_q, head_size_v);
+                CHECK_SHAPE(softmax_lse_accum, (int)params.num_splits, batch_size, num_heads, seqlen_q);
+                params.oaccum_batch_stride = out_accum.stride(1);
+                params.lseaccum_batch_stride = softmax_lse_accum.stride(1);
+            } else {
+                CHECK_SHAPE(out_accum, (int)params.num_splits, num_heads, total_q, head_size_v);
+                CHECK_SHAPE(softmax_lse_accum, (int)params.num_splits, num_heads, total_q);
+            }
+        } else if (!is_varlen_q) {
             out_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q, head_size_v}, opts.dtype(outaccum_type));
             softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
             params.oaccum_batch_stride = out_accum.stride(1);
@@ -1166,36 +1212,49 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
-        run_mha_fwd(params, stream);
-        if (params.num_splits > 1) {
-            if (out_type == at::ScalarType::BFloat16) {
-                // Since we want output in BF16. Otherwise fwd_combine will output to FP16
-                params.is_bf16 = true;
+        if (skip_combine) {
+            // Ring: force the Split kernel (even for num_splits==1) to write fp32 partials
+            // into the caller-owned out_accum/lse_accum, and skip the combine.
+            run_mha_fwd_ring(params, stream);
+        } else {
+            run_mha_fwd(params, stream);
+            if (params.num_splits > 1) {
+                if (out_type == at::ScalarType::BFloat16) {
+                    // Since we want output in BF16. Otherwise fwd_combine will output to FP16
+                    params.is_bf16 = true;
+                }
+                // Unless there's seqused_q, for the purpose of attn_combine, we can just treat it as batch=1
+                // and seqlen = total_q, and don't need to dispatch to Varlen there.
+                // However, with dynamic split, each row needs to know which batch it belongs to
+                // to read the number of splits, so we just use the varlen version of combine kernel.
+                // if (is_varlen_q && !seqused_q_.has_value()) {
+                // if (is_varlen_q) {
+                //     params.b = 1;
+                //     params.seqlen_q = total_q;
+                // }
+                // This will zero out the semaphore if needed
+                run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
+            } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
+                // need to zero out the semaphore in this case
+                tile_count_semaphore.index({torch::indexing::Slice(params.tile_count_semaphore_offset, params.tile_count_semaphore_offset + 1)}).zero_();
             }
-            // Unless there's seqused_q, for the purpose of attn_combine, we can just treat it as batch=1
-            // and seqlen = total_q, and don't need to dispatch to Varlen there.
-            // However, with dynamic split, each row needs to know which batch it belongs to
-            // to read the number of splits, so we just use the varlen version of combine kernel.
-            // if (is_varlen_q && !seqused_q_.has_value()) {
-            // if (is_varlen_q) {
-            //     params.b = 1;
-            //     params.seqlen_q = total_q;
-            // }
-            // This will zero out the semaphore if needed
-            run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
-        } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
-            // need to zero out the semaphore in this case
-            tile_count_semaphore.index({torch::indexing::Slice(params.tile_count_semaphore_offset, params.tile_count_semaphore_offset + 1)}).zero_();
         }
     } else if (total_q > 0 && num_heads_k > 0) {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
-        out.zero_();
-        softmax_lse.fill_(std::numeric_limits<float>::infinity());
+        if (skip_combine) {
+            out_accum.zero_();
+            softmax_lse_accum.fill_(-std::numeric_limits<float>::infinity());
+        } else {
+            out.zero_();
+            softmax_lse.fill_(std::numeric_limits<float>::infinity());
+        }
     }
 
-    // return {out, softmax_lse};
     return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
+
+// ===========================================================================
+
 
 #ifdef FLASHATTENTION_DISABLE_BACKWARD
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
@@ -1258,12 +1317,10 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 #endif
 
 
-// b: batch_size
-// s_q: seqlen_q
-// s_k: seqlen_k
-// h: num_heads
-// h_k: num_heads_k
-// d: head_size
+// Ring backward kBlockM/kBlockN (causal-independent; single source of truth for
+// sizing the persistent dq_accum). Defined below; forward-declared for mha_bwd.
+static std::tuple<int, int> ring_bwd_kblock_mn(int arch, int head_size_rounded, double softcap);
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
     at::Tensor q,     // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
@@ -1286,7 +1343,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     int64_t window_size_right,
     double softcap,
     bool deterministic,
-    int64_t sm_margin
+    int64_t sm_margin,
+    // Ring / context-parallel backward, folded in. ring_phase == 0 (default) is the
+    // standard backward, byte-identical to before. When ring_phase != 0 the three
+    // fp32 buffers below are CALLER-OWNED and persist across phases:
+    //   1 = preprocess (clear dq_accum + write D/softmax_lse_log2, once per rank),
+    //   2 = step       (accumulate this K/V shard's dQ into dq_accum, emit dK/dV, per hop),
+    //   3 = convert    (dq_accum -> dq, once per rank).
+    int64_t ring_phase,
+    std::optional<at::Tensor> dq_accum_,
+    std::optional<at::Tensor> dsoftmax_sum_,
+    std::optional<at::Tensor> softmax_lse_log2_
 ) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1367,16 +1434,28 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     int const arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
     int const head_size_rounded = round_up_headdim(std::max(head_size, head_size_v));
     int const head_size_v_rounded = head_size_rounded;
+    bool const is_ring = ring_phase != 0;
+    if (is_ring) {
+        TORCH_CHECK(arch >= 90, "ring backward (ring_phase != 0) requires Hopper (sm90+).");
+        TORCH_CHECK(!(head_size_rounded <= 64 && softcap > 0.0),
+                    "ring backward does not support softcap for hdim<=64 (kBlockM would differ "
+                    "across causal/non-causal ring steps and break the persistent dq_accum).");
+        deterministic = false;  // ring path is always non-deterministic (dq_semaphore unused)
+    }
     TORCH_CHECK(!deterministic || head_size_rounded < 256, "Deterministic backward not supported for hdim 256.");
     // Very important that these match the kernel configs
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    TORCH_CHECK(!is_ring || !is_local,
+                "ring backward (ring_phase != 0) does not support local / sliding-window: the "
+                "hd128 ring pins kBlockM=80 for plain causal, which disagrees with the kernel's "
+                "local kBlockM=64 and would corrupt the persistent dq_accum layout.");
     int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
         : (head_size_rounded <= 96 ? 64
            : (head_size_rounded <= 128 ? (is_causal || is_local || softcap > 0.0 ? 64 : 80)
               : 64));
     int const kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
     int const kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
-    int const kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
+    int kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
     int const kBlockN_sm90 = head_size_rounded <= 128
         ? 128
         : (head_size_rounded <= 192 ? 96 : 80);
@@ -1387,7 +1466,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         : (head_size_rounded <= 96 ? 128
            : (head_size_rounded <= 128 ? 96
               : (head_size_rounded <= 192 ? 64 : 64)));
-    int const kBlockN = arch >= 90 ? kBlockN_sm90 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm80);
+    int kBlockN = arch >= 90 ? kBlockN_sm90 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm80);
+    // Ring keeps ONE (causal-independent) block across mixed causal/non-causal steps so
+    // the persistent dq_accum layout stays consistent (hd128 -> tuned 80-block).
+    if (is_ring) { std::tie(kBlockM, kBlockN) = ring_bwd_kblock_mn(arch, head_size_rounded, softcap); }
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     int const seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
     int const seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
@@ -1474,21 +1556,37 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     auto opts = q.options();
     // Need softmax_d to have total_q_padded_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
     at::Tensor softmax_d, softmax_lse_log2;
-    if (!is_varlen) {
+    at::Tensor dq_accum, dk_accum, dv_accum;
+    if (is_ring) {
+        // Ring: the three fp32 buffers are caller-owned and persist across phases 1/2/3.
+        dq_accum = dq_accum_.value();
+        softmax_d = dsoftmax_sum_.value();
+        softmax_lse_log2 = softmax_lse_log2_.value();
+        TORCH_CHECK(dq_accum.dtype() == at::kFloat && softmax_d.dtype() == at::kFloat
+                    && softmax_lse_log2.dtype() == at::kFloat,
+                    "ring dq_accum / dsoftmax_sum / softmax_lse_log2 must be float32");
+        if (!is_varlen) {
+            CHECK_SHAPE(dq_accum, batch_size, num_heads, seqlen_q_rounded * head_size_rounded);
+            CHECK_SHAPE(softmax_d, batch_size, num_heads, seqlen_q_rounded);
+            CHECK_SHAPE(softmax_lse_log2, batch_size, num_heads, seqlen_q_rounded);
+        } else {
+            CHECK_SHAPE(dq_accum, num_heads, total_q_padded_rounded * head_size_rounded);
+            CHECK_SHAPE(softmax_d, num_heads, total_q_padded_rounded);
+            CHECK_SHAPE(softmax_lse_log2, num_heads, total_q_padded_rounded);
+        }
+    } else if (!is_varlen) {
         // Need softmax_d to have seqlen_q_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
         softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
         softmax_lse_log2 = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
+        dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, opts.dtype(at::kFloat));
     } else {
         softmax_d = torch::empty({num_heads, total_q_padded_rounded}, opts.dtype(at::kFloat));
         softmax_lse_log2 = torch::empty({num_heads, total_q_padded_rounded}, opts.dtype(at::kFloat));
-    }
-    at::Tensor dq_accum, dk_accum, dv_accum;
-    if (!is_varlen) {
-        dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, opts.dtype(at::kFloat));
-    } else {
         dq_accum = torch::empty({num_heads, total_q_padded_rounded * head_size_rounded}, opts.dtype(at::kFloat));
     }
-    if (num_heads_k != num_heads) {  // MQA / GQA
+    // MQA/GQA fp32 dk/dv accumulators. Ring only emits a shard's dK/dV in phase 2.
+    bool const use_kv_accum = (num_heads_k != num_heads) && (!is_ring || ring_phase == 2);
+    if (use_kv_accum) {
         if (!is_varlen) {
             dk_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded}, opts.dtype(at::kFloat));
             dv_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_v_rounded}, opts.dtype(at::kFloat));
@@ -1512,8 +1610,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
                      seqused_q_.has_value() ? seqused_q_.value().data_ptr() : nullptr,
                      seqused_k_.has_value() ? seqused_k_.value().data_ptr() : nullptr,
                      dq_accum.data_ptr(),
-                     num_heads_k != num_heads ? dk_accum.data_ptr() : nullptr,
-                     num_heads_k != num_heads ? dv_accum.data_ptr() : nullptr,
+                     use_kv_accum ? dk_accum.data_ptr() : nullptr,
+                     use_kv_accum ? dv_accum.data_ptr() : nullptr,
                      softmax_lse.data_ptr(),
                      softmax_d.data_ptr(),
                      /*p_dropout=*/0.f,
@@ -1529,12 +1627,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
+    params.ring_bwd_phase = (int)ring_phase;  // 0 = standard backward (all phases run)
 
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
-    // Will be zero'ed out in the backward preprocess kernel
-    at::Tensor dq_semaphore = torch::empty({(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, opts.dtype(torch::kInt32));
-    params.dq_semaphore = dq_semaphore.data_ptr<int>();
+    // Will be zero'ed out in the backward preprocess kernel. Ring runs deterministic=false,
+    // so the semaphore is dead (main kernel takes lock_ptr=nullptr, preprocess clear is
+    // null-guarded): skip the per-call int32 allocation and leave the pointer null.
+    at::Tensor dq_semaphore;
+    if (is_ring) {
+        params.dq_semaphore = nullptr;
+    } else {
+        dq_semaphore = torch::empty({(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, opts.dtype(torch::kInt32));
+        params.dq_semaphore = dq_semaphore.data_ptr<int>();
+    }
     at::Tensor dk_semaphore, dv_semaphore;
     if (num_heads_k != num_heads && params.deterministic) {
         // TODO: maybe also zero'ed out dk_semaphore and dv_semaphore in the backward preprocess kernel
@@ -1558,13 +1664,51 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
         dk.zero_();
         dv.zero_();
-        softmax_d.zero_();
+        if (!is_ring) softmax_d.zero_();  // ring: softmax_d is the caller's persistent D buffer
     } else if (total_q > 0 && num_heads_k > 0) {
-        dq.zero_();
-        softmax_d.zero_();
+        if (!is_ring) {
+            dq.zero_();
+            softmax_d.zero_();
+        } else {
+            // ring phase-2 with an empty K/V shard contributes nothing: zero only this
+            // shard's dK/dV; leave the persistent dq_accum / softmax_d (dsoftmax_sum) intact.
+            dk.zero_();
+            dv.zero_();
+        }
     }
 
     return { softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
+}
+
+// ===========================================================================
+// Ring-attention native backward (FA3): the phased context-parallel backward is
+// FOLDED INTO mha_bwd above via `ring_phase` (0 = standard backward, untouched).
+//   phase 1 (preprocess): D=rowsum(dO*O) -> dsoftmax_sum, softmax_lse_log2, and CLEAR
+//                         the caller-owned persistent fp32 dq_accum. Once per rank.
+//   phase 2 (step):       main bwd kernel for the CURRENT K/V shard -- accumulate its
+//                         dQ into dq_accum (no clear, no bf16 round-trip) and emit this
+//                         shard's dK/dV (h_k-headed; GQA reduced on-device). Per hop.
+//   phase 3 (convert):    dq_accum -> dq (bf16/fp16), scaled once. Once per rank.
+// ring_bwd_kblock_mn below is CAUSAL-INDEPENDENT so the persistent dq_accum keeps ONE
+// layout across mixed causal/non-causal steps (hd128 -> tuned 80-block). It sizes the
+// buffers the caller passes to mha_bwd (see ring_bwd_alloc in flash_attn_interface.py).
+// ===========================================================================
+
+// kBlockM/kBlockN the ring backward uses. Mirrors mha_bwd's selection but is
+// CAUSAL-INDEPENDENT (a persistent dq_accum must keep one layout across mixed
+// causal/non-causal ring steps): hd64 -> 128, hd96 -> 64, hd128 -> 80 (no-softcap;
+// matches the ring branch of run_mha_bwd_hdim128, which pins the causal diagonal to
+// the tuned 80-block too) or 64 with softcap (where non-causal also uses 64),
+// hd192/256 -> 64. hd64 + softcap>0 is rejected by mha_bwd's is_ring guard. Ring
+// backward is sm90-only (also enforced there), so only sm90 block sizes are reachable.
+// Single source of truth for sizing the persistent dq_accum.
+static std::tuple<int, int> ring_bwd_kblock_mn(int arch, int head_size_rounded, double softcap) {
+    (void)arch;  // sm90-only path
+    int kBlockM = head_size_rounded <= 64 ? 128
+        : (head_size_rounded <= 96 ? 64
+           : (head_size_rounded <= 128 ? (softcap > 0.0 ? 64 : 80) : 64));
+    int kBlockN = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 96 : 80);
+    return {kBlockM, kBlockN};
 }
 
 std::tuple<at::Tensor, at::Tensor>
@@ -1705,7 +1849,10 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "bool skip_combine = False,"
+        "Tensor(oa!)? out_accum = None,"
+        "Tensor(la!)? lse_accum = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
@@ -1728,7 +1875,11 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int window_size_right = -1,"
         "float softcap = 0.0,"
         "bool deterministic = False,"
-        "int sm_margin = 0) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "int ring_phase = 0,"
+        "Tensor(dq_accum!)? dq_accum = None,"
+        "Tensor(dsoftmax_sum!)? dsoftmax_sum = None,"
+        "Tensor(softmax_lse_log2!)? softmax_lse_log2 = None) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"
