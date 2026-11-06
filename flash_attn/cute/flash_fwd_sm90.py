@@ -823,6 +823,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         self.num_threads_per_warp_group,
                         mK.element_type,
                         arch=self.arch.major * 10 + self.arch.minor,
+                        same_hdim_kv=self.same_hdim_kv,
                     )
 
                 load_K = partial(
