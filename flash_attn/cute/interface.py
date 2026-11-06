@@ -2319,6 +2319,16 @@ def _flash_attn_bwd(
                     "deterministic block-sparse backward requires block_sparse_tensors.spt "
                     "to match dq_write_order direction"
                 )
+    # SM100: fixed-length sequences that fill whole tiles (Q tiles, sparse Q blocks, and KV
+    # tiles per cluster) never place a row or column past seqlen_q / seqlen_k, so the backward
+    # can skip the per-element sequence-bound masking.
+    bwd_mask_seqlen = (
+        arch // 10 not in [10, 11]
+        or is_varlen
+        or seqlen_q % (tile_m * (q_subtile_factor if use_block_sparsity else 1)) != 0
+        or seqlen_k % (tile_n * cluster_size) != 0
+    )
+
     # Everything that selects codegen comes from the config or the problem facts below.
     compile_key = (
         arch,
@@ -2355,6 +2365,7 @@ def _flash_attn_bwd(
         cu_total_m_blocks_k is not None,
         use_dedicated_hd256_kernel and cu_seqlens_q is not None and max_seqlen_q is None,
         use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
+        bwd_mask_seqlen,
     )
 
     # SM90 / SM100 bound the K/V TMA loads of varlen / seqused_k calls by rewriting per-CTA
@@ -2511,6 +2522,7 @@ def _flash_attn_bwd(
                     registers=config.registers,
                     Q_stage=config.num_stages_Q,
                     dO_stage=config.num_stages_dO,
+                    mask_seqlen=bwd_mask_seqlen,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
