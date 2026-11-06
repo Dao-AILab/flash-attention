@@ -553,8 +553,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
                                       Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                      make_stride(Split ? kHeadDim : params.o_row_stride, _1{}));
-        Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
-                                      Shape<Int<kBlockM>>{}, Stride<_1>{});
+        // Without Split, write straight to softmax_lse, which may be unpadded (h, total_q) for varlen.
+        auto gLSEaccum = [&] {
+            if constexpr (Split) {
+                return make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lseaccum),
+                                   Shape<Int<kBlockM>>{}, Stride<_1>{});
+            } else {
+                return get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
+            }
+        }();
 
         GmemTiledCopyO gmem_tiled_copy_Oaccum;
         auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
