@@ -49,14 +49,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         split_head: bool,
         use_clc_scheduler: bool = False,
         mxfp8: bool = False,
+        reverse_pairs: bool = False,
     ):
-        """mxfp8: NOTE [MXFP8 hd256 backward] in sm100_hd256_2cta_fmha_backward.py."""
+        """mxfp8: NOTE [MXFP8 hd256 backward] in sm100_hd256_2cta_fmha_backward.py. reverse_pairs: run
+        each head's query pairs from the end (causal: the longest first)."""
         self.acc_dtype = acc_dtype
         self.mxfp8 = mxfp8
-        assert not (mxfp8 and (use_clc_scheduler or split_head or is_causal))
+        assert not (mxfp8 and (use_clc_scheduler or split_head))
+        # causal MXFP8: the dP residual on the forward's BF16 band (NOTE [MXFP8 hd256 backward])
+        self.band_residual = mxfp8 and is_causal
         # MXFP8: the dK / dV kernel (independent of dQ) is launched as this kernel's programmatic
         # dependent, so its CTAs fill the SMs this kernel's last wave leaves idle
         self.pdl_primary = mxfp8
+        self.reverse_pairs = reverse_pairs
         self.mma_tiler = mma_tiler
         self.is_causal = is_causal
         self.window_size_left = window_size_left
@@ -102,6 +107,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         )
         self.iterations_qk = self.cta_tiler[2] // self.qk_mma_tiler[2]
         self.iterations_dov = self.cta_tiler[2] // self.dov_mma_tiler[2]
+        # the band residual MMA reads this step's dO, released after it (one dO stage)
+        assert not self.band_residual or self.iterations_dov == 1
         self.iterations_dsk = self.cta_tiler[2] // self.dsk_mma_tiler[1]
         self.cluster_shape_mn = (2, 1)
         self.tmem_warp_shape_mn = (4, 1)
@@ -111,8 +118,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
         # MXFP8 (one tile per CTA): the epilogue warps also run the S / dP -> dS step as a second compute warp
         # group (each group half of the 128 key columns), then store dQ; otherwise they idle until the epilogue.
-        # Only on sm_107 (B300, B1/B4 S4k-S16k H16: 0.6% slower backward).
-        self.wg2_compute = mxfp8 and mxu.is_sm107() and not is_persistent and not use_clc_scheduler
+        # Causal everywhere, non-causal only on sm_107 (B300 non-causal, B1/B4 S4k-S16k H16: 0.6% slower
+        # backward).
+        self.wg2_compute = (
+            mxfp8 and (is_causal or mxu.is_sm107()) and not is_persistent and not use_clc_scheduler
+        )
         self.compute_warp_ids = (0, 1, 2, 3, 4, 5, 6, 7) if self.wg2_compute else (0, 1, 2, 3)
         self.epilogue_warp_ids = (4, 5, 6, 7)
         self.num_compute_wgs = len(self.compute_warp_ids) // 4
@@ -180,6 +190,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.do_stage = self.iterations_dov
         self.v_stage = self.iterations_dov
         self.kt_stage = 1
+        # band_residual: the residual R of the pair's last two key tiles has its own two V-shaped
+        # SMEM stages after V's, prefetched at the work tile's first step (no wait on V's single stage)
+        self.r_stage = 2 if self.band_residual else 0
         self.qk_acc_stage = 1
         self.dov_acc_stage = 1
         self.dsk_acc_stage = 1
@@ -407,8 +420,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             mSFQ_tma, mSFdO_tma = [
                 mxu.mx_sf_tile_view(t, 64, n_q, hb, h_r, h_k, False) for t in (sfq_mx, sfdo_mx)
             ]
+            # band_residual: v_mx / sfv_mx hold V (keys [0, s)) then the residual R (keys [s, 2s))
+            n_kv = n_k * 2 if cutlass.const_expr(self.band_residual) else n_k
             mSFK_tma, mSFV_tma = [
-                mxu.mx_sf_tile_view(t, 64, n_k, hb, h_r, h_k, True) for t in (sfk_mx, sfv_mx)
+                mxu.mx_sf_tile_view(t, 64, n, hb, h_r, h_k, True)
+                for t, n in ((sfk_mx, n_k), (sfv_mx, n_kv))
             ]
 
         cta_group = tcgen05.CtaGroup.TWO
@@ -445,7 +461,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             ds_source,
         )
 
-        sSFA_layout = sSFB_layout = tSFA_layout = tSFB_layout = None
+        sSFA_layout = sSFB_layout = tSFA_layout = tSFB_layout = sSFV_layout = None
         if cutlass.const_expr(self.mxfp8):
             qk_tiled_mma, dov_tiled_mma = [
                 mxu.make_mx_tiled_mma(
@@ -478,6 +494,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             )
             assert cute.cosize(sSFA_layout) == 1024
             assert cute.cosize(sSFB_layout) == 1024 * self.k_stage
+            sSFV_layout = sSFB_layout
+            if cutlass.const_expr(self.r_stage > 0):
+                sSFV_layout = blockscaled_layout.make_smem_layout_sfb(
+                    qk_tiled_mma, self.qk_mma_tiler, mxu.SF_VEC, self.v_stage + self.r_stage
+                )
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -509,7 +530,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             dov_tiled_mma,
             self.dov_mma_tiler,
             self.sdp_dtype,
-            self.v_stage,
+            self.v_stage + self.r_stage,
         )
         ds_tmem_layout_staged = sm100_utils.make_smem_layout_a(
             dsk_tiled_mma,
@@ -664,6 +685,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             # CLC pipeline barriers and response buffer
             clc_mbar_ptr: cute.struct.MemRange[Int64, 2]
             clc_response: cute.struct.MemRange[Int32, 4]
+            # band residual stages (zero-size otherwise)
+            load_r_mbar_ptr: cute.struct.MemRange[Int64, self.r_stage * 2]
 
         self.shared_storage = SharedStorage
 
@@ -718,6 +741,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             sSFB_layout,
             tSFA_layout,
             tSFB_layout,
+            sSFV_layout,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -782,6 +806,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         sSFB_layout: Optional[cute.Layout] = None,
         tSFA_layout: Optional[cute.Layout] = None,
         tSFB_layout: Optional[cute.Layout] = None,
+        sSFV_layout: Optional[cute.Layout] = None,
     ):
         # llvm.inline_asm(
         #     None,
@@ -848,6 +873,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         ).make_participants()
+        load_r_producer = load_r_consumer = None
+        if cutlass.const_expr(self.r_stage > 0):
+            load_r_producer, load_r_consumer = pipeline.PipelineTmaUmma.create(
+                num_stages=self.r_stage,
+                producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
+                consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+                tx_count=self.tma_copy_v_bytes,
+                barrier_storage=storage.load_r_mbar_ptr.data_ptr(),
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            ).make_participants()
         load_do_producer, load_do_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.do_stage,
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
@@ -1035,10 +1071,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 for _ in range(2)
             ]
             sSFK, sSFV = [
-                smem.allocate_tensor(
-                    element_type=mxu.SF_DTYPE, layout=sSFB_layout, byte_alignment=128
-                )
-                for _ in range(2)
+                smem.allocate_tensor(element_type=mxu.SF_DTYPE, layout=lay, byte_alignment=128)
+                for lay in (sSFB_layout, sSFV_layout)
             ]
         # Alias the dQ TMA epilogue staging buffer onto sdO.  A standalone
         # (128, 64) bf16 allocation exceeds B200's per-block SMEM limit for
@@ -1096,6 +1130,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             tile_sched = SingleTileVarlenScheduler.create(tile_sched_params)
         else:
             blk_idx = cute.arch.block_idx()
+            if cutlass.const_expr(self.reverse_pairs):
+                blk_idx = mxu.reversed_pair_block_idx(blk_idx, cute.arch.grid_dim())
             tile_sched = FmhaStaticTileScheduler(
                 tile_sched_params, blk_idx[0], blk_idx, cute.arch.grid_dim()
             )
@@ -1410,6 +1446,31 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 tKTsKT[None, kt_handle.index],
                                 tma_bar_ptr=kt_handle.barrier,
                             )
+                        if cutlass.const_expr(self.band_residual):
+                            if i == 0:
+                                # the residual R of the last two key tiles (the forward's BF16 band of
+                                # this 256-query pair, s keys further) into R's own stages, behind
+                                # the first step's loads
+                                for j in cutlass.range(2, unroll=1):
+                                    r_coord = (
+                                        seqlen_kv_loop_start
+                                        + seqlen_kv_loop_steps
+                                        - 2
+                                        + j
+                                        + mK_kdl.shape[0] // 128
+                                    )
+                                    r_handle = load_r_producer.acquire_and_advance()
+                                    cute.copy(
+                                        tma_atom_v,
+                                        tVgV[None, r_coord, 0],
+                                        tVsV[None, self.v_stage + r_handle.index],
+                                        tma_bar_ptr=r_handle.barrier,
+                                    )
+                                    load_sfv(
+                                        r_coord,
+                                        self.v_stage + r_handle.index,
+                                        tma_bar_ptr=r_handle.barrier,
+                                    )
                         kv_coord += 1
 
                 work_tile = tile_sched.advance_to_next_work()
@@ -1417,6 +1478,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             load_k_producer.tail()
             load_v_producer.tail()
             load_kt_producer.tail()
+            if cutlass.const_expr(self.r_stage > 0):
+                load_r_producer.tail()
             load_q_producer.tail()
             load_do_producer.tail()
             load_lse_producer.tail()
@@ -1599,6 +1662,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                         )
                                         dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 v_handle.release()
+                            if cutlass.const_expr(self.band_residual):
+                                if seqlen_kv_loop_steps == 2:
+                                    load_r_consumer = self.dp_band_residual(
+                                        dov_tiled_mma,
+                                        tdPtdP_slice,
+                                        tdPrdO,
+                                        tdPrV,
+                                        sf_dov,
+                                        load_r_consumer,
+                                    )
                             cute.arch.fence_view_async_tmem_store()
                             dp_handle.commit()
 
@@ -1766,6 +1839,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                             )
                                             dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                     v_handle.release()
+                                if cutlass.const_expr(self.band_residual):
+                                    if i == seqlen_kv_loop_steps - 2:
+                                        load_r_consumer = self.dp_band_residual(
+                                            dov_tiled_mma,
+                                            tdPtdP_slice,
+                                            tdPrdO,
+                                            tdPrV,
+                                            sf_dov,
+                                            load_r_consumer,
+                                        )
                                 dp_handle.commit()
 
                             # QKend
@@ -1924,6 +2007,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                         )
                                         dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 v_handle.release()
+                                if cutlass.const_expr(not self.band_residual):
+                                    load_do_releaser.release()
+                                    load_do_releaser.advance()
+                            if cutlass.const_expr(self.band_residual):
+                                load_r_consumer = self.dp_band_residual(
+                                    dov_tiled_mma,
+                                    tdPtdP_slice,
+                                    tdPrdO,
+                                    tdPrV,
+                                    sf_dov,
+                                    load_r_consumer,
+                                )
+                                # (dO is released after the residual MMA, which reads it; iterations_dov == 1)
                                 load_do_releaser.release()
                                 load_do_releaser.advance()
                             dp_handle.commit()
@@ -2084,6 +2180,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                         )
                                         dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 v_handle.release()
+                                if cutlass.const_expr(not self.band_residual):
+                                    load_do_releaser.release()
+                                    load_do_releaser.advance()
+                            if cutlass.const_expr(self.band_residual):
+                                load_r_consumer = self.dp_band_residual(
+                                    dov_tiled_mma,
+                                    tdPtdP_slice,
+                                    tdPrdO,
+                                    tdPrV,
+                                    sf_dov,
+                                    load_r_consumer,
+                                )
+                                # (dO is released after the residual MMA, which reads it; iterations_dov == 1)
                                 load_do_releaser.release()
                                 load_do_releaser.advance()
                             dp_handle.commit()
@@ -2424,6 +2533,28 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         (tSFA, _, _, _), (tSFB, _, _, _) = sf
         tiled_mma.set(tcgen05.Field.SFA, tSFA[None, None, k_block].iterator)
         tiled_mma.set(tcgen05.Field.SFB, tSFB[None, None, k_block].iterator)
+
+    @cute.jit
+    def dp_band_residual(self, dov_tiled_mma, tdPtdP_slice, tdPrdO, tdPrV, sf_dov, load_r_consumer):
+        """band_residual: dP += dO R^T on the forward's BF16 band (NOTE [MXFP8 hd256 backward]), R = MX(V - Vhat)
+        along d from its own prefetched stage. Returns the advanced R consumer."""
+        for iter in cutlass.range(self.iterations_dov, unroll=1):
+            tdPrdO_slice = tdPrdO[None, None, None, iter]
+            r_handle = load_r_consumer.wait_and_advance()
+            self.copy_sf(sf_dov, self.v_stage + r_handle.index)
+            tdPrV_trans_slice = tdPrV[None, None, None, self.v_stage + r_handle.index]
+            for kphase_idx in cutlass.range(cute.size(tdPrdO_slice, mode=[2]), unroll_full=True):
+                self.set_sf(dov_tiled_mma, sf_dov, kphase_idx)
+                cute.gemm(
+                    dov_tiled_mma,
+                    tdPtdP_slice,
+                    tdPrdO_slice[(None, None, kphase_idx)],
+                    tdPrV_trans_slice[(None, None, kphase_idx)],
+                    tdPtdP_slice,
+                )
+                dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+            r_handle.release()
+        return load_r_consumer
 
     @cute.jit
     def compute_step(

@@ -51,6 +51,11 @@ from flash_attn.cute.utils import AuxData, as_bshkrd_tensor, as_shhb_tensor
 #   * the LSE slots M - off (dK / dV kernel: P~ <= 2^off fits E4M3 with the constant P^T scale
 #     2^-8, and is bitwise the forward's P wherever the forward used the final row max) and
 #     M - off + 8 (dQ kernel).
+# Causal: the forward ran each 256-row work tile's band (keys [256 floor(i / 256), i]) on BF16 P
+# and the original V. There both kernels add dO R^T to dP, with the residual R = MX(V - Vhat_d)
+# along head_dim stored as keys [s, 2s) of the V copy, so dP reads V to about BF16 precision (one
+# extra MXFP8 MMA per band tile): the dQ kernel's last two key tiles of each 256-query pair and the
+# dK / dV kernel's first two query tiles. dV on the band stays MXFP8 (e4m3 P).
 #
 # Scale layouts. The dQ kernel's pair MMAs are M=256 with standard 128-row interleave_sf chunks.
 # The dK / dV kernel's pair MMAs are M=128 (64 keys per CTA; accumulator layout B: lanes 64..127
@@ -70,7 +75,7 @@ from flash_attn.cute.utils import AuxData, as_bshkrd_tensor, as_shhb_tensor
 # (S, dP, dQ): the S scales sit in the tail of dP (copied once dP(i-1) has been read; dS uses dP's
 # first 64 columns) and the dP scales in the tail of S, so QK(i) also waits for the dP(i-1) release;
 # sm_107 gives them dedicated columns of its 576-column allocation.
-# Scope: non-causal, MHA, dense (no varlen / seqused), seqlen_q = seqlen_k, static scheduler.
+# Scope: MHA, dense (no varlen / seqused), seqlen_q = seqlen_k, static scheduler.
 
 
 class BlackwellFusedMultiHeadAttentionBackward:
@@ -100,8 +105,10 @@ class BlackwellFusedMultiHeadAttentionBackward:
         window_size_right: int | None = None,
         use_clc_scheduler: bool = False,
         mxfp8: bool = False,
+        dq_reverse: bool = False,
     ):
-        """Initialization. mxfp8: NOTE [MXFP8 hd256 backward]."""
+        """Initialization. mxfp8: NOTE [MXFP8 hd256 backward]. dq_reverse: the dQ kernel runs each
+        head's query pairs from the end (causal: the longest first)."""
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim == 256 and head_dim_v == 256, (
             "SM100 dedicated backward kernel only supports (head_dim, head_dim_v) = (256, 256)"
@@ -149,6 +156,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             False,  # split_head
             use_clc_scheduler=self.use_clc_scheduler,
             mxfp8=mxfp8,
+            reverse_pairs=dq_reverse,
         )
         self.dkdv_kernel = BlackwellFusedMultiHeadAttentionBackwardDKDVKernel(
             self.acc_dtype,
