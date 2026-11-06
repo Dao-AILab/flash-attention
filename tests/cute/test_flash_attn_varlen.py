@@ -97,6 +97,102 @@ def test_hd256_varlen_epilogue(seqlens, causal):
     )
 
 
+def _padded_cu_seqlens(lengths, capacity):
+    """cu_seqlens with `capacity` slots; unused trailing slots repeat the last offset."""
+    cu = torch.zeros(capacity + 1, dtype=torch.int32)
+    cu[1 : len(lengths) + 1] = torch.tensor(lengths).cumsum(0)
+    cu[len(lengths) + 1 :] = cu[len(lengths)]
+    return cu.cuda()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (10, 11),
+    reason="SM100/SM110-only test",
+)
+@pytest.mark.parametrize(
+    "lengths,capacity,heads,num_splits",
+    [
+        # fewer tiles than persistent CTAs; interior empty sequence; padded tail spans several
+        # 31-batch decoder groups
+        ((3000, 0, 517, 4096, 9), 100, (2, 1), 1),
+        # packed GQA, ~500 tiles: several dynamically claimed tiles per CTA
+        ((4096, 2048, 1024, 1024), 32, (16, 4), 1),
+        # split-KV with folded per-batch splits
+        ((2048, 0, 1024), 40, (4, 4), 3),
+    ],
+)
+def test_varlen_dynamic_scheduler_metadata_reuse(lengths, capacity, heads, num_splits):
+    """Reused scheduler metadata (DynamicPersistentVarlenScheduler) across unsynchronized calls:
+    the kernel resets the tile semaphore at exit."""
+    from flash_attn.cute.interface import get_scheduler_metadata
+
+    torch.manual_seed(0)
+    hq, hkv = heads
+    total = sum(lengths)
+    cu = _padded_cu_seqlens(lengths, capacity)
+    k = torch.randn(total, hkv, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    qs = [torch.randn(total, hq, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    kwargs = dict(cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=max(lengths),
+                  max_seqlen_k=max(lengths), causal=True, num_splits=num_splits)
+
+    def metadata():
+        return get_scheduler_metadata(max(lengths), max(lengths), hq, hkv, 128,
+                                      num_splits=num_splits, causal=True,
+                                      cu_seqlens_q=cu, cu_seqlens_k=cu)
+
+    refs = [flash_attn_varlen_func(q, k, v, scheduler_metadata=metadata(), **kwargs)[0]
+            for q in qs]
+    if num_splits == 1:  # same per-tile math as the default single-tile scheduler
+        assert torch.equal(refs[0], flash_attn_varlen_func(qs[0], k, v, **kwargs)[0])
+    md = metadata()
+    assert md.tile_count_semaphore is not None
+    outs = [flash_attn_varlen_func(q, k, v, scheduler_metadata=md, **kwargs)[0] for q in qs]
+    for out, ref in zip(outs, refs):
+        assert torch.equal(out, ref)
+    assert md.tile_count_semaphore.item() == 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (10, 11),
+    reason="SM100/SM110-only test",
+)
+def test_varlen_dynamic_scheduler_many_empty_slots():
+    """Request slots beyond the row count add no tiles, so the dynamic scheduler's tile bound
+    must not count them: one token in 131,072 slots with 128 heads is 128 tiles."""
+    from flash_attn.cute.prepare_scheduler import SchedulerMetadataTensorsTorch
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 128, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 128, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    cu = _padded_cu_seqlens((1,), 1 << 17)
+    semaphore = torch.zeros(1, dtype=torch.int32, device="cuda")
+    md = SchedulerMetadataTensorsTorch(tile_count_semaphore=semaphore)
+    kwargs = dict(cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=1, max_seqlen_k=1, causal=True)
+    out = flash_attn_varlen_func(q, k, v, scheduler_metadata=md, **kwargs)[0]
+    assert torch.equal(out, flash_attn_varlen_func(q, k, v, **kwargs)[0])
+    assert semaphore.item() == 0
+
+
+def test_varlen_padded_cu_seqlens_tail():
+    """Padded cu_seqlens slots (repeating the last offset) do not change forward or backward."""
+    torch.manual_seed(0)
+    lengths = (700, 0, 1300, 64)
+    total = sum(lengths)
+    q = torch.randn(total, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(total, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    assert check_varlen_vs_torch_flash(
+        q, k, v,
+        cu_seqlens_q=_padded_cu_seqlens(lengths, 100),
+        cu_seqlens_k=_padded_cu_seqlens(lengths, 100),
+        total_q=total, total_k=total, causal=True, mha_type="gqa",
+    )
+
+
 def check_varlen_vs_torch_flash(
     q, k, v,
     cu_seqlens_q=None,
