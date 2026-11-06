@@ -150,8 +150,23 @@ class DynamicPersistentSchedulerState(SchedulerState):
 # claimed_x by C and optionally reverses M for LPT, while unsplit 1CTA grids use the
 # L2-swizzled static mapping. StaticPersistentTileScheduler takes num_block as a cluster
 # count, caps the grid at the SM count rounded down to whole clusters, and strides over work
-# by the launched cluster count. Varlen metadata units and the backward/MLA contracts are
-# separate. Row mapping: NOTE [SM100 forward coordinate spaces] in flash_fwd_sm100.py.
+# by the launched cluster count. Varlen metadata units and the MLA contracts are separate;
+# the backward's is NOTE [SM100 backward work coordinates] below. Row mapping: NOTE [SM100
+# forward coordinate spaces] in flash_fwd_sm100.py.
+
+
+# NOTE [SM100 backward work coordinates]
+# The SM100 backward tiles KV rows. With C = cta_group_size (2 for 2CTA, else 1), every CTA
+# of a cluster receives the same logical (work_n, head, batch) and validity: work_n is the
+# C * tile_n-row KV work tile, the CTA rank is not part of it. The kernel applies the rank
+# once, work_kv_block(work_n, cta_rank) = work_n * C + cta_rank (NOTE [SM100 backward
+# coordinate spaces] in flash_bwd_sm100.py).
+#
+# The backward passes work tiles in num_block (ceil_div(seqlen_k, C * tile_n)) with
+# use_cluster_idx = (C > 1). SingleTileScheduler then reads cluster_idx(); SingleTileLPTBwd-
+# Scheduler and SingleTileVarlenScheduler decode blockIdx.x // C and skip their CTA-rank fold.
+# Grids still count physical CTAs (physical_x = C * cluster_slot + cta_rank). Without
+# use_cluster_idx (sm90 backward, cluster 1) the same schedulers hand out CTA tiles as before.
 
 
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
@@ -802,6 +817,8 @@ class SingleTileLPTBwdScheduler:
         num_hb_quotient: Int32
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         spt: cutlass.Constexpr[bool] = True
+        # num_block counts work tiles (clusters); see NOTE [SM100 backward work coordinates]
+        use_cluster_idx: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -826,7 +843,10 @@ class SingleTileLPTBwdScheduler:
             # swizzle. Instead we want to divide by the remainder.
             num_hb_quotient = (args.num_head * args.num_batch) // swizzle
             num_hb_remainder = (args.num_head * args.num_batch) % swizzle
-            num_block = cute.ceil_div(args.num_block, args.cluster_shape_mn[0])
+            if const_expr(args.use_cluster_idx):
+                num_block = args.num_block  # already in work tiles (clusters)
+            else:
+                num_block = cute.ceil_div(args.num_block, args.cluster_shape_mn[0])
             return SingleTileLPTBwdScheduler.Params(
                 total_blocks=(num_block * args.cluster_shape_mn[0])
                 * args.num_head
@@ -842,6 +862,7 @@ class SingleTileLPTBwdScheduler:
                 num_hb_quotient=Int32(num_hb_quotient),
                 cluster_shape_mn=args.cluster_shape_mn,
                 spt=args.lpt,
+                use_cluster_idx=args.use_cluster_idx,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
@@ -896,7 +917,7 @@ class SingleTileLPTBwdScheduler:
         batch_idx, head_idx = divmod(bidhb_actual, params.num_head_divmod)
         if cutlass.const_expr(params.spt):
             block = params.num_block - 1 - block
-        if cutlass.const_expr(params.cluster_shape_mn[0] > 1):
+        if cutlass.const_expr(params.cluster_shape_mn[0] > 1 and not params.use_cluster_idx):
             bidx_in_cluster = cute.arch.block_in_cluster_idx()
             block = block * params.cluster_shape_mn[0] + bidx_in_cluster[0]
         is_valid = self._tile_idx < params.total_blocks
