@@ -869,6 +869,14 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     TORCH_CHECK(head_size <= 256, "FlashAttention backward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
+    if (head_size > 192 && is_dropout) {
+        int max_smem_per_block;
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(
+            &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, q.get_device()));
+        TORCH_CHECK(max_smem_per_block >= 144 * 1024,
+                    "FlashAttention backward for head dim > 192 with dropout requires at least 144 KB of shared memory per block");
+    }
+
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size_rounded = round_multiple(head_size, head_size <= 128 ? 32 : 64);
     const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
@@ -1088,6 +1096,14 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
     TORCH_CHECK(head_size <= 256, "FlashAttention backward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    if (head_size > 192 && is_dropout) {
+        int max_smem_per_block;
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(
+            &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, q.get_device()));
+        TORCH_CHECK(max_smem_per_block >= 144 * 1024,
+                    "FlashAttention backward for head dim > 192 with dropout requires at least 144 KB of shared memory per block");
+    }
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
