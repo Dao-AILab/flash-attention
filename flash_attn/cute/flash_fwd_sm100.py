@@ -260,6 +260,9 @@ class FlashAttentionForwardSm100:
             self.use_tma_KV and not (has_tile_count_semaphore and is_varlen_q)
         ), "CLC requires TMA KV and no varlen-Q tile-count semaphore"
         self.use_clc_scheduler = config.use_clc_scheduler
+        assert not config.use_dynamic_varlen or (has_tile_count_semaphore and is_varlen_q), (
+            "use_dynamic_varlen needs the varlen-Q tile-count semaphore the interface allocates"
+        )
         self.dynamic_persistent = (
             has_tile_count_semaphore and is_varlen_q
         ) or self.use_clc_scheduler

@@ -63,6 +63,8 @@ class FwdConfig:
     use_swapab selects the SM100/SM103 SwapAB decode kernel (flash_fwd_decode_sm100.py), where
     tile_m is the query-head tile and only num_splits is tunable; see SwapABPolicy.config. The
     SwapAB kernel sizes its own SMEM stages, so its configs carry the neutral layout.
+    use_dynamic_varlen runs SM100 varlen on DynamicPersistentVarlenScheduler with a semaphore the
+    interface allocates when the caller passes no scheduler metadata; see routes_dynamic_varlen.
     lpt_global orders a 1CTA unsplit dense CLC launch longest-first over the whole problem
     instead of per L2 section; see NOTE [global LPT].
     """
@@ -86,6 +88,7 @@ class FwdConfig:
     overlap_sO_sQ: bool
     kv_stage: int
     use_swapab: bool = False
+    use_dynamic_varlen: bool = False
     lpt_global: bool = False
 
 
@@ -613,8 +616,11 @@ def default_pack_gqa(inputs: FwdHeuristicInputs) -> bool:
 
 
 def hd256_2cta_varlen_ok(inputs: FwdHeuristicInputs) -> bool:
-    """Caller-built varlen scheduler metadata assumes 1CTA tiles."""
-    return not inputs.has_cu_seqlens_q or not inputs.has_caller_scheduler_metadata
+    """Varlen scheduler metadata (caller-built, or a tile semaphore for the dynamic scheduler)
+    assumes 1CTA tiles."""
+    return not inputs.has_cu_seqlens_q or not (
+        inputs.has_caller_scheduler_metadata or inputs.has_tile_count_semaphore
+    )
 
 
 def can_use_tma_o(
@@ -1225,6 +1231,46 @@ class SwapABPolicy:
 SWAPAB = SwapABPolicy()
 
 
+def routes_dynamic_varlen(config: FwdConfig, inputs: FwdHeuristicInputs) -> bool:
+    """Whether a padded SM100 varlen call should run DynamicPersistentVarlenScheduler.
+
+    The single-tile varlen grid launches a partial M tile per request slot, empty or not
+    (CUDA-graph slots with no tokens). When the slots could outnumber the real M tiles, the
+    dynamic scheduler's SM-count grid visits only real tiles. ``config`` is the selection without
+    the route; decode (one M tile per request), SplitKV, and SwapAB keep it. A selected CLC
+    scheduler (the GB300 packed-varlen rules in select_tuned_sm100_overrides) yields: on padded
+    calls both claim, the route measured 1.04-1.43x faster. Explicit configs bypass selection.
+    """
+    m_tile = config.q_stage * config.tile_m
+    rows_per_token = inputs.qhead_per_kvhead if config.pack_gqa else 1
+    if not (
+        inputs.device_capacity in (10, 11)
+        and inputs.has_cu_seqlens_q
+        and not inputs.has_caller_scheduler_metadata
+        and not inputs.has_tile_count_semaphore
+        and not inputs.disable_scheduler_metadata
+        and not inputs.has_mask_mod
+        and not inputs.use_block_sparsity
+        and not config.use_swapab
+        and config.num_splits == 1
+        and inputs.max_seqlen_q * rows_per_token > m_tile
+        and inputs.batch_size * m_tile > inputs.total_q * rows_per_token
+    ):
+        return False
+    from flash_attn.cute.tile_scheduler import DynamicPersistentVarlenScheduler as Sched
+
+    max_tiles = Sched.max_claimable_tiles(
+        inputs.total_q,
+        inputs.batch_size,
+        m_tile,
+        inputs.num_heads,
+        inputs.num_heads_kv,
+        config.pack_gqa,
+        1,
+    )
+    return max_tiles < Sched.MAX_TILES
+
+
 def needs_split_metadata(config: FwdConfig, inputs: FwdHeuristicInputs) -> bool:
     """Whether the forward must prepare per-sequence split counts (prepare-scheduler kernel).
 
@@ -1285,7 +1331,8 @@ def select_tuned_sm100_overrides(
             nonpersistent = (
                 dense_noncausal and head_dim == 64 and packs_all_q_heads and num_n_blocks >= 32
             )
-            # CLC wins on balanced MHA or packed high-head varlen and dense causal short-K.
+            # CLC wins on balanced MHA or packed high-head varlen and dense causal short-K. On padded
+            # varlen calls (more request slots than M tiles) routes_dynamic_varlen overrides it.
             packed_varlen = (
                 inputs.has_cu_seqlens_q
                 and inputs.has_cu_seqlens_k
@@ -1330,6 +1377,26 @@ def select_tuned_sm100_overrides(
 @lru_cache(maxsize=1024)
 def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     """Select one fully resolved config from host-visible metadata."""
+    config = _select_fwd_config(inputs)
+    if routes_dynamic_varlen(config, inputs._replace(pack_gqa=config.pack_gqa)):
+        # Re-select as the dynamic scheduler will run: one split, 1CTA (hd256 then prefers
+        # PackGQA unless the caller fixed it).
+        routed = _select_fwd_config(
+            inputs._replace(has_tile_count_semaphore=True, requested_num_splits=1)
+        )
+        # Numerics: the route changes scheduling only; exp2 emulation is kept from the unrouted
+        # choice.
+        config = replace(
+            routed,
+            use_dynamic_varlen=True,
+            ex2_emu_freq=config.ex2_emu_freq,
+            ex2_emu_start_frg=config.ex2_emu_start_frg,
+        )
+        validate_fwd_config(config, inputs)
+    return config
+
+
+def _select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     # A SwapAB request overrides only the measured-loss rule: vetoed or unsupported calls take
     # the standard kernel.
     if (
@@ -1495,7 +1562,11 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
     scheduler choices unless changes sets them. The result is validated.
     """
     config = replace(base, **changes)
-    resolved = inputs._replace(pack_gqa=config.pack_gqa)
+    # use_dynamic_varlen runs with the tile semaphore the interface allocates.
+    resolved = inputs._replace(
+        pack_gqa=config.pack_gqa,
+        has_tile_count_semaphore=inputs.has_tile_count_semaphore or config.use_dynamic_varlen,
+    )
     if config.use_swapab:
         # registers=None: the SwapAB kernel owns its fixed per-role budgets (64/120/208 at
         # tile_hq=32) and its SMEM stages; it keeps hardware exp2.
@@ -1554,7 +1625,8 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
 def with_clc_scheduler(config: FwdConfig, inputs: FwdHeuristicInputs, enable: bool) -> FwdConfig:
     """config with the CLC scheduler on or off, for tests and benchmarks that compare schedulers.
 
-    Turning CLC off restores the static persistence selection would choose without it.
+    Turning CLC off restores the static persistence selection would choose without it; turning
+    it on replaces the dynamic varlen route, which validation rejects alongside CLC.
     derive_fwd_config re-derives the dependent fields, such as registers, and validates, so a
     layout CLC cannot run raises ValueError.
     """
@@ -1569,7 +1641,11 @@ def with_clc_scheduler(config: FwdConfig, inputs: FwdHeuristicInputs, enable: bo
         use_clc_scheduler=False,
     )
     return derive_fwd_config(
-        config, inputs, use_clc_scheduler=enable, is_static_persistent=is_static_persistent
+        config,
+        inputs,
+        use_clc_scheduler=enable,
+        is_static_persistent=is_static_persistent,
+        use_dynamic_varlen=False,
     )
 
 
@@ -1622,6 +1698,27 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         if config != expected:
             raise ValueError(f"SwapAB tunes only num_splits: expected {expected}, got {config}")
         return
+    if config.use_dynamic_varlen:
+        if not (
+            inputs.device_capacity in (10, 11)
+            and inputs.has_cu_seqlens_q
+            and config.num_splits == 1
+            and not config.use_2cta_instrs
+            and not config.use_clc_scheduler
+            and not config.is_static_persistent
+        ):
+            raise ValueError(
+                "use_dynamic_varlen needs SM100 varlen Q with one split, 1CTA, and no CLC or "
+                "static persistence"
+            )
+        # The interface allocates the tile semaphore. Selection routes only calls without
+        # caller-built metadata, and an explicit config cannot take caller-built metadata.
+        if inputs.disable_scheduler_metadata or inputs.has_caller_scheduler_metadata:
+            raise ValueError(
+                "use_dynamic_varlen runs with the tile semaphore the interface allocates: it needs "
+                "scheduler metadata enabled and no caller-built scheduler_metadata"
+            )
+        inputs = inputs._replace(has_tile_count_semaphore=True)
     if config.tile_m <= 0 or config.tile_n <= 0:
         raise ValueError(f"Tile dimensions must be positive, got {(config.tile_m, config.tile_n)}")
     if config.tile_m % 16 != 0 or config.tile_n % 16 != 0:
