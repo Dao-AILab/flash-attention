@@ -150,8 +150,26 @@ class DynamicPersistentSchedulerState(SchedulerState):
 # claimed_x by C and optionally reverses M for LPT, while unsplit 1CTA grids use the
 # L2-swizzled static mapping. StaticPersistentTileScheduler takes num_block as a cluster
 # count, caps the grid at the SM count rounded down to whole clusters, and strides over work
-# by the launched cluster count. Varlen metadata units and the backward/MLA contracts are
-# separate. Row mapping: NOTE [SM100 forward coordinate spaces] in flash_fwd_sm100.py.
+# by the launched cluster count. Varlen metadata units and the MLA contracts are separate;
+# the backward's is NOTE [SM100 backward work coordinates] below. Row mapping: NOTE [SM100
+# forward coordinate spaces] in flash_fwd_sm100.py.
+
+
+# NOTE [SM100 backward work coordinates]
+# The SM100 backward tiles KV rows. With C = cta_group_size (2 for 2CTA, else 1), every CTA
+# of a cluster receives the same logical (work_n, head, batch) and validity: work_n is the
+# C * tile_n-row KV work tile, the CTA rank is not part of it. The kernel applies the rank
+# once, work_kv_block(work_n, cta_rank) = work_n * C + cta_rank (NOTE [SM100 backward
+# coordinate spaces] in flash_bwd_sm100.py).
+#
+# The backward passes work tiles in num_block (ceil_div(seqlen_k, C * tile_n)) with
+# use_cluster_idx = (C > 1). SingleTileScheduler then reads cluster_idx(); SingleTileLPTBwd-
+# Scheduler and SingleTileVarlenScheduler decode blockIdx.x // C and skip their CTA-rank fold.
+# Grids still count physical CTAs (physical_x = C * cluster_slot + cta_rank). Without
+# use_cluster_idx (sm90 backward, cluster 1) the same schedulers hand out CTA tiles as before.
+# The head is a scheduler head (NOTE [SM100 backward coordinate spaces]): num_head counts
+# query heads, packed groups, or KV heads under the head loop; qhead_fold / qhead_pack tell
+# the deterministic schedulers how many query heads' Q / dO / dQaccum one tile touches.
 
 
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
@@ -247,6 +265,12 @@ class TileSchedulerArguments(ParamsBase):
     # every batch's first splits launch before the excess splits, which exit at once. Cluster
     # shape (1, 1) only.
     split_major: cutlass.Constexpr[bool] = False
+    # Backward GQA: each KV-head tile processes qhead_fold query heads in total.
+    # Each head-loop iteration packs qhead_pack query heads into the tile's rows.
+    # Deterministic schedulers size their L2 sections using the combined Q, dO,
+    # and dQaccum memory footprint of all qhead_fold query heads.
+    qhead_fold: cutlass.Constexpr[int] = 1
+    qhead_pack: cutlass.Constexpr[int] = 1
 
 
 class SingleTileScheduler:
@@ -802,6 +826,8 @@ class SingleTileLPTBwdScheduler:
         num_hb_quotient: Int32
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         spt: cutlass.Constexpr[bool] = True
+        # num_block counts work tiles (clusters); see NOTE [SM100 backward work coordinates]
+        use_cluster_idx: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -816,7 +842,10 @@ class SingleTileLPTBwdScheduler:
             )
             size_one_dqaccum_head = cutlass.Int64(args.seqlen_k) * (args.headdim) * 4
             # size_one_dqaccum_head = 0
-            size_one_head = size_one_qdo_head + size_one_dqaccum_head
+            # seqlen_k here is mQ's rows, which already hold the packed heads
+            size_one_head = (
+                (size_one_qdo_head + size_one_dqaccum_head) * args.qhead_fold // args.qhead_pack
+            )
             log2_floor = lambda n: 31 - clz(n)
             swizzle = (
                 1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
@@ -826,7 +855,10 @@ class SingleTileLPTBwdScheduler:
             # swizzle. Instead we want to divide by the remainder.
             num_hb_quotient = (args.num_head * args.num_batch) // swizzle
             num_hb_remainder = (args.num_head * args.num_batch) % swizzle
-            num_block = cute.ceil_div(args.num_block, args.cluster_shape_mn[0])
+            if const_expr(args.use_cluster_idx):
+                num_block = args.num_block  # already in work tiles (clusters)
+            else:
+                num_block = cute.ceil_div(args.num_block, args.cluster_shape_mn[0])
             return SingleTileLPTBwdScheduler.Params(
                 total_blocks=(num_block * args.cluster_shape_mn[0])
                 * args.num_head
@@ -842,6 +874,7 @@ class SingleTileLPTBwdScheduler:
                 num_hb_quotient=Int32(num_hb_quotient),
                 cluster_shape_mn=args.cluster_shape_mn,
                 spt=args.lpt,
+                use_cluster_idx=args.use_cluster_idx,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
@@ -896,7 +929,7 @@ class SingleTileLPTBwdScheduler:
         batch_idx, head_idx = divmod(bidhb_actual, params.num_head_divmod)
         if cutlass.const_expr(params.spt):
             block = params.num_block - 1 - block
-        if cutlass.const_expr(params.cluster_shape_mn[0] > 1):
+        if cutlass.const_expr(params.cluster_shape_mn[0] > 1 and not params.use_cluster_idx):
             bidx_in_cluster = cute.arch.block_in_cluster_idx()
             block = block * params.cluster_shape_mn[0] + bidx_in_cluster[0]
         is_valid = self._tile_idx < params.total_blocks
@@ -982,6 +1015,8 @@ class VarlenDecoder(ParamsBase):
         # if backward, add dqaccum block size to calculate swizzle
         if head_swizzle:
             kv_block_size += args.headdim * 4 * args.tile_shape_mn[1]
+            # num_n_blocks below counts unpacked query rows (from the K tiles): the whole fold
+            kv_block_size *= args.qhead_fold
         max_kvblock_in_l2 = size_l2 // kv_block_size
         return VarlenDecoder(
             num_head=args.num_head,

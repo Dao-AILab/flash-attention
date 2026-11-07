@@ -1,10 +1,17 @@
-"""SM100 backward with the query heads of a KV head packed into the Q tile
-(FLASH_ATTENTION_BWD_PACK_GQA=1) against the per-head path (FLASH_ATTENTION_BWD_PACK_GQA=0) and
-against FP64 eager.
+"""SM100 backward with the query heads of a KV head folded into one tile, against the
+per-head path (FLASH_ATTENTION_BWD_PACK_GQA=0, FLASH_ATTENTION_BWD_HEAD_LOOP=0) and against
+FP64 eager. The fold modes:
 
-See NOTE [bwd pack_gqa] in pack_gqa.py: one tile per KV head iterates over the packed
-rows of all its query heads, dK / dV stay in TMEM for the group (no fp32 accumulate, no
-postprocess), dQaccum / LSE / dPsum are per KV head in packed row order.
+- pack: FLASH_ATTENTION_BWD_PACK_GQA=2 packs 2 query heads into the Q tile rows (NOTE
+  [bwd pack_gqa] in pack_gqa.py); the remaining qhead_per_kvhead // 2 sub-groups of a KV
+  head are separate tiles whose dK / dV accumulate in fp32 (+ postprocess). pack4: the same
+  with 4 (hdim 256: what the deterministic causal fold picks when the dQ chains are few).
+  pack_full: the one full pack (largest power of two dividing qhead_per_kvhead) that the
+  other head dims take (FLASH_ATTENTION_BWD_PACK_GQA=1, the chooser's pick).
+- pack_loop: pack 2, and the sub-groups looped inside one tile per KV head
+  (FLASH_ATTENTION_BWD_HEAD_LOOP=1, hdim 256): K / V loaded once, dK / dV stay in TMEM and are
+  stored directly.
+- loop: head loop only (no packing), every query head of the KV head a pass of the loop.
 """
 
 import itertools
@@ -30,7 +37,36 @@ pytestmark = pytest.mark.skipif(
 
 SEED = 20261004
 HEAD_DIMS = [64, 128, 256]
-HEADS = {"gqa8_2": (8, 2), "gqa16_4": (16, 4), "gqa32_4": (32, 4), "mqa8_1": (8, 1)}
+# qhead_per_kvhead 4 / 4 / 8 / 8 (pack 2 or 4 + sub-groups, full pack 4 / 8), 6 / 6 / 3 (pack
+# 2 + 3 sub-groups, no pack 4) and 5 (no packing: head loop only)
+HEADS = {
+    "gqa8_2": (8, 2),
+    "gqa16_4": (16, 4),
+    "gqa32_4": (32, 4),
+    "mqa8_1": (8, 1),
+    "gqa24_4": (24, 4),
+    "gqa12_2": (12, 2),
+    "gqa6_2": (6, 2),
+    "gqa40_8": (40, 8),
+}
+# fold -> (pack_gqa, head_loop, pack_factor) overrides; FLASH_ATTENTION_BWD_PACK_GQA takes
+# 0 (off), 1 (on, the chooser picks the pack) or 2 / 4 (that pack)
+FOLDS = {
+    "pack": (
+        True,
+        False,
+        2,
+    ),  # pack 2; the other sub-groups through the dK / dV postprocess
+    "pack4": (
+        True,
+        False,
+        4,
+    ),  # pack 4; the other sub-groups through the dK / dV postprocess
+    "pack_full": (True, False, None),  # other head dims: the one full pack
+    "pack_loop": (True, True, 2),  # pack 2 and the other sub-groups looped in the CTA
+    "loop": (False, True, None),  # unpacked, every query head a pass of the loop
+}
+ENV_KEYS = ("FLASH_ATTENTION_BWD_PACK_GQA", "FLASH_ATTENTION_BWD_HEAD_LOOP")
 FEATURE_KWARGS = {
     "none": {},
     "local": {"window_size": (64, 32)},
@@ -47,28 +83,52 @@ SHAPES = [
 
 @pytest.fixture
 def pack_gqa_env():
-    saved = os.environ.get("FLASH_ATTENTION_BWD_PACK_GQA")
+    saved = {key: os.environ.get(key) for key in ENV_KEYS}
     yield
-    if saved is None:
-        os.environ.pop("FLASH_ATTENTION_BWD_PACK_GQA", None)
-    else:
-        os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = saved
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    clear_fold_env_caches()
+
+
+def clear_fold_env_caches():
+    """The backward reads the fold env knobs once per process; clear them to re-read."""
     utils._get_bwd_pack_gqa_override.cache_clear()
+    utils._get_bwd_head_loop_override.cache_clear()
+
+
+def set_fold_env(pack, head_loop=False, pack_factor=None):
+    """FLASH_ATTENTION_BWD_PACK_GQA = 0 (off), 1 (on, the chooser picks the pack) or the pack
+    (2 / 4); FLASH_ATTENTION_BWD_HEAD_LOOP = 0 / 1."""
+    if pack and pack_factor is not None:
+        os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = str(pack_factor)
+    else:
+        os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = "1" if pack else "0"
+    os.environ["FLASH_ATTENTION_BWD_HEAD_LOOP"] = "1" if head_loop else "0"
+    clear_fold_env_caches()
 
 
 def set_pack_gqa_env(pack):
-    """The backward reads FLASH_ATTENTION_BWD_PACK_GQA once per process; clear it to re-read."""
-    os.environ["FLASH_ATTENTION_BWD_PACK_GQA"] = "1" if pack else "0"
-    utils._get_bwd_pack_gqa_override.cache_clear()
+    set_fold_env(pack)
 
 
-def hd256_on_general_kernel():
-    getter = getattr(utils, "_get_hd256_generic_bwd", None)
-    return getter is None or getter()
-
-
-def run_fwd_bwd_layout(layout, q, k, v, dout, q_lens, k_lens, causal, pack, **kwargs):
-    set_pack_gqa_env(pack)
+def run_fwd_bwd_layout(
+    layout,
+    q,
+    k,
+    v,
+    dout,
+    q_lens,
+    k_lens,
+    causal,
+    pack,
+    head_loop,
+    pack_factor=None,
+    **kwargs,
+):
+    set_fold_env(pack, head_loop, pack_factor)
     head_dim = q.shape[-1]
     if layout == "dense":
         b = len(q_lens)
@@ -101,14 +161,27 @@ def run_fwd_bwd_layout(layout, q, k, v, dout, q_lens, k_lens, causal, pack, **kw
 @pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
 @pytest.mark.parametrize("feature", list(FEATURE_KWARGS))
 @pytest.mark.parametrize("layout", ["dense", "varlen"])
+@pytest.mark.parametrize("fold", list(FOLDS))
 @pytest.mark.parametrize("mha_type", list(HEADS))
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
 @pytest.mark.parametrize("q_lens,k_lens", SHAPES)
 def test_bwd_pack_gqa_matches_unpacked(
-    q_lens, k_lens, head_dim, mha_type, layout, feature, causal, pack_gqa_env
+    q_lens, k_lens, head_dim, mha_type, fold, layout, feature, causal, pack_gqa_env
 ):
-    if head_dim == 256 and not hd256_on_general_kernel():
-        pytest.skip("hdim 256 backward runs on the dedicated kernels (no packing)")
+    pack, head_loop, pack_factor = FOLDS[fold]
+    heads_q, heads_kv = HEADS[mha_type]
+    qhead_per_kvhead = heads_q // heads_kv
+    full_pack = qhead_per_kvhead & -qhead_per_kvhead
+    if head_loop and head_dim != 256:
+        pytest.skip("the head loop is an hdim 256 (serial schedule) path")
+    if fold == "pack_full" and (head_dim == 256 or full_pack <= 2):
+        pytest.skip(
+            "hdim 256 never takes the full pack; a full pack of 2 is the pack cell"
+        )
+    if pack and qhead_per_kvhead % (pack_factor or full_pack):
+        pytest.skip("qhead_per_kvhead does not divide into the packed heads")
+    if head_loop and qhead_per_kvhead // (pack_factor if pack else 1) == 1:
+        pytest.skip("one sub-group: nothing to loop over")
     if layout == "varlen":
         # Ragged version of the same budget: tile edges, a short slot, an empty slot.
         q_lens, k_lens = (
@@ -118,7 +191,6 @@ def test_bwd_pack_gqa_matches_unpacked(
     if causal and any(nq > nk for nq, nk in zip(q_lens, k_lens)):
         pytest.skip("bottom-right causal leaves query rows without keys")
     torch.manual_seed(SEED)
-    heads_q, heads_kv = HEADS[mha_type]
     dtype = torch.bfloat16
     q = torch.randn(
         sum(q_lens), heads_q, head_dim, device="cuda", dtype=dtype, requires_grad=True
@@ -130,21 +202,21 @@ def test_bwd_pack_gqa_matches_unpacked(
     dout = torch.randn_like(q)
     kwargs = FEATURE_KWARGS[feature]
     args = (layout, q, k, v, dout, q_lens, k_lens, causal)
-    ref = run_fwd_bwd_layout(*args, False, **kwargs)
-    got = run_fwd_bwd_layout(*args, True, **kwargs)
+    ref = run_fwd_bwd_layout(*args, False, False, **kwargs)
+    got = run_fwd_bwd_layout(*args, pack, head_loop, pack_factor, **kwargs)
     assert torch.equal(got[0], ref[0]), (
         "forward does not depend on the backward packing"
     )
     for name, a, b_ in zip(("dQ", "dK", "dV"), ref[1:], got[1:]):
-        # dQ: same fp32 reduction per KV head; dK / dV: one TMEM accumulation instead of fp32
-        # atomics over the group -> at most bf16 rounding of the result.
+        # dQ: same fp32 reduction per scratch head; dK / dV: one TMEM accumulation over the
+        # group (or fp32 atomics in another order) -> at most bf16 rounding of the result.
         assert torch.isfinite(b_.float()).all(), f"{name} has non-finite values"
         tol = 2 * torch.finfo(dtype).eps * a.float().abs().max()
         assert (a.float() - b_.float()).abs().max() <= tol, (
             f"{name} differs from the unpacked path"
         )
     if feature == "deterministic":
-        again = run_fwd_bwd_layout(*args, True, **kwargs)
+        again = run_fwd_bwd_layout(*args, pack, head_loop, pack_factor, **kwargs)
         assert all(torch.equal(x, y) for x, y in zip(got, again)), (
             "deterministic run differs"
         )
@@ -165,8 +237,6 @@ def test_bwd_pack_gqa_unused_kv_tail(head_dim, mha_type, layout, causal, pack_gq
     are exercised with a different grid. Same layouts as test_flash_attn_sm100_bwd_unused_kv_tail:
     packed K/V with cu_seqlens_k + seqused_k, and dense (batch, seqlen, heads, d) with seqused_k.
     """
-    if head_dim == 256 and not hd256_on_general_kernel():
-        pytest.skip("hdim 256 backward runs on the dedicated kernels (no packing)")
     torch.manual_seed(SEED)
     heads_q, heads_kv = HEADS[mha_type]
     dtype = torch.bfloat16

@@ -2169,7 +2169,7 @@ class Sm100BwdRegisters:
     empty: int
 
 
-# None for kernels that do not split registers by role (SM120, dedicated SM100 hdim 256).
+# None for kernels that do not split registers by role (SM120).
 BwdRegisters = Sm90BwdRegisters | Sm100BwdRegisters | None
 
 
@@ -2178,14 +2178,15 @@ class BwdConfig:
     """Fully resolved backward launch configuration.
 
     tile_m / tile_n are the main kernel's Q and KV tiles, which also size the preprocess,
-    postprocess, and accumulators. The dedicated SM100 hdim-256 kernels run fixed internal
-    tiles; its config records the 128x128 tiles the surrounding kernels use. SM90-only MMA
-    options (PdS stages, SdP_swapAB / AtomLayoutMSdP, dQ_single_wg) hold neutral values on
-    other architectures. cluster_size differs from use_2cta_instrs only for the dedicated
-    hdim-256 kernel, which always uses 2CTA instructions. pack_gqa (SM100 generic kernel only)
-    folds the query heads of a KV head into the Q tile (NOTE [bwd pack_gqa] in pack_gqa.py);
-    the preprocess then writes LSE_log2 / dPsum / dQaccum per KV head in packed row order and
-    the postprocess reads them that way.
+    postprocess, and accumulators. SM90-only MMA options (PdS stages, SdP_swapAB /
+    AtomLayoutMSdP, dQ_single_wg) hold neutral values on other architectures. cluster_size is
+    2 exactly with use_2cta_instrs. pack_factor (SM100 only, 1 = off) query heads of a KV head
+    share the Q tile rows (NOTE [bwd pack_gqa] in
+    pack_gqa.py); the preprocess then writes LSE_log2 / dPsum / dQaccum per scratch head
+    (num_heads / pack_factor) in packed row order and the postprocess reads them that way. A
+    KV head's remaining qhead_per_kvhead / pack_factor sub-groups are separate tiles whose
+    dK / dV go through the fp32 accumulate + postprocess, or, with head_loop (hdim 256), the
+    passes of one tile per KV head that keeps K / V resident and dK / dV in TMEM.
     """
 
     device_capacity: int
@@ -2206,9 +2207,14 @@ class BwdConfig:
     use_2cta_instrs: bool
     cluster_size: int
     spt: bool
-    use_dedicated_hd256_kernel: bool
-    pack_gqa: bool
+    pack_factor: int
+    head_loop: bool
     registers: BwdRegisters
+
+    @property
+    def pack_gqa(self) -> bool:
+        """Whether query heads are packed into the Q tile rows (pack_factor > 1)."""
+        return self.pack_factor > 1
 
     @property
     def num_wg(self) -> int:
@@ -2221,9 +2227,10 @@ class BwdHeuristicInputs(NamedTuple):
 
     Holds only the facts the policy reads. sparse_block_size_q / sparse_block_size_kv are the
     caller's block_size, None when unset. num_sms, batch_size, the sequence bounds, and the
-    token totals feed only the SM100 GQA pack_gqa heuristic (bwd_pack_gqa_heuristic);
-    max_seqlen_q / max_seqlen_k fall back to the token totals for varlen calls without a
-    host bound, and num_sms is 0 where the heuristic does not run (bwd_selection_reads_num_sms).
+    token totals feed only the SM100 query-head fold chooser (select_bwd_fold and
+    bwd_pack_gqa_heuristic); max_seqlen_q / max_seqlen_k are the mean sequence length for
+    varlen calls without a host bound (the total, as an upper bound, refuses every causal
+    fold), and num_sms is 0 where the chooser does not run (bwd_selection_reads_num_sms).
     """
 
     device_arch: int
@@ -2250,14 +2257,15 @@ class BwdHeuristicInputs(NamedTuple):
     has_learnable_sink: bool = False
     requested_V_in_regs: bool = False
     # FLASH_ATTENTION_BWD_TILE_N: 64 requests the SM100 2CTA 64-row KV tile; any value
-    # (64 or 128) also leaves pack_gqa off.
+    # (64 or 128) also leaves the query-head fold off.
     requested_tile_n: int | None = None
-    # FLASH_ATTENTION_BWD_PACK_GQA=0/1: replaces the pack_gqa heuristic where packing is
-    # supported; None leaves it to the heuristic.
-    requested_pack_gqa: bool | None = None
+    # FLASH_ATTENTION_BWD_PACK_GQA: 0 leaves the query heads unpacked, 1 packs where the fold
+    # is supported, 2 / 4 pack that many query heads per tile; None leaves it to the heuristic.
+    requested_pack_gqa: int | None = None
+    # FLASH_ATTENTION_BWD_HEAD_LOOP=0/1: forces the hdim 256 head loop off / on; None leaves it
+    # to the heuristic.
+    requested_head_loop: bool | None = None
     disable_2cta: bool = False
-    # FLASH_ATTENTION_HD256_GENERIC_BWD: SM100 hdim 256 on FlashAttentionBackwardSm100.
-    hd256_generic: bool = False
 
     @property
     def device_capacity(self) -> int:
@@ -2270,11 +2278,6 @@ class BwdHeuristicInputs(NamedTuple):
     @property
     def is_hdim256(self) -> bool:
         return self.head_dim == 256 and self.head_dim_v == 256
-
-    @property
-    def uses_dedicated_hd256_kernel(self) -> bool:
-        """SM100 hdim 256 runs the dedicated kernels unless FLASH_ATTENTION_HD256_GENERIC_BWD."""
-        return self.is_hdim256 and not self.hd256_generic
 
 
 def bwd_sparse_q_block_size(inputs: BwdHeuristicInputs) -> int | None:
@@ -2327,7 +2330,7 @@ def bwd_tile_hdim(head_dim: int) -> int:
 
 
 def can_use_bwd_2cta(inputs: BwdHeuristicInputs, *, tile_n: int) -> bool:
-    """Whether the SM100 generic backward supports 2CTA instructions for this problem."""
+    """Whether the SM100 backward supports 2CTA instructions for this problem."""
     # 2CTA tiles pair adjacent KV tiles, so a sparse KV block must cover an even count.
     sparse_ok = (
         not inputs.use_block_sparsity
@@ -2337,7 +2340,7 @@ def can_use_bwd_2cta(inputs: BwdHeuristicInputs, *, tile_n: int) -> bool:
 
 
 def can_use_bwd_tile_n_64(inputs: BwdHeuristicInputs, *, use_2cta_instrs: bool) -> bool:
-    """Whether the SM100 generic backward supports a 64-row KV tile per CTA.
+    """Whether the SM100 backward supports a 64-row KV tile per CTA.
 
     See NOTE [M=64 accumulator layout] in flash_bwd_sm100.py: only with 2CTA, for hdim 256
     (serial schedule) or the pipelined schedule (hdim <= 128) without block sparsity, where
@@ -2356,7 +2359,7 @@ def can_use_bwd_tile_n_64(inputs: BwdHeuristicInputs, *, use_2cta_instrs: bool) 
 
 
 def bwd_needs_2cta(inputs: BwdHeuristicInputs) -> str | None:
-    """Name the SM100 generic-backward problem that only the 2CTA serial schedule supports."""
+    """Name the SM100 backward problem that only the 2CTA serial schedule supports."""
     if inputs.is_hdim256:
         return "SM100 backward with head_dim=256"
     if bwd_tile_hdim(inputs.head_dim) == 192:
@@ -2366,21 +2369,29 @@ def bwd_needs_2cta(inputs: BwdHeuristicInputs) -> str | None:
     return None
 
 
-def can_use_bwd_pack_gqa(
-    inputs: BwdHeuristicInputs, *, tile_m: int, use_dedicated_hd256_kernel: bool
-) -> bool:
-    """Whether the SM100 backward supports packing the query heads of a KV head into the Q tile.
+class BwdFold(NamedTuple):
+    """How the SM100 backward folds the query heads of a KV head into tiles: pack_factor query
+    heads in the Q tile rows (1 = unpacked) and, with head_loop (hdim 256), one tile per KV head
+    that loops over its qhead_per_kvhead // pack_factor sub-groups in the CTA (NOTE [bwd
+    pack_gqa] in pack_gqa.py)."""
 
-    NOTE [bwd pack_gqa] (pack_gqa.py) scope: the generic SM100 kernel, qhead_per_kvhead > 1
-    dividing tile_m, without block sparsity, score_mod, mask_mod, or learnable_sink. softcap
-    does not count as a score_mod here.
+    pack_factor: int
+    head_loop: bool
+
+
+BWD_FOLD_OFF = BwdFold(1, False)
+
+
+def can_use_bwd_fold(inputs: BwdHeuristicInputs) -> bool:
+    """Whether the SM100 backward supports folding the query heads of a KV head into tiles.
+
+    NOTE [bwd pack_gqa] (pack_gqa.py) scope: SM100, qhead_per_kvhead > 1, without block
+    sparsity, score_mod, mask_mod, or learnable_sink. softcap does not count as a score_mod
+    here. A pack must also divide tile_m and qhead_per_kvhead (bwd_pack_fits).
     """
-    qhead_per_kvhead = inputs.qhead_per_kvhead
     return (
         inputs.device_capacity in (10, 11)
-        and not use_dedicated_hd256_kernel
-        and qhead_per_kvhead > 1
-        and tile_m % qhead_per_kvhead == 0
+        and inputs.qhead_per_kvhead > 1
         and not inputs.use_block_sparsity
         and not inputs.has_score_mod
         and not inputs.has_mask_mod
@@ -2388,15 +2399,40 @@ def can_use_bwd_pack_gqa(
     )
 
 
+def bwd_pack_fits(inputs: BwdHeuristicInputs, pack_factor: int, *, tile_m: int) -> bool:
+    """Whether pack_factor query heads per tile divide tile_m and qhead_per_kvhead."""
+    return (
+        pack_factor >= 1
+        and tile_m % pack_factor == 0
+        and inputs.qhead_per_kvhead % pack_factor == 0
+    )
+
+
+def can_use_bwd_head_loop(inputs: BwdHeuristicInputs, pack_factor: int) -> bool:
+    """The head loop needs hdim 256 (the serial 2CTA schedule) and more than one sub-group of
+    query heads per KV head left after the pack."""
+    return inputs.is_hdim256 and inputs.qhead_per_kvhead // pack_factor > 1
+
+
 def bwd_pack_gqa_heuristic(
-    inputs: BwdHeuristicInputs, *, tile_m: int, tile_n: int, cluster_size: int
+    inputs: BwdHeuristicInputs,
+    *,
+    tile_m: int,
+    tile_n: int,
+    cluster_size: int,
+    kv_group: int = 1,
 ) -> bool:
     """Whether the SM100 backward should pack the query heads of a KV head into the Q tile.
 
     Packing divides the tile count by qhead_per_kvhead. Its per-tile saving (K/V loaded once per
     KV head, dK/dV kept in TMEM, no fp32 dK/dV accumulate + postprocess) shrinks with seqlen_q,
     while the wave-quantization loss of the smaller grid can grow; measured on B200: ~25% gross
-    gain at 2k, ~7% at 8k, and a 3.5-wave packed grid loses ~13%.
+    gain at 2k, ~7% at 8k, and a 3.5-wave packed grid loses ~13%. A partial pack of four or
+    more sub-groups (kv_group tiles per KV head, their dK / dV through the fp32 accumulate +
+    postprocess) keeps half of that saving: hdim 128 / 64 MQA 16/1 and GQA 32/2 pack 4
+    (kv_group 4 / 8) causal gain +7..+10% at 2k, +1..+5% at 4k and lose 2..3% at 8k, where the
+    full-pack model still packs; two sub-groups keep the saving (hdim 192 GQA 32/8 pack 2 +3%
+    at 8k causal, hdim 128 GQA 64/8 pack 4 within 2% of unpacked there).
 
     A packed tile also loops over qhead_per_kvhead times more Q rows, so the longest packed CTA
     runs qh * ceil(seqlen_q / tile_m) iterations (every KV tile, or the first one with causal).
@@ -2434,6 +2470,8 @@ def bwd_pack_gqa_heuristic(
     ctas_unpacked = batch_size * inputs.num_heads * n_blocks_kv * cluster_size
     ctas_packed = batch_size * inputs.num_heads_kv * n_blocks_kv * cluster_size
     gain = 0.25 * 2048 / max(seqlen_q, 1)
+    if kv_group >= 4:
+        gain *= 0.5
     if inputs.causal or inputs.local:
         # causal / local tiles are uneven and the qh-times longer packed tiles balance
         # worse at the tail: smaller gain, and only pack with a margin
@@ -2442,40 +2480,172 @@ def bwd_pack_gqa_heuristic(
     return gain > wave_loss(ctas_packed) - wave_loss(ctas_unpacked)
 
 
-def select_bwd_pack_gqa(
+# Fold rules of select_bwd_fold, measured on B200 (the cells are in PR #3059).
+_BWD_MAX_PACK = 4  # wider packs lose from 2k on (causal MQA 16/1, GQA 32/2, 64/8: -3..-38%)
+_BWD_CHAIN_WASTE_MAX = 0.03  # deterministic causal: largest fold whose dQ-chain waste stays under
+_BWD_LOOP_DENSE_TRIPS_X_MBLOCKS = 64  # deterministic causal: the head loop serializes past this
+_BWD_LOOP_VARLEN_TRIPS_X_MBLOCKS = 96  # (the varlen LPT schedule tolerates more trips)
+_BWD_WIDE_PACK_MBLOCKS_X_HDIM = 4096  # 2-CTA deterministic causal: pack 4 steps down to pack 2
+_BWD_WIDE_PACK_SLOW_MBLOCKS = 32  # hdim 192 causal: a partial pack 4 steps down to pack 2
+
+
+def select_bwd_fold(
     inputs: BwdHeuristicInputs,
     *,
     tile_m: int,
     tile_n: int,
     cluster_size: int,
-    use_dedicated_hd256_kernel: bool,
-) -> bool:
-    """SM100 backward pack_gqa: off when FLASH_ATTENTION_BWD_TILE_N is set or unsupported, else
-    FLASH_ATTENTION_BWD_PACK_GQA if given, else bwd_pack_gqa_heuristic."""
-    if inputs.requested_tile_n is not None or not can_use_bwd_pack_gqa(
-        inputs, tile_m=tile_m, use_dedicated_hd256_kernel=use_dedicated_hd256_kernel
-    ):
-        return False
-    if inputs.requested_pack_gqa is not None:
-        return inputs.requested_pack_gqa
-    return bwd_pack_gqa_heuristic(inputs, tile_m=tile_m, tile_n=tile_n, cluster_size=cluster_size)
+) -> BwdFold:
+    """SM100 backward query-head fold, off when FLASH_ATTENTION_BWD_TILE_N is set or the fold
+    is unsupported (can_use_bwd_fold).
+
+    Candidates, largest fold first. With the head loop (hdim 256): pack 2 + loop over the
+    other sub-groups (fold = qhead_per_kvhead, the default), loop only, pack 4, pack 2. Without
+    it: pack 4 and pack 2 when they divide qhead_per_kvhead (the other sub-groups go through
+    the dK / dV postprocess). The first one bwd_pack_gqa_heuristic accepts for its own tile
+    count wins: a smaller fold has a shorter critical path and a bigger grid.
+
+    Deterministic causal adds the dQ semaphore chains over the n_blocks of a (batch, scratch
+    head): a co-resident later tile of a chain is held to the pace of the earlier one, so the
+    looped candidates are dropped once the loop walks too many sub-groups through the chains
+    (_BWD_LOOP_*), a 2-CTA pack 4 steps down to pack 2 once its chain hops cost more than its
+    K / V saving (_BWD_WIDE_PACK_MBLOCKS_X_HDIM), and the largest fold whose chain waste
+    (co-resident tiles per chain - 1) * 2 * tile_m / seqlen_q stays under _BWD_CHAIN_WASTE_MAX
+    wins, else the smallest accepted fold. Off the deterministic path the hdim 192 kernel
+    steps a partial pack 4 down to pack 2 as well (_BWD_WIDE_PACK_SLOW_MBLOCKS).
+
+    requested_pack_gqa (FLASH_ATTENTION_BWD_PACK_GQA: 0 off, 1 on, 2 / 4 that pack) and
+    requested_head_loop (FLASH_ATTENTION_BWD_HEAD_LOOP) force or exclude candidates; forced
+    candidates skip the heuristic and the deterministic rules.
+    """
+    if inputs.requested_tile_n is not None or not can_use_bwd_fold(inputs):
+        return BWD_FOLD_OFF
+    qh = inputs.qhead_per_kvhead
+    seqlen_q = inputs.max_seqlen_q
+    m_blocks = ceil_div(seqlen_q, tile_m)
+    head_loop_possible = inputs.is_hdim256
+    pack_override, loop_override = inputs.requested_pack_gqa, inputs.requested_head_loop
+
+    def fits(pack):
+        return bwd_pack_fits(inputs, pack, tile_m=tile_m)
+
+    candidates = []
+    if pack_override is not None and pack_override > 1:
+        pack = pack_override
+        if fits(pack):
+            if head_loop_possible and loop_override is True and qh // pack > 1:
+                candidates.append(BwdFold(pack, True))
+            candidates.append(BwdFold(pack, False))
+    elif head_loop_possible:
+        for pack in (2, 4):
+            if fits(pack):
+                if pack == 2 and qh // pack > 1:
+                    candidates.append(BwdFold(pack, True))
+                candidates.append(BwdFold(pack, False))
+        candidates.append(BwdFold(1, True))
+    else:
+        pack = min(qh & -qh, tile_m, _BWD_MAX_PACK)
+        while pack > 1:
+            candidates.append(BwdFold(pack, False))
+            pack //= 2
+
+    def allowed(cand):
+        if loop_override is not None and cand.head_loop != loop_override:
+            return False
+        return pack_override != 0 or cand.pack_factor == 1
+
+    candidates = [cand for cand in candidates if allowed(cand)]
+    if not candidates:
+        return BWD_FOLD_OFF
+
+    def fold(cand):
+        return cand.pack_factor * (qh // cand.pack_factor if cand.head_loop else 1)
+
+    # largest fold first; for equal folds pack 2 (+ loop) before the unpacked loop before a
+    # wider pack
+    candidates.sort(key=lambda cand: (-fold(cand), cand.pack_factor != 2, not cand.head_loop))
+
+    def forced(cand):
+        return (cand.head_loop and loop_override is True) or (
+            cand.pack_factor > 1 and pack_override is not None and pack_override >= 1
+        )
+
+    def accepted(cand):
+        # the heuristic sees the fold as the packed group: one tile per fold query heads
+        return forced(cand) or bwd_pack_gqa_heuristic(
+            inputs._replace(num_heads_kv=inputs.num_heads // fold(cand)),
+            tile_m=tile_m,
+            tile_n=tile_n,
+            cluster_size=cluster_size,
+            # off hdim 256 a pack below qhead_per_kvhead pays the dK / dV postprocess
+            kv_group=1 if head_loop_possible else qh // fold(cand),
+        )
+
+    no_override = pack_override is None and loop_override is None
+    det_causal = inputs.causal and inputs.deterministic and no_override
+    nondet_causal = inputs.causal and not inputs.deterministic and no_override
+    num_clusters = max(1, inputs.num_sms // cluster_size)
+
+    def chain_waste(cand):
+        chains = max(1, inputs.batch_size * inputs.num_heads // fold(cand))
+        return max(0.0, num_clusters / chains - 1.0) * 2 * tile_m / max(seqlen_q, 1)
+
+    def loop_serialized(cand):
+        if not cand.head_loop:
+            return False
+        trips_x_m_blocks = (qh // cand.pack_factor) * m_blocks
+        if inputs.has_cu_seqlens:
+            return trips_x_m_blocks > _BWD_LOOP_VARLEN_TRIPS_X_MBLOCKS
+        return trips_x_m_blocks > _BWD_LOOP_DENSE_TRIPS_X_MBLOCKS
+
+    def wide_pack_steps_down(cand):
+        if cand.head_loop or cand.pack_factor <= 2 or cluster_size == 1:
+            return False
+        if det_causal:
+            return m_blocks * inputs.head_dim > _BWD_WIDE_PACK_MBLOCKS_X_HDIM
+        return (
+            nondet_causal
+            and inputs.head_dim > 128
+            and not head_loop_possible
+            and qh > cand.pack_factor
+            and m_blocks >= _BWD_WIDE_PACK_SLOW_MBLOCKS
+        )
+
+    ok = [cand for cand in candidates if accepted(cand)]
+    if det_causal and any(not cand.head_loop for cand in ok):
+        # only when an unlooped fold is available: without one (odd qhead_per_kvhead) the
+        # loop stays, one tile per query head with the dK / dV postprocess is far slower
+        ok = [cand for cand in ok if not loop_serialized(cand)]
+    if any(wide_pack_steps_down(cand) for cand in ok):
+        # pack 2 whether or not the heuristic took it for its own tile count (it halves the
+        # gain of a 4+ way partial pack): the saving is there at pack 2 too
+        keep = {cand for cand in ok if not wide_pack_steps_down(cand)} | {BwdFold(2, False)}
+        ok = [cand for cand in candidates if cand in keep]
+    for cand in ok:
+        if not det_causal or cand.head_loop or chain_waste(cand) <= _BWD_CHAIN_WASTE_MAX:
+            return cand
+    # deterministic causal: every fold waits on the chains; the smallest accepted fold still
+    # beats none
+    return ok[-1] if det_causal and ok else BWD_FOLD_OFF
 
 
 def bwd_selection_reads_num_sms(inputs: BwdHeuristicInputs) -> bool:
-    """Whether select_bwd_config reads inputs.num_sms: only bwd_pack_gqa_heuristic does, for SM100
-    calls that can pack and set neither FLASH_ATTENTION_BWD_TILE_N nor FLASH_ATTENTION_BWD_PACK_GQA.
+    """Whether select_bwd_config reads inputs.num_sms: only select_bwd_fold does, for SM100 calls
+    that can fold (no FLASH_ATTENTION_BWD_TILE_N) and leave a candidate to the heuristic:
+    every one without FLASH_ATTENTION_BWD_PACK_GQA, else the hdim 256 head loop unless
+    FLASH_ATTENTION_BWD_HEAD_LOOP settles it.
 
     The interface looks the SM count up only then, so cross-compiling other calls needs no
     FLASH_ATTENTION_NUM_SMS.
     """
+    if inputs.requested_tile_n is not None or not can_use_bwd_fold(inputs):
+        return False
+    if inputs.requested_pack_gqa is None:
+        return True
     return (
-        inputs.requested_tile_n is None
-        and inputs.requested_pack_gqa is None
-        and can_use_bwd_pack_gqa(
-            inputs,
-            tile_m=SM100_BWD_TILE_M,
-            use_dedicated_hd256_kernel=inputs.uses_dedicated_hd256_kernel,
-        )
+        inputs.requested_pack_gqa <= 1
+        and inputs.is_hdim256
+        and inputs.requested_head_loop is None
     )
 
 
@@ -2546,8 +2716,8 @@ def select_sm100_bwd_registers(
 
 
 # Architecture-specific options at their neutral values, for architectures that do not
-# expose them: the SM90 MMA options, and the SM100 2CTA and pack_gqa options. spt (SM90 and SM100) is
-# always bwd_spt(inputs) there and False on SM120.
+# expose them: the SM90 MMA options, and the SM100 2CTA and query-head fold options. spt (SM90
+# and SM100) is always bwd_spt(inputs) there and False on SM120.
 _SM90_ONLY_NEUTRAL_FIELDS = dict(
     num_stages_PdS=1,
     SdP_swapAB=False,
@@ -2562,8 +2732,8 @@ _SM90_ONLY_NEUTRAL_FIELDS = dict(
 _SM100_ONLY_NEUTRAL_FIELDS = dict(
     use_2cta_instrs=False,
     cluster_size=1,
-    use_dedicated_hd256_kernel=False,
-    pack_gqa=False,
+    pack_factor=1,
+    head_loop=False,
 )
 # The SM100 kernel launches 16 warps: dQ reduce, 2x compute, MMA, load, relay, and empty.
 SM100_BWD_THREADS_PER_CTA = 512
@@ -2613,10 +2783,9 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 else Sm90BwdRegisters(mma=240, mma_no_dq=240, producer=24)
             )
         case 10 | 11:
-            hd256_generic = inputs.is_hdim256 and inputs.hd256_generic
-            # hdim 256 on the generic kernel runs a 64-row KV tile per CTA (NOTE [M=64
-            # accumulator layout] in flash_bwd_sm100.py); the 2CTA decision sees that tile.
-            tile_n = 64 if hd256_generic else 128
+            # hdim 256 runs a 64-row KV tile per CTA (NOTE [M=64 accumulator layout] in
+            # flash_bwd_sm100.py); the 2CTA decision sees that tile.
+            tile_n = 64 if inputs.is_hdim256 else 128
             use_2cta_instrs = not inputs.disable_2cta and can_use_bwd_2cta(inputs, tile_n=tile_n)
             if (
                 inputs.requested_tile_n == 64
@@ -2624,34 +2793,23 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 and can_use_bwd_tile_n_64(inputs, use_2cta_instrs=use_2cta_instrs)
             ):
                 tile_n = 64
-            dedicated = inputs.uses_dedicated_hd256_kernel
-            # The dedicated hdim-256 kernel always uses 2CTA instructions; its cluster follows
-            # the generic 2CTA decision.
-            any_2cta = use_2cta_instrs or dedicated
             cluster_size = 2 if use_2cta_instrs else 1
+            fold = select_bwd_fold(
+                inputs, tile_m=SM100_BWD_TILE_M, tile_n=tile_n, cluster_size=cluster_size
+            )
             fields.update(
                 tile_m=SM100_BWD_TILE_M,
                 tile_n=tile_n,
-                num_stages_Q=1 if any_2cta else 2,
+                num_stages_Q=1 if use_2cta_instrs else 2,
                 num_stages_dO=1,
                 num_threads=SM100_BWD_THREADS_PER_CTA,
-                use_2cta_instrs=any_2cta,
+                use_2cta_instrs=use_2cta_instrs,
                 cluster_size=cluster_size,
                 spt=bwd_spt(inputs),
-                use_dedicated_hd256_kernel=dedicated,
-                pack_gqa=select_bwd_pack_gqa(
-                    inputs,
-                    tile_m=SM100_BWD_TILE_M,
-                    tile_n=tile_n,
-                    cluster_size=cluster_size,
-                    use_dedicated_hd256_kernel=dedicated,
-                ),
+                pack_factor=fold.pack_factor,
+                head_loop=fold.head_loop,
             )
-            registers = (
-                None
-                if dedicated
-                else select_sm100_bwd_registers(inputs, use_2cta_instrs=use_2cta_instrs)
-            )
+            registers = select_sm100_bwd_registers(inputs, use_2cta_instrs=use_2cta_instrs)
         case 12:
             fields = sm120_bwd_fields(inputs)
             registers = None
@@ -2667,7 +2825,7 @@ def validate_bwd_registers(config: BwdConfig) -> None:
     registers = config.registers
     if config.device_capacity == 9:
         expected = Sm90BwdRegisters
-    elif config.device_capacity in (10, 11) and not config.use_dedicated_hd256_kernel:
+    elif config.device_capacity in (10, 11):
         expected = Sm100BwdRegisters
     else:
         expected = type(None)
@@ -2817,7 +2975,9 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
     if capacity not in (10, 11) and any(
         getattr(config, name) != value for name, value in _SM100_ONLY_NEUTRAL_FIELDS.items()
     ):
-        raise ValueError(f"SM{capacity} backward does not support SM100 2CTA or pack_gqa options")
+        raise ValueError(
+            f"SM{capacity} backward does not support SM100 2CTA or query-head fold options"
+        )
     if capacity != 12 and config.spt != bwd_spt(inputs):
         raise ValueError(
             f"SM{capacity} backward needs spt={bwd_spt(inputs)} (deterministic dQ lock order)"
@@ -2843,58 +3003,51 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
             raise ValueError(f"SM100 backward launches {SM100_BWD_THREADS_PER_CTA} threads")
         if config.num_stages_Q != (1 if config.use_2cta_instrs else 2) or config.num_stages_dO != 1:
             raise ValueError("SM100 backward uses 2 Q stages (1 with 2CTA) and 1 dO stage")
-        if config.pack_gqa and not can_use_bwd_pack_gqa(
-            inputs,
-            tile_m=config.tile_m,
-            use_dedicated_hd256_kernel=config.use_dedicated_hd256_kernel,
-        ):
+        if (config.pack_factor > 1 or config.head_loop) and not can_use_bwd_fold(inputs):
             raise ValueError(
-                "SM100 backward pack_gqa needs the generic kernel, qhead_per_kvhead > 1 dividing "
-                f"tile_m={config.tile_m}, and no block sparsity, score_mod, mask_mod, or "
+                "SM100 backward query-head folds (pack_factor > 1, head_loop) need "
+                "qhead_per_kvhead > 1 and no block sparsity, score_mod, mask_mod, or "
                 "learnable_sink"
             )
-        if config.use_dedicated_hd256_kernel:
-            if not inputs.is_hdim256:
-                raise ValueError("The dedicated SM100 backward kernel requires head_dim=256")
-            if not config.use_2cta_instrs or config.cluster_size not in (1, 2):
-                raise ValueError(
-                    "The dedicated SM100 hdim-256 backward needs 2CTA instructions "
-                    "and cluster_size 1 or 2"
+        if not bwd_pack_fits(inputs, config.pack_factor, tile_m=config.tile_m):
+            raise ValueError(
+                f"SM100 backward pack_factor={config.pack_factor} must divide "
+                f"tile_m={config.tile_m} and qhead_per_kvhead={inputs.qhead_per_kvhead}"
+            )
+        if config.head_loop and not can_use_bwd_head_loop(inputs, config.pack_factor):
+            raise ValueError(
+                "SM100 backward head_loop needs head_dim 256 and more than one sub-group of "
+                "query heads per KV head after the pack"
+            )
+        if config.cluster_size != (2 if config.use_2cta_instrs else 1):
+            raise ValueError("SM100 backward uses cluster_size=2 exactly with 2CTA")
+        if config.tile_m != 128 or config.tile_n not in (64, 128):
+            raise ValueError(
+                f"SM100 backward requires tile_m=128 and tile_n in (64, 128), "
+                f"got {(config.tile_m, config.tile_n)}"
+            )
+        config_kv_subtile_factor(config, inputs)
+        can_2cta = can_use_bwd_2cta(inputs, tile_n=config.tile_n)
+        needs_2cta = bwd_needs_2cta(inputs)
+        if needs_2cta is not None and not config.use_2cta_instrs:
+            reason = (
+                "2CTA was disabled by request"
+                if inputs.disable_2cta or can_2cta
+                else (
+                    f"sparse_block_size[1] must cover an even number of "
+                    f"tile_n={config.tile_n} tiles; got factor "
+                    f"{config_kv_subtile_factor(config, inputs)}"
                 )
-            if (config.tile_m, config.tile_n) != (128, 128):
-                raise ValueError("The dedicated SM100 hdim-256 backward uses 128x128 tiles")
-            # The dedicated kernel checks the sparse KV size against tile_n like the generic one.
-            config_kv_subtile_factor(config, inputs)
-        else:
-            if config.cluster_size != (2 if config.use_2cta_instrs else 1):
-                raise ValueError("SM100 backward uses cluster_size=2 exactly with 2CTA")
-            if config.tile_m != 128 or config.tile_n not in (64, 128):
-                raise ValueError(
-                    f"SM100 backward requires tile_m=128 and tile_n in (64, 128), "
-                    f"got {(config.tile_m, config.tile_n)}"
-                )
-            config_kv_subtile_factor(config, inputs)
-            can_2cta = can_use_bwd_2cta(inputs, tile_n=config.tile_n)
-            needs_2cta = bwd_needs_2cta(inputs)
-            if needs_2cta is not None and not config.use_2cta_instrs:
-                reason = (
-                    "2CTA was disabled by request"
-                    if inputs.disable_2cta or can_2cta
-                    else (
-                        f"sparse_block_size[1] must cover an even number of "
-                        f"tile_n={config.tile_n} tiles; got factor "
-                        f"{config_kv_subtile_factor(config, inputs)}"
-                    )
-                )
-                raise ValueError(f"{needs_2cta} requires 2CTA; {reason}.")
-            if config.use_2cta_instrs and not can_2cta:
-                raise ValueError("2CTA instructions are not supported for this backward problem")
-            if config.tile_n == 64 and not can_use_bwd_tile_n_64(
-                inputs, use_2cta_instrs=config.use_2cta_instrs
-            ):
-                raise ValueError("tile_n=64 is not supported for this SM100 backward problem")
-            if inputs.is_hdim256 and config.tile_n != 64:
-                raise ValueError("SM100 generic backward with head_dim=256 needs tile_n=64")
+            )
+            raise ValueError(f"{needs_2cta} requires 2CTA; {reason}.")
+        if config.use_2cta_instrs and not can_2cta:
+            raise ValueError("2CTA instructions are not supported for this backward problem")
+        if config.tile_n == 64 and not can_use_bwd_tile_n_64(
+            inputs, use_2cta_instrs=config.use_2cta_instrs
+        ):
+            raise ValueError("tile_n=64 is not supported for this SM100 backward problem")
+        if inputs.is_hdim256 and config.tile_n != 64:
+            raise ValueError("SM100 backward with head_dim=256 needs tile_n=64")
     sparse_q = bwd_sparse_q_block_size(inputs)
     if sparse_q is not None and (sparse_q <= 0 or sparse_q % config.tile_m != 0):
         raise ValueError(
