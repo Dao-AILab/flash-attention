@@ -138,8 +138,13 @@ class FlashAttentionBackwardPreprocess:
                 else (32 if self.head_dim_v_padded % 32 == 0 else 16)
             )
         )
-        num_copy_elems = 128 // self.dtype.width
-        threads_per_row = gmem_k_block_size // num_copy_elems
+        threads_per_row, num_copy_elems = utils.fit_row_copy(
+            self.dtype,
+            self.tile_m,
+            self.head_dim_v_padded,
+            self.num_threads,
+            gmem_k_block_size // (128 // self.dtype.width),
+        )
         self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(
             self.dtype, threads_per_row, self.num_threads, num_copy_elems
         )

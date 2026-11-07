@@ -50,6 +50,7 @@ from flash_attn.cute.interface import (
     _bwd_postprocess_convert,
     _flash_attn_fwd,
     _flash_attn_fwd_combine,
+    _get_scheduler_metadata,
     _flash_attn_bwd,
 )
 
@@ -248,17 +249,16 @@ def test_flash_attn_work_tiles_cover_q(
     torch.testing.assert_close(lse, scores.logsumexp(dim=-1), atol=1e-3, rtol=1e-4)
 
 
-@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
-@pytest.mark.parametrize("num_splits", [0, -1])
+@pytest.mark.skipif(not IS_SM120, reason="SM120 SplitKV policy")
+@pytest.mark.parametrize("num_splits", [0, -1, 3])
 def test_flash_attn_sm120_num_splits(num_splits):
+    torch.manual_seed(0)
     q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 4096, 1, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 4096, 1, 64, device="cuda", dtype=torch.bfloat16)
     out = flash_attn_func(q, k, v)
-    out_auto = flash_attn_func(q, k, v, num_splits=num_splits)
-    torch.testing.assert_close(out_auto, out)
-    with pytest.raises(ValueError, match="SM120 forward only supports num_splits=1"):
-        flash_attn_func(q, k, v, num_splits=3)
+    out_split = flash_attn_func(q, k, v, num_splits=num_splits)
+    torch.testing.assert_close(out_split, out, atol=2e-3, rtol=0)
 
 
 @pytest.mark.skipif(
@@ -952,13 +952,13 @@ def test_flash_attn_output(
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         # num_splits_vals = [1, 3]
         pack_gqa_vals = [True] if has_qv else [False, True, None] if not TEST_BWD_ONLY else [False]
-        # SplitKV is not supported for hdim >= 192, except hd256 on SM100
+        # SplitKV is not supported for hdim >= 192, except hd256 on SM100 and all on SM12x
         # pack_gqa_vals = [False]
-        split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
+        split_hdim_ok = d < 192 or IS_SM120 or (IS_SM100 and d == 256 and dv == 256)
         num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY and not has_qv else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            # SplitKV not supported on SM90/SM120 - skip this iteration
-            if (IS_SM90 or IS_SM120) and num_splits > 1:
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
                 continue
             if IS_SM100 and (d >= 192 and dv >= 192) and not (d == 256 and dv == 256):
                 continue
@@ -1002,6 +1002,7 @@ def test_flash_attn_output(
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
                 or (IS_SM100 and d == 256 and dv == 256 and (softcap == 0.0 or HD256_GENERIC_BWD))
+                or (IS_SM120 and d == 256 and dv == 256)
             )
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
@@ -1864,15 +1865,15 @@ def test_flash_attn_varlen_output(
         pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
         # pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
-        # SplitKV is not supported for hdim >= 192, except hd256 on SM100
-        split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
+        # SplitKV is not supported for hdim >= 192, except hd256 on SM100 and all on SM12x
+        split_hdim_ok = d < 192 or IS_SM120 or (IS_SM100 and d == 256 and dv == 256)
         num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         precompute_metadata_vals = [False, True]
         for pack_gqa, num_splits, precompute_metadata in itertools.product(
             pack_gqa_vals, num_splits_vals, precompute_metadata_vals
         ):
-            # SplitKV not supported on SM90/SM120 - skip this iteration
-            if (IS_SM90 or IS_SM120) and num_splits > 1:
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
                 continue
             if precompute_metadata and is_fake_mode():
                 continue
@@ -1956,6 +1957,7 @@ def test_flash_attn_varlen_output(
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
                 or (IS_SM100 and d == 256 and dv == 256 and (softcap == 0.0 or HD256_GENERIC_BWD))
+                or (IS_SM120 and d == 256 and dv == 256)
             )
             and not has_learnable_sink
             # and False
@@ -2107,8 +2109,8 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
     - "metadata_full": scheduler_metadata with num_splits>1 (SM100 only).
       Runs the full prepare kernel.
     """
-    if cumsum_mode == "metadata_full" and (IS_SM90 or DISABLE_SPLIT):
-        pytest.skip("split-kv not yet implemented on SM90")
+    if cumsum_mode == "metadata_full" and (IS_SM90 or IS_SM120 or DISABLE_SPLIT):
+        pytest.skip("caller-built split-kv scheduler metadata is SM100-only")
     device = "cuda"
     torch.manual_seed(0)
     random.seed(0)
@@ -2252,6 +2254,98 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
         assert (x - x_ref).abs().max().item() <= 2 * (
             x_pt - x_ref
         ).abs().max().item() + atol, name
+
+
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="Reads the prepare kernel's per-batch split counts")
+@pytest.mark.parametrize("batch_size", [8, 4096])
+def test_scheduler_metadata_max_n_blocks_per_split(batch_size):
+    """max_n_blocks_per_split: a batch's split takes at most that many KV blocks unless the
+    batch already has the static split count, and the cap only raises a batch's count."""
+    torch.manual_seed(0)
+    tile_n, num_splits, cap = 128, 16, 4
+    seqused_k = torch.randint(1, 8192, (batch_size,), dtype=torch.int32, device="cuda")
+    seqused_k[0] = 8192
+    common = dict(
+        num_batch=batch_size,
+        max_seqlen_q=1,
+        max_seqlen_k=8192,
+        nheads=8,
+        nheads_kv=2,
+        headdim=128,
+        num_splits=num_splits,
+        tile_m=128,
+        tile_n=tile_n,
+        pack_gqa=True,
+        cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32, device="cuda"),
+        seqused_k=seqused_k,
+    )
+    free = _get_scheduler_metadata(**common).num_splits_dynamic_ptr
+    capped = _get_scheduler_metadata(
+        **common, max_n_blocks_per_split=cap
+    ).num_splits_dynamic_ptr
+    n_blocks = (seqused_k + tile_n - 1) // tile_n
+    floor = torch.clamp((n_blocks + cap - 1) // cap, 1, num_splits)
+    assert (capped >= floor).all() and (capped <= num_splits).all()
+    assert (capped >= free).all()
+
+
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="Reads the prepare kernel's split layout")
+@pytest.mark.parametrize("max_extra_splits", [0, 5, 40, 1000])
+@pytest.mark.parametrize("seqlen_q", [1, 4])
+def test_scheduler_metadata_compact_split_layout(max_extra_splits, seqlen_q):
+    """max_extra_splits: the counts keep at most that many splits beyond one per batch, and
+    split_slot_batch lists each batch's (m block, split) slots in batch order, then -1."""
+    torch.manual_seed(0)
+    batch_size, nheads, nheads_kv, tile_m, tile_n = 37, 8, 2, 16, 64
+    seqused_k = torch.randint(1, 4096, (batch_size,), dtype=torch.int32, device="cuda")
+    seqused_k[3] = 32768
+    meta = _get_scheduler_metadata(
+        num_batch=batch_size,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=32768,
+        nheads=nheads,
+        nheads_kv=nheads_kv,
+        headdim=128,
+        num_splits=32,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        pack_gqa=True,
+        cu_seqlens_q=torch.arange(
+            0, (batch_size + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device="cuda"
+        ),
+        seqused_k=seqused_k,
+        max_extra_splits=max_extra_splits,
+    )
+    counts = meta.num_splits_dynamic_ptr.tolist()
+    assert all(1 <= c <= 32 for c in counts)
+    assert sum(c - 1 for c in counts) <= max_extra_splits
+    m = -(-seqlen_q * nheads // nheads_kv // tile_m)
+    expected = [(b << 16) | j for b, c in enumerate(counts) for j in range(m * c)]
+    table = meta.split_slot_batch.tolist()
+    assert len(table) == m * (batch_size + max_extra_splits)
+    assert table == expected + [-1] * (len(table) - len(expected))
+
+
+def test_scheduler_metadata_compact_split_layout_rejects_fixed_split_length():
+    """A fixed split length sets the split counts, so the compact layout cannot bound them."""
+    batch_size = 4
+    with pytest.raises(ValueError, match="seqlen_k_per_split"):
+        _get_scheduler_metadata(
+            num_batch=batch_size,
+            max_seqlen_q=1,
+            max_seqlen_k=4096,
+            nheads=8,
+            nheads_kv=2,
+            headdim=128,
+            num_splits=32,
+            tile_m=16,
+            tile_n=64,
+            pack_gqa=True,
+            cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32, device="cuda"),
+            seqused_k=torch.full((batch_size,), 4096, dtype=torch.int32, device="cuda"),
+            seqlen_k_per_split=128,
+            max_extra_splits=0,
+        )
 
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="hd256 2CTA is SM100/SM110 only")
@@ -2745,8 +2839,8 @@ def test_flash_attn_kvcache(
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
-            # SplitKV not supported on SM90/SM120 - skip this iteration
-            if (IS_SM90 or IS_SM120) and num_splits > 1:
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
                 continue
             if precompute_metadata and is_fake_mode():
                 continue
@@ -3289,7 +3383,9 @@ def check_sm100_unused_v_cache(
         assert torch.equal(lse, results[0][1])
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110 or IS_SM120), reason="SM100/SM110/SM12x nonpaged V cache"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("varlen", [False, True])
@@ -3305,7 +3401,9 @@ def test_flash_attn_sm100_unused_v_cache(
     )
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110 or IS_SM120), reason="SM100/SM110/SM12x nonpaged V cache"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "varlen,causal,num_splits,disable_2cta",
@@ -3334,7 +3432,9 @@ def test_flash_attn_sm100_unused_v_cache_edges(
     )
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110 or IS_SM120), reason="SM100/SM110/SM12x nonpaged V cache"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "d,dv", [(128, 8), (128, 24), (128, 80), (192, 128), (256, 256)]
@@ -3345,7 +3445,9 @@ def test_flash_attn_sm100_unused_v_cache_dimensions(monkeypatch, dtype, d, dv, v
     check_sm100_unused_v_cache(monkeypatch, d, varlen, False, dtype, 1, dv=dv)
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110 or IS_SM120), reason="SM100/SM110/SM12x nonpaged V cache"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 # Dense-Q layouts also run on SwapAB decode, which has its own bounded V descriptor; it does
 # not take cu_seqlens_k.
@@ -3373,7 +3475,9 @@ def test_flash_attn_sm100_unused_v_cache_layouts(monkeypatch, dtype, varlen, v_l
     )
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110 or IS_SM120), reason="SM100/SM110/SM12x nonpaged V cache"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_sm100_unused_v_cache_packed_boundary(dtype):
@@ -4815,8 +4919,8 @@ def test_flash_attn_ragged_tensormap_workspace_padding(packed_kv, seqlen_q, num_
     """Dense Q + seqused_q with many short sequences: the varlen schedulers pad every
     batch by a cluster-sized tile, so the grid exceeds sum(ceil(seqlen_q / tile)) and the
     descriptor workspace must cover it (the kernel traps otherwise)."""
-    if (IS_SM90 or IS_SM120) and num_splits > 1:
-        pytest.skip("SplitKV not supported on SM90/SM120")
+    if IS_SM90 and num_splits > 1:
+        pytest.skip("SplitKV not supported on SM90")
     torch.manual_seed(0)
     batch, seqlen_k, nheads, d = 49, 217, 6, 128
     q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)

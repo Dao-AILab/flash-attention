@@ -341,6 +341,29 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
 PipelineTmaAsync.create = _override_create(PipelineTmaAsyncOg, PipelineTmaAsync)
 
 
+class PipelineTmaAsyncGenericConsumer(PipelineTmaAsyncOg):
+    """TMA pipeline whose consumers read a stage through the generic proxy (ldmatrix). The
+    empty wait orders those reads; the proxy fence orders them before the async-proxy TMA
+    refill that follows the acquire."""
+
+    @dsl_user_op
+    def producer_acquire(
+        self,
+        state: PipelineState,
+        try_acquire_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        super().producer_acquire(state, try_acquire_token, loc=loc, ip=ip)
+        cute.arch.fence_proxy("async.shared", space="cta")
+
+
+PipelineTmaAsyncGenericConsumer.create = _override_create(
+    PipelineTmaAsyncOg, PipelineTmaAsyncGenericConsumer
+)
+
+
 # ── PipelineTmaUmma ─────────────────────────────────────────────────────────
 
 
