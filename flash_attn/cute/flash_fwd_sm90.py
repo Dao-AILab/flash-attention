@@ -596,7 +596,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if blocksparse_tensors is not None
                 else None
             ),
-            # Don't need to pass in tile_mn because we won't access offset_padded
+            # Varlen sparse indexing uses num_n_blocks, so it needs the actual
+            # KV tile size even though this kernel does not use offset_padded.
+            tile_m=self.tile_m,
+            tile_n=self.tile_n,
         )
         AttentionMaskCls = partial(
             AttentionMask,
