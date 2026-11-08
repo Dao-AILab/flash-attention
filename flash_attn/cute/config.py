@@ -511,7 +511,9 @@ def check_register_record(registers: object, expected: type, kernel: str) -> Non
         raise ValueError(
             f"{kernel} needs registers of type {expected.__name__}, got {type(registers).__name__}"
         )
-    if registers is not None and any(v % 8 != 0 or not 24 <= v <= 256 for v in vars(registers).values()):
+    if registers is not None and any(
+        v % 8 != 0 or not 24 <= v <= 256 for v in vars(registers).values()
+    ):
         raise ValueError(f"Register counts must be multiples of 8 in [24, 256], got {registers}")
 
 
