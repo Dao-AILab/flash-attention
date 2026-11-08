@@ -284,7 +284,7 @@ _ENVS = [  # (disable_2cta, hd256_generic, requested_tile_n)
 ]
 
 
-@pytest.mark.parametrize("device_arch", [90, 100, 103, 110, 120])
+@pytest.mark.parametrize("device_arch", [90, 100, 103, 110])
 def test_selection_matches_the_legacy_policy(device_arch):
     # Dtype does not affect this policy; V_in_regs is only forwarded on SM90.
     for (d, dv), mask, det, sparse, env in itertools.product(
@@ -378,7 +378,6 @@ def test_pack_gqa_explicit_configs():
             {"registers": Sm100BwdRegisters(160, 160, 104, 104, 24)},
             "exceeds 512",
         ),
-        (make_inputs(device_arch=120), {"tile_m": 128}, "SM120 backward supports one configuration"),
         (make_inputs(), {"pack_gqa": True}, "pack_gqa needs"),
         (make_inputs(num_heads=24, num_heads_kv=8), {"pack_gqa": True}, "pack_gqa needs"),
         (make_inputs(**_GQA8, has_score_mod=True), {"pack_gqa": True}, "pack_gqa needs"),
@@ -400,13 +399,17 @@ def test_pack_gqa_explicit_configs():
             "pack_gqa needs",
         ),
         (make_inputs(**_GQA8, device_arch=90), {"pack_gqa": True}, "2CTA or pack_gqa options"),
-        (make_inputs(**_GQA8, device_arch=120), {"pack_gqa": True}, "2CTA or pack_gqa options"),
     ],
 )
 def test_invalid_configs_are_rejected(inputs, changes, error):
     config = select_bwd_config(inputs)
     with pytest.raises(ValueError, match=error):
         validate_bwd_config(replace(config, **changes), inputs)
+
+
+def test_sm12x_backward_is_planned_by_its_host():
+    with pytest.raises(ValueError, match="planned by flash_attn.cute.sm120"):
+        select_bwd_config(make_inputs(device_arch=120))
 
 
 # Interface: these run on CPU with fake tensors and stop at the compile-cache lookup.
