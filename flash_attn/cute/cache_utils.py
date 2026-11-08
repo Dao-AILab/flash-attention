@@ -1,5 +1,8 @@
 # Manage Ahead-of-Time (AOT) compiled kernels
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    from flash_attn.cute import _filelock as fcntl
 import hashlib
 import os
 import pickle
@@ -25,7 +28,7 @@ from flash_attn.cute.fa_logging import fa_log
 # "undefined symbol" errors when loading cached kernels from disk.
 for _lib_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
     if Path(_lib_path).exists():
-        ctypes.CDLL(_lib_path, mode=ctypes.RTLD_GLOBAL)
+        ctypes.CDLL(_lib_path, mode=getattr(ctypes, "RTLD_GLOBAL", 0))
 
 CompileKeyType: TypeAlias = tuple[Hashable, ...]
 CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
