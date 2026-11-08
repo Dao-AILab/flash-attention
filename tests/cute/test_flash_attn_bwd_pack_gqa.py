@@ -6,8 +6,8 @@ FP64 eager. The fold modes:
   [bwd pack_gqa] in pack_gqa.py); the remaining qhead_per_kvhead // 2 sub-groups of a KV
   head are separate tiles whose dK / dV accumulate in fp32 (+ postprocess). pack4: the same
   with 4 (hdim 256: what the deterministic causal fold picks when the dQ chains are few).
-  pack_full: the one full pack (largest power of two dividing qhead_per_kvhead) that the
-  other head dims take (FLASH_ATTENTION_BWD_PACK_GQA=1, the chooser's pick).
+  pack_auto: FLASH_ATTENTION_BWD_PACK_GQA=1, the chooser's pick: the largest pack that
+  divides qhead_per_kvhead, at most _BWD_MAX_PACK (asserted on the selected config).
 - pack_loop: pack 2, and the sub-groups looped inside one tile per KV head
   (FLASH_ATTENTION_BWD_HEAD_LOOP=1, hdim 256): K / V loaded once, dK / dV stay in TMEM and are
   stored directly.
@@ -22,7 +22,8 @@ import torch
 
 from eager_reference import check_against_reference, make_cu_seqlens
 
-from flash_attn.cute import utils
+from flash_attn.cute import interface, utils
+from flash_attn.cute.config import _BWD_MAX_PACK
 from flash_attn.cute.interface import (
     _flash_attn_bwd,
     flash_attn_func,
@@ -37,8 +38,8 @@ pytestmark = pytest.mark.skipif(
 
 SEED = 20261004
 HEAD_DIMS = [64, 128, 256]
-# qhead_per_kvhead 4 / 4 / 8 / 8 (pack 2 or 4 + sub-groups, full pack 4 / 8), 6 / 6 / 3 (pack
-# 2 + 3 sub-groups, no pack 4) and 5 (no packing: head loop only)
+# qhead_per_kvhead 4 / 4 / 8 / 8 (pack 2 or 4 + sub-groups), 6 / 6 / 3 (pack 2 + 3
+# sub-groups, no pack 4) and 5 (no packing: head loop only)
 HEADS = {
     "gqa8_2": (8, 2),
     "gqa16_4": (16, 4),
@@ -62,7 +63,7 @@ FOLDS = {
         False,
         4,
     ),  # pack 4; the other sub-groups through the dK / dV postprocess
-    "pack_full": (True, False, None),  # other head dims: the one full pack
+    "pack_auto": (True, False, None),  # the chooser's pack (largest dividing, <= _BWD_MAX_PACK)
     "pack_loop": (True, True, 2),  # pack 2 and the other sub-groups looped in the CTA
     "loop": (False, True, None),  # unpacked, every query head a pass of the loop
 }
@@ -79,6 +80,22 @@ SHAPES = [
     pytest.param((1000,), (1000,), id="1x1000"),
     pytest.param((16, 16), (640, 640), id="2x16x640"),
 ]
+
+
+@pytest.fixture
+def selected_bwd_configs(monkeypatch):
+    """The BwdConfig of every backward call, in call order (the interface selects one per
+    call, cached kernels included)."""
+    configs = []
+    select = interface.select_bwd_config
+
+    def record(inputs):
+        config = select(inputs)
+        configs.append(config)
+        return config
+
+    monkeypatch.setattr(interface, "select_bwd_config", record)
+    return configs
 
 
 @pytest.fixture
@@ -171,21 +188,32 @@ def run_fwd_bwd_layout(
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
 @pytest.mark.parametrize("q_lens,k_lens", SHAPES)
 def test_bwd_pack_gqa_matches_unpacked(
-    q_lens, k_lens, head_dim, mha_type, fold, layout, feature, causal, pack_gqa_env
+    q_lens,
+    k_lens,
+    head_dim,
+    mha_type,
+    fold,
+    layout,
+    feature,
+    causal,
+    pack_gqa_env,
+    selected_bwd_configs,
 ):
     if head_dim == 256 and not hd256_on_general_kernel():
         pytest.skip("hdim 256 backward runs on the dedicated kernels (no packing)")
     pack, head_loop, pack_factor = FOLDS[fold]
     heads_q, heads_kv = HEADS[mha_type]
     qhead_per_kvhead = heads_q // heads_kv
-    full_pack = qhead_per_kvhead & -qhead_per_kvhead
+    # FLASH_ATTENTION_BWD_PACK_GQA=1: the largest pack dividing qhead_per_kvhead, capped
+    auto_pack = min(qhead_per_kvhead & -qhead_per_kvhead, _BWD_MAX_PACK)
     if head_loop and head_dim != 256:
         pytest.skip("the head loop is an hdim 256 (serial schedule) path")
-    if fold == "pack_full" and (head_dim == 256 or full_pack <= 2):
+    if fold == "pack_auto" and (head_dim == 256 or auto_pack <= 2):
         pytest.skip(
-            "hdim 256 never takes the full pack; a full pack of 2 is the pack cell"
+            "the chooser's pack is the pack cell (2), or the pack4 cell with the head loop "
+            "off (hdim 256)"
         )
-    if pack and qhead_per_kvhead % (pack_factor or full_pack):
+    if pack and qhead_per_kvhead % (pack_factor or auto_pack):
         pytest.skip("qhead_per_kvhead does not divide into the packed heads")
     if head_loop and qhead_per_kvhead // (pack_factor if pack else 1) == 1:
         pytest.skip("one sub-group: nothing to loop over")
@@ -211,6 +239,13 @@ def test_bwd_pack_gqa_matches_unpacked(
     args = (layout, q, k, v, dout, q_lens, k_lens, causal)
     ref = run_fwd_bwd_layout(*args, False, False, **kwargs)
     got = run_fwd_bwd_layout(*args, pack, head_loop, pack_factor, **kwargs)
+    # the cell ran the fold it is named after
+    assert selected_bwd_configs[-2].pack_factor == 1
+    assert not selected_bwd_configs[-2].head_loop
+    assert selected_bwd_configs[-1].pack_factor == (
+        (pack_factor or auto_pack) if pack else 1
+    )
+    assert selected_bwd_configs[-1].head_loop == head_loop
     assert torch.equal(got[0], ref[0]), (
         "forward does not depend on the backward packing"
     )

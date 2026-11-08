@@ -2501,43 +2501,36 @@ _BWD_WIDE_PACK_MBLOCKS_X_HDIM = 4096  # 2-CTA deterministic causal: pack 4 steps
 _BWD_WIDE_PACK_SLOW_MBLOCKS = 32  # hdim 192 causal: a partial pack 4 steps down to pack 2
 
 
-def select_bwd_fold(
-    inputs: BwdHeuristicInputs,
-    *,
-    tile_m: int,
-    tile_n: int,
-    cluster_size: int,
-    use_dedicated_hd256_kernel: bool,
-) -> BwdFold:
-    """SM100 backward query-head fold, off when FLASH_ATTENTION_BWD_TILE_N is set or the fold
-    is unsupported (can_use_bwd_fold).
+def bwd_fold_heads(cand: BwdFold, qhead_per_kvhead: int) -> int:
+    """Query heads of a KV head one tile covers under the fold: the pack, times the sub-groups
+    the head loop walks."""
+    return cand.pack_factor * (qhead_per_kvhead // cand.pack_factor if cand.head_loop else 1)
 
-    Candidates, largest fold first. With the head loop (hdim 256): pack 2 + loop over the
-    other sub-groups (fold = qhead_per_kvhead, the default), loop only, pack 4, pack 2. Without
-    it: pack 4 and pack 2 when they divide qhead_per_kvhead (the other sub-groups go through
-    the dK / dV postprocess). The first one bwd_pack_gqa_heuristic accepts for its own tile
-    count wins: a smaller fold has a shorter critical path and a bigger grid.
 
-    Deterministic causal adds the dQ semaphore chains over the n_blocks of a (batch, scratch
-    head): a co-resident later tile of a chain is held to the pace of the earlier one, so the
-    looped candidates are dropped once the loop walks too many sub-groups through the chains
-    (_BWD_LOOP_*), a 2-CTA pack 4 steps down to pack 2 once its chain hops cost more than its
-    K / V saving (_BWD_WIDE_PACK_MBLOCKS_X_HDIM), and the largest fold whose chain waste
-    (co-resident tiles per chain - 1) * 2 * tile_m / seqlen_q stays under _BWD_CHAIN_WASTE_MAX
-    wins, else the smallest accepted fold. Off the deterministic path the hdim 192 kernel
-    steps a partial pack 4 down to pack 2 as well (_BWD_WIDE_PACK_SLOW_MBLOCKS).
+def bwd_fold_forced(cand: BwdFold, inputs: BwdHeuristicInputs) -> bool:
+    """Whether the env knobs force the candidate: FLASH_ATTENTION_BWD_HEAD_LOOP=1 a looped one,
+    FLASH_ATTENTION_BWD_PACK_GQA >= 1 a packed one. A forced candidate skips the heuristic and
+    the deterministic rules, so it needs no SM count."""
+    return (cand.head_loop and inputs.requested_head_loop is True) or (
+        cand.pack_factor > 1
+        and inputs.requested_pack_gqa is not None
+        and inputs.requested_pack_gqa >= 1
+    )
 
-    requested_pack_gqa (FLASH_ATTENTION_BWD_PACK_GQA: 0 off, 1 on, 2 / 4 that pack) and
-    requested_head_loop (FLASH_ATTENTION_BWD_HEAD_LOOP) force or exclude candidates; forced
-    candidates skip the heuristic and the deterministic rules.
+
+def bwd_fold_candidates(inputs: BwdHeuristicInputs, *, tile_m: int) -> list[BwdFold]:
+    """The SM100 backward fold candidates select_bwd_fold chooses from, largest fold first;
+    empty when none applies (an odd qhead_per_kvhead off hdim 256, or the env knobs exclude
+    them all), the caller then stays unpacked without reading the SM count.
+
+    With the head loop (hdim 256): pack 2 + loop over the other sub-groups (fold =
+    qhead_per_kvhead), loop only, pack 4, pack 2. Without it: the packs from the largest power
+    of two dividing qhead_per_kvhead (at most _BWD_MAX_PACK) down to 2 (the other sub-groups go
+    through the dK / dV postprocess). FLASH_ATTENTION_BWD_PACK_GQA 0 keeps the unpacked
+    candidates, 2 / 4 that pack only; FLASH_ATTENTION_BWD_HEAD_LOOP keeps the looped or the
+    unlooped ones. Equal folds: pack 2 (+ loop) before the unpacked loop before a wider pack.
     """
-    if inputs.requested_tile_n is not None or not can_use_bwd_fold(
-        inputs, use_dedicated_hd256_kernel=use_dedicated_hd256_kernel
-    ):
-        return BWD_FOLD_OFF
     qh = inputs.qhead_per_kvhead
-    seqlen_q = inputs.max_seqlen_q
-    m_blocks = ceil_div(seqlen_q, tile_m)
     head_loop_possible = inputs.is_hdim256
     pack_override, loop_override = inputs.requested_pack_gqa, inputs.requested_head_loop
 
@@ -2570,20 +2563,59 @@ def select_bwd_fold(
         return pack_override != 0 or cand.pack_factor == 1
 
     candidates = [cand for cand in candidates if allowed(cand)]
+    candidates.sort(
+        key=lambda cand: (-bwd_fold_heads(cand, qh), cand.pack_factor != 2, not cand.head_loop)
+    )
+    return candidates
+
+
+def select_bwd_fold(
+    inputs: BwdHeuristicInputs,
+    *,
+    tile_m: int,
+    tile_n: int,
+    cluster_size: int,
+    use_dedicated_hd256_kernel: bool,
+) -> BwdFold:
+    """SM100 backward query-head fold, off when FLASH_ATTENTION_BWD_TILE_N is set or the fold
+    is unsupported (can_use_bwd_fold).
+
+    Candidates: bwd_fold_candidates, largest fold first. The first one bwd_pack_gqa_heuristic
+    accepts for its own tile count wins: a smaller fold has a shorter critical path and a
+    bigger grid.
+
+    Deterministic causal adds the dQ semaphore chains over the n_blocks of a (batch, scratch
+    head): a co-resident later tile of a chain is held to the pace of the earlier one, so the
+    looped candidates are dropped once the loop walks too many sub-groups through the chains
+    (_BWD_LOOP_*), a 2-CTA pack 4 steps down to pack 2 once its chain hops cost more than its
+    K / V saving (_BWD_WIDE_PACK_MBLOCKS_X_HDIM), and the largest fold whose chain waste
+    (co-resident tiles per chain - 1) * 2 * tile_m / seqlen_q stays under _BWD_CHAIN_WASTE_MAX
+    wins, else the smallest accepted fold. Off the deterministic path the hdim 192 kernel
+    steps a partial pack 4 down to pack 2 as well (_BWD_WIDE_PACK_SLOW_MBLOCKS).
+
+    requested_pack_gqa (FLASH_ATTENTION_BWD_PACK_GQA: 0 off, 1 on, 2 / 4 that pack) and
+    requested_head_loop (FLASH_ATTENTION_BWD_HEAD_LOOP) force or exclude candidates
+    (bwd_fold_candidates, bwd_fold_forced); forced candidates skip the heuristic and the
+    deterministic rules.
+    """
+    if inputs.requested_tile_n is not None or not can_use_bwd_fold(
+        inputs, use_dedicated_hd256_kernel=use_dedicated_hd256_kernel
+    ):
+        return BWD_FOLD_OFF
+    candidates = bwd_fold_candidates(inputs, tile_m=tile_m)
     if not candidates:
         return BWD_FOLD_OFF
+    qh = inputs.qhead_per_kvhead
+    seqlen_q = inputs.max_seqlen_q
+    m_blocks = ceil_div(seqlen_q, tile_m)
+    head_loop_possible = inputs.is_hdim256
+    pack_override, loop_override = inputs.requested_pack_gqa, inputs.requested_head_loop
 
     def fold(cand):
-        return cand.pack_factor * (qh // cand.pack_factor if cand.head_loop else 1)
-
-    # largest fold first; for equal folds pack 2 (+ loop) before the unpacked loop before a
-    # wider pack
-    candidates.sort(key=lambda cand: (-fold(cand), cand.pack_factor != 2, not cand.head_loop))
+        return bwd_fold_heads(cand, qh)
 
     def forced(cand):
-        return (cand.head_loop and loop_override is True) or (
-            cand.pack_factor > 1 and pack_override is not None and pack_override >= 1
-        )
+        return bwd_fold_forced(cand, inputs)
 
     def accepted(cand):
         # the heuristic sees the fold as the packed group: one tile per fold query heads
@@ -2646,9 +2678,10 @@ def select_bwd_fold(
 
 def bwd_selection_reads_num_sms(inputs: BwdHeuristicInputs) -> bool:
     """Whether select_bwd_config reads inputs.num_sms: only select_bwd_fold does, for SM100 calls
-    that can fold (no FLASH_ATTENTION_BWD_TILE_N) and leave a candidate to the heuristic:
-    every one without FLASH_ATTENTION_BWD_PACK_GQA, else the hdim 256 head loop unless
-    FLASH_ATTENTION_BWD_HEAD_LOOP settles it.
+    that can fold (no FLASH_ATTENTION_BWD_TILE_N) and leave a candidate to the heuristic, one
+    bwd_fold_candidates lists that the env knobs do not force (bwd_fold_forced). A call without
+    one (an odd qhead_per_kvhead off hdim 256, a forced pack) selects its config unpacked or
+    as forced.
 
     The interface looks the SM count up only then, so cross-compiling other calls needs no
     FLASH_ATTENTION_NUM_SMS.
@@ -2657,12 +2690,9 @@ def bwd_selection_reads_num_sms(inputs: BwdHeuristicInputs) -> bool:
         inputs, use_dedicated_hd256_kernel=inputs.uses_dedicated_hd256_kernel
     ):
         return False
-    if inputs.requested_pack_gqa is None:
-        return True
-    return (
-        inputs.requested_pack_gqa <= 1
-        and inputs.is_hdim256
-        and inputs.requested_head_loop is None
+    return any(
+        not bwd_fold_forced(cand, inputs)
+        for cand in bwd_fold_candidates(inputs, tile_m=SM100_BWD_TILE_M)
     )
 
 

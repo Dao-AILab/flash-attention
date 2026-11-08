@@ -168,8 +168,8 @@ class DynamicPersistentSchedulerState(SchedulerState):
 # Grids still count physical CTAs (physical_x = C * cluster_slot + cta_rank). Without
 # use_cluster_idx (sm90 backward, cluster 1) the same schedulers hand out CTA tiles as before.
 # The head is a scheduler head (NOTE [SM100 backward coordinate spaces]): num_head counts
-# query heads, packed groups, or KV heads under the head loop; qhead_fold / qhead_pack tell
-# the deterministic schedulers how many query heads' Q / dO / dQaccum one tile touches.
+# query heads, packed groups, or KV heads under the head loop; qhead_fold tells the
+# deterministic schedulers how many query heads' Q / dO / dQaccum one tile touches.
 
 
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
@@ -265,12 +265,11 @@ class TileSchedulerArguments(ParamsBase):
     # every batch's first splits launch before the excess splits, which exit at once. Cluster
     # shape (1, 1) only.
     split_major: cutlass.Constexpr[bool] = False
-    # Backward GQA: each KV-head tile processes qhead_fold query heads in total.
-    # Each head-loop iteration packs qhead_pack query heads into the tile's rows.
-    # Deterministic schedulers size their L2 sections using the combined Q, dO,
-    # and dQaccum memory footprint of all qhead_fold query heads.
+    # Backward GQA: each tile processes qhead_fold query heads in total (its packed heads
+    # and, under the head loop, every sub-group of the KV head). Deterministic schedulers size
+    # their L2 sections using the combined Q, dO, and dQaccum memory footprint of all
+    # qhead_fold query heads; the backward passes seqlen_k as unpacked Q rows for that.
     qhead_fold: cutlass.Constexpr[int] = 1
-    qhead_pack: cutlass.Constexpr[int] = 1
 
 
 class SingleTileScheduler:
@@ -842,10 +841,9 @@ class SingleTileLPTBwdScheduler:
             )
             size_one_dqaccum_head = cutlass.Int64(args.seqlen_k) * (args.headdim) * 4
             # size_one_dqaccum_head = 0
-            # seqlen_k here is mQ's rows, which already hold the packed heads
-            size_one_head = (
-                (size_one_qdo_head + size_one_dqaccum_head) * args.qhead_fold // args.qhead_pack
-            )
+            # seqlen_k here is the unpacked Q rows: every query head of the fold adds a full
+            # Q / dO / dQaccum footprint
+            size_one_head = (size_one_qdo_head + size_one_dqaccum_head) * args.qhead_fold
             log2_floor = lambda n: 31 - clz(n)
             swizzle = (
                 1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))

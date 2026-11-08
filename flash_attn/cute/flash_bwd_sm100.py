@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
 import enum
 import math
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -158,6 +158,20 @@ class CtaSchedule(enum.Enum):
     ONE_CTA = enum.auto()
     TWO_CTA_PIPELINED = enum.auto()
     TWO_CTA_SERIAL = enum.auto()
+
+
+class QSideLoaders(NamedTuple):
+    """The Q-side loaders of one query head or packed group of a backward tile
+    (FlashAttentionBackwardSm100._q_side_loaders): TMA producer copies for Q, dO and, 2-CTA
+    only, dO.T and Q.T (None otherwise), and the LSE / dPsum tiles (one row block per
+    m_block) the stats copies read."""
+
+    load_Q: Callable
+    load_dO: Callable
+    load_dOt: Optional[Callable]
+    load_Qt: Optional[Callable]
+    gLSE: cute.Tensor
+    gdPsum: cute.Tensor
 
 
 class FlashAttentionBackwardSm100:
@@ -1063,7 +1077,9 @@ class FlashAttentionBackwardSm100:
             if const_expr(mCuSeqlensK is None)
             else cute.size(mCuSeqlensK.shape[0] - 1),  # num_batches
             1,  # num_splits
-            cute.size(mQ.shape[0]),  # pass seqlen_q or total_q for seqlen_k
+            # unpacked Q rows (seqlen_q, or total_q) for seqlen_k: mQ's rows hold the packed
+            # heads, pack_factor per token
+            cute.size(mQ.shape[0]) // self.pack_factor,
             mQ.shape[1],  # headdim
             mV.shape[1],  # headdim_v
             total_q=cute.size(mK.shape[0])  # pass total_k for total_q
@@ -1084,7 +1100,6 @@ class FlashAttentionBackwardSm100:
             # the tile's Q / dO / dQaccum footprint covers its packed heads and, with the head
             # loop, every sub-group of the KV head; it sizes the deterministic L2 section
             qhead_fold=self.pack_factor * self.groups_per_tile,
-            qhead_pack=self.pack_factor,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -2112,19 +2127,19 @@ class FlashAttentionBackwardSm100:
         thr_mma_dV,
         thr_mma_dK,
         tma_atom_Q,
-        tma_atom_dOt,
         tma_atom_dO,
+        tma_atom_dOt,
         tma_atom_Qt,
         sQ,
-        sdOt,
         sdO,
+        sdOt,
         sQt,
         pipeline_Q,
         pipeline_dO,
         pipeline_Qt,
         q_do_mcast_mask,
         block_in_cluster_coord_vmnk,
-    ):
+    ) -> "QSideLoaders":
         mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_q]
         if const_expr(not seqlen.has_cu_seqlens_q):
             mdO_cur = mdO[None, None, head_q, batch_idx]
@@ -2204,7 +2219,14 @@ class FlashAttentionBackwardSm100:
                 mcast_mask=q_do_mcast_mask,
             )
             load_Qt = copy_utils.tma_producer_copy_fn(load_Qt, pipeline_Qt)
-        return load_Q, load_dO, load_dOt, load_Qt, gLSE, gdPsum
+        return QSideLoaders(
+            load_Q=load_Q,
+            load_dO=load_dO,
+            load_dOt=load_dOt,
+            load_Qt=load_Qt,
+            gLSE=gLSE,
+            gdPsum=gdPsum,
+        )
 
     @cute.jit
     def load(
@@ -2445,12 +2467,12 @@ class FlashAttentionBackwardSm100:
                     thr_mma_dV,
                     thr_mma_dK,
                     tma_atom_Q,
-                    tma_atom_dOt,
                     tma_atom_dO,
+                    tma_atom_dOt,
                     tma_atom_Qt,
                     sQ,
-                    sdOt,
                     sdO,
+                    sdOt,
                     sQt,
                     pipeline_Q,
                     pipeline_dO,
@@ -2460,7 +2482,9 @@ class FlashAttentionBackwardSm100:
                 )
                 for g in range(n_groups)
             ]
-            load_Q, load_dO, load_dOt, load_Qt, gLSE, gdPsum = loaders_g[0]
+            load_Q, load_dO = loaders_g[0].load_Q, loaders_g[0].load_dO
+            load_dOt, load_Qt = loaders_g[0].load_dOt, loaders_g[0].load_Qt
+            gLSE, gdPsum = loaders_g[0].gLSE, loaders_g[0].gdPsum
 
             copy_atom_stats = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
             copy_stats = partial(cute.copy, copy_atom_stats)
@@ -2537,9 +2561,9 @@ class FlashAttentionBackwardSm100:
                         # query-head (sub-)groups of this KV head follow, reusing the resident
                         # K / V / Kt: only their Q side is loaded
                         for g in cutlass.range_constexpr(n_groups):
-                            load_Q_g, load_dO_g, load_dOt_g, load_Qt_g, gLSE_g, gdPsum_g = (
-                                loaders_g[g]
-                            )
+                            load_Q_g, load_dO_g = loaders_g[g].load_Q, loaders_g[g].load_dO
+                            load_dOt_g, load_Qt_g = loaders_g[g].load_dOt, loaders_g[g].load_Qt
+                            gLSE_g, gdPsum_g = loaders_g[g].gLSE, loaders_g[g].gdPsum
                             m_block_first = m_block_min + 1 if g == 0 else m_block_min
                             for m_block in cutlass.range(m_block_first, m_block_max, unroll=1):
                                 # LSE

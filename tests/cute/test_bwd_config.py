@@ -772,15 +772,24 @@ def _identity_score_mod(score, b, h, q_idx, kv_idx, aux_tensors):
 
 
 @pytest.mark.parametrize(
-    ("head_dim", "score_mod", "can_pack"),
-    [(128, None, True), (256, None, False), (128, _identity_score_mod, False)],
-    ids=["pack_gqa", "hdim256", "score_mod"],
+    ("head_dim", "nheads", "score_mod", "can_pack"),
+    [
+        (128, 16, None, True),
+        (256, 16, None, False),
+        (128, 16, _identity_score_mod, False),
+        # 6 query heads over 2 KV heads (ratio 3): no pack divides it and the head loop is
+        # hdim 256 only, so there is no fold candidate to choose between
+        (128, 6, None, False),
+    ],
+    ids=["pack_gqa", "hdim256", "score_mod", "odd_ratio"],
 )
 def test_cross_compiled_gqa_backward_needs_num_sms_only_to_pack(
-    head_dim, score_mod, can_pack, monkeypatch
+    head_dim, nheads, score_mod, can_pack, monkeypatch
 ):
     """A GQA backward cross-compiled for SM100 without a matching GPU or FLASH_ATTENTION_NUM_SMS
-    selects its config unless the pack_gqa heuristic, the only reader of the SM count, runs."""
+    selects its config unless the pack_gqa heuristic, the only reader of the SM count, runs:
+    it does not run without a fold candidate (hdim 256 on the dedicated kernel, score_mod, an
+    odd qhead_per_kvhead off hdim 256)."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     from flash_attn.cute import interface
@@ -801,11 +810,11 @@ def test_cross_compiled_gqa_backward_needs_num_sms_only_to_pack(
     monkeypatch.setattr(interface, "_bwd_preprocess", lambda *args, **kwargs: None)
     monkeypatch.setattr(interface._flash_attn_bwd, "compile_cache", LookupSpy())
     with FakeTensorMode():
-        q = torch.empty(2, 512, 16, head_dim, dtype=torch.bfloat16)
-        k = torch.empty(2, 512, 4, head_dim, dtype=torch.bfloat16)
+        q = torch.empty(2, 512, nheads, head_dim, dtype=torch.bfloat16)
+        k = torch.empty(2, 512, 2 if nheads == 6 else 4, head_dim, dtype=torch.bfloat16)
         v = torch.empty_like(k)
         out = torch.empty_like(q)
-        lse = torch.empty(2, 16, 512, dtype=torch.float32)
+        lse = torch.empty(2, nheads, 512, dtype=torch.float32)
         expected = (RuntimeError, "SM count") if can_pack else (_KeyLookedUp, None)
         with pytest.raises(expected[0], match=expected[1]):
             interface._flash_attn_bwd(
