@@ -230,6 +230,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     key_leftpad=None,
+    return_lse=False,
 ):
     """
     Arguments:
@@ -302,6 +303,9 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    if return_lse:  # a row without keys has an infinite LSE, as in FlashAttention
+        lse = torch.logsumexp(scores, dim=-1)
+        return output.to(dtype=dtype_og), attention.to(dtype=dtype_og), lse.masked_fill(lse == float("-inf"), float("inf"))
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
@@ -319,6 +323,7 @@ def attention_kvpacked_ref(
     upcast=True,
     reorder_ops=False,
     key_leftpad=None,
+    return_lse=False,
 ):
     return attention_ref(
         q,
@@ -335,6 +340,7 @@ def attention_kvpacked_ref(
         softcap=softcap,
         reorder_ops=reorder_ops,
         key_leftpad=key_leftpad,
+        return_lse=return_lse,
     )
 
 
@@ -1590,9 +1596,10 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
 )
 # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
 @pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
 def test_flash_attn_varlen_causal(
-    seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype
+    seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, mha_type, dtype
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -1607,20 +1614,21 @@ def test_flash_attn_varlen_causal(
     torch.random.manual_seed(0)
     batch_size = 8
     nheads = 9
+    nheads_k = nheads if mha_type == "mha" else 3
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
 
     if paged_kv_block_size is None:
         k = torch.randn(
-            batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True
+            batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
         )
         v = torch.randn(
-            batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True
+            batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
         )
         block_table = None
     else:
         k, v, block_table, k_cache_paged, v_cache_paged, num_blocks = _generate_block_kvcache(
-            seqlen_k, paged_kv_block_size, batch_size, nheads, d, device, dtype
+            seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
         )
     query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
     key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random")
@@ -1639,7 +1647,7 @@ def test_flash_attn_varlen_causal(
         dq_pad_fn,
         dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
-    out_unpad = flash_attn_varlen_func(
+    out_unpad, lse, _ = flash_attn_varlen_func(
         q_unpad,
         k_unpad if paged_kv_block_size is None else k_cache_paged,
         v_unpad if paged_kv_block_size is None else v_cache_paged,
@@ -1651,9 +1659,10 @@ def test_flash_attn_varlen_causal(
         causal=causal,
         window_size=window_size,
         block_table=block_table,
+        return_attn_probs=True,
     )
     out = output_pad_fn(out_unpad)
-    out_ref, attn_ref = attention_ref(
+    out_ref, attn_ref, lse_ref = attention_ref(
         q,
         k,
         v,
@@ -1664,6 +1673,7 @@ def test_flash_attn_varlen_causal(
         None,
         causal=causal,
         window_size=window_size,
+        return_lse=True,
     )
     out_pt, attn_pt = attention_ref(
         q,
@@ -1684,6 +1694,11 @@ def test_flash_attn_varlen_causal(
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+    lse_ref = rearrange(lse_ref, "b h s -> b s h")[query_padding_mask].T  # (nheads, total_q), as softmax_lse
+    print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+    # With a paged KV cache, the LSE of rows without keys goes to the wrong place (#3004)
+    if paged_kv_block_size is None or (key_padding_mask.sum(-1) >= query_padding_mask.sum(-1)).all():
+        assert torch.allclose(lse, lse_ref, rtol=0, atol=1e-3)
 
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
