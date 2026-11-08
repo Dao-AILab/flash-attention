@@ -269,6 +269,10 @@ def test_split_selection(changes, expected_splits, expected_tile_n):
         ({**_HD128}, dict(ex2_emu_start_frg=-1), "must be >= 0"),
         ({"device_arch": 90, **_HD128}, dict(ex2_emu_freq=16), "SM100-only options"),
         ({"device_arch": 80}, dict(ex2_emu_start_frg=1), "SM100-only options"),
+        # Softmax stats release order: either order is valid outside S ping-pong; SM100-only.
+        ({}, dict(sm_stats_cross_stage=False), None),
+        ({"max_seqlen_q": 1}, dict(sm_stats_cross_stage=True), "softmax stats release order"),
+        ({"device_arch": 90, **_HD128}, dict(sm_stats_cross_stage=True), "SM100-only options"),
         # SMEM layout: any layout that fits is the caller's choice.
         ({**_HD128}, dict(kv_stage=2), None),
         ({**_HD128}, dict(kv_stage=1), r"kv_stage must be in \[2, 32\], got 1"),
@@ -532,6 +536,21 @@ def test_clc_respects_cuda_grid_limits(changes, clc):
     if not clc:
         with pytest.raises(ValueError, match="CLC is not supported"):
             derive_fwd_config(config, inputs, use_clc_scheduler=True, is_static_persistent=False)
+
+
+def test_softmax_stats_release_order_follows_the_measured_table():
+    # BF16 hd64 non-causal measured faster with cross-stage on SM100, same-stage on SM103.
+    inputs = make_inputs(device_arch=100)
+    assert select_fwd_config(inputs).sm_stats_cross_stage
+    assert not select_fwd_config(inputs._replace(device_arch=103)).sm_stats_cross_stage
+    assert not select_fwd_config(
+        inputs._replace(dtype="torch.float8_e4m3fn", **_HD128)
+    ).sm_stats_cross_stage
+    # S ping-pong never uses cross-stage; deriving without it re-derives the table choice.
+    decode = inputs._replace(max_seqlen_q=1)
+    decode_config = select_fwd_config(decode)
+    assert decode_config.use_s_ping_pong and not decode_config.sm_stats_cross_stage
+    assert derive_fwd_config(decode_config, decode, use_s_ping_pong=False).sm_stats_cross_stage
 
 
 # Frozen copies of the register and SMEM policy the forward kernels applied before it moved

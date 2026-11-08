@@ -52,6 +52,7 @@ _BASE_CONFIG = FwdConfig(
     ex2_emu_start_frg=1,
     overlap_sO_sQ=False,
     kv_stage=12,
+    sm_stats_cross_stage=False,
 )
 
 
