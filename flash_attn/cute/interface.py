@@ -742,6 +742,9 @@ def _flash_attn_fwd(
     mla_1cta_kb64 = mla_kernel == "1cta_kb64"
     use_swapab = mla_kernel is None and config.use_swapab
     prepare_split_metadata = mla_kernel is None and needs_split_metadata(config, inputs)
+    use_dynamic_varlen = (
+        mla_kernel is None and config.use_dynamic_varlen and scheduler_metadata is None
+    )
 
     is_split_kv = num_splits > 1
     if is_split_kv:
@@ -883,6 +886,13 @@ def _flash_attn_fwd(
     if qv is not None:
         # the MLA kernels write all num_splits partials (no per-batch dynamic split counts)
         assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
+    if use_dynamic_varlen:
+        # The dynamic scheduler computes tile counts on device and resets its semaphore at exit:
+        # no prepare kernel is needed. Allocate a zeroed semaphore per call; callers can reuse
+        # their own via scheduler_metadata to avoid the fill launch.
+        scheduler_metadata = SchedulerMetadataTensorsTorch(
+            tile_count_semaphore=torch.zeros(1, dtype=torch.int32, device=device)
+        )
     if prepare_split_metadata:
         scheduler_metadata = _get_scheduler_metadata(
             num_batch=batch_size,
@@ -1046,7 +1056,13 @@ def _flash_attn_fwd(
         tensormap_workspace = torch.empty((n_ctas, 16), dtype=torch.int64, device=q.device)
 
     compile_key = (
-        fwd_codegen_config(config),
+        # use_dynamic_varlen only decides who allocates the semaphore, whose presence is keyed
+        # below: a routed call and one passing its own semaphore share a kernel when their
+        # configs otherwise match (the route keeps the unrouted exp2 emulation, so SM100 hd256
+        # can differ).
+        replace(fwd_codegen_config(config), use_dynamic_varlen=False)
+        if isinstance(config, FwdConfig)
+        else fwd_codegen_config(config),
         dtype,
         head_dim,
         head_dim_v,
@@ -3819,7 +3835,13 @@ def flash_attn_varlen_func(
         Used with gather_kv_indices to determine if we need oob masking.
 
     scheduler_metadata: optional tensors used by certain tile schedulers, for optimization
-        and functionality. computed in get_scheduler_metadata.
+        and functionality. computed in get_scheduler_metadata. On SM100, eligible padded varlen
+        calls may route to DynamicPersistentVarlenScheduler, which allocates a zeroed semaphore
+        per call. Eager loops can avoid that fill by passing
+        SchedulerMetadataTensorsTorch(tile_count_semaphore=sem), with one initially zeroed
+        int32[1] semaphore per stream. The kernel resets it at exit; concurrent launches must
+        not share it. On SM100 hd256 that call may select a different exp2 emulation than the
+        routed one, so outputs need not be bitwise equal.
 
     seqlen_k_per_split: when using dynamic (per-batch) num_splits, can set a fixed seqlen_k to be
         covered per split for bitwise reproducibility.

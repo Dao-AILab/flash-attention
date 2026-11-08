@@ -144,8 +144,9 @@ def test_varlen_dynamic_scheduler_metadata_reuse(lengths, capacity, heads, num_s
 
     refs = [flash_attn_varlen_func(q, k, v, scheduler_metadata=metadata(), **kwargs)[0]
             for q in qs]
-    if num_splits == 1:  # same per-tile math as the default single-tile scheduler
-        assert torch.equal(refs[0], flash_attn_varlen_func(qs[0], k, v, **kwargs)[0])
+    if num_splits == 1:  # same per-tile math as the single-tile scheduler
+        single_tile = flash_attn_varlen_func(qs[0], k, v, disable_scheduler_metadata=True, **kwargs)
+        assert torch.equal(refs[0], single_tile[0])
     md = metadata()
     assert md.tile_count_semaphore is not None
     outs = [flash_attn_varlen_func(q, k, v, scheduler_metadata=md, **kwargs)[0] for q in qs]
