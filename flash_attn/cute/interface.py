@@ -8,7 +8,7 @@ import operator
 import warnings
 from dataclasses import replace
 from functools import lru_cache
-from typing import Callable, Optional, Tuple
+from typing import Callable, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -430,6 +430,68 @@ def _compute_blocks_to_batch(cu_total_blocks, num_blocks, device):
 _compute_blocks_to_batch.compile_cache = get_jit_cache("blocks_to_batch")
 
 
+class TensorwiseScales(NamedTuple):
+    """FP8 dequantization scales: one fp32 value per (batch, kv_head) for each of Q, K and V.
+
+    A missing member is 1. With MLA (qv), Q @ K^T and Qv @ V^T share one accumulator, so K and V
+    take one descale: pass the same tensor as k and v (only v when there is no q / k rope part).
+    Passing one tensor as both k and v (head_dim 512) also means one descale: k and v must then be
+    the same tensor or both None.
+    """
+
+    q: torch.Tensor | None = None
+    k: torch.Tensor | None = None
+    v: torch.Tensor | None = None
+
+
+def _check_shared_kv_scales(scales) -> None:
+    """Reject distinct K / V descales when one tensor is both K and V.
+
+    The shared head_dim-512 K / V call runs as no-rope MLA, whose kernel folds the single latent
+    descale into the scores as well as the output, so scales.k and scales.v must agree.
+    """
+    if isinstance(scales, TensorwiseScales):
+        assert scales.k is scales.v, (
+            "k is v: scales.k and scales.v must be the same tensor (or both None), since one "
+            "tensor has one descale"
+        )
+
+
+def _validate_tensorwise_scales(
+    scales: TensorwiseScales,
+    q: torch.Tensor | None,
+    v: torch.Tensor,
+    qv: torch.Tensor | None,
+    *,
+    batch_size: int,
+    num_head_kv: int,
+) -> TensorwiseScales:
+    """Check FP8 descales against the inputs; return them in a kernel-compatible layout.
+
+    maybe_contiguous keeps ABI-valid strided or broadcast tensors as they are. All-unset scales
+    pass through.
+    """
+    if all(t is None for t in scales):
+        return scales
+    assert v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2), (
+        "TensorwiseScales are only supported for FP8 inputs"
+    )
+    for t, name in zip(scales, ("scales.q", "scales.k", "scales.v")):
+        if t is not None:
+            _validate_tensor(t, name, (batch_size, num_head_kv), torch.float32, v.device)
+    if qv is not None and scales.k is not scales.v:
+        # one tensor, not equal values: comparing values would sync the device
+        assert q is None, (
+            "MLA absorbed requires scales.k and scales.v to be the same tensor: Q@K^T and "
+            "Qv@V^T share one accumulator, so one descale must fold into the softmax scale"
+        )
+        assert scales.k is None, (
+            "MLA without q / k (no rope part) reads the latent cache as v: pass its descale as "
+            "scales.v (scales.k, if given, must be the same tensor)"
+        )
+    return TensorwiseScales(*(maybe_contiguous(t, align_bytes=4) for t in scales))
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -463,9 +525,7 @@ def _flash_attn_fwd(
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
     aux_scalars: Optional[tuple] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
+    scales: TensorwiseScales | None = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     seqlen_k_per_split: Optional[int] = None,
@@ -489,6 +549,7 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
+        scales: Dequantization scales of low-precision Q/K/V (see TensorwiseScales).
         config: Fully resolved forward config, or None for the default: an MlaFwdConfig with qv,
             else a FwdConfig.
     """
@@ -500,13 +561,6 @@ def _flash_attn_fwd(
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
-    # MLA needs K and V to share one descale tensor: check identity before maybe_contiguous
-    kv_descale_shared = k_descale is not None and k_descale is v_descale
-    q_descale, k_descale, v_descale = [
-        maybe_contiguous(t, align_bytes=4) for t in (q_descale, k_descale, v_descale)
-    ]
-    if kv_descale_shared:
-        v_descale = k_descale
     page_table = maybe_contiguous(page_table, align_bytes=4)
     learnable_sink = maybe_contiguous(learnable_sink, align_bytes=4)
     gather_kv_indices = maybe_contiguous(gather_kv_indices, align_bytes=16)
@@ -532,6 +586,20 @@ def _flash_attn_fwd(
         seqlen_k = v.shape[-3]
     num_head_kv = v.shape[-2]
     head_dim_v = v.shape[-1]
+    # The scale format is the type of scales, not the dtype of its tensors: each format is one
+    # type with one validator. Other formats (block scales, lookup-table or codebook
+    # dequantization) slot in as a new type and a new case.
+    descales = TensorwiseScales()
+    match scales:
+        case None:
+            pass
+        case TensorwiseScales():
+            descales = _validate_tensorwise_scales(
+                scales, q, v, qv, batch_size=batch_size, num_head_kv=num_head_kv
+            )
+        case _:
+            raise TypeError(f"scales must be TensorwiseScales or None, got {type(scales).__name__}")
+    has_descale = any(t is not None for t in descales)
     if cu_seqlens_k is None:
         if page_table is None:
             assert k is None or k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -588,9 +656,6 @@ def _flash_attn_fwd(
                 k,
                 v,
                 qv,
-                q_descale,
-                k_descale,
-                v_descale,
                 cu_seqlens_q,
                 cu_seqlens_k,
                 seqused_q,
@@ -663,21 +728,6 @@ def _flash_attn_fwd(
                 lse.copy_(learnable_sink if qv is not None else learnable_sink[:, None])
         return out, lse, None, None, None
 
-    if is_fp8:
-        for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
-            if t is not None:
-                _validate_tensor(
-                    t,
-                    name,
-                    (batch_size, num_head_kv),
-                    torch.float32,
-                    device,
-                )
-    else:
-        assert q_descale is None and k_descale is None and v_descale is None, (
-            "q_descale/k_descale/v_descale are only supported for FP8 inputs"
-        )
-
     dtype = torch2cute_dtype_map[q_dtype]
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
@@ -733,7 +783,7 @@ def _flash_attn_fwd(
         mla=None if qv is None else dict(
             is_topk_gather=gather_kv_indices is not None,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
-            has_descale=any(t is not None for t in (q_descale, k_descale, v_descale)),
+            has_descale=has_descale,
         ),
     )
     num_splits = config.num_splits
@@ -817,22 +867,6 @@ def _flash_attn_fwd(
         assert q is None or head_dim == 64
         assert not local, "local not yet supported with qv"
         # validate_mla_fwd_config keeps descales, fp8 and split kv on the 1CTA kernel.
-        if q is not None and (k_descale is not None or v_descale is not None):
-            # one tensor, not equal values: comparing values would sync the device
-            assert k_descale is not None and v_descale is not None, (
-                "MLA absorbed needs k_descale and v_descale together (or neither)"
-            )
-            assert kv_descale_shared, (
-                "MLA absorbed requires k_descale and v_descale to be the same tensor: "
-                "Q@K^T and Qv@V^T share one accumulator, so one descale must fold into "
-                "the softmax scale"
-            )
-        elif k_descale is not None:
-            # without a rope part S = Qv @ V^T only: the latent cache's descale is v_descale
-            assert kv_descale_shared, (
-                "MLA without q / k (no rope part) reads the latent cache as v: pass its "
-                "descale as v_descale (k_descale, if given, must be the same tensor)"
-            )
         assert softcap is None
         assert score_mod is None
         assert mask_mod is None
@@ -1015,9 +1049,7 @@ def _flash_attn_fwd(
             v,
             qv,
             page_table,
-            q_descale,
-            k_descale,
-            v_descale,
+            *descales,
             gather_kv_indices,
         )
     )
@@ -1089,9 +1121,7 @@ def _flash_attn_fwd(
             if learnable_sink is not None
             else None
         ),
-        q_descale is not None,
-        k_descale is not None,
-        v_descale is not None,
+        *(t is not None for t in descales),
         block_sparse_tensors is None or block_sparse_tensors.cu_total_m_blocks is None,
         block_sparse_tensors is None or block_sparse_tensors.cu_block_idx_offsets is None,
         arch,
@@ -1159,19 +1189,9 @@ def _flash_attn_fwd(
         else:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
-        q_descale_tensor, k_descale_tensor, v_descale_tensor = (
-            to_cute_tensor(t, assumed_align=4, leading_dim=1)
-            for t in (q_descale, k_descale, v_descale)
-        )
         descale_tensors_tensor = (
-            DescaleTensors(
-                q_descale=q_descale_tensor,
-                k_descale=k_descale_tensor,
-                v_descale=v_descale_tensor,
-            )
-            if q_descale_tensor is not None
-            or k_descale_tensor is not None
-            or v_descale_tensor is not None
+            DescaleTensors(*(to_cute_tensor(t, assumed_align=4, leading_dim=1) for t in descales))
+            if has_descale
             else None
         )
 
@@ -1453,11 +1473,7 @@ def _flash_attn_fwd(
                 t.view(torch.uint8) if t is not None else None
                 for t in (q_call, k_call, v_call, qv_call)
             ]
-        descale_tensors = (
-            DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
-            if q_descale is not None or k_descale is not None or v_descale is not None
-            else None
-        )
+        descale_tensors = DescaleTensors(*descales) if has_descale else None
         if qv is not None:
             _flash_attn_fwd.compile_cache[compile_key](
                 q_call,
@@ -3344,10 +3360,12 @@ class FlashAttnFunc(torch.autograd.Function):
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
         config: FwdConfig | MlaFwdConfig | None = None,
+        scales: TensorwiseScales | None = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
+            _check_shared_kv_scales(scales)
             # specialize MLA attention formula
             # O = softmax(Q @ K.T + Qv @ V.T) @ V
             # by setting q, k to None
@@ -3375,6 +3393,7 @@ class FlashAttnFunc(torch.autograd.Function):
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             config=config,
+            scales=scales,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -3422,9 +3441,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 15)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 15)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3453,7 +3472,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 15)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3494,10 +3513,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
         config: FwdConfig | MlaFwdConfig | None = None,
+        scales: TensorwiseScales | None = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
+            _check_shared_kv_scales(scales)
             # specialize MLA attention formula
             # O = softmax(Q @ K.T + Qv @ V.T) @ V
             # by setting q, k to None
@@ -3536,6 +3557,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             disable_scheduler_metadata=disable_scheduler_metadata,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             config=config,
+            scales=scales,
         )
         ctx.save_for_backward(
             q,
@@ -3609,9 +3631,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 17)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 18)
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 17)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 18)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3645,7 +3667,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 17)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 18)
 
 
 def _validate_gather_bwd_kwargs(
@@ -3710,7 +3732,13 @@ def flash_attn_func(
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
     config: FwdConfig | MlaFwdConfig | None = None,
+    scales: TensorwiseScales | None = None,
 ):
+    """Compute attention.
+
+    scales: dequantization scales of low-precision Q/K/V; TensorwiseScales for FP8, which is
+        forward-only. None for unscaled inputs (FP8 then uses descale 1).
+    """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -3753,6 +3781,7 @@ def flash_attn_func(
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
         config,
+        scales,
     )
 
 
@@ -3791,6 +3820,7 @@ def flash_attn_varlen_func(
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
     config: FwdConfig | MlaFwdConfig | None = None,
+    scales: TensorwiseScales | None = None,
 ):
     """
     Tensor arguments:
@@ -3868,6 +3898,8 @@ def flash_attn_varlen_func(
         the call (raises if it cannot run it), then used as given: it decides the kernel, tiles
         and split count in place of num_splits and FLASH_ATTENTION_MLA_1CTA. None (default)
         selects one. The backward is unaffected.
+    scales: dequantization scales of low-precision Q/K/V; TensorwiseScales for FP8, which is
+        forward-only. None for unscaled inputs (FP8 then uses descale 1).
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -3907,6 +3939,7 @@ def flash_attn_varlen_func(
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
         config,
+        scales,
     )
 
 
