@@ -8,6 +8,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 from cutlass.cute import FastDivmodDivisorV2
 from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.utils import LayoutEnum, TensorMapManager, TensorMapUpdateMode
@@ -118,6 +119,20 @@ from flash_attn.cute.block_sparse_utils import (
 #   pf = 2 with head_loop, head_idx = 1: that is kv_head 1; the trips walk sub-group 0 then 1
 #   with scratch heads 1 * 2 + g = 2, 3, so in sub-group 1 packed row 5 is again token 2 of
 #   query head 7.
+
+
+@cute.jit
+def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
+    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+
+    The peer CTA's ``cp.async.bulk`` complete-tx releases at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with a release by a thread
+    of another CTA. ``cute.arch.mbarrier_wait`` has no scope argument, so this uses
+    the Primitives ``mbarrier_try_wait_parity`` with ``MBarrierScope.CLUSTER``,
+    which lowers to ``mbarrier.try_wait.parity.acquire.cluster``.
+    """
+    while not prims.mbarrier_try_wait_parity(mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER):
+        pass
 
 
 def work_kv_block(work_n, cta_rank, *, cta_group_size: int):
@@ -2093,8 +2108,9 @@ class FlashAttentionBackwardSm100:
 
             if process_tile:
                 for _ in cutlass.range(num_iters, unroll=1):
-                    # Wait for dS_xchg from peer CTA
-                    cute.arch.mbarrier_wait(dS_cluster_full_mbar_ptr, phase=dS_cluster_phase)
+                    # Wait for dS_xchg from peer CTA. Its bulk copy completes this
+                    # barrier with a cluster-scope release, so acquire at cluster scope.
+                    _mbarrier_wait_acquire_cluster(dS_cluster_full_mbar_ptr, dS_cluster_phase)
 
                     # Arrive on MMA leader warp
                     with cute.arch.elect_one():
