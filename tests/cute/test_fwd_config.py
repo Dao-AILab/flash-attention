@@ -58,6 +58,14 @@ def test_every_architecture_selects_a_valid_default(device_arch, causal):
         ({}, True, True),
         ({"device_arch": 90, "num_heads": 24, "num_heads_kv": 8, **_HD128}, None, True),
         ({"num_heads": 24, "num_heads_kv": 8, **_HD256}, None, False),
+        ({"num_heads": 24, "num_heads_kv": 8, **_HD256, "page_size": 128}, None, False),
+        # hd256 prefers 2CTA over PackGQA only where 2CTA is possible: not with other page
+        # sizes or FLASH_ATTENTION_DISABLE_2CTA (#3146). Block sparsity stays unpacked
+        # (non-divisible PackGQA faults, see test_flash_attn_hd256_features.py).
+        ({"num_heads": 24, "num_heads_kv": 8, **_HD256, "page_size": 896}, None, True),
+        ({"num_heads": 24, "num_heads_kv": 8, **_HD256, "disable_2cta": True}, None, True),
+        ({"num_heads": 24, "num_heads_kv": 8, **_HD256, "page_size": 896,
+          "use_block_sparsity": True}, None, False),
         # Per-head sparse masks force pack_gqa off, even over an explicit request.
         ({"num_heads_kv": 4, "use_block_sparsity": True, "sparse_mask_per_head": True},
          True, False),
