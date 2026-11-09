@@ -231,7 +231,7 @@ class AttentionMask:
                 and fastdiv_mods[0] is not None
                 and fastdiv_mods[1] is not None
             )
-            wrap_aux_indices = const_expr(
+            bound_aux_indices = const_expr(
                 has_fastdiv and mask_seqlen and const_expr(aux_data.tensors is not None)
             )
 
@@ -246,16 +246,16 @@ class AttentionMask:
                     head_idx_for_mod = head_idx * self.qhead_per_kvhead_packgqa + head_offset
                     row_for_mod = global_row_idx // self.qhead_per_kvhead_packgqa
                 row_for_seqlen = row_for_mod
-                if const_expr(wrap_aux_indices):
-                    _, row_for_mod = divmod(row_for_mod, fastdiv_mods[0])
+                if const_expr(bound_aux_indices):
+                    row_for_mod = utils.clamp_index(row_for_mod, fastdiv_mods[0])
 
                 for col in cutlass.range_constexpr(ncol):
                     col_idx_local = t0ScS_mn[0, col][COL]
                     # Convert to absolute column index
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
                     col_for_mod = global_col_idx
-                    if const_expr(wrap_aux_indices):
-                        _, col_for_mod = divmod(global_col_idx, fastdiv_mods[1])
+                    if const_expr(bound_aux_indices):
+                        col_for_mod = utils.clamp_index(global_col_idx, fastdiv_mods[1])
 
                     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
                     head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
@@ -443,7 +443,7 @@ class AttentionMask:
 
         Each accumulator lane calls mask_mod once with logical (batch, head, q, kv)
         indices. Pack-GQA rows are converted back to logical q/head indices before
-        the call. When aux tensors are present, indices are wrapped with fastdiv so
+        the call. When aux tensors are present, indices are clamped into [0, seqlen) so
         mask_mod never reads outside the per-example auxiliary storage.
         """
         has_fastdiv = const_expr(
@@ -469,10 +469,10 @@ class AttentionMask:
             mask_row_for_mod = mask_row
             if const_expr(has_fastdiv and aux_data.tensors is not None):
                 if check_q_boundary:
-                    _, mask_row_for_mod = divmod(mask_row, fastdiv_mods[0])
+                    mask_row_for_mod = utils.clamp_index(mask_row, fastdiv_mods[0])
             global_col_for_mod = global_col
             if const_expr(has_fastdiv and mask_seqlen and aux_data.tensors is not None):
-                _, global_col_for_mod = divmod(global_col, fastdiv_mods[1])
+                global_col_for_mod = utils.clamp_index(global_col, fastdiv_mods[1])
 
             head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
             mask_row_ssa = utils.scalar_to_ssa(mask_row_for_mod, cutlass.Int32)
@@ -548,7 +548,7 @@ class AttentionMask:
             mask_row_for_mod = mask_row
             if const_expr(has_fastdiv and aux_data.tensors is not None):
                 if check_q_boundary:
-                    _, mask_row_for_mod = divmod(mask_row, fastdiv_mods[0])
+                    mask_row_for_mod = utils.clamp_index(mask_row, fastdiv_mods[0])
 
             head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32).broadcast_to(
                 (vec_size,)
@@ -565,7 +565,7 @@ class AttentionMask:
                 col_j_global = col_j_coord + n_block * self.tile_n
                 col_j_for_mod = col_j_global
                 if const_expr(has_fastdiv and mask_seqlen and aux_data.tensors is not None):
-                    _, col_j_for_mod = divmod(col_j_global, fastdiv_mods[1])
+                    col_j_for_mod = utils.clamp_index(col_j_global, fastdiv_mods[1])
                 kv_idx_vec[j] = col_j_for_mod
             kv_idx_ssa = kv_idx_vec.load()
 
@@ -845,7 +845,7 @@ class AttentionMask:
                     and fastdiv_mods[0] is not None
                     and fastdiv_mods[1] is not None
                 )
-                wrap_aux_indices = const_expr(
+                bound_aux_indices = const_expr(
                     has_fastdiv and mask_seqlen and const_expr(aux_data.tensors is not None)
                 )
                 batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
@@ -860,9 +860,9 @@ class AttentionMask:
 
                     q_idx_for_mod = global_q
                     kv_idx_for_mod = global_kv
-                    if const_expr(wrap_aux_indices):
-                        _, q_idx_for_mod = divmod(global_q, fastdiv_mods[0])
-                        _, kv_idx_for_mod = divmod(global_kv, fastdiv_mods[1])
+                    if const_expr(bound_aux_indices):
+                        q_idx_for_mod = utils.clamp_index(global_q, fastdiv_mods[0])
+                        kv_idx_for_mod = utils.clamp_index(global_kv, fastdiv_mods[1])
 
                     q_idx_ssa = utils.scalar_to_ssa(q_idx_for_mod, cutlass.Int32)
                     kv_idx_ssa = utils.scalar_to_ssa(kv_idx_for_mod, cutlass.Int32)
