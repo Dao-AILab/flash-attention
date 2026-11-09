@@ -2375,7 +2375,9 @@ class BwdConfig:
     KV head's remaining qhead_per_kvhead / pack_factor sub-groups are separate tiles whose
     dK / dV go through the fp32 accumulate + postprocess, or, with head_loop (hdim 256 on the
     generic kernel), the passes of one tile per KV head that keeps K / V resident and dK / dV
-    in TMEM.
+    in TMEM. fold_LSE_dPsum (SM100 generic kernel only) folds the
+    LSE / dPsum subtractions into the S / dP MMAs (NOTE [hdim64 LSE / dPsum fold into the S / dP
+    MMA] in flash_bwd_sm100.py).
     """
 
     device_capacity: int
@@ -2399,6 +2401,7 @@ class BwdConfig:
     use_dedicated_hd256_kernel: bool
     pack_factor: int
     head_loop: bool
+    fold_LSE_dPsum: bool
     registers: BwdRegisters
 
     @property
@@ -2415,8 +2418,8 @@ class BwdConfig:
 class BwdHeuristicInputs(NamedTuple):
     """Host metadata for backward config selection and validation.
 
-    Holds only the facts the policy reads. sparse_block_size_q / sparse_block_size_kv are the
-    caller's block_size, None when unset. num_sms, batch_size, the sequence bounds, and the
+    Holds only the facts the policy reads. dtype is str(torch.dtype) of the inputs.
+    sparse_block_size_q / sparse_block_size_kv are the caller's block_size, None when unset. num_sms, batch_size, the sequence bounds, and the
     token totals feed only the SM100 query-head fold chooser (select_bwd_fold and
     bwd_pack_gqa_heuristic); max_seqlen_q / max_seqlen_k are the mean sequence length for
     varlen calls without a host bound (the total, as an upper bound, refuses every causal
@@ -2428,6 +2431,7 @@ class BwdHeuristicInputs(NamedTuple):
     head_dim_v: int
     num_heads: int
     num_heads_kv: int
+    dtype: str
     num_sms: int = 0
     batch_size: int = 1
     max_seqlen_q: int = 1
@@ -2443,6 +2447,9 @@ class BwdHeuristicInputs(NamedTuple):
     sparse_block_size_kv: int | None = None
     sparse_spt: bool | None = None
     has_score_mod: bool = False
+    has_score_mod_bwd: bool = False
+    has_softcap: bool = False
+    zero_softmax_scale: bool = False
     has_mask_mod: bool = False
     has_learnable_sink: bool = False
     requested_V_in_regs: bool = False
@@ -2882,6 +2889,32 @@ def bwd_selection_reads_num_sms(inputs: BwdHeuristicInputs) -> bool:
     )
 
 
+def can_fold_LSE_dPsum(
+    inputs: BwdHeuristicInputs, *, tile_m: int, tile_n: int, cluster_size: int
+) -> bool:
+    """Whether the SM100 backward folds the LSE / dPsum subtractions into the S / dP MMAs.
+
+    NOTE [hdim64 LSE / dPsum fold into the S / dP MMA] (flash_bwd_sm100.py) scope: the generic
+    kernel's split_P_dS layout (1-CTA, 128 x 128 tiles, both head dims padded to 64), bf16, and
+    no block sparsity, score_mod, score_mod_bwd, or softcap. Selected wherever allowed; also MHA
+    and non-deterministic only, since GQA and deterministic mode measured slower. The fold
+    divides by softmax_scale, so softmax_scale=0 keeps the subtractions.
+    """
+    return (
+        inputs.device_capacity in (10, 11)
+        and cluster_size == 1
+        and (tile_m, tile_n) == (128, 128)
+        and bwd_tile_hdim(inputs.head_dim) == 64
+        and bwd_tile_hdim(inputs.head_dim_v) == 64
+        and inputs.dtype == "torch.bfloat16"
+        and inputs.qhead_per_kvhead == 1
+        and not inputs.deterministic
+        and not inputs.use_block_sparsity
+        and not (inputs.has_score_mod or inputs.has_score_mod_bwd or inputs.has_softcap)
+        and not inputs.zero_softmax_scale
+    )
+
+
 # fmt: off
 def select_sm90_bwd_tile(
     head_dim: int,
@@ -2949,8 +2982,8 @@ def select_sm100_bwd_registers(
 
 
 # Architecture-specific options at their neutral values, for architectures that do not
-# expose them: the SM90 MMA options, and the SM100 2CTA and query-head fold options. spt (SM90
-# and SM100) is always bwd_spt(inputs) there and False on SM120.
+# expose them: the SM90 MMA options, and the SM100 2CTA, query-head fold, and LSE / dPsum fold
+# options. spt (SM90 and SM100) is always bwd_spt(inputs) there and False on SM120.
 _SM90_ONLY_NEUTRAL_FIELDS = dict(
     num_stages_PdS=1,
     SdP_swapAB=False,
@@ -2968,6 +3001,7 @@ _SM100_ONLY_NEUTRAL_FIELDS = dict(
     use_dedicated_hd256_kernel=False,
     pack_factor=1,
     head_loop=False,
+    fold_LSE_dPsum=False,
 )
 # The SM100 kernel launches 16 warps: dQ reduce, 2x compute, MMA, load, relay, and empty.
 SM100_BWD_THREADS_PER_CTA = 512
@@ -3052,6 +3086,9 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 use_dedicated_hd256_kernel=dedicated,
                 pack_factor=fold.pack_factor,
                 head_loop=fold.head_loop,
+                fold_LSE_dPsum=can_fold_LSE_dPsum(
+                    inputs, tile_m=SM100_BWD_TILE_M, tile_n=tile_n, cluster_size=cluster_size
+                ),
             )
             registers = (
                 None
@@ -3220,12 +3257,11 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
         )
     if config.num_stages_Q < 1 or config.num_stages_dO < 1 or config.num_stages_PdS < 1:
         raise ValueError("Pipeline stage counts must be positive")
-    if capacity not in (10, 11) and any(
-        getattr(config, name) != value for name, value in _SM100_ONLY_NEUTRAL_FIELDS.items()
-    ):
-        raise ValueError(
-            f"SM{capacity} backward does not support SM100 2CTA or query-head fold options"
-        )
+    sm100_only = [
+        name for name, value in _SM100_ONLY_NEUTRAL_FIELDS.items() if getattr(config, name) != value
+    ]
+    if capacity not in (10, 11) and sm100_only:
+        raise ValueError(f"SM{capacity} backward does not support the SM100 options {sm100_only}")
     if capacity != 12 and config.spt != bwd_spt(inputs):
         raise ValueError(
             f"SM{capacity} backward needs spt={bwd_spt(inputs)} (deterministic dQ lock order)"
@@ -3311,6 +3347,14 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
                 raise ValueError("tile_n=64 is not supported for this SM100 backward problem")
             if inputs.is_hdim256 and config.tile_n != 64:
                 raise ValueError("SM100 generic backward with head_dim=256 needs tile_n=64")
+        if config.fold_LSE_dPsum and not can_fold_LSE_dPsum(
+            inputs, tile_m=config.tile_m, tile_n=config.tile_n, cluster_size=config.cluster_size
+        ):
+            raise ValueError(
+                "SM100 backward fold_LSE_dPsum needs the 1-CTA 128x128 kernel with head dims "
+                "padded to 64, bf16, MHA, non-deterministic, and no block sparsity, score_mod, "
+                "score_mod_bwd, or softcap"
+            )
     sparse_q = bwd_sparse_q_block_size(inputs)
     if sparse_q is not None and (sparse_q <= 0 or sparse_q % config.tile_m != 0):
         raise ValueError(
