@@ -40,9 +40,14 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
         auto gmem_ptr_lse = make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lse_ptr) + lse_offset);
 
         auto lse_shape = varlen_q ? make_shape(1, params.h, params.total_q) : make_shape(params.b, params.h, params.seqlen_q);
-        auto lse_stride = params.seqlenq_ngroups_swapped ? make_stride(1, params.seqlen_q * params.b, params.b) : (
-            params.unpadded_lse ? make_stride(params.h * params.total_q, params.total_q, 1) :  make_stride(params.h * params.seqlen_q, params.seqlen_q, 1)
-            );
+        // The swapped (h, seqlen_q, b) layout applies only to the unpadded
+        // path (see the comment above): when unpadded_lse is false the
+        // wrappers allocate and read a padded (b, h, seqlen_q) buffer even
+        // under the seqlenq <-> ngroups swap (mha_fwd / mha_fwd_kvcache do a
+        // flat reshape after the kernel), so padded must take precedence.
+        auto lse_stride = params.unpadded_lse ? (
+            params.seqlenq_ngroups_swapped ? make_stride(1, params.seqlen_q * params.b, params.b) : make_stride(params.h * params.total_q, params.total_q, 1)
+            ) : make_stride(params.h * params.seqlen_q, params.seqlen_q, 1);
 
         auto lse_layout = make_layout(lse_shape, lse_stride);
         Tensor mLSE = make_tensor(gmem_ptr_lse, lse_layout);
@@ -549,12 +554,21 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
         const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
             + m_block * kBlockM) * params.d_rounded;
-        const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
         Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
                                       Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                      make_stride(Split ? kHeadDim : params.o_row_stride, _1{}));
-        Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
-                                      Shape<Int<kBlockM>>{}, Stride<_1>{});
+        // Split path writes into the padded lseaccum buffer; non-Split path writes the final LSE,
+        // whose layout depends on unpadded_lse and seqlenq_ngroups_swapped — use get_lse_tile
+        // so all three layouts are handled uniformly.
+        auto gLSEaccum = [&] {
+            if constexpr (Split) {
+                const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+                return make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lseaccum),
+                                   Shape<Int<kBlockM>>{}, Stride<_1>{});
+            } else {
+                return get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
+            }
+        }();
 
         GmemTiledCopyO gmem_tiled_copy_Oaccum;
         auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
@@ -1027,15 +1041,22 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
                                          + m_block * kBlockM) * params.d_rounded;
-    const index_t row_offset_lseaccum = (Split || !params.unpadded_lse ?
-            ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q : bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
-        ) + m_block * kBlockM;
 
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                  make_stride(Split ? kHeadDim : params.o_row_stride, _1{}));
-    Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
-                                   Shape<Int<kBlockM>>{}, Stride<_1>{});
+    // Split path writes into the padded lseaccum buffer; non-Split path writes the final LSE,
+    // whose layout depends on unpadded_lse and seqlenq_ngroups_swapped — use get_lse_tile
+    // so all three layouts are handled uniformly.
+    auto gLSEaccum = [&] {
+        if constexpr (Split) {
+            const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+            return make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lseaccum),
+                               Shape<Int<kBlockM>>{}, Stride<_1>{});
+        } else {
+            return get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
+        }
+    }();
     // if (tidx == 0) { printf("row_offset_o = %d, bidh = %d, gOaccum = %p\n", row_offset_o, bidh, gOaccum.data()); }
 
     GmemTiledCopyO gmem_tiled_copy_Oaccum;
