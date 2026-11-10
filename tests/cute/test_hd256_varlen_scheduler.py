@@ -1,7 +1,10 @@
 """HD256 varlen API, cache, and CUDA-graph regression tests on SM100/SM110.
 
-None, fresh CUDA scalar maxima and Python integers must share one device-driven
-specialization per kernel, without host reads.
+For the shapes tested here, None, fresh CUDA scalar maxima and Python integers must share
+one device-driven specialization per kernel, without host reads. Host bounds still enter
+host-side choices (single-block grids, the backward fold): an integer bound that differs
+from the omitted / tensor fallback, such as max_seqlen_q=128 for two packed 128-row
+sequences against total_q=256, may select another specialization with the same results.
 Set FLASH_ATTENTION_HD256_STRESS=1 for additional randomized cases.
 """
 
@@ -256,7 +259,7 @@ def test_hd256_seqused_one_side_large_batch(used, batch_size, causal):
 
 
 # ---------------------------------------------------------------------------
-# Compile-key behaviour: none/cuda/int all share one specialization per kernel.
+# Compile-key behaviour: none/cuda/int share one specialization per kernel for these shapes.
 # ---------------------------------------------------------------------------
 
 
@@ -290,8 +293,9 @@ def test_hd256_varlen_maxima_compile_keys(causal, monkeypatch):
 
     by_mode["int"] = run("int")
     torch.cuda.synchronize()
-    # Neither kernel specializes on the maxima: the forward reads lengths on device and the
-    # backward derives its grid from cu_seqlens, so explicit int maxima reuse both keys.
+    # Neither kernel specializes on these maxima: the forward reads lengths on device and the
+    # backward derives its grid from cu_seqlens, so explicit int maxima reuse both keys (a
+    # host bound that changed a host-side choice, e.g. the fold, would be a new key).
     assert (len(fwd_cache.cache), len(bwd_cache.cache)) == (1, 1), (
         "explicit int maxima should not select a distinct specialization"
     )
