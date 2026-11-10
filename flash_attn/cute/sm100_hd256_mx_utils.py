@@ -248,3 +248,109 @@ def cvt_e4m3x16_scaled(vals, sf_byte: Int32, *, loc=None, ip=None):
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
     return [Int32(llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+# mxds (NOTE [MXFP8 hd256 dS for dQ]): the dK / dV kernel's dS quantization and stores
+
+
+@dsl_user_op
+def cvt_e4m3x4(a: Float32, b: Float32, c: Float32, d: Float32, *, loc=None, ip=None) -> Int32:
+    """Four FP32 -> E4M3 (cvt.rn.satfinite), a in the low byte."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
+            "{ .reg .b16 lo, hi;\n cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\n"
+            " cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n mov.b32 $0, {lo, hi}; }",
+            "=r,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def st_global_v8_b32(gptr: cute.Pointer, words, *, loc=None, ip=None) -> None:
+    """One 32-byte global store (st.global.v8.b32, sm_100+): a full sector per thread."""
+    llvm.inline_asm(
+        None,
+        [gptr.toint(loc=loc, ip=ip).ir_value()]
+        + [Int32(w).ir_value(loc=loc, ip=ip) for w in words],
+        "st.global.v8.b32 [$0], {$1, $2, $3, $4, $5, $6, $7, $8};",
+        "l,r,r,r,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def st_global_u8(gptr: cute.Pointer, val: Int32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [gptr.toint(loc=loc, ip=ip).ir_value(), Int32(val).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b16 v;\n cvt.u16.u32 v, $1;\n st.global.u8 [$0], v; }",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def redux_max_u32(x: Int32, *, loc=None, ip=None) -> Int32:
+    """max of x (unsigned) over the 32 lanes of the warp (redux.sync.max.u32)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(x).ir_value(loc=loc, ip=ip)],
+            "redux.sync.max.u32 $0, $1, 0xffffffff;",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def e8m0_reciprocal(sf: Int32, *, loc=None, ip=None) -> Float32:
+    """2^(127 - sf) for a biased E8M0 exponent sf in [0, 254]."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(sf).ir_value(loc=loc, ip=ip)],
+            "{ .reg .b32 t;\n sub.s32 t, 254, $1;\n shl.b32 t, t, 23;\n mov.b32 $0, t; }",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def st_shared_v4_b32(addr: Int32, words, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip)] + [Int32(w).ir_value(loc=loc, ip=ip) for w in words],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def st_global_u16(gptr: cute.Pointer, val: Int32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [gptr.toint(loc=loc, ip=ip).ir_value(), Int32(val).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b16 v;\n cvt.u16.u32 v, $1;\n st.global.u16 [$0], v; }",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
