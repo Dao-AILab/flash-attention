@@ -8,10 +8,11 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.experimental.primitives as prims
 from cutlass.cute import FastDivmodDivisorV2
 from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.utils import LayoutEnum, TensorMapManager, TensorMapUpdateMode
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
@@ -121,18 +122,48 @@ from flash_attn.cute.block_sparse_utils import (
 #   query head 7.
 
 
+@dsl_user_op
+def _mbarrier_try_wait_relaxed_cluster(
+    mbar_ptr: cute.Pointer, phase: Int32, *, loc=None, ip=None
+) -> cutlass.Boolean:
+    """One ``mbarrier.try_wait.parity.relaxed.cluster`` attempt (no memory ordering)."""
+    return cutlass.Boolean(
+        nvvm.mbarrier_try_wait_parity_timelimit(
+            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+            Int32(phase).ir_value(loc=loc, ip=ip),
+            # the same suspend-time hint cute.arch.mbarrier_wait uses
+            Int32(10_000_000).ir_value(loc=loc, ip=ip),
+            scope=nvvm.MBarrierScopeKind.CLUSTER,
+            order=nvvm.MemOrderKind.RELAXED,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _fence_acquire_cluster_shared(*, loc=None, ip=None) -> None:
+    """``fence.acquire.sync_restrict::shared::cluster.cluster``."""
+    nvvm.fence_sync_restrict(nvvm.MemOrderKind.ACQUIRE, loc=loc, ip=ip)
+
+
 @cute.jit
 def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
-    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+    """Wait on an mbarrier completed by the peer CTA, acquiring at cluster scope.
 
-    The peer CTA's ``cp.async.bulk`` complete-tx releases at cluster scope; the
-    default ``.acquire.cta`` wait does not synchronize with a release by a thread
-    of another CTA. ``cute.arch.mbarrier_wait`` has no scope argument, so this uses
-    the Primitives ``mbarrier_try_wait_parity`` with ``MBarrierScope.CLUSTER``,
-    which lowers to ``mbarrier.try_wait.parity.acquire.cluster``.
+    The peer CTA's ``cp.async.bulk`` complete-tx is a release at cluster scope. The
+    default ``cute.arch.mbarrier_wait`` acquires at CTA scope only, which does not
+    synchronize with a release by a thread of another CTA. This is the PTX acquire
+    pattern for that case: a relaxed cluster-scope try-wait that observes the phase
+    flip, then ``fence.acquire.sync_restrict::shared::cluster.cluster``, an acquire
+    fence restricted to the cluster's shared memory. A ``.acquire.cluster`` try-wait
+    would also work but makes ptxas invalidate L1 after every attempt (it must cover
+    global memory too); the restricted fence covers only shared memory and compiles
+    to no SASS instruction.
     """
-    while not prims.mbarrier_try_wait_parity(mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER):
+    while not _mbarrier_try_wait_relaxed_cluster(mbar_ptr, phase):
         pass
+    _fence_acquire_cluster_shared()
 
 
 def work_kv_block(work_n, cta_rank, *, cta_group_size: int):
