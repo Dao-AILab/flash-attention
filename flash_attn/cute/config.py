@@ -2976,6 +2976,63 @@ def select_sm90_bwd_tile(
 # fmt: on
 
 
+def fit_sm90_bwd_tile_to_block_sparsity(
+    fields: dict,
+    head_dim: int,
+    head_dim_v: int,
+    sparse_block_size_q: int,
+    sparse_block_size_kv: int,
+) -> dict:
+    """Shrink the SM90 backward tile fields to fit explicit sparse blocks.
+
+    As in the forward, sparse Q blocks may span multiple M tiles but tile_n must match the
+    sparse KV block. A smaller tile_n changes which GEMM dimension can sit on WGMMA's 64-row
+    M axis, so the swap and atom-layout flags follow the tile. Unsupported sizes are rejected
+    by normalize_block_sparse_config_bwd.
+    """
+    tile_m, tile_n = fields["tile_m"], fields["tile_n"]
+    if sparse_block_size_q % tile_m != 0 and sparse_block_size_q % 64 == 0:
+        tile_m = 64
+    if 32 <= sparse_block_size_kv < tile_n and sparse_block_size_kv % 16 == 0:
+        tile_n = sparse_block_size_kv
+    if (tile_m, tile_n) == (fields["tile_m"], fields["tile_n"]):
+        return fields
+    SdP_swapAB, AtomLayoutMSdP = fields["SdP_swapAB"], fields["AtomLayoutMSdP"]
+    dKV_swapAB, AtomLayoutNdKV = fields["dKV_swapAB"], fields["AtomLayoutNdKV"]
+    num_wg = fields["num_threads"] // 128 - 1
+    if tile_n != fields["tile_n"]:
+        if sparse_block_size_q % 64 != 0:
+            return fields
+        if all(ceil_div(d, 64) * 64 % (64 * num_wg) == 0 for d in (head_dim, head_dim_v)):
+            # head_dim on M of swapped dK/dV, one warp group per 64 rows, so each warp group
+            # covers all of tile_n. Fastest where head_dim allows it.
+            tile_m, SdP_swapAB, AtomLayoutMSdP, dKV_swapAB, AtomLayoutNdKV = 64, False, 1, True, 1
+        elif tile_n % 64 == 0 and SdP_swapAB and not dKV_swapAB:
+            # tile_n stays on M of the swapped S/dP and unswapped dK/dV, 64 rows per warp group.
+            AtomLayoutMSdP, AtomLayoutNdKV = num_wg * 64 // tile_n, tile_n // 64
+        elif tile_n % (16 * num_wg) == 0:
+            # tile_n split across the warp groups on N of swapped dK/dV. Slices that are not a
+            # multiple of 16 compile but give wrong dK/dV.
+            tile_m, SdP_swapAB, AtomLayoutMSdP, dKV_swapAB, AtomLayoutNdKV = (
+                64, False, 1, True, num_wg
+            )
+        else:
+            return fields
+    keep_m = tile_m == fields["tile_m"]
+    return dict(
+        fields,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        SdP_swapAB=SdP_swapAB,
+        dKV_swapAB=dKV_swapAB,
+        dQ_swapAB=fields["dQ_swapAB"] if keep_m else False,
+        AtomLayoutMSdP=AtomLayoutMSdP,
+        AtomLayoutNdKV=AtomLayoutNdKV,
+        AtomLayoutMdQ=fields["AtomLayoutMdQ"] if keep_m else 1,
+    )
+
+
+
 def select_sm100_bwd_registers(
     inputs: BwdHeuristicInputs, *, use_2cta_instrs: bool
 ) -> Sm100BwdRegisters:
@@ -3050,6 +3107,14 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 V_in_regs=inputs.requested_V_in_regs,
                 spt=bwd_spt(inputs),
             )
+            if inputs.use_block_sparsity and inputs.sparse_block_size_kv is not None:
+                fields = fit_sm90_bwd_tile_to_block_sparsity(
+                    fields,
+                    inputs.head_dim,
+                    inputs.head_dim_v,
+                    bwd_sparse_q_block_size(inputs),
+                    inputs.sparse_block_size_kv,
+                )
             # Two MMA warp groups; with dQ_single_wg the one without dQ needs fewer registers.
             registers = (
                 Sm90BwdRegisters(mma=256, mma_no_dq=224, producer=24)
