@@ -439,6 +439,7 @@ _SM_STATS_CROSS_STAGE = {
     ("fp8", 96, False, False): ("sm_100",),
     ("fp8", 96, True, False): ("sm_100",),
     ("mxfp8_qk", 64, True, False): ("sm_103", "sm_107"),
+    ("mxfp8_pv", 64, True, False): ("sm_100",),
 }
 # === END SM100 TUNING KNOBS ===
 
@@ -487,11 +488,14 @@ def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs) -> Sm100Registers | No
     family = sm100_arch_family(inputs.device_arch)
     if family == "sm_107":
         # Dedicated scale columns: fewer softmax registers relieve register pressure in the
-        # correction and MMA/load warps at hd64.
-        return Sm100Registers(160, 96, 96) if inputs.head_dim_padded < 96 else None
+        # correction and MMA/load warps at non-causal hd64.
+        if inputs.head_dim_padded < 96 and not inputs.causal:
+            return Sm100Registers(160, 96, 96)
+        return None
     # The MMA warp also issues the PV scale copies and the split-P wait. It spills with the
-    # 48 registers of the hd128 default, and on sm_103 the persistent loop needs 80.
-    if family == "sm_103":
+    # 48 registers of the hd128 default, and on sm_103 the persistent non-causal loop
+    # needs 80 (causal uses a single-tile scheduler, or CLC with its own split).
+    if family == "sm_103" and not inputs.causal:
         softmax, correction = 168, 96
     elif inputs.head_dim_padded >= 96:
         softmax, correction = 184, 80
@@ -892,6 +896,16 @@ _CAUSAL_CLC_DEFAULT = {
     ("fp8", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
     ("mxfp8_qk", 64): {"sm_100": None},
     ("mxfp8_qk", 128): {"sm_100": None, "sm_103": None, "sm_107": None},
+    # Native PV's default splits spill once persistent; these cells name their own.
+    ("mxfp8_pv", 64): {
+        "sm_100": None,
+        "sm_103": Sm100Registers(softmax=184, correction=64, other=80),
+    },
+    ("mxfp8_pv", 128): {
+        "sm_100": Sm100Registers(softmax=168, correction=88, other=88),
+        "sm_103": Sm100Registers(softmax=168, correction=88, other=88),
+        "sm_107": None,
+    },
 }
 _HD256_CLC_MIN_HEAD_SLICES = 32
 
@@ -1032,8 +1046,10 @@ def sm100_fwd_buffer_bytes(
 ) -> tuple[int, int, int, int]:
     """Per-CTA (sQ, sO, K stage, V stage) bytes of the SM100 forward kernel."""
     element_bytes = 1 if "float8" in inputs.dtype else 2
-    # QK MXFP8 keeps V in BF16.
-    v_element_bytes = 2 if inputs.mxfp8_path == "qk" else element_bytes
+    # QK MXFP8 keeps V in BF16. Causal native PV sizes every V slot for BF16 V, which the
+    # diagonal blocks use.
+    bf16_v = inputs.mxfp8_path == "qk" or (sm100_native_pv(inputs) and inputs.causal)
+    v_element_bytes = 2 if bf16_v else element_bytes
     is_split_kv = num_splits > 1
     # SplitKV stores fp32 partials; FP8 inputs produce bf16 output.
     o_bytes = 4 if is_split_kv else 2
