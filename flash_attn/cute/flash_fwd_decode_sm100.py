@@ -1695,6 +1695,7 @@ class FlashAttentionForwardSm100SwapAB:
         mBlocksToBatchIdx: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
         tensormap_workspace: Optional[cute.Tensor] = None,
+        mKvStart: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -1712,6 +1713,7 @@ class FlashAttentionForwardSm100SwapAB:
             mCuTotalMBlocks,
             mCuTotalSplitsMBlocks,
             mBlocksToBatchIdx,
+            mKvStart,
         ):
             assert value is None, "swap-AB adapter: unsupported argument"
         assert len(mQ.shape) == (3 if self.is_varlen_q else 4)
