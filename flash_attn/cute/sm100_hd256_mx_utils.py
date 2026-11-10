@@ -5,11 +5,12 @@ See NOTE [MXFP8 hd256 backward] in sm100_hd256_2cta_fmha_backward.py.
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32
+from cutlass import Float32, Int32
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_layout
-from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
 
 from flash_attn.cute import utils as fa_utils
 
@@ -166,15 +167,37 @@ def make_sf_s2t(
     return tSF, copy, src, dst
 
 
-@cute.jit
+@dsl_user_op
+def fmax_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """PTX max.f32: ptxas fuses a dependent pair max(max(a, b), c) into one FMNMX3 and folds |x|
+    operands (cute.arch.fmax(abs=True) lowers to max.xorsign.abs, which it does not fuse)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "max.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 def mx_scale(x: cute.Tensor):
     """E8M0 scale of the 32 values of x, 2^ceil(log2(amax / 448)) (blockscaled_utils' rule):
-    (biased exponent, FP32 reciprocal); amax is a depth-5 tree of xorsign-abs max."""
-    m1 = [cute.arch.fmax(x[i], x[i + 1], abs=True) for i in range(0, 32, 2)]
-    m2 = [cute.arch.fmax(m1[i], m1[i + 1], abs=True) for i in range(0, 16, 2)]
-    m3 = [cute.arch.fmax(m2[i], m2[i + 1], abs=True) for i in range(0, 8, 2)]
-    m4 = [cute.arch.fmax(m3[i], m3[i + 1], abs=True) for i in range(0, 4, 2)]
-    return fa_utils.e8m0_ceil_scale(cute.arch.fmax(m4[0], m4[1], abs=True))
+    (biased exponent, FP32 reciprocal); amax is a ternary max.f32 tree on |x| (FMNMX3). Plain
+    Python: traced inline."""
+    v = [cute.math.abs(x[i]) for i in range(32)]
+    while len(v) > 1:
+        nxt = []
+        for i in range(0, len(v), 3):
+            acc = v[i]
+            for g in v[i + 1 : i + 3]:
+                acc = fmax_f32(acc, g)
+            nxt.append(acc)
+        v = nxt
+    return fa_utils.e8m0_ceil_scale(v[0])
 
 
 @cute.jit
@@ -196,3 +219,32 @@ def lane_halves_smem_layout_sfb(tmem_layout: cute.Layout, stages: int = 1) -> cu
         stride=((((16, 4), 512), (0, 0)), 0, (1, 8), 1024),
     )
     return layout
+
+
+@dsl_user_op
+def cvt_e4m3x16_scaled(vals, sf_byte: Int32, *, loc=None, ip=None):
+    """sm_107: 16 FP32 -> 16 E4M3 bytes (element i in byte i of four Int32 words), each multiplied
+    by 2^(127 - sf_byte) inside cvt.rn.satfinite.scaled::n1::ue8m0 (no FMUL). Bitwise equal to an
+    FP32 multiply by the reciprocal scale and a plain satfinite convert for normal FP32 inputs; FP32
+    subnormals flush to zero. sf_byte must be per-lane data (a constant or kernel parameter fails in
+    ptxas)."""
+    asm = "{ .reg .b16 lo, hi; .reg .b8 sf;\n cvt.u8.u32 sf, $20;\n"
+    for w in range(4):
+        a0, a1, a2, a3 = (4 + 4 * w + i for i in range(4))
+        asm += (
+            f" cvt.rn.satfinite.scaled::n1::ue8m0.e4m3x2.f32 lo, ${a1}, ${a0}, sf;\n"
+            f" cvt.rn.satfinite.scaled::n1::ue8m0.e4m3x2.f32 hi, ${a3}, ${a2}, sf;\n"
+            f" mov.b32 ${w}, {{lo, hi}};\n"
+        )
+    asm += "}"
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [Float32(v).ir_value(loc=loc, ip=ip) for v in vals]
+        + [Int32(sf_byte).ir_value(loc=loc, ip=ip)],
+        asm,
+        "=r,=r,=r,=r," + ",".join(["f"] * 16) + ",r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return [Int32(llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip)) for i in range(4)]
