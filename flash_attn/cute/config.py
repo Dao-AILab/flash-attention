@@ -673,13 +673,19 @@ def default_pack_gqa(inputs: FwdHeuristicInputs) -> bool:
     """Resolve pack_gqa=None; ``inputs.pack_gqa`` is ignored."""
     if inputs.qhead_per_kvhead == 1:
         return False
-    # hd256 favors 2CTA over cp.async-Q PackGQA.
+    # hd256 favors 2CTA over cp.async-Q PackGQA where 2CTA is possible (is_2cta_eligible: no
+    # seqused_q, 1CTA varlen metadata, 128-token or unpaged KV, not disabled); otherwise an
+    # unpacked tile per query head reads its KV once per head for nothing (#3146). Block
+    # sparsity stays unpacked either way: non-divisible PackGQA faults there.
     prefer_hd256_2cta = (
         inputs.device_capacity in (10, 11)
         and inputs.is_hdim256
         and 128 % inputs.qhead_per_kvhead != 0
         and not inputs.has_seqused_q
         and hd256_2cta_varlen_ok(inputs)
+        and (
+            inputs.page_size in (None, 128) and not inputs.disable_2cta or inputs.use_block_sparsity
+        )
         and (
             inputs.max_seqlen_q > 128
             or (
