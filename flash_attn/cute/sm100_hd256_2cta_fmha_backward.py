@@ -55,7 +55,8 @@ from flash_attn.cute.utils import AuxData, as_bshkrd_tensor, as_shhb_tensor
 # and the original V. There both kernels add dO R^T to dP, with the residual R = MX(V - Vhat_d)
 # along head_dim stored as keys [s, 2s) of the V copy, so dP reads V to about BF16 precision (one
 # extra MXFP8 MMA per band tile): the dQ kernel's last two key tiles of each 256-query pair and the
-# dK / dV kernel's first two query tiles. dV on the band stays MXFP8 (e4m3 P).
+# dK / dV kernel's first two query tiles. dV on the band reads BF16 P~ and dO / L, as the forward's
+# PV read BF16 P (NOTE [MXFP8 hd256 band dV] in sm100_hd256_2cta_fmha_backward_dkdvkernel.py).
 #
 # Scale layouts. The dQ kernel's pair MMAs are M=256 with standard 128-row interleave_sf chunks.
 # The dK / dV kernel's pair MMAs are M=128 (64 keys per CTA; accumulator layout B: lanes 64..127
