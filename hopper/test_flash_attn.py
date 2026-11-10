@@ -1077,6 +1077,31 @@ def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, de
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
 
 
+def test_flash_attn_kvcache_cache_batch_idx_length():
+    # The forward mainloops read kv_batch_idx[b] for every b < batch_size, so mha_fwd must
+    # reject a cache_batch_idx whose length is not batch_size instead of reading past its end.
+    # Same check as FA2's mha_fwd_kvcache (#3097).
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen_k, nheads, d = 4, 256, 2, 128
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    # Slices of one buffer: the memory right after a short slice holds valid indices.
+    buf = torch.tensor([1, 0, 3, 2, 3], device=device, dtype=torch.int32)
+    # flash_api.cpp and flash_api_stable.cpp word the shape error differently.
+    match = r"kv_batch_idx (must have shape|dimension 0 must have size)"
+
+    for cache_batch_idx in (buf[:2], buf):  # 2 and 5 indices for 4 sequences
+        with pytest.raises(RuntimeError, match=match):
+            flash_attn_with_kvcache(q, k_cache, v_cache, cache_batch_idx=cache_batch_idx)
+
+    # Positive control: one index per sequence must NOT raise.
+    out = flash_attn_with_kvcache(q, k_cache, v_cache, cache_batch_idx=buf[:batch_size])
+    assert out.shape == (batch_size, 1, nheads, d)
+    assert not out.isnan().any()
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize('causal', [False])
