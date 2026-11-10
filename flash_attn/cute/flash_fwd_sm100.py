@@ -591,6 +591,7 @@ class FlashAttentionForwardSm100:
         mSFK: cute.Tensor | None = None,
         mSFV: cute.Tensor | None = None,
         mV_bf16: cute.Tensor | None = None,
+        mMxStats: cute.Tensor | None = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -645,6 +646,13 @@ class FlashAttentionForwardSm100:
             if const_expr(mLSE is not None)
             else None
         )
+        # (b, h, s, 2) -> (s, 2, h, b): per row [m, L]; see BlockScales.stats_out.
+        self.export_mx_stats = mMxStats is not None
+        if const_expr(self.export_mx_stats):
+            assert self.qk_blockscaled and mCuSeqlensQ is None and not self.is_split_kv
+            mMxStats = cute.make_tensor(
+                mMxStats.iterator, cute.select(mMxStats.layout, mode=[2, 3, 1, 0])
+            )
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
@@ -1222,7 +1230,7 @@ class FlashAttentionForwardSm100:
             mSFV, tma_atom_SFV, sSFP_layout, sSFV_layout,
             mV_bf16, tma_atom_V_bf16, sV_bf16_layout, tP_bf16_layout, tiled_mma_pv_bf16,
             tiled_mma_ones, sOnes_layout, tiled_mma_ones_bf16, sOnesB_layout,
-            tiled_mma_sfk, tiled_mma_sfv,
+            tiled_mma_sfk, tiled_mma_sfv, mMxStats,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1342,6 +1350,7 @@ class FlashAttentionForwardSm100:
         sOnesB_layout: cute.ComposedLayout | None = None,
         tiled_mma_sfk: cute.TiledMma | None = None,
         tiled_mma_sfv: cute.TiledMma | None = None,
+        mMxStats: cute.Tensor | None = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1985,6 +1994,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                mMxStats=mMxStats,
             )
             tmem_alloc_barrier.arrive_unaligned()
 
@@ -3433,7 +3443,7 @@ class FlashAttentionForwardSm100:
                     sScale[tidx + sm_stats_index * self.m_block_size] = softmax.row_sum[0]
                     if const_expr(self.num_stats == 3):
                         sScale[tidx + (sm_stats_index + 2 * self.s_p_o_stage) * self.m_block_size] = softmax.row_sum_unquantized[0]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
+                    if const_expr(mLSE is not None or learnable_sink is not None or self.export_mx_stats):
                         sScale[
                             tidx + sm_stats_index * self.m_block_size + self.s_p_o_stage * self.m_block_size
                         ] = softmax.row_max[0]
@@ -3776,6 +3786,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        mMxStats: cute.Tensor | None = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -3859,6 +3870,8 @@ class FlashAttentionForwardSm100:
 
             # Default LSE to -inf for invalid split_idx tiles
             stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
+            # (row max, O normalizer) per stage for BlockScales.stats_out; empty rows keep (-inf, 0).
+            mx_stats = [(-Float32.inf, 0.0)] * self.q_stage
 
             if const_expr(self.use_block_sparsity):
                 total_block_count = get_total_block_count(
@@ -3976,7 +3989,7 @@ class FlashAttentionForwardSm100:
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
                     row_sum = sScale[tidx + sm_stats_index * self.m_block_size]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
+                    if const_expr(mLSE is not None or learnable_sink is not None or self.export_mx_stats):
                         row_max = sScale[tidx + sm_stats_index * self.m_block_size + self.s_p_o_stage * self.m_block_size]
                     else:
                         row_max = None
@@ -4010,6 +4023,8 @@ class FlashAttentionForwardSm100:
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum_lse if const_expr(self.pv_blockscaled) else row_sum,
                                     row_max, acc_O_mn_row_is_zero_or_nan)
+                    if const_expr(self.export_mx_stats):
+                        mx_stats[stage] = (row_max, row_sum)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
                     scale = scale * v_descale
                     # Wait for the last O to be ready from the MMA warp
@@ -4145,6 +4160,18 @@ class FlashAttentionForwardSm100:
                                 mLSE_cur.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
                             )
                             cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
+
+            if const_expr(self.export_mx_stats):
+                # The final row max of S (score units) and L, the sum that normalized O. Scaling the
+                # max here would let the compiler share the product with the LSE and change its
+                # rounding, so the consumer applies softmax_scale * log2(e) itself.
+                mStats_cur = mMxStats[None, None, head_idx, batch_idx]
+                for stage in cutlass.range_constexpr(self.q_stage):
+                    q_block = self._q_block(work_m, stage, mma_tile_coord_v)
+                    gStats = cute.local_tile(mStats_cur, (self.m_block_size, 2), (q_block, 0))
+                    if tidx < seqlen.seqlen_q - q_block * self.m_block_size:
+                        gStats[tidx, 0] = mx_stats[stage][0]
+                        gStats[tidx, 1] = mx_stats[stage][1]
 
             if const_expr(pipeline_load_epi is not None and self.use_correction_warps_for_epi):
                 pipeline_load_epi.producer_acquire(load_epi_producer_state)
