@@ -131,6 +131,14 @@ def mx_sf_tile_view(t: cute.Tensor, rows: int, n_tiles, hb, h_r, h_k, bcast_r: b
 
 
 @cute.jit
+def reversed_pair_block_idx(bid, grid):
+    """Longest-first within each (head, batch) of a non-persistent 2CTA grid (x = tile, cluster pairs along
+    x): the tile pairs run from the end, heads stay outermost (clusters dispatch in linear cluster-id order,
+    so concurrently resident CTAs share a head's K / V in L2, which a heads-fastest order would spread)."""
+    return (grid[0] - 2 - 2 * (bid[0] // 2) + bid[0] % 2, bid[1], bid[2])
+
+
+@cute.jit
 def make_sf_s2t(
     sSF: cute.Tensor,
     tmem_layout: cute.Layout,
