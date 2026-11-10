@@ -49,3 +49,14 @@ def test_block_scales_require_both_qk_scales():
     sf = torch.ones(512).to(torch.float8_e8m0fnu)
     with pytest.raises(ValueError, match="QK MXFP8 requires both scales.q and scales.k"):
         flash_attn_func(q, k, v.to(torch.bfloat16), scales=BlockScales(sf, None))
+
+
+@pytest.mark.parametrize("head_dims", [(256, 128), (128, 256), (192, 192)])
+def test_block_scales_head_dims(head_dims):
+    head_dim, head_dim_v = head_dims
+    q, k = (torch.zeros(2, 128, heads, head_dim, dtype=torch.float8_e4m3fn) for heads in (4, 2))
+    v = torch.zeros(2, 128, 2, head_dim_v, dtype=torch.bfloat16)
+    sf = torch.ones(512).to(torch.float8_e8m0fnu)
+    with pytest.raises(NotImplementedError, match="head dimensions 64 and 128, or 256 and 256"):
+        flash_attn_func(q, k, v, scales=BlockScales(sf, sf))
+

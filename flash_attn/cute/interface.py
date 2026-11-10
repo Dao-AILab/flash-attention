@@ -586,8 +586,11 @@ def _validate_block_scales(
     if q.dtype != torch.float8_e4m3fn or k.dtype != q.dtype or v.dtype != v_dtype:
         raise ValueError("Native MXFP8 PV requires e4m3 Q/K/V" if pv
                          else "QK MXFP8 requires e4m3 Q/K and bf16 V")
-    if q.shape[-1] not in (64, 128) or v.shape[-1] not in (64, 128):
+    head_dims = (q.shape[-1], v.shape[-1])
+    if pv and not set(head_dims) <= {64, 128}:
         raise NotImplementedError(f"{mode} supports head dimensions 64 and 128")
+    if head_dims != (256, 256) and not set(head_dims) <= {64, 128}:
+        raise NotImplementedError(f"{mode} supports head dimensions 64 and 128, or 256 and 256")
     if requires_grad or (v_bf16 is not None and v_bf16.requires_grad):
         raise NotImplementedError(f"{mode} is forward-only")
     # (scales, operand, name, MN extent, K extent); K is the scaled (reduction) axis.
