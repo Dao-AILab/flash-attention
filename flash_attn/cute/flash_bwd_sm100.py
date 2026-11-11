@@ -11,6 +11,8 @@ import cutlass.cute as cute
 from cutlass.cute import FastDivmodDivisorV2
 from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.utils import LayoutEnum, TensorMapManager, TensorMapUpdateMode
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
@@ -148,6 +150,50 @@ from flash_attn.cute.block_sparse_utils import (
 #   pf = 2 with head_loop, head_idx = 1: that is kv_head 1; the trips walk sub-group 0 then 1
 #   with scratch heads 1 * 2 + g = 2, 3, so in sub-group 1 packed row 5 is again token 2 of
 #   query head 7.
+
+
+@dsl_user_op
+def _mbarrier_try_wait_relaxed_cluster(
+    mbar_ptr: cute.Pointer, phase: Int32, *, loc=None, ip=None
+) -> cutlass.Boolean:
+    """One ``mbarrier.try_wait.parity.relaxed.cluster`` attempt (no memory ordering)."""
+    return cutlass.Boolean(
+        nvvm.mbarrier_try_wait_parity_timelimit(
+            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+            Int32(phase).ir_value(loc=loc, ip=ip),
+            # the same suspend-time hint cute.arch.mbarrier_wait uses
+            Int32(10_000_000).ir_value(loc=loc, ip=ip),
+            scope=nvvm.MBarrierScopeKind.CLUSTER,
+            order=nvvm.MemOrderKind.RELAXED,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _fence_acquire_cluster_shared(*, loc=None, ip=None) -> None:
+    """``fence.acquire.sync_restrict::shared::cluster.cluster``."""
+    nvvm.fence_sync_restrict(nvvm.MemOrderKind.ACQUIRE, loc=loc, ip=ip)
+
+
+@cute.jit
+def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
+    """Wait on an mbarrier completed by the peer CTA, acquiring at cluster scope.
+
+    The peer CTA's ``cp.async.bulk`` complete-tx is a release at cluster scope. The
+    default ``cute.arch.mbarrier_wait`` acquires at CTA scope only, which does not
+    synchronize with a release by a thread of another CTA. This is the PTX acquire
+    pattern for that case: a relaxed cluster-scope try-wait that observes the phase
+    flip, then ``fence.acquire.sync_restrict::shared::cluster.cluster``, an acquire
+    fence restricted to the cluster's shared memory. A ``.acquire.cluster`` try-wait
+    would also work but makes ptxas invalidate L1 after every attempt (it must cover
+    global memory too); the restricted fence covers only shared memory and compiles
+    to no SASS instruction.
+    """
+    while not _mbarrier_try_wait_relaxed_cluster(mbar_ptr, phase):
+        pass
+    _fence_acquire_cluster_shared()
 
 
 def work_kv_block(work_n, cta_rank, *, cta_group_size: int):
@@ -2249,8 +2295,9 @@ class FlashAttentionBackwardSm100:
 
             if process_tile:
                 for _ in cutlass.range(num_iters, unroll=1):
-                    # Wait for dS_xchg from peer CTA
-                    cute.arch.mbarrier_wait(dS_cluster_full_mbar_ptr, phase=dS_cluster_phase)
+                    # Wait for dS_xchg from peer CTA. Its bulk copy completes this
+                    # barrier with a cluster-scope release, so acquire at cluster scope.
+                    _mbarrier_wait_acquire_cluster(dS_cluster_full_mbar_ptr, dS_cluster_phase)
 
                     # Arrive on MMA leader warp
                     with cute.arch.elect_one():
