@@ -2648,7 +2648,7 @@ class FlashAttentionForwardSm100:
 
             # Block sparse or dense iteration
             if const_expr(self.use_block_sparsity):
-                # When aux_tensors exist, Q indices beyond seqlen_q must be wrapped to avoid
+                # When aux_tensors exist, Q indices beyond seqlen_q must be bounded to avoid
                 # OOB aux_tensor access. Only edge tiles (where m_tile_end > seqlen_q) need this.
                 if const_expr(aux_tensors is not None):
                     m_tile_end = (self._q_block(work_m, stage) + self.cta_group_size) * self.m_block_size
@@ -3864,7 +3864,7 @@ class FlashAttentionForwardSm100:
 
         if cutlass.const_expr(aux_data.tensors is not None):
             seqlen_q_divmod, _ = fastdiv_mods
-            _, q_idx_logical = divmod(q_idx_logical, seqlen_q_divmod)
+            q_idx_logical = utils.clamp_index(q_idx_logical, seqlen_q_divmod)
 
         apply_score_mod_inner(
             tSrS_t2r,

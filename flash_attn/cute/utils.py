@@ -258,6 +258,17 @@ def compute_softmax_scale_log2(softmax_scale, score_mod):
         return LOG2_E, softmax_scale
 
 
+@cute.jit
+def clamp_index(idx, seqlen_divmod: FastDivmodDivisorV2):
+    """Clamp a tile index into [0, seqlen) so aux_tensors loads from a partial tile stay in bounds.
+
+    Scores and mask values at clamped (out-of-bounds) positions are masked afterwards, so any
+    in-bounds index works; a min is one instruction per element where a modulo is a fastdivmod.
+    Requires seqlen >= 1, which holds wherever a tile is processed.
+    """
+    return cutlass.min(idx, seqlen_divmod.divisor - 1)
+
+
 def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
     """Compute FastDivmodDivisorV2 pairs for aux_tensors index computation.
 

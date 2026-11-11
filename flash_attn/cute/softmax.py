@@ -553,7 +553,7 @@ def apply_score_mod_inner(
         qk_acc_dtype: Data type for accumulator
         aux_tensors: Optional aux_tensors for FlexAttention
         aux_scalars: Optional runtime scalar captures for FlexAttention
-        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
+        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) bounding aux_tensors indices
         seqlen_info: Sequence length info
         constant_q_idx: If provided, use this constant for all q_idx values
                         If None, compute q_idx per-element
@@ -598,20 +598,18 @@ def apply_score_mod_inner(
                 head_offset = q_idx_packed - q_idx_logical * qhead_per_kvhead
                 head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
 
-            # If we will do loads we mod, in order to not read OOB
+            # If we will do loads we clamp, in order to not read OOB
             if cutlass.const_expr(aux_data.tensors is not None and fastdiv_mods is not None):
                 if cutlass.const_expr(constant_q_idx is None):
                     seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
                     q_idx_floored = floor_if_packed(
                         index_tensor[i + j][q_idx_pos], qhead_per_kvhead
                     )
-                    _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
-                    q_idx_vec[j] = q_idx_wrapped
+                    q_idx_vec[j] = utils.clamp_index(q_idx_floored, seqlen_q_divmod)
                 else:
                     _, seqlen_k_divmod = fastdiv_mods
 
-                _, kv_idx_wrapped = divmod(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
-                kv_idx_vec[j] = kv_idx_wrapped
+                kv_idx_vec[j] = utils.clamp_index(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
             else:
                 # No bounds checking - direct indexing
                 if constant_q_idx is None:
@@ -683,7 +681,7 @@ def apply_score_mod_bwd_inner(
         qk_acc_dtype: Data type for accumulator
         aux_tensors: Optional aux_tensors for FlexAttention
         aux_scalars: Optional runtime scalar captures for FlexAttention
-        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
+        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) bounding aux_tensors indices
         seqlen_info: Sequence length info
         constant_q_idx: If provided, use this constant for all q_idx values
         qhead_per_kvhead: Pack-GQA replication factor
@@ -727,13 +725,11 @@ def apply_score_mod_bwd_inner(
                     q_idx_floored = floor_if_packed(
                         index_tensor[i + j][q_idx_pos], qhead_per_kvhead
                     )
-                    _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
-                    q_idx_vec[j] = q_idx_wrapped
+                    q_idx_vec[j] = utils.clamp_index(q_idx_floored, seqlen_q_divmod)
                 else:
                     _, seqlen_k_divmod = fastdiv_mods
 
-                _, kv_idx_wrapped = divmod(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
-                kv_idx_vec[j] = kv_idx_wrapped
+                kv_idx_vec[j] = utils.clamp_index(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
             else:
                 # No bounds checking - direct indexing
                 if constant_q_idx is None:
