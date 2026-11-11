@@ -2910,19 +2910,23 @@ def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtyp
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d,nheads_kv", [(64, 4), (128, 4), (256, 4), (256, 2)])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 256)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, causal, dtype):
-    """Test that gradient flows through the returned LSE tensor."""
+def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, nheads_kv, causal, dtype):
+    """Test that gradient flows through the returned LSE tensor (hdim 256 MHA / GQA: the
+    SM100 general backward)."""
+    if d == 256 and not (IS_SM100 or IS_SM110):
+        pytest.skip("hdim 256 backward is SM100/SM110 only")
     device = "cuda"
     torch.random.manual_seed(42)
     batch_size = 2
     nheads = 4
+    qhead_per_kvhead = nheads // nheads_kv
 
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
 
     out, lse = flash_attn_func(q, k, v, causal=causal, return_lse=True)
 
@@ -2939,33 +2943,44 @@ def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, causal, dtype):
     dq, dk, dv = torch.autograd.grad(loss, (q, k, v))
 
     # Compare against reference: manually compute what the gradients should be
-    # Reference: standard attention in float
-    q_ref = q.detach().float().requires_grad_()
-    k_ref = k.detach().float().requires_grad_()
-    v_ref = v.detach().float().requires_grad_()
-    # (batch, seqlen_q, nheads, d) -> (batch, nheads, seqlen_q, d)
-    qk = torch.einsum("bshd,bthd->bhst", q_ref, k_ref) / (d ** 0.5)
-    if causal:
-        mask = torch.triu(torch.ones(seqlen_q, seqlen_k, device=device, dtype=torch.bool), diagonal=seqlen_k - seqlen_q + 1)
-        qk = qk.masked_fill(mask, float("-inf"))
-    lse_ref = torch.logsumexp(qk, dim=-1)  # (batch, nheads, seqlen_q)
-    p = torch.softmax(qk, dim=-1)
-    # v_ref: (batch, seqlen_k, nheads, d)
-    out_ref = torch.einsum("bhst,bthd->bshd", p, v_ref)
-    loss_ref = (out_ref * g.float()).sum() + (lse_ref * dlse_weight.float()).sum()
-    dq_ref, dk_ref, dv_ref = torch.autograd.grad(loss_ref, (q_ref, k_ref, v_ref))
+    mask = (
+        torch.triu(torch.ones(seqlen_q, seqlen_k, device=device, dtype=torch.bool), diagonal=seqlen_k - seqlen_q + 1)
+        if causal
+        else None
+    )
 
-    # Use relaxed tolerances since flash_attn operates in bf16 while reference is float32.
-    # The reference is also not a perfect bf16 simulation (it doesn't reorder ops), so
-    # we use a generous tolerance.
-    print(f"dQ max diff: {(dq.float() - dq_ref).abs().max().item()}")
-    print(f"dK max diff: {(dk.float() - dk_ref).abs().max().item()}")
-    print(f"dV max diff: {(dv.float() - dv_ref).abs().max().item()}")
-    # Absolute tolerance: bf16 has ~0.004-0.02 error for these sizes
+    def reference_grads(compute_dtype):
+        """Standard attention with the GQA K / V expanded, matmuls in compute_dtype."""
+        q_ref, k_ref, v_ref = (t.detach().to(compute_dtype).requires_grad_() for t in (q, k, v))
+        # GQA: each KV head serves qhead_per_kvhead consecutive query heads
+        k_rep = k_ref.repeat_interleave(qhead_per_kvhead, dim=2)
+        v_rep = v_ref.repeat_interleave(qhead_per_kvhead, dim=2)
+        # (batch, seqlen_q, nheads, d) -> (batch, nheads, seqlen_q, d)
+        qk = torch.einsum("bshd,bthd->bhst", q_ref, k_rep).float() / (d ** 0.5)
+        if causal:
+            qk = qk.masked_fill(mask, float("-inf"))
+        lse_ref = torch.logsumexp(qk, dim=-1)  # (batch, nheads, seqlen_q)
+        p = torch.softmax(qk, dim=-1).to(compute_dtype)
+        # v_rep: (batch, seqlen_k, nheads, d)
+        out_ref = torch.einsum("bhst,bthd->bshd", p, v_rep)
+        loss_ref = (out_ref.float() * g.float()).sum() + (lse_ref * dlse_weight.float()).sum()
+        return [t.float() for t in torch.autograd.grad(loss_ref, (q_ref, k_ref, v_ref))]
+
+    # Reference in float32 (the target) and in bf16 (the same reference at the kernel's
+    # precision: its error against float32 is the noise floor of these shapes).
+    dq_ref, dk_ref, dv_ref = reference_grads(torch.float32)
+    dq_pt, dk_pt, dv_pt = reference_grads(dtype)
+
+    # flash_attn operates in bf16 while the float32 reference does not reorder ops: the
+    # kernel stays within an absolute 0.02 (bf16 at these sizes) or within twice the bf16
+    # reference's own error (a GQA dV row sums qhead_per_kvhead query heads and can exceed
+    # the absolute bound).
     atol = 0.02
-    assert (dq.float() - dq_ref).abs().max().item() <= atol, f"dQ error too large"
-    assert (dk.float() - dk_ref).abs().max().item() <= atol, f"dK error too large"
-    assert (dv.float() - dv_ref).abs().max().item() <= atol, f"dV error too large"
+    for name, actual, ref, pt in (("dQ", dq, dq_ref, dq_pt), ("dK", dk, dk_ref, dk_pt), ("dV", dv, dv_ref, dv_pt)):
+        err = (actual.float() - ref).abs().max().item()
+        pt_err = (pt - ref).abs().max().item()
+        print(f"{name} max diff: {err} (bf16 reference: {pt_err})")
+        assert err <= max(atol, 2 * pt_err), f"{name} error too large"
 
     # Also test: gradient with only dLSE (no dO)
     out2, lse2 = flash_attn_func(q, k, v, causal=causal, return_lse=True)
@@ -2974,7 +2989,8 @@ def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, causal, dtype):
 
     q_ref2 = q.detach().float().requires_grad_()
     k_ref2 = k.detach().float().requires_grad_()
-    qk2 = torch.einsum("bshd,bthd->bhst", q_ref2, k_ref2) / (d ** 0.5)
+    k_rep2 = k_ref2.repeat_interleave(qhead_per_kvhead, dim=2)
+    qk2 = torch.einsum("bshd,bthd->bhst", q_ref2, k_rep2) / (d ** 0.5)
     if causal:
         qk2 = qk2.masked_fill(mask, float("-inf"))
     lse_ref2 = torch.logsumexp(qk2, dim=-1)

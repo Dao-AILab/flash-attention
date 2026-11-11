@@ -1815,12 +1815,11 @@ def _bwd_preprocess(
         assert lse_log2 is None
     else:
         assert scale_p is None
-    is_varlen = cu_seqlens_q is not None or seqused_q is not None
-    if is_varlen:
-        batch_size = (cu_seqlens_q.shape[0] - 1) if cu_seqlens_q is not None else seqused_q.shape[0]
-    else:
-        batch_size = 0
-    if cu_total_m_blocks is None and is_varlen and batch_size > BIN_BATCH_SEARCH_THRESH:
+    # SingleTileVarlenScheduler only with cu_seqlens_q; seqused_q alone keeps the dense
+    # SingleTileScheduler, which ignores the batch-lookup table.
+    if cu_seqlens_q is None:
+        cu_total_m_blocks = None
+    elif cu_total_m_blocks is None and cu_seqlens_q.shape[0] - 1 > BIN_BATCH_SEARCH_THRESH:
         cu_total_m_blocks, _ = _compute_tile_cumsum(
             cu_seqlens=cu_seqlens_q,
             seqused=seqused_q,
@@ -1927,12 +1926,11 @@ def _bwd_postprocess_convert(
     fake_mode,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
-    is_varlen = cu_seqlens is not None or seqused is not None
-    if is_varlen:
-        batch_size = (cu_seqlens.shape[0] - 1) if cu_seqlens is not None else seqused.shape[0]
-    else:
-        batch_size = 0
-    if cu_total_m_blocks is None and is_varlen and batch_size > BIN_BATCH_SEARCH_THRESH:
+    # SingleTileVarlenScheduler only with cu_seqlens; seqused alone keeps the dense
+    # SingleTileScheduler, which ignores the batch-lookup table.
+    if cu_seqlens is None:
+        cu_total_m_blocks = None
+    elif cu_total_m_blocks is None and cu_seqlens.shape[0] - 1 > BIN_BATCH_SEARCH_THRESH:
         cu_total_m_blocks, _ = _compute_tile_cumsum(
             cu_seqlens=cu_seqlens,
             seqused=seqused,
@@ -2372,13 +2370,14 @@ def _flash_attn_bwd(
         dK_semaphore = None
         dV_semaphore = None
 
-    # SingleTileVarlenScheduler batch-lookup aid, above BIN_BATCH_SEARCH_THRESH;
-    # shared across preprocess, main bwd, and the three postprocess calls. Each side needs
-    # its own lengths: a call may carry only seqused_k (or only cu_seqlens_q / seqused_q).
+    # SingleTileVarlenScheduler batch-lookup aid, above BIN_BATCH_SEARCH_THRESH. The Q table
+    # serves the preprocess and the dQ postprocess, which schedule by cu_seqlens_q only
+    # (seqused_q alone keeps their dense scheduler, which ignores the table); the K table
+    # serves the main kernel, which on SM100 schedules by cu_seqlens_k or seqused_k.
     cu_total_m_blocks_q = None
     cu_total_m_blocks_k = None
     if batch_size > BIN_BATCH_SEARCH_THRESH:
-        if cu_seqlens_q is not None or seqused_q is not None:
+        if cu_seqlens_q is not None:
             cu_total_m_blocks_q, _ = _compute_tile_cumsum(
                 cu_seqlens=cu_seqlens_q,
                 seqused=seqused_q,
@@ -3895,9 +3894,11 @@ def flash_attn_varlen_func(
         anything, including NaN, also for a sequence with seqused_k = 0.
 
     max_seqlen_q/k: optional scalar length bounds. With Blackwell cumulative
-        lengths, tensor hints are not read on the host. HD256 uses flat grids
-        for omitted/tensor hints and rectangular grids for host integers.
-        Integer bounds must cover every CUDA graph replay.
+        lengths, tensor hints are not read on the host. A Python integer also
+        enters host-side choices (single-block grids, the SM100 backward fold),
+        so it may select a different specialization than the omitted / tensor
+        fallback, with the same results. Integer bounds must cover every CUDA
+        graph replay.
 
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.

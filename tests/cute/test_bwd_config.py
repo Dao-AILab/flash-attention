@@ -460,15 +460,18 @@ def choose_fold(
     causal,
     deterministic,
     varlen=False,
-    cluster_size=2,
-    m_block_size=128,
-    n_block_size=128,
+    cluster_size=None,
+    m_block_size=None,
+    n_block_size=None,
     head_dim=256,
     pack_gqa_override=None,
     head_loop_override=None,
 ):
-    """select_bwd_fold on B200 (148 SMs, 74 clusters) for a shape of batch x seqlen tokens on
-    the generic kernel; hdim 256 (the head loop) unless given, hdim 192 pairs with hdim_v 128."""
+    """The fold on B200 (148 SMs, 74 clusters) for a shape of batch x seqlen tokens on the
+    generic kernel; hdim 256 (the head loop) unless given, hdim 192 pairs with hdim_v 128.
+    Without a tile / cluster override this is the production fold of select_bwd_config (hdim
+    256: 128 x 64 on 2 CTAs); a row that gives one probes select_bwd_fold off the production
+    kernel, the other parameters staying at their production values."""
     inputs = BwdHeuristicInputs(
         dtype="torch.bfloat16",
         device_arch=100,
@@ -488,12 +491,15 @@ def choose_fold(
         requested_pack_gqa=pack_gqa_override,
         requested_head_loop=head_loop_override,
     )
+    production = select_bwd_config(inputs)
+    if cluster_size is None and m_block_size is None and n_block_size is None:
+        return (production.pack_factor, production.head_loop)
     return tuple(
         select_bwd_fold(
             inputs,
-            tile_m=m_block_size,
-            tile_n=n_block_size,
-            cluster_size=cluster_size,
+            tile_m=production.tile_m if m_block_size is None else m_block_size,
+            tile_n=production.tile_n if n_block_size is None else n_block_size,
+            cluster_size=production.cluster_size if cluster_size is None else cluster_size,
         )
     )
 

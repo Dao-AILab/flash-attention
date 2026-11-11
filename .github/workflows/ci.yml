@@ -27,6 +27,8 @@ env:
     or 1024-1024-256-False-1-0.0-False-False-False-mha-dtype0
     or 1024-1024-256-False-0-15.0-False-False-True-mqa-dtype0
     or test_flash_attn_hd256_sm100_deterministic_backward
+    or test_flash_attn_lse_grad and 128-128-256-2-False-dtype0
+    or test_flash_attn_lse_grad and 128-128-256-2-True-dtype0
     or test_cuda_graph
 
 jobs:
