@@ -9,15 +9,21 @@ import warnings
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
+USE_AITER_ROCM = os.getenv("FLASH_ATTENTION_AITER_ENABLE", "FALSE") == "TRUE"
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
-if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
+if USE_AITER_ROCM and USE_TRITON_ROCM:
+    raise RuntimeError(
+        "FLASH_ATTENTION_AITER_ENABLE and "
+        "FLASH_ATTENTION_TRITON_AMD_ENABLE cannot both be TRUE"
+    )
+if not USE_AITER_ROCM and not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
     try:
         import flash_attn_2_cuda
     except ImportError:
         warnings.warn("flash_attn_2_cuda (which has ROCm/HIP kernels) not found, falling back to Triton implementation")
         USE_TRITON_ROCM = True
 
-if USE_TRITON_ROCM:
+if USE_AITER_ROCM or USE_TRITON_ROCM:
     from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2 as flash_attn_gpu
 else:
     import flash_attn_2_cuda as flash_attn_gpu
@@ -1214,6 +1220,39 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    if USE_AITER_ROCM:
+        if softcap != 0.0:
+            raise NotImplementedError(
+                "softcap is not supported by the AITER ROCm backend"
+            )
+        # Let AITER own FMHA v3 / CK eligibility and dispatch. The import is
+        # intentionally lazy to keep the existing backends' import path intact.
+        from aiter.ops.mha import flash_attn_func as aiter_flash_attn_func
+
+        return_lse = return_attn_probs or (
+            torch.is_grad_enabled()
+            and any(x.requires_grad for x in (q, k, v))
+        )
+        aiter_window_size = (
+            (*window_size, 0) if len(window_size) == 2 else window_size
+        )
+        result = aiter_flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=aiter_window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+        )
+        if return_attn_probs:
+            return result
+        return result[0] if isinstance(result, tuple) else result
+
     return FlashAttnFunc.apply(
         q,
         k,
