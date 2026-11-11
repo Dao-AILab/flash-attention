@@ -2,6 +2,7 @@
 
 import sys
 import functools
+import math
 import importlib.util
 import warnings
 import os
@@ -752,19 +753,68 @@ class CachedWheelsCommand(_bdist_wheel):
             super().run()
 
 
+def _cgroup_cpu_quota() -> Optional[float]:
+    """CPU quota of this container's cgroup (v2 or v1), or None if it has none."""
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+        return None if quota == "max" else int(quota) / int(period)
+    except (OSError, ValueError):
+        pass
+    try:
+        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+        period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+        return quota / period if quota > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _available_cpus() -> int:
+    """CPUs this process may use: the affinity mask, capped by the cgroup CPU quota."""
+    if hasattr(os, "sched_getaffinity"):
+        cpus = len(os.sched_getaffinity(0))
+    else:
+        cpus = os.cpu_count() or 1
+    quota = _cgroup_cpu_quota()
+    if quota is not None:
+        cpus = min(cpus, max(1, math.ceil(quota)))
+    return cpus
+
+
+def _available_memory_bytes() -> int:
+    """Free memory, capped by what is left under the cgroup memory limit.
+
+    psutil reports the host's memory, so inside a container with a memory limit it
+    overestimates what the build can use.
+    """
+    import psutil
+
+    memory = psutil.virtual_memory()
+    for limit_file, usage_file in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        try:
+            limit = Path(limit_file).read_text().strip()
+            usage = int(Path(usage_file).read_text())
+        except (OSError, ValueError):
+            continue
+        if limit == "max" or int(limit) >= memory.total:
+            return memory.available
+        return min(memory.available, max(0, int(limit) - usage))
+    return memory.available
+
+
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         # do not override env MAX_JOBS if already exists
         if not os.environ.get("MAX_JOBS"):
-            import psutil
-
             nvcc_threads = max(1, int(NVCC_THREADS))
 
             # calculate the maximum allowed NUM_JOBS based on cores
-            max_num_jobs_cores = max(1, os.cpu_count() // 2)
+            max_num_jobs_cores = max(1, _available_cpus() // 2)
 
             # calculate the maximum allowed NUM_JOBS based on free memory
-            free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
+            free_memory_gb = _available_memory_bytes() / (1024 ** 3)  # free memory in GB
             # Assume worst-case peak observed memory usage of ~5GB per NVCC thread.
             # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * 5GB <= free_memory.
             max_num_jobs_memory = max(1, int(free_memory_gb / (5 * nvcc_threads)))
