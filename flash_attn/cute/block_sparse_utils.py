@@ -897,7 +897,9 @@ def handle_block_sparse_empty_tile_correction_sm100(
                     qhead_per_kvhead,
                     pack_gqa,
                 )
-                row_max_value, row_sum_value = apply_learnable_sink(
+                # Empty tile: the sink is the row's only column (row_max == -inf), so there is
+                # no O to rescale and the returned factor is unused.
+                row_max_value, row_sum_value, _ = apply_learnable_sink(
                     row_max_value,
                     row_sum_value,
                     sink_val,
