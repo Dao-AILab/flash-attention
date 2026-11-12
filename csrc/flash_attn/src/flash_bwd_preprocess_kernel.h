@@ -233,7 +233,13 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
 
     Tensor tdQsdQ = gmem_thr_copy_dQ.partition_S(sdQ);    // ((Atom,AtomNum),ATOM_M,ATOM_N)
     Tensor tdQgdQ = gmem_thr_copy_dQ.partition_D(gdQ);
-    Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum);
+    Tensor tdQgdQaccum = [&] {
+        if constexpr (kHeadDim == 512) {
+            return tiled_mma_dq.get_thread_slice(tidx).partition_C(gdQaccum);
+        } else {
+            return gmem_thr_copy_dQaccum.partition_S(gdQaccum);
+        }
+    }();
 
     Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
     CUTE_STATIC_ASSERT_V(size(acc_dq) == size(tdQgdQaccum));
@@ -241,7 +247,12 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
     Tensor tdQrdQaccum = make_fragment_like(tdQgdQaccum);
     clear(acc_dq);
     for (int s = 0; s < nsplits; ++s) {
-        cute::copy(gmem_tiled_copy_dQaccum, tdQgdQaccum, tdQrdQaccum);
+        if constexpr (kHeadDim == 512) {
+            #pragma unroll
+            for (int i = 0; i < size(acc_dq); ++i) { tdQrdQaccum(i) = tdQgdQaccum(i); }
+        } else {
+            cute::copy(gmem_tiled_copy_dQaccum, tdQgdQaccum, tdQrdQaccum);
+        }
         #pragma unroll
         for (int i = 0; i < size(acc_dq); ++i) { acc_dq(i) += tdQrdQaccum(i); }
         tdQgdQaccum.data() = tdQgdQaccum.data() + params.dq_accum_split_stride;
