@@ -460,6 +460,21 @@ class BlockScales(NamedTuple):
         rescaled. On peaked rows the normalization can differ from the quantized P that PV
         consumed by a few percent.
     LSE always uses the FP32 sum. Causal attention uses BF16 diagonal blocks in both modes.
+
+    stats_out, an FP32 (batch, nheads, seqlen_q, 2) output buffer, receives per row the final
+    softmax statistics: the final row max m of the scores S = Q K^T (before softmax_scale) and L,
+    the sum that normalized O ("exact": the sum of the rounded P that PV consumed; otherwise the
+    FP32 sum). With c = softmax_scale * log2(e) rounded to FP32 and M = m * c in FP32, let
+    P~ = 2^(S * c - M + offset); the offset is 8 for "exact" native PV, 4 for "fast", and 0 with
+    BF16 V. Then O ~= sum(P V) / L, where the forward's P is P~ rounded (E4M3 outside the causal
+    BF16 band, BF16 on it), except that blocks processed under an earlier running max were rounded
+    at that max and rescaled online. So (m, L) reconstruct the forward's P only up to that
+    rounding, and bitwise (after rounding P~ the same way) only where the forward used the final
+    row max. With native PV a backward can rely on P~ <= 2^8 (M lags the true scaled row max by at
+    most the 4 that "fast" offsets, and not at all in "exact"), on L being O's normalizer, and on
+    the final (m, L) as constants of the function it differentiates; not on reproducing every P of
+    the online recipe. Rows without a visible key get m = -inf and L = 0. Writing it does not
+    change O or LSE.
     """
 
     q: torch.Tensor
@@ -467,6 +482,7 @@ class BlockScales(NamedTuple):
     v: torch.Tensor | None = None
     v_bf16: torch.Tensor | None = None
     pv_softmax: Literal["exact", "fast"] = "exact"
+    stats_out: torch.Tensor | None = None
 
 
 def _check_shared_kv_scales(scales) -> None:
@@ -607,6 +623,17 @@ def _validate_block_scales(
                 f"{name} must be the contiguous interleave_sf buffer with MN={mn}, "
                 f"K={k_extent} ({expected} elements)"
             )
+    stats_out = scales.stats_out
+    if stats_out is not None:
+        if (stats_out.dtype != torch.float32 or stats_out.device != q.device
+                or not stats_out.is_contiguous()):
+            raise ValueError("stats_out must be a contiguous FP32 tensor on the device of Q")
+        if stats_out.shape != (q.shape[0], q.shape[2], q.shape[1], 2):
+            raise ValueError("stats_out must have shape (batch, nheads, seqlen_q, 2)")
+        if any(t is not None for t in pv_unsupported) or softcap not in (None, 0.0):
+            raise NotImplementedError(
+                "stats_out does not support sinks, softcap, modifiers, or auxiliary data"
+            )
     # Flatten physical chunks; the kernel constructs their logical operand views.
     sfq, sfk, sfv = (t if t is None else maybe_contiguous(t.reshape(-1)) for t in scales[:3])
     return scales._replace(q=sfq, k=sfk, v=sfv, v_bf16=maybe_contiguous(v_bf16))
@@ -741,6 +768,7 @@ def _flash_attn_fwd(
         (block_scales.q, block_scales.k, block_scales.v) if qk_blockscaled else (None, None, None)
     )
     v_bf16 = block_scales.v_bf16 if qk_blockscaled else None
+    mx_stats = block_scales.stats_out if qk_blockscaled else None
     pv_softmax = block_scales.pv_softmax if qk_blockscaled else "exact"
     if cu_seqlens_k is None:
         if page_table is None:
@@ -865,6 +893,9 @@ def _flash_attn_fwd(
 
     if seqlen_k == 0 or total_q == 0:
         out.zero_()
+        if mx_stats is not None:
+            mx_stats[..., 0].fill_(float("-inf"))
+            mx_stats[..., 1].zero_()
         if lse is not None:
             if learnable_sink is None:
                 lse.fill_(float("-inf"))
@@ -1303,6 +1334,8 @@ def _flash_attn_fwd(
     if qk_blockscaled:
         compile_key += ("mxfp8_qk", v.dtype, pv_blockscaled,
                         get_broadcast_dims(v_bf16) if v_bf16 is not None else None, pv_softmax)
+        if mx_stats is not None:
+            compile_key += ("mx_stats",)
 
     if _needs_compile(_flash_attn_fwd.compile_cache, compile_key):
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1623,6 +1656,7 @@ def _flash_attn_fwd(
                             t.element_type = cutlass.Float8E8M0FNU
                     compile_args.extend(sf_tensors)
                     compile_args.append(to_cute_tensor(v_bf16) if v_bf16 is not None else None)
+                    compile_args.append(to_cute_tensor(mx_stats) if mx_stats is not None else None)
             elif arch // 10 in [8, 9, 12]:
                 compile_args.extend([
                     cu_total_m_blocks_tensor,
@@ -1719,6 +1753,7 @@ def _flash_attn_fwd(
                 if not use_swapab:
                     call_args.extend(t.view(torch.uint8) if t is not None else None for t in sf_operands)
                     call_args.append(v_bf16)
+                    call_args.append(mx_stats)
             elif arch // 10 in [8, 9, 12]:
                 call_args.extend([
                     cu_total_m_blocks,
