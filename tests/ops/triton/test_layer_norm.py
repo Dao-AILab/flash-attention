@@ -16,6 +16,35 @@ from flash_attn.ops.triton.layer_norm import (
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 
 
+@pytest.mark.parametrize("is_rms_norm", [False, True])
+def test_preallocated_residual_out(is_rms_norm):
+    torch.manual_seed(0)
+    x = torch.randn(4, 3, 192, device="cuda", requires_grad=True)
+    residual = torch.randn_like(x, requires_grad=True)
+    weight = torch.randn(192, device="cuda", requires_grad=True)
+    buffer = torch.full_like(x, float("nan"))
+
+    y, residual_sum = layer_norm_fn(
+        x, weight, None, residual=residual, prenorm=True,
+        is_rms_norm=is_rms_norm, residual_out=buffer,
+    )
+    assert residual_sum.data_ptr() == buffer.data_ptr()
+    expected_sum = x + residual
+    torch.testing.assert_close(buffer, expected_sum, rtol=0, atol=0)
+    if is_rms_norm:
+        expected = expected_sum * torch.rsqrt(expected_sum.square().mean(-1, keepdim=True) + 1e-6) * weight
+    else:
+        expected = F.layer_norm(expected_sum, (192,), weight, eps=1e-6)
+    torch.testing.assert_close(y, expected)
+
+    grad = torch.randn_like(y)
+    inputs = (x, residual, weight)
+    actual_grads = torch.autograd.grad(y, inputs, grad)
+    expected_grads = torch.autograd.grad(expected, inputs, grad)
+    for actual, reference in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual, reference, atol=3e-5, rtol=3e-5)
+
+
 # @pytest.mark.parametrize("zero_centered_weight", [False, True])
 @pytest.mark.parametrize("zero_centered_weight", [False])
 @pytest.mark.parametrize("has_weight1", [False, True])
