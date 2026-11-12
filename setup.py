@@ -11,7 +11,6 @@ import glob
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Literal, Optional
 from packaging.version import parse, Version
 import platform
 
@@ -66,9 +65,15 @@ SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE
 USE_SYSTEM_AITER = os.getenv("FLASH_ATTENTION_USE_SYSTEM_AITER", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
+USE_AITER = False
 if IS_ROCM:
-    ROCM_BACKEND = "triton" if os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE" else "ck"
+    # Load the pure selector without importing flash_attn/__init__.py during the build.
+    backend_spec = importlib.util.spec_from_file_location(
+        "flash_attn_amd", Path(this_dir) / "flash_attn" / "flash_attn_amd.py"
+    )
+    backend_module = importlib.util.module_from_spec(backend_spec)
+    backend_spec.loader.exec_module(backend_module)
+    USE_AITER = isinstance(backend_module.select_amd_backend(os.environ), backend_module.Aiter)
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
 @functools.lru_cache(maxsize=None)
@@ -276,12 +281,12 @@ def check_system_aiter():
     """
     spec = importlib.util.find_spec("aiter")
     locations = list(spec.submodule_search_locations or []) if spec is not None else []
-    kernels = os.path.join("ops", "triton", "_triton_kernels", "flash_attn_triton_amd")
-    if any(os.path.isdir(os.path.join(root, kernels)) for root in locations):
+    public_mha = os.path.join("ops", "triton", "attention", "mha.py")
+    if any(os.path.isfile(os.path.join(root, public_mha)) for root in locations):
         return
     raise RuntimeError(
         "FLASH_ATTENTION_USE_SYSTEM_AITER=TRUE was set, but no installed aiter provides "
-        f"aiter.{kernels.replace(os.sep, '.')}. Install a compatible aiter, or unset "
+        "aiter.ops.triton.attention.mha. Install a compatible aiter, or unset "
         "FLASH_ATTENTION_USE_SYSTEM_AITER to build the bundled third_party/aiter."
     )
 
@@ -289,7 +294,7 @@ def check_system_aiter():
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if IS_ROCM:
-    if ROCM_BACKEND == "triton":
+    if USE_AITER:
         if USE_SYSTEM_AITER:
             check_system_aiter()
         else:
@@ -303,7 +308,7 @@ if IS_ROCM:
                 [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
                 check=True,
             )
-    elif ROCM_BACKEND == "ck":
+    else:
         if os.path.isdir(".git"):
             subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
         else:
@@ -523,7 +528,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
     # Skips CK C++ extension compilation if using Triton Backend
-    if ROCM_BACKEND == "ck":
+    if not USE_AITER:
         ck_dir = "csrc/composable_kernel"
 
         #use codegen get code dispatch
@@ -810,7 +815,7 @@ class NinjaBuildExtension(BuildExtension):
 
 
 # Build install_requires based on platform
-if ROCM_BACKEND == "triton":
+if USE_AITER:
     # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
     install_requires = [
         "einops",
