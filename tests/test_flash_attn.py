@@ -2584,6 +2584,44 @@ def test_flash_attn_varlen_paged_kv_num_splits(dtype):
         _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize(
+    "seqlens_q, seqlens_k",
+    [([4, 4], [256, 0]), ([3, 5], [0, 300]), ([1, 1, 8], [256, 256, 0])],
+)
+def test_flash_attn_varlen_paged_kv_empty_seqlen_k_lse(seqlens_q, seqlens_k, d, dtype):
+    """Regression test for #2842: a sequence with seqlen_k == 0 takes the split-KV kernel's early exit,
+    which must write +inf to that sequence's slots of the unpadded (nheads, total_q) softmax_lse."""
+    from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
+
+    device = "cuda"
+    nheads, page_block_size = 4, 256
+    batch_size = len(seqlens_q)
+    nblocks = max((s + page_block_size - 1) // page_block_size for s in seqlens_k)
+    k_cache, v_cache = torch.randn(
+        2, batch_size * nblocks, page_block_size, nheads, d, device=device, dtype=dtype
+    )
+    block_table = torch.randperm(batch_size * nblocks, dtype=torch.int32, device=device).reshape(batch_size, nblocks)
+    cu_seqlens_q = F.pad(torch.tensor(seqlens_q, device=device).cumsum(0), (1, 0)).to(torch.int32)
+    cu_seqlens_k = F.pad(torch.tensor(seqlens_k, device=device).cumsum(0), (1, 0)).to(torch.int32)
+    q = torch.randn(sum(seqlens_q), nheads, d, device=device, dtype=dtype)
+    # zero_tensors=True pre-fills softmax_lse with -inf, so a missing +inf write is detected deterministically.
+    out, lse, _, _ = _flash_attn_varlen_forward(
+        q, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k, max(seqlens_q), max(seqlens_k),
+        dropout_p=0.0, softmax_scale=d ** -0.5, causal=False, block_table=block_table, zero_tensors=True,
+    )
+    k_cache_seq = rearrange(k_cache[block_table], "b nblocks page h d -> b (nblocks page) h d")
+    for i, (start, end) in enumerate(zip(cu_seqlens_q[:-1].tolist(), cu_seqlens_q[1:].tolist())):
+        if seqlens_k[i] == 0:
+            assert torch.all(lse[:, start:end] == float("inf"))
+            assert torch.all(out[start:end] == 0)
+        else:
+            scores = torch.einsum("qhd,khd->hqk", q[start:end].float(), k_cache_seq[i, :seqlens_k[i]].float())
+            lse_ref = (scores * d ** -0.5).logsumexp(-1)
+            assert (lse[:, start:end] - lse_ref).abs().max().item() < 1e-3
+
+
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("paged_kv_block_size", [256])
 @pytest.mark.parametrize("append_knew", [False, True])
