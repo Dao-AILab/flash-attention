@@ -1812,7 +1812,14 @@ class FlashAttentionBackwardSm90:
         tidx, _, _ = cute.arch.thread_idx()
         # warp-local thread index (dQaccum_store runs on warp 1, global tidx 32-63)
         warp_local_tidx = tidx % cute.arch.WARP_SIZE
-        read_flag = const_expr(not self.deterministic)
+
+        # Deterministic frees sdQaccum at the end of each m_block, so free it once up front
+        if const_expr(self.deterministic):
+            for warp_group_idx in cutlass.range_constexpr(self.num_wg_dQ):
+                cute.arch.barrier_arrive(
+                    barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
+                    number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
+                )
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1865,17 +1872,16 @@ class FlashAttentionBackwardSm90:
                         m_block_safe = m_block
 
                         num_dQ_chunks = self.num_wg_dQ
-                        for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
-                            if const_expr(not self.deterministic):
-                                # If deterministic, we already waited at the end of the prev iter
+                        if const_expr(not self.deterministic):
+                            for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
                                 cute.arch.cp_async_bulk_wait_group(
-                                    num_dQ_chunks - 1 - warp_group_idx, read=read_flag
+                                    num_dQ_chunks - 1 - warp_group_idx, read=True
                                 )
-                            cute.arch.barrier_arrive(
-                                barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
-                                number_of_threads=self.num_threads_per_warp_group
-                                + cute.arch.WARP_SIZE,
-                            )
+                                cute.arch.barrier_arrive(
+                                    barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
+                                    number_of_threads=self.num_threads_per_warp_group
+                                    + cute.arch.WARP_SIZE,
+                                )
 
                         # Semaphore acquire: wait for prior n_blocks to finish writing this m_block
                         if const_expr(self.deterministic):
@@ -1909,7 +1915,16 @@ class FlashAttentionBackwardSm90:
 
                         # Semaphore release: signal that this n_block is done with this m_block
                         if const_expr(self.deterministic):
-                            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                            for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
+                                cute.arch.cp_async_bulk_wait_group(
+                                    num_dQ_chunks - 1 - warp_group_idx, read=True
+                                )
+                                cute.arch.barrier_arrive(
+                                    barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
+                                    number_of_threads=self.num_threads_per_warp_group
+                                    + cute.arch.WARP_SIZE,
+                                )
+                            cute.arch.cp_async_bulk_wait_group(0, read=False)
                             barrier.arrive_inc(
                                 mdQ_semaphore_cur[(m_block_safe, None)].iterator,
                                 warp_local_tidx,
