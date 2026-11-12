@@ -904,7 +904,7 @@ def test_mxfp8_qk_policy_follows_its_own_rows():
     assert select_fwd_config(causal_hd64._replace(device_arch=103)).sm_stats_cross_stage
 
 
-@pytest.mark.parametrize("mxfp8_path", ["qk", "pv"])
+@pytest.mark.parametrize("mxfp8_path", ["qk", "pv", "pv_fast"])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("device_arch", [100, 103, 107])
@@ -917,7 +917,7 @@ def test_mxfp8_kv_stages_fit_the_scales(mxfp8_path, head_dim, causal, device_arc
     # for QK MXFP8) plus K's scale chunk.
     rows = config.q_stage * 128
     q_o = rows * head_dim + config.q_stage * 512 + rows * head_dim * 2
-    q_o += 512 if mxfp8_path == "pv" else 0
+    q_o += 0 if mxfp8_path == "qk" else 512
     bf16_v = mxfp8_path == "qk" or causal  # causal native PV: BF16 diagonal V blocks
     kv_stage_bytes = 128 * head_dim * (2 if bf16_v else 1) + 512
     assert config.kv_stage == min((224 * 1024 - q_o) // kv_stage_bytes, 32)
@@ -970,6 +970,9 @@ _MXFP8_CLC_HD64 = Sm100Registers(softmax=184, correction=64, other=80)
         ({"mxfp8_path": "pv", "device_arch": 100}, True, None),
         ({"mxfp8_path": "pv", "device_arch": 103}, True, _MXFP8_CLC_HD64),
         ({"mxfp8_path": "pv", "device_arch": 107}, False, None),
+        ({"mxfp8_path": "pv_fast", "device_arch": 103, **_HD128}, True, _MXFP8_CLC_HD64),
+        ({"mxfp8_path": "pv_fast", "device_arch": 107, **_HD128}, True, None),
+        ({"mxfp8_path": "pv_fast", "device_arch": 103}, True, None),
     ],
 )
 def test_causal_mxfp8_clc_cells(changes, clc, registers):
@@ -990,3 +993,25 @@ def test_mxfp8_pv_keeps_hardware_exp2():
     assert fp8.ex2_emu_freq > 0
     config = select_fwd_config(pv)
     assert (config.ex2_emu_freq, config.ex2_emu_start_frg) == (0, 0)
+
+
+def test_mxfp8_pv_fast_policy():
+    fast = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128,
+                       mxfp8_path="pv_fast")
+    # sm_100 "fast" has its own spill-free splits; sm_103 keeps the "exact" ones.
+    assert astuple(select_fwd_config(fast).registers) == (176, 64, 96)
+    assert select_fwd_config(fast._replace(device_arch=103)).registers == select_fwd_config(
+        fast._replace(device_arch=103, mxfp8_path="pv")
+    ).registers
+    assert astuple(select_fwd_config(fast._replace(device_arch=107)).registers) == (168, 96, 80)
+    # Causal "fast" hd128 runs CLC with its own split on sm_100 and sm_103.
+    causal_inputs = fast._replace(causal=True)
+    causal = select_fwd_config(causal_inputs)
+    assert causal.use_clc_scheduler and astuple(causal.registers) == (184, 64, 80)
+    no_clc = derive_fwd_config(causal, causal_inputs, use_clc_scheduler=False)
+    assert astuple(no_clc.registers) == (192, 64, 64)
+    # "fast" has no quantized-P contract: sm_100 emulates exp2 for half the columns.
+    assert (causal.ex2_emu_freq, causal.ex2_emu_start_frg) == (8, 1)
+    assert select_fwd_config(fast._replace(device_arch=103)).ex2_emu_freq == 0
+    assert select_fwd_config(fast).sm_stats_cross_stage
+    assert not select_fwd_config(fast._replace(mxfp8_path="pv")).sm_stats_cross_stage
