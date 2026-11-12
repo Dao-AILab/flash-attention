@@ -28,32 +28,29 @@ is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
 
 
 def attn_bias_from_alibi_slopes(
-    slopes, seqlen_q, seqlen_k, query_padding_mask=None, key_padding_mask=None, causal=False, key_leftpad=None
+    slopes, seqlen_q, seqlen_k, query_padding_mask=None, key_padding_mask=None, key_leftpad=None
 ):
     batch, nheads = slopes.shape
     device = slopes.device
     slopes = rearrange(slopes, "b h -> b h 1 1")
-    if causal:
-        return torch.arange(-seqlen_k + 1, 1, device=device, dtype=torch.float32) * slopes
-    else:
-        row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
-        col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
-        if key_leftpad is not None:
-            key_leftpad = rearrange(key_leftpad, "b -> b 1 1 1")
-            col_idx = repeat(col_idx, "s -> b 1 1 s", b=key_leftpad.shape[0])
-            col_idx = torch.where(col_idx >= key_leftpad, col_idx - key_leftpad, 2**32)
-        sk = (
-            seqlen_k
-            if key_padding_mask is None
-            else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
-        )
-        sq = (
-            seqlen_q
-            if query_padding_mask is None
-            else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
-        )
-        relative_pos = torch.abs(row_idx + sk - sq - col_idx)
-        return -slopes * relative_pos.to(dtype=slopes.dtype)
+    row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
+    col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
+    if key_leftpad is not None:
+        key_leftpad = rearrange(key_leftpad, "b -> b 1 1 1")
+        col_idx = repeat(col_idx, "s -> b 1 1 s", b=key_leftpad.shape[0])
+        col_idx = torch.where(col_idx >= key_leftpad, col_idx - key_leftpad, 2**32)
+    sk = (
+        seqlen_k
+        if key_padding_mask is None
+        else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    sq = (
+        seqlen_q
+        if query_padding_mask is None
+        else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    relative_pos = torch.abs(row_idx + sk - sq - col_idx)
+    return -slopes * relative_pos.to(dtype=slopes.dtype)
 
 
 def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random"):
@@ -230,6 +227,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     key_leftpad=None,
+    return_lse=False,
 ):
     """
     Arguments:
@@ -302,6 +300,9 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    if return_lse:  # a row without keys has an infinite LSE, as in FlashAttention
+        lse = torch.logsumexp(scores, dim=-1)
+        return output.to(dtype=dtype_og), attention.to(dtype=dtype_og), lse.masked_fill(lse == float("-inf"), float("inf"))
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
@@ -319,6 +320,7 @@ def attention_kvpacked_ref(
     upcast=True,
     reorder_ops=False,
     key_leftpad=None,
+    return_lse=False,
 ):
     return attention_ref(
         q,
@@ -335,6 +337,7 @@ def attention_kvpacked_ref(
         softcap=softcap,
         reorder_ops=reorder_ops,
         key_leftpad=key_leftpad,
+        return_lse=return_lse,
     )
 
 
@@ -598,7 +601,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     )
     if alibi:
         alibi_slopes = torch.rand(batch_size, nheads, device=device, dtype=torch.float32) * 0.3
-        attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen, seqlen, causal=causal)
+        attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen, seqlen)
     else:
         alibi_slopes, attn_bias = None, None
     out, lse, S_dmask = flash_attn_qkvpacked_func(
@@ -751,7 +754,7 @@ def test_flash_attn_varlen_qkvpacked(
     if alibi:
         alibi_slopes = torch.rand(batch_size, nheads, device=device, dtype=torch.float32) * 0.3
         attn_bias = attn_bias_from_alibi_slopes(
-            alibi_slopes, seqlen, seqlen, key_padding_mask, key_padding_mask, causal=causal
+            alibi_slopes, seqlen, seqlen, key_padding_mask, key_padding_mask
         )
     else:
         alibi_slopes, attn_bias = None, None
@@ -936,7 +939,7 @@ def test_flash_attn_output(
         )
     if alibi:
         alibi_slopes = torch.rand(batch_size, nheads, device=device, dtype=torch.float32) * 0.3
-        attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k, causal=causal)
+        attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k)
     else:
         alibi_slopes, attn_bias = None, None
 
@@ -1005,7 +1008,7 @@ def test_flash_attn_output(
         dropout_mask = None
 
     if kvpacked:
-        out_ref, attn_ref = attention_kvpacked_ref(
+        out_ref, attn_ref, lse_ref = attention_kvpacked_ref(
             q,
             kv,
             None,
@@ -1016,6 +1019,7 @@ def test_flash_attn_output(
             causal=causal,
             window_size=window_size,
             softcap=softcap,
+            return_lse=True,
         )
         out_pt, attn_pt = attention_kvpacked_ref(
             q,
@@ -1032,7 +1036,7 @@ def test_flash_attn_output(
             reorder_ops=True,
         )
     else:
-        out_ref, attn_ref = attention_ref(
+        out_ref, attn_ref, lse_ref = attention_ref(
             q,
             k,
             v,
@@ -1044,6 +1048,7 @@ def test_flash_attn_output(
             causal=causal,
             window_size=window_size,
             softcap=softcap,
+            return_lse=True,
         )
         out_pt, attn_pt = attention_ref(
             q,
@@ -1065,6 +1070,8 @@ def test_flash_attn_output(
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+    print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+    assert torch.allclose(lse, lse_ref, rtol=0, atol=1e-3)
     if dropout_p > 0.0:
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
@@ -1211,7 +1218,7 @@ def test_flash_attn_varlen_output(
     if alibi:
         alibi_slopes = torch.rand(batch_size, nheads, device=device, dtype=torch.float32) * 0.3
         attn_bias = attn_bias_from_alibi_slopes(
-            alibi_slopes, seqlen_q, seqlen_k, query_padding_mask, key_padding_mask, causal=causal
+            alibi_slopes, seqlen_q, seqlen_k, query_padding_mask, key_padding_mask
         )
     else:
         alibi_slopes, attn_bias = None, None
@@ -1779,7 +1786,7 @@ def test_flash_attn_splitkv(
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     if alibi:
         alibi_slopes = torch.rand(batch_size, nheads, device=device, dtype=torch.float32) * 0.3
-        attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k, causal=causal)
+        attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k)
     else:
         alibi_slopes, attn_bias = None, None
     out, lse, _ = flash_attn_func(
@@ -1998,7 +2005,7 @@ def test_flash_attn_kvcache(
     if alibi:
         alibi_slopes = torch.rand(batch_size, nheads, device=device, dtype=torch.float32) * 0.3
         attn_bias = attn_bias_from_alibi_slopes(
-            alibi_slopes, seqlen_q, seqlen_k, None, key_padding_mask, causal=causal, key_leftpad=cache_leftpad
+            alibi_slopes, seqlen_q, seqlen_k, None, key_padding_mask, key_leftpad=cache_leftpad
         )
     else:
         alibi_slopes, attn_bias = None, None
@@ -2053,7 +2060,7 @@ def test_flash_attn_kvcache(
         v_cache_ref[update_mask] = rearrange(v, "b s ... -> (b s) ...")
     k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
-    out = flash_attn_with_kvcache(
+    out, lse = flash_attn_with_kvcache(
         q,
         k_cache if paged_kv_block_size is None else k_cache_paged,
         v_cache if paged_kv_block_size is None else v_cache_paged,
@@ -2070,6 +2077,7 @@ def test_flash_attn_kvcache(
         rotary_interleaved=rotary_interleaved,
         alibi_slopes=alibi_slopes,
         num_splits=num_splits,
+        return_softmax_lse=True,
     )
     # out = flash_attn_with_kvcache(
     #     q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=causal, window_size=window_size
@@ -2081,7 +2089,7 @@ def test_flash_attn_kvcache(
     # o1 = torch.einsum('bhst,bthd->bshd', s_tmp, v_cache_ref)
     # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
     # probs = torch.softmax(qk, dim=-1)
-    out_ref, _ = attention_ref(
+    out_ref, _, lse_ref = attention_ref(
         q_ro,
         k_cache_rep,
         v_cache_rep,
@@ -2093,6 +2101,7 @@ def test_flash_attn_kvcache(
         causal=causal,
         window_size=window_size,
         key_leftpad=cache_leftpad,
+        return_lse=True,
     )
     out_pt, _ = attention_ref(
         q_ro,
@@ -2113,6 +2122,8 @@ def test_flash_attn_kvcache(
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+    print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+    assert torch.allclose(lse, lse_ref, rtol=0, atol=1e-3)
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
