@@ -577,6 +577,15 @@ def test_flash_attn_varlen_output(
             # Check that FlashAttention's numerical error is at most 3x the numerical error
             # of a Pytorch implementation.
             assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
+            if seqused_q is not None:  # the same inputs in the padded layout: seqused_q, seqused_k and no cu_seqlens
+                out_padded = flash_attn_varlen_func(
+                    q.detach().to(dtype), k.detach().to(dtype), v.detach().to(dtype), None, None, None, None,
+                    seqused_q=seqused_q, seqused_k=seqused_k, causal=causal, qv=qv, q_descale=q_descale,
+                    k_descale=k_descale, v_descale=v_descale, window_size=window_size,
+                    attention_chunk=attention_chunk, softcap=softcap, pack_gqa=pack_gqa, num_splits=num_splits,
+                )
+                out_padded.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+                assert (out_padded - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
 
 
         if (
