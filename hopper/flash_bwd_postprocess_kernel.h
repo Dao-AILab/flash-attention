@@ -104,7 +104,7 @@ public:
 
     using ShapedQ = cute::Shape<int32_t, int32_t, int32_t, int32_t>;   // (seqlen_q, d, head, batch)
     using StridedQ = cute::Stride<int64_t, _1, int64_t, int64_t>;
-    using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
+    using ShapedQaccum = cute::Shape<int64_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
     using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
 
     // Device side arguments
@@ -174,7 +174,7 @@ public:
         // Step 1: load dQaccum from gmem to smem
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum const*>(params.ptr_dQaccum)),
                                       params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
-        Tensor gdQaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));  // (M * K)
+        Tensor gdQaccum = local_tile(domain_offset(make_coord(int64_t(seqlen_info.offset_padded) * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(int64_t(m_block)));  // (M * K)
         if constexpr (IsSm90) {  // Use BulkCopy
             static constexpr uint32_t TmaTransactionBytesdQaccum = static_cast<uint32_t>(size(SmemLayoutdQaccumFlat{}) * cute::sizeof_bits_v<ElementAccum> / 8);
             auto bulk_copy = Copy_Traits<SM90_BULK_COPY_AUTO>{};

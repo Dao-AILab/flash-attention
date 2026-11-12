@@ -1484,14 +1484,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     }
     at::Tensor dq_accum, dk_accum, dv_accum;
     if (!is_varlen) {
-        dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+        dq_accum = torch::empty({batch_size, num_heads, static_cast<int64_t>(seqlen_q_rounded) * head_size_rounded}, opts.dtype(at::kFloat));
     } else {
-        dq_accum = torch::empty({num_heads, total_q_padded_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+        dq_accum = torch::empty({num_heads, static_cast<int64_t>(total_q_padded_rounded) * head_size_rounded}, opts.dtype(at::kFloat));
     }
     if (num_heads_k != num_heads) {  // MQA / GQA
         if (!is_varlen) {
-            dk_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded}, opts.dtype(at::kFloat));
-            dv_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_v_rounded}, opts.dtype(at::kFloat));
+            dk_accum = torch::zeros({batch_size, num_heads_k, static_cast<int64_t>(seqlen_k_rounded) * head_size_rounded}, opts.dtype(at::kFloat));
+            dv_accum = torch::zeros({batch_size, num_heads_k, static_cast<int64_t>(seqlen_k_rounded) * head_size_v_rounded}, opts.dtype(at::kFloat));
         } else {
             dk_accum = torch::zeros({num_heads_k, total_k_padded_rounded, head_size_rounded}, opts.dtype(at::kFloat));
             dv_accum = torch::zeros({num_heads_k, total_k_padded_rounded, head_size_v_rounded}, opts.dtype(at::kFloat));

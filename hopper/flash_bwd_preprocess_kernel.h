@@ -63,7 +63,7 @@ public:
     using StrideO = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using ShapedPsum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q, head, batch)
     using StridedPsum = cute::Stride<_1, int64_t, int64_t>;
-    using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
+    using ShapedQaccum = cute::Shape<int64_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
     using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
 
     // Device side arguments
@@ -230,7 +230,7 @@ public:
 
         if constexpr (Clear_dQaccum) {
             Tensor mdQaccum = make_tensor(make_gmem_ptr(params.ptr_dQaccum), params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
-            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));
+            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(int64_t(seqlen_info.offset_padded) * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(int64_t(m_block)));
             GmemTiledCopyAccum gmem_tiled_copy_dQaccum;
             auto gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_thread_slice(thread_idx);
             Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_D(gdQaccum);
