@@ -585,8 +585,6 @@ def _validate_block_scales(
         raise ValueError("Native MXFP8 PV requires e4m3 Q/K/V" if pv
                          else "QK MXFP8 requires e4m3 Q/K and bf16 V")
     head_dims = (q.shape[-1], v.shape[-1])
-    if pv and not set(head_dims) <= {64, 128}:
-        raise NotImplementedError(f"{mode} supports head dimensions 64 and 128")
     if head_dims != (256, 256) and not set(head_dims) <= {64, 128}:
         raise NotImplementedError(f"{mode} supports head dimensions 64 and 128, or 256 and 256")
     if requires_grad or (v_bf16 is not None and v_bf16.requires_grad):
