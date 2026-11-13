@@ -1164,7 +1164,14 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadLSE + tidx / kBlockM;
         const int col = tidx % kBlockM;
-        ElementAccum lse = (row < params.num_splits && col < lse_size - bidx * kBlockM) ? gLSEaccum(row, col) : -INFINITY;
+        const index_t lse_idx = row_offset_lse + col;
+        bool valid_lse = row < params.num_splits && lse_idx < lse_size;
+        if (valid_lse && params.cu_seqlens_q != nullptr) {
+            const int batch_idx = lse_idx / (params.h * params.seqlen_q);
+            const int q_row = lse_idx % params.seqlen_q;
+            valid_lse = q_row < params.cu_seqlens_q[batch_idx + 1] - params.cu_seqlens_q[batch_idx];
+        }
+        ElementAccum lse = valid_lse ? gLSEaccum(row, col) : -INFINITY;
         if (row < kMaxSplits) { sLSE[row][col] = lse; }
         // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse); }
     }
@@ -1207,7 +1214,18 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         if (params.unpadded_lse) {
             const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
             if (lse_offset < lse_size) {
-                gLSE_unpadded(lse_offset) = lse_logsum;
+                if (params.cu_seqlens_q != nullptr) {
+                    const int batch_idx = lse_offset / (params.h * params.seqlen_q);
+                    const int head_idx = (lse_offset / params.seqlen_q) % params.h;
+                    const int q_row = lse_offset % params.seqlen_q;
+                    const int q_start = params.cu_seqlens_q[batch_idx];
+                    if (q_row < params.cu_seqlens_q[batch_idx + 1] - q_start) {
+                        const index_t lse_addr = head_idx * index_t(params.total_q) + q_start + q_row;
+                        reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr)[lse_addr] = lse_logsum;
+                    }
+                } else {
+                    gLSE_unpadded(lse_offset) = lse_logsum;
+                }
             }
         } else {
             gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
@@ -1280,7 +1298,14 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             const int head_idx = (idx - batch_idx * (params.h * params.seqlen_q)) / params.seqlen_q;
             // The index to the rows of Q
             const int row = idx - batch_idx * (params.h * params.seqlen_q) - head_idx * params.seqlen_q;
-            auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_idx * params.o_batch_stride
+            if (params.cu_seqlens_q != nullptr) {
+                const int q_start = params.cu_seqlens_q[batch_idx];
+                if (row >= params.cu_seqlens_q[batch_idx + 1] - q_start) { continue; }
+            }
+            const index_t batch_offset = params.cu_seqlens_q == nullptr
+                ? batch_idx * params.o_batch_stride
+                : index_t(params.cu_seqlens_q[batch_idx]) * params.o_row_stride;
+            auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_offset
                 + head_idx * params.o_head_stride + row * params.o_row_stride;
             #pragma unroll
             for (int k = 0; k < size<2>(rO); ++k) {
