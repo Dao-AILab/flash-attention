@@ -31,6 +31,7 @@ from .interface import (
     combine_kernel_geometry,
     fwd_codegen_config,
 )
+from .p_quant import resolve_p_quant
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ROUNDS = 5
@@ -313,6 +314,10 @@ def tune_fwd_config(
         raise ValueError("at least one FwdConfig is required")
     if compile_workers < 1:
         raise ValueError("compile_workers must be positive")
+    if resolve_p_quant(forward_kwargs.get("p_quant")) is not None:
+        # Candidates are checked against the default config's output, but a quantized P
+        # depends on the tile and split schedule, so correct candidates would be rejected.
+        raise NotImplementedError("autotuning is not supported with p_quant")
     if torch.compiler.is_compiling():
         raise RuntimeError("autotuning must run outside torch.compile")
     if not CUTE_DSL_CACHE_ENABLED:

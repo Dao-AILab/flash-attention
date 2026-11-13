@@ -155,6 +155,8 @@ class FwdHeuristicInputs(NamedTuple):
     has_aux_scalars: bool = False
     # MXFP8 block-scaled forward: "qk" (e4m3 Q/K with block scales, BF16 V); None otherwise.
     mxfp8_path: str | None = None
+    # Name of the P quant-dequant format (flash_attn.cute.p_quant); None otherwise.
+    p_quant: str | None = None
 
     @property
     def device_capacity(self) -> int:
@@ -1246,6 +1248,8 @@ class SwapABPolicy:
             "single query token per sequence": is_dense_q and inputs.total_q != inputs.batch_size,
             "dtype": inputs.dtype not in ("torch.float16", "torch.bfloat16"),
             "MXFP8 block scales": inputs.mxfp8_path is not None,
+            # The decode kernel computes P inline and has no quant-dequant path.
+            "p_quant": inputs.p_quant is not None,
             "head dimensions": not self.supports_head_dims(inputs.head_dim, inputs.head_dim_v),
             "GQA ratio": inputs.qhead_per_kvhead > self.max_qhead_per_kvhead,
             f"page size must be a multiple of {self.page_multiple}": (

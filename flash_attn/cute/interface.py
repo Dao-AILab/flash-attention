@@ -20,6 +20,7 @@ from cutlass import Int32, Float32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
+from flash_attn.cute.p_quant import PQuantFormat, resolve_p_quant
 from flash_attn.cute.config import (
     BwdConfig,
     BwdHeuristicInputs,
@@ -564,6 +565,87 @@ def _validate_block_scales(
     return BlockScales(*(maybe_contiguous(t.reshape(-1)) for t in scales))
 
 
+# Architectures the P quant-dequant modes run on. Other SM10x architectures only compile (see
+# _p_quant_compile_only_arch). sm_100 is the target of the hardware qualification; whether it
+# has passed is recorded in docs/p-quant-contract.md, not here.
+_P_QUANT_ENABLED_ARCHS = (100,)
+_P_QUANT_HEAD_DIMS = (64, 96, 128)
+
+
+def _refuse_p_quant(fmt: PQuantFormat, feature: str):
+    raise NotImplementedError(f"p_quant={fmt.name!r} is not supported with {feature}")
+
+
+def _refuse_p_quant_backward_options(p_quant, **options) -> None:
+    """Refuse backward-only options together with p_quant.
+
+    The autograd entry points save these for the backward, where they would change the
+    gradient away from the surrogate the mode is specified with. ``options`` maps a
+    feature name to its value; any value that is not None is refused.
+    """
+    fmt = resolve_p_quant(p_quant)
+    if fmt is None:
+        return
+    for feature, value in options.items():
+        if value is not None:
+            _refuse_p_quant(fmt, feature)
+
+
+def _validate_p_quant(
+    p_quant, *, arch, compile_only_arch, q, k, v, qv, scales, page_table, learnable_sink,
+    softcap, score_mod, mask_mod, block_sparse_tensors, gather_kv_indices, config,
+    gather_bwd_recompute_p,
+) -> Optional[PQuantFormat]:
+    """Resolve p_quant and refuse every combination it is not qualified for.
+
+    Runs before any early return, kernel selection or compilation, so a requested format
+    either runs the quantizing kernel or raises; it never runs an unquantized one.
+    """
+    fmt = resolve_p_quant(p_quant)  # ValueError on unknown names
+    if fmt is None:
+        return None
+
+    def refuse(feature: str):
+        _refuse_p_quant(fmt, feature)
+
+    if compile_only_arch:
+        if arch // 10 != 10:
+            refuse(f"architecture sm_{arch} (compile-only checks cover SM10x)")
+    elif arch not in _P_QUANT_ENABLED_ARCHS:
+        refuse(f"architecture sm_{arch} (enabled: sm_100)")
+    if qv is not None:
+        refuse("MLA (qv)")
+    if scales is not None:
+        refuse("quantized inputs (scales)")
+    dtypes = [t.dtype for t in (q, k, v) if t is not None]
+    if any(dtype != torch.bfloat16 for dtype in dtypes):
+        refuse(f"{', '.join(sorted({str(d) for d in dtypes}))} inputs (BF16 q, k and v are required)")
+    head_dim, head_dim_v = q.shape[-1], v.shape[-1]
+    if head_dim != head_dim_v or head_dim not in _P_QUANT_HEAD_DIMS:
+        refuse(
+            f"head dimensions ({head_dim}, {head_dim_v}); supported: equal, one of "
+            f"{_P_QUANT_HEAD_DIMS}"
+        )
+    refused = {
+        "paged KV (page_table)": page_table is not None,
+        "learnable_sink": learnable_sink is not None,
+        "softcap": softcap is not None and softcap != 0.0,
+        "score_mod": score_mod is not None,
+        "mask_mod": mask_mod is not None,
+        "block sparsity": block_sparse_tensors is not None,
+        "sparse or gather KV (gather_kv_indices)": gather_kv_indices is not None,
+        "gather_bwd_recompute_p": gather_bwd_recompute_p,
+        "an explicit SwapAB config": isinstance(config, FwdConfig) and config.use_swapab,
+        "a forced SwapAB backend (FLASH_ATTENTION_SM100_BACKEND=swapab)": (
+            utils._get_sm100_backend_override() is True
+        ),
+    }
+    for feature, present in refused.items():
+        if present:
+            refuse(feature)
+    return fmt
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -605,6 +687,8 @@ def _flash_attn_fwd(
     gather_bwd_recompute_p: bool = False,
     *,
     config: FwdConfig | MlaFwdConfig | None = None,
+    p_quant: str | PQuantFormat | None = None,
+    _p_quant_compile_only_arch: bool = False,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -626,6 +710,11 @@ def _flash_attn_fwd(
             forward-only attention.
         config: Fully resolved forward config, or None for the default: an MlaFwdConfig with qv,
             else a FwdConfig.
+        p_quant: Fake quantization (quant-dequant) of the attention probabilities fed to P @ V:
+            "fp8_e4m3", "nvfp4", or None. The row sum, LSE and backward stay unquantized. See
+            flash_attn.cute.p_quant and _validate_p_quant for what it supports.
+        _p_quant_compile_only_arch: tests only. Lets p_quant compile for SM10x architectures it
+            has not been executed on; the public entry points never set it.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
@@ -753,6 +842,19 @@ def _flash_attn_fwd(
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
+    # Before any early return: a quantized mode must never fall through to an unquantized path.
+    # The default (no format requested) skips the call altogether, so the unquantized path
+    # does not pay for it. With the call on that path a B200 host spent 1.4 to 2.7 us more per
+    # forward (unprofiled); how much of that the call itself was, was not measured.
+    p_quant_fmt = None
+    if p_quant is not None:
+        p_quant_fmt = _validate_p_quant(
+            p_quant, arch=arch, compile_only_arch=_p_quant_compile_only_arch, q=q, k=k, v=v,
+            qv=qv, scales=scales, page_table=page_table, learnable_sink=learnable_sink,
+            softcap=softcap, score_mod=score_mod, mask_mod=mask_mod,
+            block_sparse_tensors=block_sparse_tensors, gather_kv_indices=gather_kv_indices,
+            config=config, gather_bwd_recompute_p=gather_bwd_recompute_p,
+        )
     alignment = 16 // v.element_size()
     if arch // 10 not in [8, 12]:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
@@ -887,6 +989,7 @@ def _flash_attn_fwd(
         requires_grad=requires_grad or any(t.requires_grad for t in aux_tensors or ()),
         has_aux_scalars=aux_scalars is not None,
         mxfp8_path="qk" if qk_blockscaled else None,
+        p_quant=None if p_quant_fmt is None else p_quant_fmt.name,
         mla=None if qv is None else dict(
             is_topk_gather=gather_kv_indices is not None,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
@@ -1260,6 +1363,14 @@ def _flash_attn_fwd(
 
     if qk_blockscaled:
         compile_key += ("mxfp8_qk", v.dtype)
+    if p_quant_fmt is not None:
+        # The whole format, so a re-registered name with another policy cannot reuse a kernel,
+        # and the hash of the codec helper, so a replaced helper cannot either (a registered
+        # codec's helper may live outside this package, where the cache's source fingerprint
+        # does not see it). Identity formats have no helper.
+        from flash_attn.cute.softmax import _P_QUANT_CODECS
+
+        compile_key += ("p_quant", p_quant_fmt, _P_QUANT_CODECS.helper_hash(p_quant_fmt.codec))
 
     if _needs_compile(_flash_attn_fwd.compile_cache, compile_key):
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1459,7 +1570,11 @@ def _flash_attn_fwd(
             else:
                 fwd_cls = FlashAttentionForwardSm100
                 # SwapAB never runs block scales (config.SWAPAB.rejection).
-                mxfp8_kwargs = dict(qk_blockscaled=True) if qk_blockscaled else {}
+                extra_kwargs = dict(qk_blockscaled=True) if qk_blockscaled else {}
+                if p_quant_fmt is not None:
+                    # Selection and validation both reject SwapAB when p_quant is set.
+                    assert not use_swapab, "p_quant cannot run on the SwapAB decode kernel"
+                    extra_kwargs["p_quant"] = p_quant_fmt
                 if use_swapab:
                     from flash_attn.cute.flash_fwd_decode_sm100 import FlashAttentionForwardSm100SwapAB
                     fwd_cls = FlashAttentionForwardSm100SwapAB
@@ -1479,7 +1594,7 @@ def _flash_attn_fwd(
                     kv_subtile_factor=kv_subtile_factor,
                     seqlen_k_per_split=seqlen_k_per_split,
                     has_tile_count_semaphore=tile_count_semaphore is not None,
-                    **mxfp8_kwargs,
+                    **extra_kwargs,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -3435,9 +3550,15 @@ class FlashAttnFunc(torch.autograd.Function):
         gather_bwd_token_chunk: Optional[int] = None,
         config: FwdConfig | MlaFwdConfig | None = None,
         scales: TensorwiseScales | BlockScales | None = None,
+        p_quant: str | PQuantFormat | None = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
+        if p_quant is not None:
+            _refuse_p_quant_backward_options(
+                p_quant, score_mod_bwd=score_mod_bwd,
+                block_sparse_tensors_bwd=block_sparse_tensors_bwd,
+            )
         if shared_kv and v.shape[-1] == 512:
             _check_shared_kv_scales(scales)
             # specialize MLA attention formula
@@ -3468,6 +3589,7 @@ class FlashAttnFunc(torch.autograd.Function):
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             config=config,
             scales=scales,
+            p_quant=p_quant,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -3515,9 +3637,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 17)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 17)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3546,7 +3668,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 17)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3588,9 +3710,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         gather_bwd_token_chunk: Optional[int] = None,
         config: FwdConfig | MlaFwdConfig | None = None,
         scales: TensorwiseScales | None = None,
+        p_quant: str | PQuantFormat | None = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
+        if p_quant is not None:
+            _refuse_p_quant_backward_options(p_quant, score_mod_bwd=score_mod_bwd)
         if shared_kv and v.shape[-1] == 512:
             _check_shared_kv_scales(scales)
             # specialize MLA attention formula
@@ -3632,6 +3757,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             config=config,
             scales=scales,
+            p_quant=p_quant,
         )
         ctx.save_for_backward(
             q,
@@ -3705,9 +3831,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 18)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 19)
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 18)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 19)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3741,7 +3867,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 18)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 19)
 
 
 def _validate_gather_bwd_kwargs(
@@ -3807,6 +3933,7 @@ def flash_attn_func(
     gather_bwd_token_chunk: Optional[int] = None,
     config: FwdConfig | MlaFwdConfig | None = None,
     scales: TensorwiseScales | BlockScales | None = None,
+    p_quant: str | PQuantFormat | None = None,
 ):
     """Compute attention.
 
@@ -3814,6 +3941,11 @@ def flash_attn_func(
         (FP8 then uses descale 1).
         - TensorwiseScales: FP8 Q/K/V.
         - BlockScales(q, k): MXFP8 Q/K with BF16 V; BF16 output, dense, unsplit attention.
+    p_quant: fake quantization (quant-dequant) of the attention probabilities for
+        quantization-aware training: "fp8_e4m3" or "nvfp4"; None (default) for none. Only the
+        P @ V operand is quantized; the row sum, LSE and the backward stay unquantized, so the
+        backward is a straight-through surrogate. SM100, BF16, head dim 64/96/128; unsupported
+        combinations raise.
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -3858,6 +3990,7 @@ def flash_attn_func(
         gather_bwd_token_chunk,
         config,
         scales,
+        p_quant,
     )
 
 
@@ -3897,6 +4030,7 @@ def flash_attn_varlen_func(
     gather_bwd_token_chunk: Optional[int] = None,
     config: FwdConfig | MlaFwdConfig | None = None,
     scales: TensorwiseScales | None = None,
+    p_quant: str | PQuantFormat | None = None,
 ):
     """
     Tensor arguments:
@@ -3979,6 +4113,8 @@ def flash_attn_varlen_func(
     scales: dequantization scales of low-precision Q/K/V; TensorwiseScales for FP8, which is
         forward-only. None for unscaled inputs (FP8 then uses descale 1). MXFP8 BlockScales
         support only dense attention, through flash_attn_func.
+    p_quant: fake quantization (quant-dequant) of the attention probabilities; see
+        flash_attn_func.
     """
     if isinstance(scales, BlockScales):
         raise NotImplementedError(
@@ -4023,6 +4159,7 @@ def flash_attn_varlen_func(
         gather_bwd_token_chunk,
         config,
         scales,
+        p_quant,
     )
 
 
