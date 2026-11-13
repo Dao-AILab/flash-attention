@@ -4310,7 +4310,9 @@ class FlashAttentionBackwardSm100:
                     )
 
                 #### APPLY MASK (after score_mod, matching forward pass order)
-                check_m_boundary = (m_block + 1) * self.tile_m > seqlen.seqlen_q
+                check_m_boundary = (
+                    (m_block + 1) * self.tile_m > seqlen.seqlen_q * self.pack_factor
+                )
                 mask_fn(
                     tSrS_t2r,
                     m_block=m_block,

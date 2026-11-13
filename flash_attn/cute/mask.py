@@ -888,9 +888,30 @@ class AttentionMask:
                 if seqlenk_col_limit <= 0:
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         acc_S[i] = -cutlass.Float32.inf
+                elif check_m_boundary:
+                    # Rows are packed (qhead_per_kvhead_packgqa per position), so the
+                    # valid range is seqlen_q * g, matching BlockInfo's m-block count.
+                    g = self.qhead_per_kvhead_packgqa
+                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                        global_q = tScS_t2r[i][ROW] + m_block * self.tile_m
+                        acc_S[i] = (
+                            -cutlass.Float32.inf
+                            if global_q >= self.seqlen_q * g
+                            else acc_S[i]
+                        )
         else:  # Causal or local
             # pack_gqa: row r is position r // g, so position limits scale by g (monotone in r)
             g = self.qhead_per_kvhead_packgqa
+            if const_expr(mask_seqlen):
+                if check_m_boundary:
+                    # Last m_block: q rows past seqlen_q * g (see g above).
+                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                        global_q = tScS_t2r[i][ROW] + m_block * self.tile_m
+                        acc_S[i] = (
+                            -cutlass.Float32.inf
+                            if global_q >= self.seqlen_q * g
+                            else acc_S[i]
+                        )
             thr_row_offset = tScS_t2r[0][ROW]
             seqlenq_row_limit = self.seqlen_q * g - m_block * self.tile_m - thr_row_offset
             causal_offset = seqlenq_row_limit - seqlenk_col_limit * g
