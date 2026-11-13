@@ -32,6 +32,7 @@ from flash_attn_interface import flash_attn_with_kvcache, get_scheduler_metadata
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV", "FALSE") == "TRUE"
+DISABLE_VARLEN = os.getenv("FLASH_ATTENTION_DISABLE_VARLEN", "FALSE") == "TRUE"
 DISABLE_APPENDKV = os.getenv("FLASH_ATTENTION_DISABLE_APPENDKV", "FALSE") == "TRUE"
 DISABLE_LOCAL = os.getenv("FLASH_ATTENTION_DISABLE_LOCAL", "FALSE") == "TRUE"
 DISABLE_SOFTCAP = os.getenv("FLASH_ATTENTION_DISABLE_SOFTCAP", "FALSE") == "TRUE"
@@ -1049,6 +1050,50 @@ def test_flash_attn_kvcache(
                 assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
                 mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
+
+
+@pytest.mark.skipif(
+    DISABLE_PAGEDKV or DISABLE_HDIM128,
+    reason="Requires paged KV and head dimension 128",
+)
+@pytest.mark.parametrize("page_size", [176, 256])
+@pytest.mark.parametrize("page_table_view", [False, True], ids=["empty", "view"])
+@pytest.mark.parametrize("cache_seqlens", [None] + ([0] if not DISABLE_VARLEN else []))
+@pytest.mark.parametrize("num_splits", [0, 1, 3] if not DISABLE_SPLIT else [1])
+def test_flash_attn_kvcache_empty_page_table(
+    page_size, page_table_view, cache_seqlens, num_splits,
+):
+    torch.random.manual_seed(0)
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, nheads, d = 2, 256, 2, 128
+    # Reproduce the Hopper paged-TMA (176) and non-TMA (256) configurations.
+    # The empty-KV path should bypass both attention kernels.
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(4, page_size, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    if page_table_view:
+        # Preserve backing storage, as in the original out-of-bounds reproducer.
+        page_table = torch.zeros(batch_size, 4, dtype=torch.int32, device=device)[:, :0]
+    else:
+        page_table = torch.empty(batch_size, 0, dtype=torch.int32, device=device)
+
+    out, lse, *_ = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        num_splits=num_splits,
+        causal=False,
+        return_softmax_lse=True,
+    )
+
+    assert out.shape == q.shape
+    assert lse.shape == (batch_size, nheads, seqlen_q)
+    assert (out == 0).all().item()
+    # Match the existing host-side empty-KV behavior, including the LSE sign.
+    assert torch.isposinf(lse).all().item()
 
 
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref):
