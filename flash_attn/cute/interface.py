@@ -395,10 +395,18 @@ def _compute_tile_cumsum(
 _compute_tile_cumsum.compile_cache = get_jit_cache("tile_cumsum")
 
 
-def _blocks_to_batch_size(total_q, num_batch, tile_m, qhead_per_kvhead, pack_gqa):
-    """Upper bound on number of m_blocks in a given varlen invocation"""
+def _blocks_to_batch_size(
+    total_q, num_batch, tile_m, qhead_per_kvhead, pack_gqa, *, q_stage, cluster_shape_m
+):
+    """Upper bound on number of m_blocks in a given varlen invocation.
+
+    Must cover every flat block index the varlen tile scheduler can look up, so it uses the
+    same tile as the scheduler grid: tile_m * q_stage rows per CTA, cluster_shape_m CTAs per
+    cluster (see SingleTileVarlenScheduler.get_grid_shape).
+    """
     seqlen_mult = qhead_per_kvhead if pack_gqa and qhead_per_kvhead > 1 else 1
-    return (total_q * seqlen_mult + num_batch * (tile_m - 1)) // tile_m + 1
+    tile = tile_m * q_stage * cluster_shape_m
+    return (total_q * seqlen_mult + num_batch * (tile - 1)) // tile + 1
 
 
 def _compute_blocks_to_batch(cu_total_blocks, num_blocks, device):
@@ -1110,7 +1118,13 @@ def _flash_attn_fwd(
         blocks_to_batch_idx = _compute_blocks_to_batch(
             cu_total_m_blocks,
             _blocks_to_batch_size(
-                total_q, batch_size, config.tile_m, qhead_per_kvhead, config.pack_gqa
+                total_q,
+                batch_size,
+                config.tile_m,
+                qhead_per_kvhead,
+                config.pack_gqa,
+                q_stage=config.q_stage,
+                cluster_shape_m=cluster_shape_m,
             ),
             cu_total_m_blocks.device,
         )
@@ -4475,6 +4489,7 @@ def _get_scheduler_metadata(
             _blocks_to_batch_size(
                 total_q if total_q is not None else num_batch * max_seqlen_q,
                 num_batch, tile_m, qhead_per_kvhead, pack_gqa,
+                q_stage=q_stage, cluster_shape_m=cluster_shape_m,
             ),
             cu_total_m_blocks.device,
         )
