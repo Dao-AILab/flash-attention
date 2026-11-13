@@ -1231,7 +1231,9 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     STD_TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
     #endif
 
-    if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
+    // An allocated paged cache can still have no logical keys if its page table is empty.
+    if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0
+        && (!paged_KV || seqlen_k > 0)) {
         auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
         void* stream_ptr = nullptr;
         TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
