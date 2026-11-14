@@ -2381,6 +2381,70 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
     assert not v.grad.isnan().any()
 
 
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_varlen_large_batch(causal, deterministic):
+    """The batch used to be on gridDim.y, which is capped at 65535, so more sequences than that
+    failed with "invalid configuration argument" (#1786).
+    """
+    device = "cuda"
+    dtype = torch.float16
+    torch.random.manual_seed(0)
+    batch_size, nheads, d = 70000, 2, 64
+    seqlens = torch.randint(1, 9, (batch_size,))
+    # A few long sequences, including around the old limit, so that a batch spans several blocks.
+    seqlens[[0, 65534, 65535, batch_size - 1]] = torch.tensor([300, 257, 199, 280])
+    cu_seqlens = F.pad(seqlens.cumsum(0), (1, 0)).to(device=device, dtype=torch.int32)
+    total, max_seqlen = seqlens.sum().item(), seqlens.max().item()
+    q, k, v = [
+        torch.randn(total, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        for _ in range(3)
+    ]
+    out = flash_attn_varlen_func(
+        q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, causal=causal,
+        deterministic=deterministic,
+    )
+    g = torch.randn_like(out)
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+
+    # Reference: run each group of equal-length sequences as a dense batch.
+    out_ref, dq_ref, dk_ref, dv_ref = [torch.empty_like(out) for _ in range(4)]
+    out_pt, dq_pt, dk_pt, dv_pt = [torch.empty_like(out) for _ in range(4)]
+    for seqlen in seqlens.unique().tolist():
+        idx = (cu_seqlens[:-1][seqlens.to(device) == seqlen, None]
+               + torch.arange(seqlen, device=device)).long()
+        q_b, k_b, v_b = [x.detach()[idx].requires_grad_() for x in (q, k, v)]
+        for o, grads, kwargs in [
+            (out_ref, (dq_ref, dk_ref, dv_ref), {}),
+            (out_pt, (dq_pt, dk_pt, dv_pt), dict(upcast=False, reorder_ops=True)),
+        ]:
+            o_b, _ = attention_ref(q_b, k_b, v_b, causal=causal, **kwargs)
+            o[idx] = o_b.detach()
+            for grad, grad_b in zip(grads, torch.autograd.grad(o_b, (q_b, k_b, v_b), g[idx])):
+                grad[idx] = grad_b
+
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+    assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
+    assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
+    assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
+
+
+def test_flash_attn_kvcache_large_batch():
+    """Same as test_flash_attn_varlen_large_batch, for the split-KV kernel without splits."""
+    device = "cuda"
+    dtype = torch.float16
+    torch.random.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, nheads, d = 70000, 65, 32, 1, 64
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache, v_cache = [
+        torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype) for _ in range(2)
+    ]
+    out = flash_attn_with_kvcache(q, k_cache, v_cache)
+    out_ref, _ = attention_ref(q, k_cache, v_cache)
+    out_pt, _ = attention_ref(q, k_cache, v_cache, upcast=False, reorder_ops=True)
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
+
+
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("local", [False, True])

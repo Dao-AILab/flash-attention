@@ -122,7 +122,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     const index_t row_offset_dq_accum = binfo.q_offset(dq_accum_batch_stride, dq_accum_row_stride, bidb)
         + ((m_block_max - 1) * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128ll * bidb)) * dq_accum_row_stride + bidh * params.d_rounded
         // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
-        + (!params.deterministic ? 0 : blockIdx.x * params.dq_accum_split_stride);
+        + (!params.deterministic ? 0 : (blockIdx.x - bidb * (gridDim.x / params.b)) * params.dq_accum_split_stride);
     const index_t row_offset_lse = (params.unpadded_lse? bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb): (bidb * params.h + bidh) * params.seqlen_q) + (m_block_max - 1) * kBlockM;
     // Regarding 128 * params.b see a comment in mha_varlen_bwd about padding of dq_accum and softmax_d
     const index_t row_offset_dpsum = (params.unpadded_lse? bidh * (params.total_q + 128 * params.b) + binfo.q_offset(params.seqlen_q_rounded, 1, bidb) + 128 * bidb: (bidb * params.h + bidh) * params.seqlen_q_rounded) + (m_block_max - 1) * kBlockM;
@@ -826,13 +826,15 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
+    // The batch is folded into blockIdx.x.
+    const int num_n_block_parallel = gridDim.x / params.b;
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    const int bidb = blockIdx.x / num_n_block_parallel;
     // The block index for the head.
     const int bidh = blockIdx.z;
 
     // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
-    for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {
+    for (int n_block = blockIdx.x % num_n_block_parallel; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += num_n_block_parallel) {
         compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
     }
 }

@@ -61,7 +61,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // https://github.com/HazyResearch/flash-attention/issues/21
 
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-    dim3 grid(num_m_block, params.b, params.h);
+    // Fold the batch into gridDim.x since gridDim.y and gridDim.z are capped at 65535 (#1786).
+    dim3 grid(num_m_block * params.b, 1, params.h);
     // leftpad_k and seqused_k change each batch's actual_seqlen_k (see BlockInfo) even without cu_seqlens_k.
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.leftpad_k == nullptr && params.seqused_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
@@ -105,7 +106,8 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-    dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
+    // Without splits, fold the batch into gridDim.x since gridDim.y and gridDim.z are capped at 65535 (#1786).
+    dim3 grid = params.num_splits > 1 ? dim3(num_m_block, params.num_splits, params.b * params.h) : dim3(num_m_block * params.b, 1, params.h);
     // leftpad_k and seqused_k change each batch's actual_seqlen_k (see BlockInfo) even without cu_seqlens_k.
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.leftpad_k == nullptr && params.seqused_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
