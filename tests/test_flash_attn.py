@@ -2965,3 +2965,67 @@ def test_flash_attn_kvcache_splitkv_large_accum(seqlen_q, num_splits, free_gib):
     torch.cuda.synchronize()
     out_ref = flash_attn_with_kvcache(q, k_cache, v_cache, num_splits=1)
     torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_seqs", [5, 64, 80])
+def test_varlen_paged_kv_lse_early_exit(num_seqs):
+    device = "cuda"
+    dtype = torch.bfloat16
+    total_q = 2048
+    nheads_q, nheads_kv, head_dim = 4, 2, 128
+    page_size = 256
+
+    q_lens = [total_q // num_seqs] * num_seqs
+    q_lens[-1] += total_q % num_seqs
+
+    cu_seqlens_q = torch.tensor([0] + q_lens, device=device, dtype=torch.int32).cumsum(
+        0, dtype=torch.int32
+    )
+
+    cu_seqlens_k = torch.arange(num_seqs + 1, device=device, dtype=torch.int32)
+
+    q = torch.randn(total_q, nheads_q, head_dim, device=device, dtype=dtype)
+
+    k = torch.randn(num_seqs, page_size, nheads_kv, head_dim, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+
+    block_table = torch.arange(num_seqs, device=device, dtype=torch.int32).unsqueeze(1)
+
+    out, lse, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max(q_lens),
+        1,
+        causal=True,
+        block_table=block_table,
+        return_attn_probs=True,
+    )
+
+    assert lse.shape == (nheads_q, total_q)
+
+    torch.cuda.synchronize()
+
+    assert out.shape == q.shape
+    assert torch.isfinite(out).all()
+
+    # With one causal key, only the final query can see it.
+    offset = 0
+    for i, length in enumerate(q_lens):
+        # Fully masked query rows use +inf in this non-Split path.
+        assert torch.isposinf(lse[:, offset : offset + length - 1]).all()
+
+        # The final query can attend to the single key.
+        assert torch.isfinite(lse[:, offset + length - 1]).all()
+        assert torch.count_nonzero(out[offset : offset + length - 1]) == 0
+
+        expected = v[i, 0].repeat_interleave(nheads_q // nheads_kv, dim=0)
+        torch.testing.assert_close(
+            out[offset + length - 1],
+            expected,
+            atol=2e-3,
+            rtol=2e-3,
+        )
+        offset += length
