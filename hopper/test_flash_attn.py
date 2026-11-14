@@ -1060,8 +1060,9 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("page_table_view", [False, True], ids=["empty", "view"])
 @pytest.mark.parametrize("cache_seqlens", [None] + ([0] if not DISABLE_VARLEN else []))
 @pytest.mark.parametrize("num_splits", [0, 1, 3] if not DISABLE_SPLIT else [1])
+@pytest.mark.parametrize("causal", [False, True])
 def test_flash_attn_kvcache_empty_page_table(
-    page_size, page_table_view, cache_seqlens, num_splits,
+    page_size, page_table_view, cache_seqlens, num_splits, causal,
 ):
     torch.random.manual_seed(0)
     device = "cuda"
@@ -1085,7 +1086,7 @@ def test_flash_attn_kvcache_empty_page_table(
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         num_splits=num_splits,
-        causal=False,
+        causal=causal,
         return_softmax_lse=True,
     )
 
