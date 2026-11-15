@@ -3482,6 +3482,59 @@ def test_flash_attn_sm100_unused_v_cache_fp8(dtype, varlen):
     assert torch.allclose(lse.double(), scores.logsumexp(-1), atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged KV forward on SM90 and SM100")
+# 128: TMA pages (page_size == tile_n); 64: cp.async pages
+@pytest.mark.parametrize("page_size", [128, 64])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("has_sink", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_empty_page_table(page_size, causal, has_sink):
+    # A page table with no column holds no key, even though the shared KV pool has pages, so the
+    # result is the empty-KV one: out = 0 and lse = -inf, or the sink with a learnable sink (#3165).
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    q = torch.randn(1, 128, 2, 128, device=device, dtype=dtype)
+    k_cache = torch.randn(4, page_size, 2, 128, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.empty(1, 0, dtype=torch.int32, device=device)
+    sink = torch.randn(2, device=device, dtype=torch.float32) if has_sink else None
+    out, lse = flash_attn_varlen_func(
+        q, k_cache, v_cache, page_table=page_table, causal=causal, learnable_sink=sink,
+        return_lse=True,
+    )
+    if is_fake_mode():
+        return
+    assert (out == 0).all()
+    if sink is None:
+        expected_lse = torch.full_like(lse, float("-inf"))
+    else:
+        expected_lse = sink[:, None].expand_as(lse)
+    assert torch.equal(lse, expected_lse)
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged KV forward on SM90 and SM100")
+# 128: TMA pages (page_size == tile_n); 64: cp.async pages
+@pytest.mark.parametrize("page_size", [128, 64])
+@pytest.mark.parametrize("seqused_k_zeros", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_empty_kv_pool(page_size, seqused_k_zeros):
+    # An empty KV pool (num_pages == 0) holds no key even if the page table has columns, e.g. a
+    # warmup call with an empty cache and seqused_k all zeros: out = 0 and lse = -inf.
+    device, dtype = "cuda", torch.bfloat16
+    q = torch.randn(2, 128, 2, 128, device=device, dtype=dtype)
+    k_cache = torch.empty(0, page_size, 2, 128, device=device, dtype=dtype)
+    v_cache = torch.empty_like(k_cache)
+    page_table = torch.zeros(2, 4, dtype=torch.int32, device=device)
+    seqused_k = torch.zeros(2, dtype=torch.int32, device=device) if seqused_k_zeros else None
+    out, lse = flash_attn_varlen_func(
+        q, k_cache, v_cache, page_table=page_table, seqused_k=seqused_k, return_lse=True
+    )
+    if is_fake_mode():
+        return
+    assert (out == 0).all()
+    assert torch.isneginf(lse).all()
+
+
 @pytest.mark.skipif(not IS_SM100, reason="SM100 paged KV (TMA pages)")
 # Pages of 128 tokens also run on SwapAB decode; it does not support 64-token pages.
 @pytest.mark.parametrize(
