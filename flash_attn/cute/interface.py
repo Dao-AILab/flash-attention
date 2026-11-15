@@ -639,10 +639,6 @@ def _flash_attn_fwd(
         max_num_pages_per_seq = page_table.shape[1]
         assert page_table.shape == (batch_size, max_num_pages_per_seq)
         num_pages, page_size = v.shape[:2]
-        # The kernels count a sequence's keys, page_size * max_num_pages_per_seq, in 32 bits
-        assert max_num_pages_per_seq * page_size < 2**31, (
-            "page_table.shape[1] * page_size must be below 2**31"
-        )
         seqlen_k = num_pages * page_size
     else:
         num_pages, page_size = None, None
@@ -814,6 +810,15 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
+    if page_table is not None:
+        # The kernels count a paged sequence's keys, page_table.shape[1] * page_size, in 32 bits,
+        # and local attention adds window_size_right to that count (block_info.py).
+        page_keys = page_table.shape[1] * page_size
+        window_right = max(window_size_right, 0) if local and window_size_right is not None else 0
+        assert page_keys + window_right < 2**31, (
+            "page_table.shape[1] * page_size (+ window_size_right with local attention) must be "
+            f"below 2**31, got {page_table.shape[1]} * {page_size} + {window_right}"
+        )
 
     # Tensor hints cannot drive host selection or count as a caller-provided Q bound.
     has_max_seqlen_q_hint = max_seqlen_q is not None and not torch.is_tensor(max_seqlen_q)
