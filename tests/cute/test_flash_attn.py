@@ -3553,6 +3553,23 @@ def test_flash_attn_paged_padding_contract(
             assert torch.isneginf(lse_bad[i]).all()
 
 
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged KV forward on SM90 and SM100")
+# 128: TMA pages (page_size == tile_n); 64: cp.async pages
+@pytest.mark.parametrize("page_size", [128, 64])
+def test_flash_attn_paged_key_count_below_2_31(page_size):
+    # The kernels count a sequence's keys, page_size * page_table.shape[1], in 32 bits: at 2**31
+    # it wraps, and the forward crashes (TMA) or silently returns a wrong result (cp.async), so
+    # the host must reject such a page table (#3166). Pages may repeat, so the cache stays small.
+    device, dtype = "cuda", torch.bfloat16
+    q = torch.randn(1, 128, 1, 128, device=device, dtype=dtype)
+    k_cache = torch.randn(2, page_size, 1, 128, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.zeros(1, 2**31 // page_size, dtype=torch.int32, device=device)
+    match = r"page_table.shape\[1\] \* page_size must be below 2\*\*31"
+    with pytest.raises(AssertionError, match=match):
+        flash_attn_varlen_func(q, k_cache, v_cache, page_table=page_table)
+
+
 @pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_paged_decode_tile_boundary():

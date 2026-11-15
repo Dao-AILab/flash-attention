@@ -639,6 +639,10 @@ def _flash_attn_fwd(
         max_num_pages_per_seq = page_table.shape[1]
         assert page_table.shape == (batch_size, max_num_pages_per_seq)
         num_pages, page_size = v.shape[:2]
+        # The kernels count a sequence's keys, page_size * max_num_pages_per_seq, in 32 bits
+        assert max_num_pages_per_seq * page_size < 2**31, (
+            "page_table.shape[1] * page_size must be below 2**31"
+        )
         seqlen_k = num_pages * page_size
     else:
         num_pages, page_size = None, None
