@@ -3487,6 +3487,7 @@ def test_flash_attn_sm100_unused_v_cache_fp8(dtype, varlen):
 @pytest.mark.parametrize("page_size", [128, 64])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("has_sink", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_empty_page_table(page_size, causal, has_sink):
     # A page table with no column holds no key, even though the shared KV pool has pages, so the
     # result is the empty-KV one: out = 0 and lse = -inf, or the sink with a learnable sink (#3165).
@@ -3501,6 +3502,8 @@ def test_flash_attn_paged_empty_page_table(page_size, causal, has_sink):
         q, k_cache, v_cache, page_table=page_table, causal=causal, learnable_sink=sink,
         return_lse=True,
     )
+    if is_fake_mode():
+        return
     assert (out == 0).all()
     if sink is None:
         expected_lse = torch.full_like(lse, float("-inf"))
