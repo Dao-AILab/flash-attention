@@ -3556,6 +3556,7 @@ def test_flash_attn_paged_padding_contract(
 @pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged KV forward on SM90 and SM100")
 # 128: TMA pages (page_size == tile_n); 64: cp.async pages
 @pytest.mark.parametrize("page_size", [128, 64])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_key_count_below_2_31(page_size):
     # The kernels count a sequence's keys, page_size * page_table.shape[1], in 32 bits: at 2**31
     # it wraps, and the forward crashes (TMA) or silently returns a wrong result (cp.async), so
