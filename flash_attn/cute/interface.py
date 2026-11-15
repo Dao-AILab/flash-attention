@@ -791,7 +791,9 @@ def _flash_attn_fwd(
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
         validate_output_layout(lse, "lse", align_bytes=4)
 
-    if seqlen_k == 0 or total_q == 0:
+    # A paged sequence is bounded by its page-table row, not the shared KV pool.
+    k_capacity = page_table.shape[1] * page_size if page_table is not None else seqlen_k
+    if k_capacity == 0 or total_q == 0:
         out.zero_()
         if lse is not None:
             if learnable_sink is None:
@@ -815,8 +817,6 @@ def _flash_attn_fwd(
     has_max_seqlen_q_hint = max_seqlen_q is not None and not torch.is_tensor(max_seqlen_q)
     total_k = math.prod(v.shape[:-2])  # K/V tokens stored: dense b*s, varlen total, paged pool
     q_capacity = seqlen_q if cu_seqlens_q is None else total_q
-    # A paged sequence is bounded by its page-table row, not the shared KV pool.
-    k_capacity = page_table.shape[1] * page_size if page_table is not None else seqlen_k
     if max_seqlen_q is None:
         max_seqlen_q = q_capacity
     if max_seqlen_k is None:
