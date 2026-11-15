@@ -791,9 +791,10 @@ def _flash_attn_fwd(
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
         validate_output_layout(lse, "lse", align_bytes=4)
 
-    # A paged sequence is bounded by its page-table row, not the shared KV pool.
+    # A paged sequence is bounded by its page-table row, not the shared KV pool, so there is no
+    # key if either the pool (seqlen_k) or the page-table row (k_capacity) is empty.
     k_capacity = page_table.shape[1] * page_size if page_table is not None else seqlen_k
-    if k_capacity == 0 or total_q == 0:
+    if seqlen_k == 0 or k_capacity == 0 or total_q == 0:
         out.zero_()
         if lse is not None:
             if learnable_sink is None:
