@@ -3606,6 +3606,62 @@ def test_flash_attn_paged_padding_contract(
             assert torch.isneginf(lse_bad[i]).all()
 
 
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged KV forward on SM90 and SM100")
+# 128: TMA pages (page_size == tile_n); 64: cp.async pages
+@pytest.mark.parametrize("page_size", [128, 64])
+@pytest.mark.parametrize("window_right", [None, 256])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_key_count_below_2_31(page_size, window_right):
+    # The kernels count a sequence's keys, page_size * page_table.shape[1], in 32 bits, and local
+    # attention adds window_size_right: at 2**31 it wraps, and the forward crashes (TMA) or silently
+    # returns a wrong result (cp.async), so the host must reject such a page table (#3166). Pages
+    # may repeat, so the cache stays small.
+    device, dtype = "cuda", torch.bfloat16
+    q = torch.randn(1, 128, 1, 128, device=device, dtype=dtype)
+    k_cache = torch.randn(2, page_size, 1, 128, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    if window_right is None:
+        columns, kwargs = 2**31 // page_size, {}
+    else:  # the keys alone stay below 2**31; the window's right edge does not
+        columns, kwargs = (2**31 - 1) // page_size, {"window_size": (256, window_right)}
+    page_table = torch.zeros(1, columns, dtype=torch.int32, device=device)
+    match = r"page_table.shape\[1\] \* page_size .*must be below 2\*\*31"
+    with pytest.raises(AssertionError, match=match):
+        flash_attn_varlen_func(q, k_cache, v_cache, page_table=page_table, **kwargs)
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged KV forward on SM90 and SM100")
+# 128: TMA pages (page_size == tile_n); 64: cp.async pages
+@pytest.mark.parametrize("page_size", [128, 64])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_key_count_boundary(page_size):
+    # At the widest page table the host allows with a local window, page_size * columns +
+    # window_size_right just below 2**31, the result must match a narrow page table exactly: page 1
+    # repeats, and the window only sees its keys, at the same positions modulo the page and tile
+    # sizes since both widths agree modulo 4096 columns (#3166).
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    window = (256, 256)
+    q = torch.randn(1, 128, 1, 128, device=device, dtype=dtype)
+    k_cache = torch.randn(2, page_size, 1, 128, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    widest = (2**31 - 1 - window[1]) // page_size
+    results = []
+    for columns in (4096 + widest % 4096, widest):
+        page_table = torch.ones(1, columns, dtype=torch.int32, device=device)
+        page_table[0, 0] = 0
+        results.append(
+            flash_attn_varlen_func(
+                q, k_cache, v_cache, page_table=page_table, window_size=window, return_lse=True
+            )
+        )
+    if is_fake_mode():
+        return
+    (out_narrow, lse_narrow), (out_wide, lse_wide) = results
+    assert torch.equal(out_wide, out_narrow)
+    assert torch.equal(lse_wide, lse_narrow)
+
+
 @pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_paged_decode_tile_boundary():
