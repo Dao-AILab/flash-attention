@@ -60,9 +60,11 @@ inline __device__ void compute_dot_do_o(const Params &params) {
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
 
-    const int m_block = blockIdx.x;
+    // The batch is folded into blockIdx.x.
+    const int num_m_block = gridDim.x / params.b;
+    const int m_block = blockIdx.x % num_m_block;
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    const int bidb = blockIdx.x / num_m_block;
     // The block index for the head.
     const int bidh = blockIdx.z;
     // The thread index.
@@ -190,9 +192,11 @@ inline __device__ void convert_dQ(const Params &params, const int nsplits) {
     // Shared memory.
     extern __shared__ char smem_[];
 
-    const int m_block = blockIdx.x;
+    // The batch is folded into blockIdx.x.
+    const int num_m_block = gridDim.x / params.b;
+    const int m_block = blockIdx.x % num_m_block;
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    const int bidb = blockIdx.x / num_m_block;
     // The block index for the head.
     const int bidh = blockIdx.z;
     // The thread index.

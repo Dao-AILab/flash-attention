@@ -72,14 +72,15 @@ __global__ void flash_bwd_convert_dkv_kernel(const Flash_bwd_params params) {
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) {
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-    dim3 grid_m(num_m_block, params.b, params.h);
+    // Fold the batch into gridDim.x since gridDim.y and gridDim.z are capped at 65535 (#1786).
+    dim3 grid_m(num_m_block * params.b, 1, params.h);
     const int num_n_block = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
     int gridDimx = num_n_block;
     if (params.deterministic) {
         int num_sm = get_num_sm(get_current_device());
         gridDimx = (num_sm + params.b * params.h - 1) / (params.b * params.h);
     }
-    dim3 grid_n(gridDimx, params.b, params.h);
+    dim3 grid_n(gridDimx * params.b, 1, params.h);
 
     if (!params.deterministic) {
         flash_bwd_dot_do_o_kernel<true, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);

@@ -1081,9 +1081,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
-    const int m_block = blockIdx.x;
+    // The batch is folded into blockIdx.x.
+    const int num_m_block = gridDim.x / params.b;
+    const int m_block = blockIdx.x % num_m_block;
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    const int bidb = blockIdx.x / num_m_block;
     // The block index for the head.
     const int bidh = blockIdx.z;
 
@@ -1102,9 +1104,11 @@ inline __device__ void compute_attn(const Params &params) {
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
-    const int m_block = blockIdx.x;
+    // Without splits, the batch is folded into blockIdx.x.
+    const int num_m_block = Split ? gridDim.x : gridDim.x / params.b;
+    const int m_block = blockIdx.x % num_m_block;
     // The block index for the batch.
-    const int bidb = Split ? blockIdx.z / params.h : blockIdx.y;
+    const int bidb = Split ? blockIdx.z / params.h : blockIdx.x / num_m_block;
     // The block index for the head.
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
