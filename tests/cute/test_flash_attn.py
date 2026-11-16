@@ -3747,6 +3747,7 @@ def test_flash_attn_paged_local_huge_window(window):
 
 
 @pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Local attention on SM90 and SM100")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_local_huge_window_config_sees_given_window():
     # get_scheduler_metadata selects its config from the window as given. The forward must too:
     # on SM100 the split count depends on the window, and caller-built metadata must match it.

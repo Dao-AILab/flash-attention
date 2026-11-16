@@ -828,11 +828,11 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
+    q_capacity = seqlen_q if cu_seqlens_q is None else total_q
     # The kernels get the clamped sides. Config selection keeps the window as given, as
     # get_scheduler_metadata sees it, so caller-built metadata matches the forward's split count.
     kernel_window_left, kernel_window_right = _clamp_local_window(
-        local, window_size_left, window_size_right,
-        seqlen_q if cu_seqlens_q is None else total_q, k_capacity,
+        local, window_size_left, window_size_right, q_capacity, k_capacity
     )
     if page_table is not None:
         # The kernels count a paged sequence's keys, page_table.shape[1] * page_size, in 32 bits,
@@ -849,7 +849,6 @@ def _flash_attn_fwd(
     # Tensor hints cannot drive host selection or count as a caller-provided Q bound.
     has_max_seqlen_q_hint = max_seqlen_q is not None and not torch.is_tensor(max_seqlen_q)
     total_k = math.prod(v.shape[:-2])  # K/V tokens stored: dense b*s, varlen total, paged pool
-    q_capacity = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_q is None:
         max_seqlen_q = q_capacity
     if max_seqlen_k is None:
@@ -894,6 +893,7 @@ def _flash_attn_fwd(
             has_descale=has_descale,
         ),
     )
+    # The config is chosen; from here on the window only reaches the kernels, so use the clamped sides.
     window_size_left, window_size_right = kernel_window_left, kernel_window_right
     num_splits = config.num_splits
     mla_kernel = config.kernel if isinstance(config, MlaFwdConfig) else None
@@ -2138,8 +2138,8 @@ def _flash_attn_bwd(
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
     window_size_left, window_size_right = _clamp_local_window(
         local, window_size_left, window_size_right,
-        q.shape[1] if cu_seqlens_q is None else total_q,
-        k.shape[1] if cu_seqlens_k is None else total_k,
+        seqlen_q if cu_seqlens_q is None else total_q,
+        seqlen_k if cu_seqlens_k is None else total_k,
     )
 
     def heuristic_seqlen(seqlen, total, has_host_bound):
