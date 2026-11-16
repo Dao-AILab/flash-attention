@@ -50,9 +50,9 @@ time, so DSL pin bumps never need a rebuild. Rebuild when the Dockerfile changes
 
 ## Expanding test coverage
 
-Edit `FA4_TEST_FILTER` in `.github/workflows/ci.yml`. To run the full suite, set it to an empty string and increase `compile-workers` in the `gpu-test` action call.
+Edit `FA4_TEST_FILTER` in `.github/workflows/ci.yml`. The filter selects from `DEFAULT_TEST_TARGETS` in `run_fa4_ci.py`, which lists `test_flash_attn.py` by test function to keep collection short (the whole file parametrizes into ~400k cases, collected by every worker of both passes). When a new filter term names a test outside those targets, add its file or function there: the driver fails the run if a filter term selects no test.
 
-Alternatively, edit `run_fa4_ci.py` to change `DEFAULT_TEST_TARGETS` or worker defaults. Changes there apply to both CI and local runs.
+To run more than the smoke selection, pass `--test-target` (e.g. `--test-target tests/cute`) with an empty `--test-filter` and more compile workers. Changes to `DEFAULT_TEST_TARGETS` or worker defaults in `run_fa4_ci.py` apply to both CI and local runs.
 
 ## FA2 import isolation
 

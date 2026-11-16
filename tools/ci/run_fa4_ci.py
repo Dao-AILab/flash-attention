@@ -12,12 +12,20 @@ import re
 import shlex
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_TEST_FILTER = ""  # empty = run all; CI overrides via --test-filter
+# What the CI filter (FA4_TEST_FILTER in .github/workflows/ci.yml) selects from. test_flash_attn.py
+# is listed by function: every worker of both passes collects its targets, and the whole file
+# parametrizes into ~400k cases (about a minute per process). A filter term that selects nothing
+# from these targets fails the run (see unmatched_filter_terms), so the two cannot drift apart.
 DEFAULT_TEST_TARGETS = (
-    "tests/cute/test_flash_attn.py",
+    "tests/cute/test_flash_attn.py::test_flash_attn_output",
+    "tests/cute/test_flash_attn.py::test_flash_attn_ex2_emu_decode_prefill_consistency",
+    "tests/cute/test_flash_attn.py::test_flash_attn_hd256_sm100_deterministic_backward",
+    "tests/cute/test_flash_attn.py::test_flash_attn_lse_grad",
     "tests/cute/test_flash_attn_mla.py",
     "tests/cute/test_cuda_graph.py",
 )
@@ -28,6 +36,7 @@ class Step:
     name: str
     command: list[str]
     extra_env: dict[str, str]
+    junit_xml: str = ""  # set on the step whose selection is checked against the filter
 
 
 # ── GPU helpers ───────────────────────────────────────────────────────────────
@@ -98,6 +107,7 @@ def build_step_plan(
     test_visible_devices: str,
     benchmark_visible_devices: str,
     skip_benchmark: bool,
+    junit_xml: str = "",
 ) -> list[Step]:
     test_targets = [test_target] if isinstance(test_target, str) else test_target
     pytest_base = ["python3", "-m", "pytest", *test_targets, *(["-k", test_filter] if test_filter else []), "--durations=20"]
@@ -113,11 +123,15 @@ def build_step_plan(
         ),
         Step(
             name="Pass 2: run tests on GPU",
-            command=[*pytest_base, "-n", str(run_workers), "-x"],
+            command=[
+                *pytest_base, "-n", str(run_workers), "-x",
+                *([f"--junitxml={junit_xml}"] if junit_xml else []),
+            ],
             extra_env={
                 "FLASH_ATTENTION_FAKE_TENSOR": "0",
                 "CUDA_VISIBLE_DEVICES": test_visible_devices,
             },
+            junit_xml=junit_xml,
         ),
     ]
     if not skip_benchmark:
@@ -133,6 +147,38 @@ def build_step_plan(
             extra_env={"CUDA_VISIBLE_DEVICES": benchmark_visible_devices},
         ))
     return steps
+
+
+# ── Filter coverage check ─────────────────────────────────────────────────────
+
+def unmatched_filter_terms(test_filter: str, test_ids: list[str]) -> list[str]:
+    """Top-level `or` terms of a pytest -k expression that match none of `test_ids`.
+
+    pytest does not complain when part of a -k expression selects nothing (e.g. it names a test
+    that is not under the targets), so the run would pass without that coverage. A term is the
+    `and` of plain substrings; terms with `not` or parentheses are not checked.
+    """
+    ids = [test_id.lower() for test_id in test_ids]
+    missing = []
+    for term in re.split(r"\s+or\s+", test_filter.strip()):
+        words = re.split(r"\s+and\s+", term.lower())
+        if not term or any(w.startswith("not ") or "(" in w or ")" in w for w in words):
+            continue
+        if not any(all(w in test_id for w in words) for test_id in ids):
+            missing.append(term)
+    return missing
+
+
+def check_filter_coverage(test_filter: str, junit_xml: str) -> None:
+    cases = ET.parse(junit_xml).getroot().iter("testcase")
+    test_ids = [f"{case.get('classname', '')}::{case.get('name', '')}" for case in cases]
+    missing = unmatched_filter_terms(test_filter, test_ids)
+    if missing:
+        raise SystemExit(
+            "These --test-filter terms selected no test (is the test under --test-target / "
+            "DEFAULT_TEST_TARGETS?):\n  " + "\n  ".join(missing)
+        )
+    print(f"Filter coverage: every filter term selected a test ({len(test_ids)} tests ran).")
 
 
 # ── Step runner ───────────────────────────────────────────────────────────────
@@ -400,6 +446,7 @@ def main() -> None:
     quack_spec = read_dep_spec(pyproject, "quack-kernels")
     dsl_variant = "cu13" if read_cuda_major() >= 13 else "cu12"
     overlay = os.path.join(work_dir, "fa4_ci_overlay.img")
+    junit_xml = os.path.join(work_dir, "fa4_ci_pass2_junit.xml")
     os.makedirs(work_dir, exist_ok=True)
     print(f"Runtime DSL: cutlass-dsl[{dsl_variant}]{cutlass_spec} + quack-kernels{quack_spec} (into {overlay})")
 
@@ -416,12 +463,17 @@ def main() -> None:
             test_visible_devices=test_visible_devices,
             benchmark_visible_devices=benchmark_visible_devices,
             skip_benchmark=args.skip_benchmark,
+            junit_xml=junit_xml if args.test_filter else "",
         ):
             run_step(step, repo_root=repo_root, base_env=base_env, sif=args.sif, work_dir=work_dir, overlay=overlay, dsl_libs=dsl_libs)
+            if step.junit_xml:
+                check_filter_coverage(args.test_filter, step.junit_xml)
     finally:
         # The overlay can hold gigabytes; don't leave it behind on the runner between jobs.
         if os.path.exists(overlay):
             os.remove(overlay)
+        if os.path.exists(junit_xml):
+            os.remove(junit_xml)
 
     print("=== All tests passed ===")
 
