@@ -822,6 +822,19 @@ struct CollectiveMainloopBwdSm90 {
         cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.pipelines.barrier_KV.try_wait(work_idx % 2));
         if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_KV.wait(work_idx % 2); }
 
+        // Zero the rows of K and V past seqlen_k before dP = dO @ V^T and dQ = dS @ K read them
+        // (see flash::clear_rows_from)
+        if constexpr (Varlen) {
+            int const row_limit = seqlen_k - n_block * kBlockN;
+            if (row_limit < kBlockN) {
+                flash::clear_rows_from<NumMmaThreads>(sK, row_limit, thread_idx);
+                flash::clear_rows_from<NumMmaThreads>(sV, row_limit, thread_idx);
+                // SMEM fence to make sure the zeros are visible to GMMA
+                cutlass::arch::fence_view_async_shared();
+                flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::TransformBarrier);
+            }
+        }
+
         if constexpr (Mma_dP_is_RS) {
             using SmemCopyAtomV = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
             auto smem_tiled_copy_V = make_tiled_copy_A(SmemCopyAtomV{}, tiled_mma_dP);
