@@ -300,6 +300,21 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
     return causal, local, window_size_left, window_size_right
 
 
+def _clamp_local_window(local, window_size_left, window_size_right, max_seqlen_q, max_seqlen_k):
+    """Clamp each local window side to the longest sequence it can see.
+
+    A left side of at least seqlen_k - 1, or a right side of at least seqlen_q - 1, masks nothing,
+    so clamping keeps the result. The kernels add the sides to positions in 32 bits
+    (block_info.py, mask.py), so an unclamped huge side such as 2**31 - 1 would wrap.
+    """
+    if local:
+        if window_size_left is not None:
+            window_size_left = min(window_size_left, max_seqlen_k)
+        if window_size_right is not None:
+            window_size_right = min(window_size_right, max_seqlen_q)
+    return window_size_left, window_size_right
+
+
 # Set by the autotuner's fake-tensor probe to collect the kernels a call would compile.
 _compile_misses: contextvars.ContextVar[set | None] = contextvars.ContextVar(
     "_compile_misses", default=None
@@ -813,11 +828,19 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
+    q_capacity = seqlen_q if cu_seqlens_q is None else total_q
+    # The kernels get the clamped sides. Config selection keeps the window as given, as
+    # get_scheduler_metadata sees it, so caller-built metadata matches the forward's split count.
+    kernel_window_left, kernel_window_right = _clamp_local_window(
+        local, window_size_left, window_size_right, q_capacity, k_capacity
+    )
     if page_table is not None:
         # The kernels count a paged sequence's keys, page_table.shape[1] * page_size, in 32 bits,
         # and local attention adds window_size_right to that count (block_info.py).
         page_keys = page_table.shape[1] * page_size
-        window_right = max(window_size_right, 0) if local and window_size_right is not None else 0
+        window_right = (
+            max(kernel_window_right, 0) if local and kernel_window_right is not None else 0
+        )
         assert page_keys + window_right < 2**31, (
             "page_table.shape[1] * page_size (+ window_size_right with local attention) must be "
             f"below 2**31, got {page_table.shape[1]} * {page_size} + {window_right}"
@@ -826,7 +849,6 @@ def _flash_attn_fwd(
     # Tensor hints cannot drive host selection or count as a caller-provided Q bound.
     has_max_seqlen_q_hint = max_seqlen_q is not None and not torch.is_tensor(max_seqlen_q)
     total_k = math.prod(v.shape[:-2])  # K/V tokens stored: dense b*s, varlen total, paged pool
-    q_capacity = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_q is None:
         max_seqlen_q = q_capacity
     if max_seqlen_k is None:
@@ -871,6 +893,8 @@ def _flash_attn_fwd(
             has_descale=has_descale,
         ),
     )
+    # The config is chosen; from here on the window only reaches the kernels, so use the clamped sides.
+    window_size_left, window_size_right = kernel_window_left, kernel_window_right
     num_splits = config.num_splits
     mla_kernel = config.kernel if isinstance(config, MlaFwdConfig) else None
     mla_1cta = mla_kernel in ("1cta", "1cta_kb64")
@@ -2112,6 +2136,11 @@ def _flash_attn_bwd(
         batch_size = cu_seqlens_k.shape[0] - 1
         total_k = k.shape[0]
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
+    window_size_left, window_size_right = _clamp_local_window(
+        local, window_size_left, window_size_right,
+        seqlen_q if cu_seqlens_q is None else total_q,
+        seqlen_k if cu_seqlens_k is None else total_k,
+    )
 
     def heuristic_seqlen(seqlen, total, has_host_bound):
         # The fold chooser wants the longest sequence. A bound given as a device tensor falls
