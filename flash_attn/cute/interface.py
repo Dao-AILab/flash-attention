@@ -300,6 +300,21 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
     return causal, local, window_size_left, window_size_right
 
 
+def _clamp_local_window(local, window_size_left, window_size_right, max_seqlen_q, max_seqlen_k):
+    """Clamp each local window side to the longest sequence it can see.
+
+    A left side of at least seqlen_k - 1, or a right side of at least seqlen_q - 1, masks nothing,
+    so clamping keeps the result. The kernels add the sides to positions in 32 bits
+    (block_info.py, mask.py), so an unclamped huge side such as 2**31 - 1 would wrap.
+    """
+    if local:
+        if window_size_left is not None:
+            window_size_left = min(window_size_left, max_seqlen_k)
+        if window_size_right is not None:
+            window_size_right = min(window_size_right, max_seqlen_q)
+    return window_size_left, window_size_right
+
+
 # Set by the autotuner's fake-tensor probe to collect the kernels a call would compile.
 _compile_misses: contextvars.ContextVar[set | None] = contextvars.ContextVar(
     "_compile_misses", default=None
@@ -812,6 +827,10 @@ def _flash_attn_fwd(
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
+    )
+    window_size_left, window_size_right = _clamp_local_window(
+        local, window_size_left, window_size_right,
+        seqlen_q if cu_seqlens_q is None else total_q, k_capacity,
     )
     if page_table is not None:
         # The kernels count a paged sequence's keys, page_table.shape[1] * page_size, in 32 bits,
@@ -2112,6 +2131,11 @@ def _flash_attn_bwd(
         batch_size = cu_seqlens_k.shape[0] - 1
         total_k = k.shape[0]
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
+    window_size_left, window_size_right = _clamp_local_window(
+        local, window_size_left, window_size_right,
+        q.shape[1] if cu_seqlens_q is None else total_q,
+        k.shape[1] if cu_seqlens_k is None else total_k,
+    )
 
     def heuristic_seqlen(seqlen, total, has_host_bound):
         # The fold chooser wants the longest sequence. A bound given as a device tensor falls
