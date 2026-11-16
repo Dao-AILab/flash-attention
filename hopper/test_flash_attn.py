@@ -1218,8 +1218,10 @@ def test_flash_attn_unused_kv_tail_bwd(causal, d):
         out.backward(dout)
         return out, q_.grad, k_.grad.masked_fill(unused, 0.0), v_.grad.masked_fill(unused, 0.0)
 
+    # dQ is summed over K/V tiles with atomic adds in no fixed order, so compare with a tolerance.
+    # assert_close still fails on NaN.
     for x, x_ref in zip(attention_and_grads(float("nan")), attention_and_grads(0.0)):
-        assert torch.equal(x, x_ref)
+        torch.testing.assert_close(x, x_ref)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
