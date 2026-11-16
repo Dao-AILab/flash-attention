@@ -828,7 +828,9 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
-    window_size_left, window_size_right = _clamp_local_window(
+    # The kernels get the clamped sides. Config selection keeps the window as given, as
+    # get_scheduler_metadata sees it, so caller-built metadata matches the forward's split count.
+    kernel_window_left, kernel_window_right = _clamp_local_window(
         local, window_size_left, window_size_right,
         seqlen_q if cu_seqlens_q is None else total_q, k_capacity,
     )
@@ -836,7 +838,9 @@ def _flash_attn_fwd(
         # The kernels count a paged sequence's keys, page_table.shape[1] * page_size, in 32 bits,
         # and local attention adds window_size_right to that count (block_info.py).
         page_keys = page_table.shape[1] * page_size
-        window_right = max(window_size_right, 0) if local and window_size_right is not None else 0
+        window_right = (
+            max(kernel_window_right, 0) if local and kernel_window_right is not None else 0
+        )
         assert page_keys + window_right < 2**31, (
             "page_table.shape[1] * page_size (+ window_size_right with local attention) must be "
             f"below 2**31, got {page_table.shape[1]} * {page_size} + {window_right}"
@@ -890,6 +894,7 @@ def _flash_attn_fwd(
             has_descale=has_descale,
         ),
     )
+    window_size_left, window_size_right = kernel_window_left, kernel_window_right
     num_splits = config.num_splits
     mla_kernel = config.kernel if isinstance(config, MlaFwdConfig) else None
     mla_1cta = mla_kernel in ("1cta", "1cta_kb64")

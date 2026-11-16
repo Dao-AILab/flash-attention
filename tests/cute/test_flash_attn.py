@@ -3662,25 +3662,30 @@ def test_flash_attn_paged_key_count_boundary(page_size):
     assert torch.equal(lse_wide, lse_narrow)
 
 
+HUGE_WINDOWS = [(256, 2**31 - 1), (2**31 - 1, 0), (2**31 - 1, 2**31 - 1)]
+
+
+def _bounded_window(window, seqlen_q, seqlen_k):
+    """The bounded window that masks the same keys: a side of 2**31 - 1 becomes the sequence."""
+    if window == (2**31 - 1, 2**31 - 1):
+        return (None, None)
+    left, right = window
+    return (seqlen_k if left == 2**31 - 1 else left, seqlen_q if right == 2**31 - 1 else right)
+
+
 @pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Local backward on SM90 and SM100")
 @pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("nheads_kv", [4, 1])
-@pytest.mark.parametrize(
-    "window,ref_window",
-    [
-        ((256, 2**31 - 1), (256, 128)),
-        ((2**31 - 1, 0), (1024, 0)),
-        ((2**31 - 1, 2**31 - 1), (None, None)),
-    ],
-)
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 1024), (512, 128)])
+@pytest.mark.parametrize("window", HUGE_WINDOWS)
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_local_huge_window(window, ref_window, nheads_kv, varlen):
+def test_flash_attn_local_huge_window(window, seqlen_q, seqlen_k, nheads_kv, varlen):
     # A window side at least as long as the sequence masks nothing, so a huge one, such as the
     # common "unbounded" sentinel 2**31 - 1, must match a side as long as the sequence. The
     # kernels add the sides to positions in 32 bits, so the host clamps them first.
     torch.random.manual_seed(0)
     device, dtype = "cuda", torch.bfloat16
-    seqlen_q, seqlen_k, nheads, d = 128, 1024, 4, 128
+    nheads, d = 4, 128
     q = torch.randn(2, seqlen_q, nheads, d, device=device, dtype=dtype)
     k = torch.randn(2, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
     v = torch.randn_like(k)
@@ -3703,11 +3708,61 @@ def test_flash_attn_local_huge_window(window, ref_window, nheads_kv, varlen):
         grads = torch.autograd.grad(out, (q_, k_, v_), dout)
         return out, lse, *grads
 
-    results, refs = run(window), run(ref_window)
+    results, refs = run(window), run(_bounded_window(window, seqlen_q, seqlen_k))
     if is_fake_mode():
         return
     for name, x, ref in zip(("out", "lse", "dq", "dk", "dv"), results, refs):
         torch.testing.assert_close(x, ref, atol=1e-2, rtol=1e-2, msg=lambda m: f"{name}: {m}")
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged local attention on SM90 and SM100")
+@pytest.mark.parametrize("window", HUGE_WINDOWS)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_local_huge_window(window):
+    # Paged KV checks page_table.shape[1] * page_size + window_size_right < 2**31; a huge right
+    # side is clamped first, so it is accepted and matches the bounded window.
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    seqlen_q, page_size, pages_per_seq, nheads, d = 128, 64, 16, 4, 128
+    num_pages = 2 * pages_per_seq + 8
+    q = torch.randn(2, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(num_pages, page_size, nheads, d, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    page_table = torch.randperm(num_pages, device=device)[: 2 * pages_per_seq]
+    page_table = page_table.to(torch.int32).view(2, pages_per_seq)
+    seqused_k = torch.tensor([700, pages_per_seq * page_size], device=device, dtype=torch.int32)
+
+    def run(window_size):
+        return _flash_attn_fwd(
+            q, k, v, page_table=page_table, seqused_k=seqused_k,
+            window_size_left=window_size[0], window_size_right=window_size[1], return_lse=True,
+        )[:2]
+
+    results = run(window)
+    refs = run(_bounded_window(window, seqlen_q, pages_per_seq * page_size))
+    if is_fake_mode():
+        return
+    for name, x, ref in zip(("out", "lse"), results, refs):
+        torch.testing.assert_close(x, ref, atol=1e-2, rtol=1e-2, msg=lambda m: f"{name}: {m}")
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Local attention on SM90 and SM100")
+def test_flash_attn_local_huge_window_config_sees_given_window():
+    # get_scheduler_metadata selects its config from the window as given. The forward must too:
+    # on SM100 the split count depends on the window, and caller-built metadata must match it.
+    torch.random.manual_seed(0)
+    seqlen_q, seqlen_k = 128, 1024
+    q = torch.randn(2 * seqlen_q, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2 * seqlen_k, 4, 128, device="cuda", dtype=torch.bfloat16)
+    cu_q = torch.arange(0, 3 * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32)
+    cu_k = torch.arange(0, 3 * seqlen_k, seqlen_k, device="cuda", dtype=torch.int32)
+    with capture_selected_fwd_config() as selected:
+        flash_attn_varlen_func(
+            q, k, k, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k, window_size=(256, 2**31 - 1),
+        )
+    inputs = selected["inputs"]
+    assert (inputs.window_size_left, inputs.window_size_right) == (256, 2**31 - 1)
 
 
 @pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
