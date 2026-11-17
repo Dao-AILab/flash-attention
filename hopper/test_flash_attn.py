@@ -1224,6 +1224,45 @@ def test_flash_attn_unused_kv_tail_bwd(causal, d):
         torch.testing.assert_close(x, x_ref)
 
 
+@pytest.mark.skipif(DISABLE_VARLEN or DISABLE_BACKWARD, reason="varlen or backward is disabled")
+@pytest.mark.parametrize("d", COMPILED_HDIMS)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads_kv", [4, 1])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_flash_attn_unused_q_tail_bwd(deterministic, nheads_kv, causal, d):
+    # Queries past seqused_q can hold anything, e.g. NaN, and must not change dK and dV:
+    # dV += P^T @ dO and dK += dS^T @ Q read the rows of Q and dO past seqused_q.
+    if deterministic and d >= 256:
+        pytest.skip("Deterministic backward is not supported for hdim 256")
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size, nheads, cap, seqlen_k = 4, 4, 384, 256
+    seqlens_q = torch.tensor([100, 384, 1, 257], device=device, dtype=torch.int32)
+    q = torch.randn(batch_size * cap, nheads, d, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size * seqlen_k, nheads_kv, d, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    dout = torch.randn_like(q)
+    unused = (torch.arange(cap, device=device) >= seqlens_q[:, None]).flatten()[:, None, None]
+    cu_seqlens_q = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * cap
+    cu_seqlens_k = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * seqlen_k
+
+    def attention_and_grads(fill):
+        q_ = q.masked_fill(unused, fill).requires_grad_()
+        k_, v_ = (x.clone().requires_grad_() for x in (k, v))
+        out = flash_attn_varlen_func(
+            q_, k_, v_, cu_seqlens_q, cu_seqlens_k, cap, seqlen_k, seqused_q=seqlens_q, causal=causal,
+            deterministic=deterministic,
+        )
+        out.backward(dout.masked_fill(unused, fill))
+        # The rows of out and dQ past seqused_q are not written
+        return out.masked_fill(unused, 0.0), q_.grad.masked_fill(unused, 0.0), k_.grad, v_.grad
+
+    # dQ, and dK and dV with GQA, are summed with atomic adds in no fixed order unless deterministic, so
+    # compare with a tolerance. assert_close still fails on NaN.
+    for x, x_ref in zip(attention_and_grads(float("nan")), attention_and_grads(0.0)):
+        torch.testing.assert_close(x, x_ref)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize('causal', [False])

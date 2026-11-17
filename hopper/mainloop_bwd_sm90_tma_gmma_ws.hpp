@@ -145,6 +145,12 @@ struct CollectiveMainloopBwdSm90 {
     using SmemLayoutdO =
         decltype(tile_to_shape(SmemLayoutAtomQdO{},
                  make_shape(shape<0>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages_dO>{})));
+    // flash::clear_rows_from_contiguous needs the rows of each atom column to be contiguous
+    static constexpr int kAtomColsQdO = decltype(size<1>(SmemLayoutAtomQdO{}))::value;
+    static_assert(cute::is_same_v<decltype(coalesce(layout<0>(get_nonswizzle_portion(take<0, 2>(SmemLayoutQ{}))))),
+                                  Layout<Int<kBlockM>, Int<kAtomColsQdO>>>);
+    static_assert(cute::is_same_v<decltype(coalesce(layout<0>(get_nonswizzle_portion(take<0, 2>(SmemLayoutdO{}))))),
+                                  Layout<Int<kBlockM>, Int<kAtomColsQdO>>>);
 
     using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
                                      Int<kBlockN>, Int<kHeadDim / (NumMmaWarpGroups / AtomLayoutMdQ)>>());
@@ -418,6 +424,9 @@ struct CollectiveMainloopBwdSm90 {
         cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
     }
 
+    // Phase of barrier_Q_tail and barrier_dO_tail, only used by the producer warp
+    int tail_phase = 0;
+
     template <typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
@@ -505,11 +514,46 @@ struct CollectiveMainloopBwdSm90 {
 
         int m_block = m_block_min;
 
+        // With seqused_q, TMA loads the last m_block of Q and dO in full, so its rows past seqused_q hold whatever
+        // the buffer has there, e.g. NaN. LSE is +inf and dPsum is 0 on those rows, so P and dS are 0 there, but
+        // dV += P^T @ dO and dK += dS^T @ Q give 0 * NaN = NaN. So the TMA loads of Q and dO for that m_block
+        // signal barrier_Q_tail / barrier_dO_tail instead, and the pipeline barriers only expect the LSE / dPsum
+        // bytes. This warp then zeros those rows and arrives on the pipeline barriers, which releases the zeros
+        // to the MMA warpgroups. The MMA warpgroups are unchanged.
+        // Without seqused_q, those rows belong to the next sequence or are past the end of the tensor, where TMA
+        // fills zeros.
+        // The loads of the other m_blocks are as before, so that the loop below compiles to the same code: this
+        // warp has few registers, and keeping more state live across the loop makes it spill.
+        static_assert(size(ClusterShape{}) == 1, "Clearing the Q / dO tail assumes no TMA multicast");
+        // Evaluated where needed rather than kept live across the loop
+        auto needs_clear_tail = [&] { return Varlen && params.seqused_q && seqlen_info.seqlen_q < m_block_max * kBlockM; };
+        auto& barrier_Q_tail = shared_storage.pipelines.barrier_Q_tail;
+        auto& barrier_dO_tail = shared_storage.pipelines.barrier_dO_tail;
+        using BarrierValue = cutlass::arch::ClusterTransactionBarrier::ValueType;
+        // Wait for the stage to be empty without arriving on its full barrier, which then only expects the
+        // LSE / dPsum bytes. The arrive comes after the rows are zeroed.
+        auto producer_acquire_tail = [](auto& pipeline, auto const& state, auto& barrier_tail) {
+            while (pipeline.producer_try_acquire(state) != cutlass::BarrierStatus::WaitDone) {}
+            cutlass::arch::ClusterTransactionBarrier::expect_transaction(pipeline.producer_get_barrier(state), TmaTransactionBytesLSE);
+            barrier_tail.arrive_and_expect_tx(TmaTransactionBytesQ);
+        };
+        // Acquire the stage for the Q load of m_block, which may be the last one if is_last, and return the
+        // barrier that the Q load signals
+        auto acquire_Q = [&](int const m_block, auto is_last) -> BarrierValue& {
+            if constexpr (Varlen && decltype(is_last)::value) {
+                if (m_block == m_block_max - 1 && needs_clear_tail()) {
+                    producer_acquire_tail(pipeline_q, smem_pipe_write, barrier_Q_tail);
+                    return reinterpret_cast<BarrierValue&>(barrier_Q_tail);
+                }
+            }
+            pipeline_q.producer_acquire(smem_pipe_write);
+            return *pipeline_q.producer_get_barrier(smem_pipe_write);
+        };
+
         int lane_predicate = cute::elect_one_sync();
 
         if (lane_predicate) {
-            pipeline_q.producer_acquire(smem_pipe_write);
-            copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+            copy(params.tma_load_Q.with(acquire_Q(m_block, cute::true_type{}), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
                  tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
             copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
                  gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
@@ -524,8 +568,8 @@ struct CollectiveMainloopBwdSm90 {
             copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tKgK, tKsK);
             copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
 
-            #pragma unroll (kHeadDim < 256 ? 2 : 1)
-            for (; m_block < m_block_max - 1; ++m_block) {
+            // Load dO of m_block and Q of m_block + 1, which is the last m_block if is_last
+            auto load_step = [&](int const m_block, auto is_last) {
                 // If Q and dO have the same number of stages, we can use the same pipeline state variable
                 // to reduce registers
                 PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
@@ -536,23 +580,59 @@ struct CollectiveMainloopBwdSm90 {
                      gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
                 if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
                 ++smem_pipe_write;
-                pipeline_q.producer_acquire(smem_pipe_write);
-                copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                copy(params.tma_load_Q.with(acquire_Q(m_block + 1, is_last), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
                      tQgQ(_, m_block + 1), tQsQ(_, smem_pipe_write.index()));
                 copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
                      gLSE(_, m_block + 1), sLSE(_, smem_pipe_write.index()));
+            };
+            #pragma unroll (kHeadDim < 256 ? 2 : 1)
+            for (; m_block < m_block_max - 2; ++m_block) { load_step(m_block, cute::false_type{}); }
+            if (m_block < m_block_max - 1) {
+                load_step(m_block, cute::true_type{});
+                ++m_block;
             }
         }
         scheduler_prefetch();
+        bool const clear_tail = needs_clear_tail();
+        int stage_q_tail = 0, stage_do_tail = 0;
         if (lane_predicate) {
             PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
-            pipeline_do.producer_acquire(smem_pipe_write_do_cur);
-            copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+            if (!clear_tail) {
+                pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+            } else {
+                producer_acquire_tail(pipeline_do, smem_pipe_write_do_cur, barrier_dO_tail);
+            }
+            copy(params.tma_load_dO.with(!clear_tail ? *pipeline_do.producer_get_barrier(smem_pipe_write_do_cur) : reinterpret_cast<BarrierValue&>(barrier_dO_tail), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
                  tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
             copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
                  gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
+            stage_q_tail = smem_pipe_write.index();
+            stage_do_tail = smem_pipe_write_do_cur.index();
             if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
             ++smem_pipe_write;
+        }
+        if constexpr (Varlen) {
+            if (clear_tail) {
+                int const lane_leader = __ffs(__ballot_sync(0xffffffff, lane_predicate)) - 1;
+                stage_q_tail = __shfl_sync(0xffffffff, stage_q_tail, lane_leader);
+                stage_do_tail = __shfl_sync(0xffffffff, stage_do_tail, lane_leader);
+                int const lane = threadIdx.x % cutlass::NumThreadsPerWarp;
+                int const row_limit = seqlen_info.seqlen_q - (m_block_max - 1) * kBlockM;
+                // Q first: its load was issued an iteration earlier, and the MMA warpgroups need it first
+                auto clear_and_release = [&](auto& barrier_tail, auto const& sX, BarrierValue* barrier_full) {
+                    barrier_tail.wait(tail_phase);
+                    flash::clear_rows_from_contiguous<cutlass::NumThreadsPerWarp, kAtomColsQdO>(sX, row_limit, lane);
+                    // Make the zeros visible to GMMA (async proxy), then release them with the arrive.
+                    // (A fence.acq_rel here instead would make ptxas turn the dQ reductions of the MMA warpgroups
+                    // into atomics that return a value, which is much slower with hdim 256.)
+                    cutlass::arch::fence_view_async_shared();
+                    __syncwarp();
+                    if (lane_predicate) { cutlass::arch::ClusterBarrier::arrive(barrier_full); }
+                };
+                clear_and_release(barrier_Q_tail, sQ(_, _, stage_q_tail), pipeline_q.producer_get_barrier(PipelineState(stage_q_tail, 0, 0)));
+                clear_and_release(barrier_dO_tail, sdO(_, _, stage_do_tail), pipeline_do.producer_get_barrier(PipelineState_dO(stage_do_tail, 0, 0)));
+                tail_phase ^= 1;
+            }
         }
         if constexpr (Q_dO_same_stages) { smem_pipe_write_do = smem_pipe_write; }
     }
