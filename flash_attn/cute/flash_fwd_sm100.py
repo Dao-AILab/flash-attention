@@ -41,6 +41,7 @@ from flash_attn.cute import utils
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.p_quant import PQuantFormat
 from flash_attn.cute.softmax import (
     SoftmaxSm100,
     apply_score_mod_inner,
@@ -192,9 +193,14 @@ class FlashAttentionForwardSm100:
         *,
         config: FwdConfig,
         qk_blockscaled: bool = False,
+        p_quant: Optional[PQuantFormat] = None,
     ):
-        """config is a validated SM100/SM110 FwdConfig; the kernel copies its fields."""
+        """config is a validated SM100/SM110 FwdConfig; the kernel copies its fields.
+
+        p_quant is the quant-dequant format of the P@V operand (None for no quantization).
+        """
         self.qk_blockscaled = qk_blockscaled
+        self.p_quant = p_quant
         if qk_blockscaled:
             assert head_dim in (64, 128) and head_dim_v in (None, 64, 128)
             assert not config.use_2cta_instrs
@@ -2384,6 +2390,21 @@ class FlashAttentionForwardSm100:
             work_m, stage, cta_rank, q_stage=self.q_stage, cta_group_size=self.cta_group_size
         )
 
+    def _softmax_scaling_policy(self) -> Tuple[int, float]:
+        """(max_offset, rescale_threshold) of the softmax; see Note [Low Precision Scaling].
+
+        The softmax warp and the correction warp both read it, so the exponent offset the
+        softmax applies and the one the correction removes cannot drift apart. A P quant
+        format brings its own policy: its codec needs the scaled probability to stay in range.
+        """
+        if const_expr(self.p_quant is not None):
+            assert self.v_dtype.width == 16, "P quant-dequant needs 16-bit V"
+            return self.p_quant.max_offset, self.p_quant.rescale_threshold
+        elif const_expr(self.v_dtype.width == 8):
+            return 8, 0.0
+        else:
+            return 0, 8.0
+
     # for both softmax0 and softmax1 warp group
     @cute.jit
     def _kv_head_idx(self, head_idx: Int32) -> Int32:
@@ -2574,7 +2595,7 @@ class FlashAttentionForwardSm100:
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
             # See Note [Low Precision Scaling]
-            max_offset = 8 if cutlass.const_expr(self.v_dtype.width == 8) else 0
+            max_offset, rescale_threshold = self._softmax_scaling_policy()
             if const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
@@ -2582,7 +2603,6 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = softmax_scale * qk_descale
 
-            rescale_threshold = 8.0 if const_expr(self.v_dtype.width == 16) else 0.0
             # See Note [Low Precision Scaling]
             assert max_offset + rescale_threshold < _LOG2_DTYPE_MAX[self.v_dtype], (
                 f"max_offset ({max_offset}) + rescale_threshold ({rescale_threshold}) must stay "
@@ -2593,6 +2613,7 @@ class FlashAttentionForwardSm100:
                 rescale_threshold=rescale_threshold,
                 softmax_scale=softmax_scale_eff,
                 max_offset=max_offset,
+                p_quant=self.p_quant,
             )
             softmax.reset()
 
@@ -3051,11 +3072,10 @@ class FlashAttentionForwardSm100:
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
 
-            # Must match the softmax warp's max_offset; max_offset_scale = 2^max_offset.
-            max_offset = Float32(8.0) if cutlass.const_expr(self.v_dtype.width == 8) else Float32(0.0)
-            max_offset_scale = (
-                Float32(256.0) if cutlass.const_expr(self.v_dtype.width == 8) else Float32(1.0)
-            )
+            # The softmax warp's max_offset; max_offset_scale = 2^max_offset.
+            max_offset_int, _ = self._softmax_scaling_policy()
+            max_offset = Float32(float(max_offset_int))
+            max_offset_scale = Float32(float(2**max_offset_int))
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, work_m, split_idx=split_idx, num_splits=num_splits,

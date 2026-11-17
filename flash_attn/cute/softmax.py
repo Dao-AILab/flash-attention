@@ -12,6 +12,7 @@ from cutlass import Float32, Boolean
 from quack import layout_utils
 import flash_attn.cute.utils as utils
 from quack.cute_dsl_utils import ParamsBase
+from flash_attn.cute.p_quant import NVFP4_GLOBAL_SCALE, NVFP4_SCALE_FACTOR, PQuantFormat
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.utils import AuxData
 
@@ -301,10 +302,72 @@ class Softmax(ParamsBase):
             acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])
 
 
+def _p_quant_e4m3(p: cute.TensorSSA) -> cute.TensorSSA:
+    """FP8 quant-dequant: round to E4M3 (nearest-even, saturating) and back."""
+    return p.to(cutlass.Float8E4M3FN).to(Float32)
+
+
+@cute.jit
+def _p_quant_nvfp4(p: cute.TensorSSA) -> cute.TensorSSA:
+    """NVFP4 quant-dequant of one block of keys: E2M1 codes under one E4M3 scale.
+
+    The scale code is E4M3(448 * block_max) and the effective scale is code / 2688. The
+    divisions are exact FP32 divisions; the oracle mirrors this operation order.
+    """
+    block_max = utils.fmax_reduce(p, arch=100)
+    # The E4M3 conversion works on pairs; the second lane is unused.
+    scale_in = cute.make_rmem_tensor(2, Float32)
+    scale_in[0] = block_max * Float32(NVFP4_SCALE_FACTOR)
+    scale_in[1] = Float32(0.0)
+    scale_code = cute.make_rmem_tensor(2, Float32)
+    scale_code.store(scale_in.load().to(cutlass.Float8E4M3FN).to(Float32))
+    # A zero scale code only happens for block maxima below ~2.2e-6. Under a scale of one
+    # every value of such a block rounds to code zero, so substituting one yields the zero
+    # block the contract asks for and never divides by zero.
+    scale = (
+        scale_code[0] / Float32(NVFP4_GLOBAL_SCALE)
+        if scale_code[0] > Float32(0.0)
+        else Float32(1.0)
+    )
+    return (p / scale).to(cutlass.Float4E2M1FN).to(Float32) * scale
+
+
+class _PQuantCodecTable(dict):
+    """Codec name -> kernel helper. The hash of a helper, which enters the forward compile key,
+    is taken when the helper is put into the table: tracing a ``@cute.jit`` helper replaces the
+    function it wraps, so a hash taken later would depend on whether a kernel had already used
+    the helper."""
+
+    def __init__(self, helpers):
+        super().__init__()
+        self._hashes = {}
+        for name, helper in helpers.items():
+            self[name] = helper
+
+    def __setitem__(self, name, helper):
+        self._hashes[name] = utils.hash_callable(helper, set_cute_hash=False)
+        super().__setitem__(name, helper)
+
+    def __delitem__(self, name):
+        super().__delitem__(name)
+        del self._hashes[name]
+
+    def helper_hash(self, name):
+        """The hash of the helper of codec ``name``; False for a codec without one."""
+        return self._hashes.get(name, False)
+
+
+# Codec of each P quant-dequant format. "identity" formats keep the format's softmax
+# scaling policy and skip the rounding, so they need no entry.
+_P_QUANT_CODECS = _PQuantCodecTable({"e4m3": _p_quant_e4m3, "nvfp4": _p_quant_nvfp4})
+
+
 @dataclass
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
     max_offset: cutlass.Constexpr[int] = 0
+    # Quant-dequant applied to the P@V operand only; the row sum and LSE stay unquantized.
+    p_quant: Optional[PQuantFormat] = None
 
     @staticmethod
     def create(
@@ -312,6 +375,7 @@ class SoftmaxSm100(Softmax):
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
         max_offset: cutlass.Constexpr[int] = 0,
+        p_quant: Optional[PQuantFormat] = None,
     ):
         num_rows = 1
         arch = 100
@@ -326,6 +390,7 @@ class SoftmaxSm100(Softmax):
             softmax_scale,
             rescale_threshold=rescale_threshold,
             max_offset=max_offset,
+            p_quant=p_quant,
         )
 
     @cute.jit
@@ -457,9 +522,25 @@ class SoftmaxSm100(Softmax):
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
                             acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
-            acc_S_row_converted_frg[None, j].store(
-                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
-            )
+            if cutlass.const_expr(self.p_quant is None or self.p_quant.codec == "identity"):
+                acc_S_row_converted_frg[None, j].store(
+                    acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+                )
+            else:
+                # Quantize a copy on its way to the P@V operand. acc_S_row keeps the FP32
+                # probabilities, which the row sum reads afterwards.
+                codec = _P_QUANT_CODECS[self.p_quant.codec]
+                blk_tile = frg_tile if self.p_quant.block == 1 else self.p_quant.block
+                assert frg_tile % blk_tile == 0, "P quant block must divide the 32-key fragment"
+                acc_S_row_blk = cute.logical_divide(acc_S_row, cute.make_layout(blk_tile))
+                acc_S_row_converted_blk = cute.logical_divide(
+                    acc_S_row_converted, cute.make_layout(blk_tile)
+                )
+                for h in cutlass.range_constexpr(frg_tile // blk_tile):
+                    b = j * (frg_tile // blk_tile) + h
+                    acc_S_row_converted_blk[None, b].store(
+                        codec(acc_S_row_blk[None, b].load()).to(acc_S_row_converted.element_type)
+                    )
 
     @cute.jit
     def scale_apply_exp2_convert(
