@@ -29,14 +29,18 @@ from flash_attn.cute.interface import (
 )
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
-    block_sparse_bwd_supports_2cta,
     fast_sampling,
-    get_kv_subtile_factor,
     normalize_block_sparse_config_bwd,
     compute_dq_write_order,
     compute_dq_write_order_from_block_mask,
 )
 from flash_attn.cute.cache_utils import get_jit_cache
+from flash_attn.cute.config import (
+    BwdHeuristicInputs,
+    bwd_kv_subtile_factor,
+    config_kv_subtile_factor,
+    select_bwd_config,
+)
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
 from flash_attn.cute import utils
 from mask_mod_definitions import (
@@ -180,6 +184,9 @@ def assert_bwd_matches_reference(
 
     bwd_rtol = 2
     bwd_atol_floor = 1e-5 if min_seqlen >= 64 else 3e-5
+    if dk_cute.shape[-1] >= 256:
+        # dPsum from the bf16-rounded O: the residual dS grows with the head dim
+        bwd_atol_floor *= 2
     dq_atol = max(bwd_atol_floor, 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item())
     dk_atol = max(bwd_atol_floor, 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item())
     dv_atol = max(bwd_atol_floor, 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item())
@@ -763,7 +770,7 @@ def test_single_doc_bwd_minimal():
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_COMPREHENSIVE)
 @pytest.mark.parametrize("nheads", [16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
-@pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize("headdim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_block_sparsity", [True, False])
 @pytest.mark.parametrize(
@@ -804,7 +811,7 @@ def test_static_masks(
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_SMOKE)
 @pytest.mark.parametrize("nheads", [16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
-@pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize("headdim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_block_sparsity", [True, False])
 @pytest.mark.parametrize(
@@ -1072,15 +1079,6 @@ def test_sm100_block_sparse_empty_tile_writes_real_zeros():
     )
 
 
-def make_empty_block_sparse_tensors(sparse_block_size_kv: int) -> BlockSparseTensorsTorch:
-    """Build shape-only metadata for block-sparse dispatch helper tests."""
-    return BlockSparseTensorsTorch(
-        mask_block_cnt=torch.empty(0, dtype=torch.int32),
-        mask_block_idx=torch.empty(0, dtype=torch.int32),
-        block_size=(256, sparse_block_size_kv),
-    )
-
-
 @pytest.mark.parametrize(
     "sparse_block_size_kv,expected_factor,expected_2cta",
     [
@@ -1094,20 +1092,22 @@ def make_empty_block_sparse_tensors(sparse_block_size_kv: int) -> BlockSparseTen
 def test_sm100_block_sparse_bwd_kv_subtile_selects_cta_policy(
     sparse_block_size_kv, expected_factor, expected_2cta
 ):
-    n_block_size = 128
-    tensors = (
-        None
-        if sparse_block_size_kv is None
-        else make_empty_block_sparse_tensors(sparse_block_size_kv)
+    inputs = BwdHeuristicInputs(
+        device_arch=100, head_dim=128, head_dim_v=128, num_heads=4, num_heads_kv=4,
+        dtype="torch.bfloat16", use_block_sparsity=sparse_block_size_kv is not None,
+        sparse_block_size_q=None if sparse_block_size_kv is None else 256,
+        sparse_block_size_kv=sparse_block_size_kv,
     )
+    config = select_bwd_config(inputs)
 
-    assert get_kv_subtile_factor(tensors, n_block_size) == expected_factor
-    assert block_sparse_bwd_supports_2cta(tensors, n_block_size) is expected_2cta
+    assert config.tile_n == 128
+    assert config_kv_subtile_factor(config, inputs) == expected_factor
+    assert config.use_2cta_instrs is expected_2cta
 
 
 def test_sm100_block_sparse_bwd_kv_subtile_rejects_non_multiple():
     with pytest.raises(ValueError, match=r"multiple of tile_n=128; got 192"):
-        get_kv_subtile_factor(make_empty_block_sparse_tensors(192), 128)
+        bwd_kv_subtile_factor(192, 128)
 
 
 def test_block_sparse_bwd_normalize_accepts_odd_kv_subtile_for_1cta():

@@ -32,6 +32,24 @@ def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
 
 
 @cute.jit
+def gemm_blockscaled(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    tCtSFA: cute.Tensor,
+    tCtSFB: cute.Tensor,
+    zero_init: bool | Boolean = True,
+) -> None:
+    """QK MMA with per-32 UE8M0 scales; fragment K follows the target instruction."""
+    for k in cutlass.range(cute.size(tCrA.shape[2]), unroll_full=True):
+        tiled_mma.set(tcgen05.Field.SFA, tCtSFA[None, None, k].iterator)
+        tiled_mma.set(tcgen05.Field.SFB, tCtSFB[None, None, k].iterator)
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
+        cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
+
+
+@cute.jit
 def gemm_w_idx(
     tiled_mma: cute.TiledMma,
     acc: cute.Tensor,

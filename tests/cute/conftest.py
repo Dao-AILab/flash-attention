@@ -34,8 +34,8 @@ def _get_gpu_ids():
 def pytest_configure(config):
     # MLA routing: the tests pick the kernel explicitly. Unset, the interface would apply its
     # 1CTA / 2CTA dispatch heuristic; the suite runs 2CTA by default and 1CTA wherever
-    # supported with FLASH_ATTENTION_MLA_1CTA=1 (test_flash_attn_mla_dispatch_heuristic
-    # covers the heuristic itself, with the variable unset).
+    # supported with FLASH_ATTENTION_MLA_1CTA=1 (test_mla_fwd_config.py covers the heuristic
+    # itself, with the variable unset).
     os.environ.setdefault("FLASH_ATTENTION_MLA_1CTA", "0")
     tmp = Path(tempfile.gettempdir()) / getuser() / "flash_attention_tests"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -148,6 +148,15 @@ def _install_compile_instrumentation(config):
 
         recording_contains._fa_recorded = True
         cache_utils.JITCache.__contains__ = recording_contains
+        original_get = cache_utils.JITCache.get
+
+        def recording_get(self, key):
+            out.write(f"{names.get(id(self), type(self).__name__)}\t{key!r}\n")
+            out.flush()
+            fn = original_get(self, key)
+            return (lambda *args, **kwargs: None) if fn is None and keys_only else fn
+
+        cache_utils.JITCache.get = recording_get
         if keys_only:
             original_getitem = cache_utils.JITCache.__getitem__
 

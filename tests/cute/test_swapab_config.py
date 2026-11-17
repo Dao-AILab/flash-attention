@@ -44,6 +44,11 @@ def decode(**changes) -> FwdHeuristicInputs:
         {"num_heads": 64, "num_heads_kv": 2},
         {"num_heads": 2, "num_heads_kv": 2},
         {"device_arch": 103},
+        # Dense causal bf16 hd128 is a default causal CLC cell; SwapAB is chosen first.
+        {"causal": True},
+        # A GB300 tuned CLC cell (select_tuned_sm100_overrides) of the standard kernel.
+        {"device_arch": 103, "causal": True, "num_heads": 32, "num_heads_kv": 8,
+         "batch_size": 32, "total_q": 32, "max_seqlen_k": 1024},
         {"causal": True, "local": True, "window_size_left": 31, "window_size_right": 0,
          "has_score_mod": True, "has_mask_mod": True, "pack_gqa": True, "disable_2cta": True},
     ],
@@ -80,6 +85,7 @@ _UNSUPPORTED = [
     # A tensor (device) max_seqlen_q is no host bound.
     ({**_VARLEN_PAGED, "has_max_seqlen_q_hint": False}, "max_seqlen_q == 1"),
     ({"dtype": "torch.float8_e4m3fn"}, "dtype"),
+    ({"mxfp8_path": "qk"}, "MXFP8 block scales"),
     ({"head_dim": 192, "head_dim_v": 128}, "head dimensions"),
     ({"num_heads": 66, "num_heads_kv": 2}, "GQA ratio"),
     ({"page_size": 64}, "page size must be a multiple of 128"),
@@ -90,7 +96,6 @@ _VETOES = [
     {"requested_mma_pv_is_rs": False},
     {"requested_intra_wg_overlap": False},
     {"pack_gqa": False},
-    {"requested_use_clc_scheduler": True},
     {"disable_s_ping_pong": True},
 ]
 
@@ -98,7 +103,7 @@ _VETOES = [
 @pytest.mark.parametrize("changes", [changes for changes, _ in _UNSUPPORTED] + _VETOES)
 def test_swapab_request_falls_back_to_the_standard_kernel(changes):
     """Automatic selection and a SwapAB request both take the standard kernel's config for a
-    problem SwapAB cannot run or a request vetoes, like an FA_CLC request CLC cannot honor."""
+    problem SwapAB cannot run or a request vetoes."""
     inputs = decode(**changes)
     standard = select_fwd_config(inputs._replace(requested_use_swapab=False))
 
@@ -174,6 +179,19 @@ def test_standard_request_keeps_the_standard_kernel():
         ({"max_seqlen_k": 600, "seqlen_k_capacity": 4096, "page_size": 256}, 8),
         # An explicit count is kept.
         ({"requested_num_splits": 3}, 3),
+        # SM103 hd128 aims at 128 CTAs from 4 sequences and 16 (batch * KV head) tiles.
+        ({"device_arch": 103, "batch_size": 16, "total_q": 16, "num_heads": 32,
+          "num_heads_kv": 1, "max_seqlen_k": 16384}, 8),
+        ({"device_arch": 103, "batch_size": 16, "total_q": 16}, 4),
+        ({"device_arch": 103, "batch_size": 16, "total_q": 16, "dtype": "torch.float16"}, 2),
+        ({"device_arch": 100, "batch_size": 16, "total_q": 16, "num_heads": 32,
+          "num_heads_kv": 1, "max_seqlen_k": 16384}, 4),
+        ({"device_arch": 103, "batch_size": 12, "total_q": 12, "num_heads": 32,
+          "num_heads_kv": 1, "max_seqlen_k": 16384}, 4),
+        ({"device_arch": 103, "batch_size": 2, "total_q": 2, "num_heads": 64, "num_heads_kv": 8,
+          "max_seqlen_k": 32768}, 4),
+        ({"device_arch": 103, "batch_size": 16, "total_q": 16, "num_heads": 32,
+          "num_heads_kv": 4, "head_dim": 64, "head_dim_v": 64}, 2),
     ],
 )
 def test_split_count(changes, num_splits):
@@ -327,7 +345,6 @@ def test_explicit_configs_force_either_kernel():
     [
         {"requested_tile_m": 128, "requested_tile_n": 128},
         {"requested_mma_pv_is_rs": True},
-        {"requested_use_clc_scheduler": True},
         {"disable_s_ping_pong": True},
         {"requested_use_swapab": False},
     ],

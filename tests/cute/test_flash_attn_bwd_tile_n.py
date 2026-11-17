@@ -14,6 +14,7 @@ import torch
 
 from eager_reference import check_against_reference, make_cu_seqlens
 
+from flash_attn.cute import utils
 from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 from score_mod_definitions import score_mod_bwd_rel_bias, score_mod_rel_bias
 
@@ -45,11 +46,18 @@ def bwd_tile_n_env():
         os.environ.pop("FLASH_ATTENTION_BWD_TILE_N", None)
     else:
         os.environ["FLASH_ATTENTION_BWD_TILE_N"] = saved
+    utils._get_bwd_tile_n_override.cache_clear()
+
+
+def set_tile_n_env(tile_n):
+    """The backward reads FLASH_ATTENTION_BWD_TILE_N once per process; clear it to re-read."""
+    os.environ["FLASH_ATTENTION_BWD_TILE_N"] = str(tile_n)
+    utils._get_bwd_tile_n_override.cache_clear()
 
 
 def run_fwd_bwd(leaves, q, k, v, dout, causal, tile_n):
     """Forward + backward on the dense views; gradients land in the packed leaves."""
-    os.environ["FLASH_ATTENTION_BWD_TILE_N"] = str(tile_n)
+    set_tile_n_env(tile_n)
     out, _ = flash_attn_func(q, k, v, causal=causal)
     dq, dk, dv = torch.autograd.grad(out, leaves, dout)
     torch.cuda.synchronize()
@@ -138,7 +146,7 @@ def ragged_lens(q_lens, k_lens):
 
 
 def run_fwd_bwd_layout(layout, q, k, v, dout, q_lens, k_lens, causal, tile_n, **kwargs):
-    os.environ["FLASH_ATTENTION_BWD_TILE_N"] = str(tile_n)
+    set_tile_n_env(tile_n)
     if layout == "dense":
         b = len(q_lens)
         out, _ = flash_attn_func(

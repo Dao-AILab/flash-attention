@@ -17,11 +17,6 @@ from cutlass import Int32, const_expr
 from cutlass.cute import FastDivmodDivisorV2
 from cutlass.utils import ClcDynamicPersistentTileScheduler, ClcDynamicPersistentTileSchedulerParams
 from cutlass.cute.typing import Boolean
-from cutlass.cutlass_dsl import (
-    min as dsl_min,
-    extract_mlir_values,
-    new_from_mlir_values,
-)
 from cutlass.utils.hardware_info import HardwareInfo
 
 from quack.cute_dsl_utils import ParamsBase
@@ -147,10 +142,29 @@ class DynamicPersistentSchedulerState(SchedulerState):
 #
 # The SM100 forward passes logical M work tiles in num_block with use_cluster_idx = (C > 1).
 # SingleTileLPTScheduler's CLC grid has grid_x = num_block * C; clc_work_to_coords divides
-# claimed_x by C and optionally reverses M for LPT. StaticPersistentTileScheduler takes
-# num_block as a cluster count, caps the grid at the SM count rounded down to whole clusters,
-# and strides over work by the launched cluster count. Varlen metadata units and the backward/MLA contracts are
-# separate. Row mapping: NOTE [SM100 forward coordinate spaces] in flash_fwd_sm100.py.
+# claimed_x by C and optionally reverses M for LPT, while unsplit 1CTA grids use the
+# L2-swizzled static mapping. StaticPersistentTileScheduler takes num_block as a cluster
+# count, caps the grid at the SM count rounded down to whole clusters, and strides over work
+# by the launched cluster count. Varlen metadata units and the MLA contracts are separate;
+# the backward's is NOTE [SM100 backward work coordinates] below. Row mapping: NOTE [SM100
+# forward coordinate spaces] in flash_fwd_sm100.py.
+
+
+# NOTE [SM100 backward work coordinates]
+# The SM100 backward tiles KV rows. With C = cta_group_size (2 for 2CTA, else 1), every CTA
+# of a cluster receives the same logical (work_n, head, batch) and validity: work_n is the
+# C * tile_n-row KV work tile, the CTA rank is not part of it. The kernel applies the rank
+# once, work_kv_block(work_n, cta_rank) = work_n * C + cta_rank (NOTE [SM100 backward
+# coordinate spaces] in flash_bwd_sm100.py).
+#
+# The backward passes work tiles in num_block (ceil_div(seqlen_k, C * tile_n)) with
+# use_cluster_idx = (C > 1). SingleTileScheduler then reads cluster_idx(); SingleTileLPTBwd-
+# Scheduler and SingleTileVarlenScheduler decode blockIdx.x // C and skip their CTA-rank fold.
+# Grids still count physical CTAs (physical_x = C * cluster_slot + cta_rank). Without
+# use_cluster_idx (sm90 backward, cluster 1) the same schedulers hand out CTA tiles as before.
+# The head is a scheduler head (NOTE [SM100 backward coordinate spaces]): num_head counts
+# query heads, packed groups, or KV heads under the head loop; qhead_fold tells the
+# deterministic schedulers how many query heads' Q / dO / dQaccum one tile touches.
 
 
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
@@ -196,7 +210,8 @@ class TileSchedulerProtocol(Protocol):
         """Producer-side prefetch of next work tile (no-op for static schedulers).
 
         For dynamic schedulers: producer acquire (+ issue CLC query) + producer state advance.
-        Only called by the scheduler warp.
+        Only called by the single producer warp (CLC: the scheduler warp, or the load warp for
+        late claims; dynamic: the first load warp).
         """
         ...
 
@@ -204,6 +219,8 @@ class TileSchedulerProtocol(Protocol):
         """Producer-side cleanup after the last tile.
 
         No-op for static schedulers. For dynamic schedulers: pipeline producer_tail.
+        DynamicPersistentVarlenScheduler also reports this CTA finished; the last CTA zeroes
+        the semaphore.
         """
         ...
 
@@ -231,6 +248,8 @@ class TileSchedulerArguments(ParamsBase):
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
+    # SingleTileLPTScheduler: one L2 section over the whole problem; see NOTE [global LPT].
+    lpt_global: cutlass.Constexpr[bool] = False
     num_splits_dynamic_ptr: Optional[cute.Tensor] = None
     num_m_blocks_ptr: Optional[cute.Tensor] = None
     virtual_batch_idx_ptr: Optional[cute.Tensor] = None
@@ -244,6 +263,11 @@ class TileSchedulerArguments(ParamsBase):
     # every batch's first splits launch before the excess splits, which exit at once. Cluster
     # shape (1, 1) only.
     split_major: cutlass.Constexpr[bool] = False
+    # Backward GQA: each tile processes qhead_fold query heads in total (its packed heads
+    # and, under the head loop, every sub-group of the KV head). Deterministic schedulers size
+    # their L2 sections using the combined Q, dO, and dQaccum memory footprint of all
+    # qhead_fold query heads; the backward passes seqlen_k as unpacked Q rows for that.
+    qhead_fold: cutlass.Constexpr[int] = 1
 
 
 class SingleTileScheduler:
@@ -551,6 +575,8 @@ class SingleTileLPTScheduler:
             swizzle = (
                 1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
             )
+            if const_expr(args.lpt_global):
+                swizzle = Int32(args.num_head * args.num_batch)
             # If we're in the last section (called residual), we don't want to divide by
             # swizzle. Instead we want to divide by the remainder.
             num_hb_quotient = (args.num_head * args.num_batch) // swizzle
@@ -666,10 +692,15 @@ class SingleTileLPTScheduler:
     def clc_work_to_coords(self, work) -> WorkTileInfo:
         """Convert CLC response (block, head, batch_split) to WorkTileInfo.
 
-        CLC returns raw grid coordinates — no L2 swizzle (hardware decides order).
+        Unsplit 1CTA grids reuse the static L2-swizzled LPT mapping.
         Clustered grids use one m block per cluster; num_block counts clusters. Both CTAs
         of a cluster decode the same logical tile; see NOTE [SM100 forward work coordinates].
         """
+        if const_expr(self.params.cluster_shape_m == 1 and not self.params.is_split_kv):
+            tile_idx = work.tile_idx[0] + self.params.num_block * (
+                work.tile_idx[1] + self.params.num_head * work.tile_idx[2]
+            )
+            return WorkTileInfo(self._static_coords(tile_idx).tile_idx, work.is_valid_tile)
         assert self.params.cluster_shape_m == 1 or self.params.use_cluster_idx, (
             "CLC with clusters requires use_cluster_idx"
         )
@@ -700,10 +731,14 @@ class SingleTileLPTScheduler:
             work = self._ctx.get_current_work()
             self._tile_idx = work.tile_idx[0]
             return self.clc_work_to_coords(work)
-        # Static path: L2-swizzled coordinate mapping
+        return self._static_coords(self._tile_idx)
+
+    @cute.jit
+    def _static_coords(self, tile_idx: Int32) -> WorkTileInfo:
+        # L2-swizzled coordinate mapping (static grid, or unsplit 1CTA CLC)
         params = self.params
         # Implement LPT scheduling coordinate calculation
-        bidhb, l2_mod = divmod(self._tile_idx, params.l2_major_divmod)
+        bidhb, l2_mod = divmod(tile_idx, params.l2_major_divmod)
         # If we're in the last section (called residual), we don't want to divide by
         # swizzle. Instead we want to divide by the remainder.
         block, bidhb_residual = 0, 0
@@ -716,7 +751,7 @@ class SingleTileLPTScheduler:
         # Longest-processing-time-first
         if const_expr(params.lpt):
             block = params.num_block - 1 - block
-        is_valid = self._tile_idx < params.total_blocks
+        is_valid = tile_idx < params.total_blocks
         split_idx = self._split_idx
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
         if const_expr(params.is_split_kv and params.num_splits_dynamic_ptr is not None):
@@ -788,6 +823,8 @@ class SingleTileLPTBwdScheduler:
         num_hb_quotient: Int32
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         spt: cutlass.Constexpr[bool] = True
+        # num_block counts work tiles (clusters); see NOTE [SM100 backward work coordinates]
+        use_cluster_idx: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -802,7 +839,9 @@ class SingleTileLPTBwdScheduler:
             )
             size_one_dqaccum_head = cutlass.Int64(args.seqlen_k) * (args.headdim) * 4
             # size_one_dqaccum_head = 0
-            size_one_head = size_one_qdo_head + size_one_dqaccum_head
+            # seqlen_k here is the unpacked Q rows: every query head of the fold adds a full
+            # Q / dO / dQaccum footprint
+            size_one_head = (size_one_qdo_head + size_one_dqaccum_head) * args.qhead_fold
             log2_floor = lambda n: 31 - clz(n)
             swizzle = (
                 1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
@@ -812,7 +851,10 @@ class SingleTileLPTBwdScheduler:
             # swizzle. Instead we want to divide by the remainder.
             num_hb_quotient = (args.num_head * args.num_batch) // swizzle
             num_hb_remainder = (args.num_head * args.num_batch) % swizzle
-            num_block = cute.ceil_div(args.num_block, args.cluster_shape_mn[0])
+            if const_expr(args.use_cluster_idx):
+                num_block = args.num_block  # already in work tiles (clusters)
+            else:
+                num_block = cute.ceil_div(args.num_block, args.cluster_shape_mn[0])
             return SingleTileLPTBwdScheduler.Params(
                 total_blocks=(num_block * args.cluster_shape_mn[0])
                 * args.num_head
@@ -828,6 +870,7 @@ class SingleTileLPTBwdScheduler:
                 num_hb_quotient=Int32(num_hb_quotient),
                 cluster_shape_mn=args.cluster_shape_mn,
                 spt=args.lpt,
+                use_cluster_idx=args.use_cluster_idx,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
@@ -882,7 +925,7 @@ class SingleTileLPTBwdScheduler:
         batch_idx, head_idx = divmod(bidhb_actual, params.num_head_divmod)
         if cutlass.const_expr(params.spt):
             block = params.num_block - 1 - block
-        if cutlass.const_expr(params.cluster_shape_mn[0] > 1):
+        if cutlass.const_expr(params.cluster_shape_mn[0] > 1 and not params.use_cluster_idx):
             bidx_in_cluster = cute.arch.block_in_cluster_idx()
             block = block * params.cluster_shape_mn[0] + bidx_in_cluster[0]
         is_valid = self._tile_idx < params.total_blocks
@@ -968,6 +1011,8 @@ class VarlenDecoder(ParamsBase):
         # if backward, add dqaccum block size to calculate swizzle
         if head_swizzle:
             kv_block_size += args.headdim * 4 * args.tile_shape_mn[1]
+            # num_n_blocks below counts unpacked query rows (from the K tiles): the whole fold
+            kv_block_size *= args.qhead_fold
         max_kvblock_in_l2 = size_l2 // kv_block_size
         return VarlenDecoder(
             num_head=args.num_head,
@@ -1129,10 +1174,21 @@ class VarlenDecoder(ParamsBase):
             m_blocks_in_group = cute.arch.shuffle_sync(cumulative, cute.arch.WARP_SIZE - 1)
             group_end_tile = m_blocks_in_group * self.num_head + group_start_tile
 
+            # Padded cu_seqlens repeat the last offset; once a group starts there, every
+            # remaining batch is empty and the tile is invalid without scanning the tail.
+            stop_at_padding = const_expr(
+                self.mCuSeqlensQ is not None
+                and self.mSeqUsedQ is None
+                and self.virtual_batch_idx_ptr is None
+            )
             batch_idx = bidb_start
             while group_end_tile <= next_tile_idx:
                 batch_idx += cute.arch.WARP_SIZE - 1
-                if batch_idx >= self.num_batch:
+                at_padding = Boolean(False)
+                if const_expr(stop_at_padding):
+                    if batch_idx < self.num_batch:
+                        at_padding = self.mCuSeqlensQ[batch_idx] == self.mCuSeqlensQ[self.num_batch]
+                if batch_idx >= self.num_batch or at_padding:
                     batch_idx = Int32(self.num_batch)
                     group_end_tile = next_tile_idx + 1
                 else:
@@ -1447,7 +1503,45 @@ class SingleTileVarlenScheduler:
         return scheduler
 
 
+# DynamicPersistentVarlenScheduler semaphore: the low bits count claimed tiles (all tiles handed out
+# in one launch), the high bits count finished CTAs (at most the grid, about the SM count).
+SEMAPHORE_CLAIM_BITS = 24
+SEMAPHORE_FINISHED_BITS = 32 - SEMAPHORE_CLAIM_BITS
+SEMAPHORE_CLAIM_MASK = (1 << SEMAPHORE_CLAIM_BITS) - 1
+SEMAPHORE_MAX_CTAS = (1 << SEMAPHORE_FINISHED_BITS) - 1
+
+
 class DynamicPersistentVarlenScheduler:
+    """Persistent varlen scheduler: a grid of at most SEMAPHORE_MAX_CTAS CTAs claims tiles from
+    ``tile_count_semaphore`` with an atomic add, after each CTA's first tile (its block index).
+
+    The semaphore must be zero at launch and belong to one in-flight launch at a time; the last
+    CTA to finish resets it (see ``producer_tail``), so launches ordered on one stream can reuse it
+    without a host-side reset.
+    """
+
+    # Claimed tiles per launch must stay below this (the semaphore's claim field).
+    MAX_TILES = 1 << SEMAPHORE_CLAIM_BITS
+
+    @staticmethod
+    def max_claimable_tiles(
+        total_q: int,
+        batch_size: int,
+        m_tile: int,
+        num_head: int,
+        num_head_kv: int,
+        pack_gqa: bool,
+        num_splits: int,
+    ) -> int:
+        """Host-side upper bound on the tiles one launch can claim, in the grid's geometry: M
+        tiles of ``m_tile`` (= q_stage * tile_m) rows over packed rows (PackGQA) per scheduled head.
+        Each nonempty request adds at most one partial tile and needs at least one of the total_q
+        rows, so padded request slots beyond total_q add none."""
+        rows_per_token = num_head // num_head_kv if pack_gqa else 1
+        heads = num_head_kv if pack_gqa else num_head
+        requests = min(batch_size, total_q)
+        return (total_q * rows_per_token // m_tile + requests + 1) * heads * max(num_splits, 1)
+
     @dataclass
     class Params(ParamsBase):
         total_q: Int32
@@ -1536,8 +1630,9 @@ class DynamicPersistentVarlenScheduler:
         ) // d.tile_shape_mn[0]
         total_blocks = total_blocks_max * d.num_head * d.num_splits
         hardware_info = HardwareInfo()
-        sm_count = (
-            hardware_info.get_device_multiprocessor_count() * params.persistent_cta_multiplier
+        sm_count = min(
+            hardware_info.get_device_multiprocessor_count() * params.persistent_cta_multiplier,
+            SEMAPHORE_MAX_CTAS,
         )
         return (cutlass.min(sm_count, total_blocks), Int32(1), Int32(1))
 
@@ -1571,13 +1666,17 @@ class DynamicPersistentVarlenScheduler:
 
     @cute.jit
     def prefetch_next_work(self, *, loc=None, ip=None):
+        """Claim the next tile and publish it to the CTA's warps.
+
+        The first load warp calls this after issuing the current tile's loads. Claiming only once
+        the one-slot pipeline is free keeps a CTA at most one tile ahead.
+        """
         ctx = self._ctx
+        ctx.producer_acquire()
         next_tile_idx = Int32(0)
         if cute.arch.lane_idx() == 0:
-            next_tile_idx = cute.arch.grid_dim()[0] + utils.atomic_add_i32(
-                1,
-                self.params.tile_count_semaphore,
-            )
+            claimed = utils.atomic_add_i32(1, self.params.tile_count_semaphore)
+            next_tile_idx = cute.arch.grid_dim()[0] + (claimed & SEMAPHORE_CLAIM_MASK)
         next_tile_idx = cute.arch.shuffle_sync(next_tile_idx, 0)
         work_info, new_group_start_tile = self.get_current_work(
             next_tile_idx, self._bidb_start, self._group_start_tile
@@ -1586,7 +1685,6 @@ class DynamicPersistentVarlenScheduler:
         # group instead of restarting at batch 0.
         self._bidb_start = Int32(work_info.tile_idx[2])
         self._group_start_tile = new_group_start_tile
-        ctx.producer_acquire()
         with cute.arch.elect_one():
             block, head_idx, batch_idx, split_idx = work_info.tile_idx
             ctx.write_work_info(block, head_idx, batch_idx, split_idx)
@@ -1614,8 +1712,25 @@ class DynamicPersistentVarlenScheduler:
         self._group_start_tile = new_group_start_tile
         return work_info
 
+    @cute.jit
     def producer_tail(self, *, loc=None, ip=None):
+        """Report this CTA finished; the last CTA resets the semaphore for the next launch.
+
+        Each CTA calls this once, after its last claim (including CTAs whose first tile is
+        invalid). Claims and the report come from the same thread to the same address, so the CTA
+        that sees ``grid - 1`` others finished observes every claim and can zero the semaphore. A
+        finished count of at least ``grid`` means the semaphore was not zero at launch or is shared
+        with a concurrent launch, so tiles may have been skipped: trap instead.
+        """
         self._ctx.producer_tail(loc=loc, ip=ip)
+        if cute.arch.lane_idx() == 0:
+            finished = Int32(1 << SEMAPHORE_CLAIM_BITS)
+            old = utils.atomic_add_i32(finished, self.params.tile_count_semaphore)
+            num_finished = (old >> SEMAPHORE_CLAIM_BITS) & SEMAPHORE_MAX_CTAS
+            if num_finished == cute.arch.grid_dim()[0] - 1:
+                utils.atomic_add_i32(-(old + finished), self.params.tile_count_semaphore)
+            elif num_finished >= cute.arch.grid_dim()[0]:
+                cute.arch.inline_ptx("trap;", read_only_args=[])
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
@@ -1634,573 +1749,3 @@ class DynamicPersistentVarlenScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return self.__class__(*obj_list, loc=self._loc)
-
-
-# -----------------------------------------------------------------------------
-# SM100 FMHA-specific schedulers (kept separate from generic schedulers).
-# -----------------------------------------------------------------------------
-
-
-class Sm100FmhaStaticTileSchedulerParams:
-    """A class to represent parameters for the FMHA (Fused Multi-Head Attention) static tile scheduler.
-
-    This class holds the configuration parameters needed to initialize and configure
-    the tile scheduler for FMHA operations.
-
-    :ivar is_persistent: Whether to use persistent kernel mode.
-    :type is_persistent: bool
-    :ivar problem_shape_mbh: Problem shape in (M, B, H) format.
-    :type problem_shape_mbh: cute.Shape
-    """
-
-    def __init__(
-        self,
-        is_persistent: bool,
-        problem_shape_mbh: cute.Shape,
-        *,
-        loc=None,
-        ip=None,
-    ):
-        """
-        Initializes the Sm100FmhaStaticTileSchedulerParams with the given parameters.
-
-        :param is_persistent: Whether to use persistent kernel mode.
-        :type is_persistent: bool
-        :param problem_shape_mbh: Problem shape in (M, B, H) format.
-        :type problem_shape_mbh: cute.Shape
-        """
-        self.is_persistent = is_persistent
-        self.problem_shape_mbh = problem_shape_mbh
-        self._loc = loc
-        self._ip = ip
-
-    def __extract_mlir_values__(self):
-        values, self._values_pos = [], []
-        for obj in [self.problem_shape_mbh]:
-            obj_values = extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        obj_list = []
-        for obj, n_items in zip([self.problem_shape_mbh], self._values_pos):
-            obj_list.append(new_from_mlir_values(obj, values[:n_items]))
-            values = values[n_items:]
-        return Sm100FmhaStaticTileSchedulerParams(
-            self.is_persistent, *(tuple(obj_list)), loc=self._loc
-        )
-
-
-class Sm100FmhaStaticTileScheduler:
-    """A static tile scheduler for FMHA (Fused Multi-Head Attention) operations.
-
-    This class manages the scheduling of work tiles for FMHA kernels, supporting
-    both persistent and non-persistent kernel modes. It tracks the current work
-    position and advances through the problem space efficiently.
-
-    :ivar _params: Scheduler parameters.
-    :type _params: Sm100FmhaStaticTileSchedulerParams
-    :ivar _blk_coord: Block coordinates.
-    :type _blk_coord: cute.Coord
-    :ivar _grid_shape: Grid shape for the kernel.
-    :type _grid_shape: cute.Shape
-    :ivar _is_persistent: Whether to use persistent kernel mode.
-    :type _is_persistent: bool
-    :ivar _current_work_linear_idx: Current linear work index.
-    :type _current_work_linear_idx: Int32
-    :ivar _problem_shape_mbh: Problem shape in (M, B, H) format.
-    :type _problem_shape_mbh: cute.Layout
-    :ivar _num_blocks: Number of blocks in the problem.
-    :type _num_blocks: Int32
-    :ivar _is_first_block: Whether this is the first block.
-    :type _is_first_block: bool
-    :ivar num_persistent_sm: Number of persistent SMs.
-    :type num_persistent_sm: Int32
-    """
-
-    def __init__(
-        self,
-        params: Sm100FmhaStaticTileSchedulerParams,
-        current_work_linear_idx: Int32,
-        blk_coord: cute.Coord,
-        grid_shape: cute.Shape,
-        *,
-        loc=None,
-        ip=None,
-    ):
-        """
-        Initializes the Sm100FmhaStaticTileScheduler with the given parameters.
-
-        :param params: Scheduler parameters.
-        :type params: Sm100FmhaStaticTileSchedulerParams
-        :param current_work_linear_idx: Current linear work index.
-        :type current_work_linear_idx: Int32
-        :param blk_coord: Block coordinates.
-        :type blk_coord: cute.Coord
-        :param grid_shape: Grid shape for the kernel.
-        :type grid_shape: cute.Shape
-        """
-        self._params = params
-        self._blk_coord = blk_coord
-        self._grid_shape = grid_shape
-        self._is_persistent = params.is_persistent
-        self._current_work_linear_idx = current_work_linear_idx
-        self._problem_shape_mbh = cute.make_layout(params.problem_shape_mbh, loc=loc, ip=ip)
-        self._num_blocks = cute.size(self._problem_shape_mbh, loc=loc, ip=ip)
-        self._is_first_block = True
-        self.num_persistent_sm = cute.size(grid_shape, loc=loc, ip=ip)
-        self._loc = loc
-        self._ip = ip
-
-    # called by host
-    @staticmethod
-    def get_grid_shape(
-        params: Sm100FmhaStaticTileSchedulerParams,
-        *,
-        loc=None,
-        ip=None,
-    ) -> cute.Shape:
-        """
-        Determine the grid shape for the FMHA kernel.
-
-        For persistent kernels, the grid shape is limited by the number of SMs
-        (Streaming Multiprocessors) available on the device. For non-persistent
-        kernels, the grid shape matches the problem shape.
-
-        :param params: Scheduler parameters.
-        :type params: Sm100FmhaStaticTileSchedulerParams
-
-        :return: Grid shape as (M, B, H) tuple.
-        :rtype: cute.Shape
-        """
-        if params.is_persistent:
-            hardware_info = HardwareInfo()
-            sm_count = hardware_info.get_device_multiprocessor_count()
-            return (
-                dsl_min(sm_count, cute.size(params.problem_shape_mbh, loc=loc, ip=ip)),
-                1,
-                1,
-            )
-        else:
-            return params.problem_shape_mbh
-
-    @staticmethod
-    def check_valid_work_for_seqlen_q(
-        q_tiler: int,
-        current_idx: Int32,
-        seqlen_q: Int32,
-    ) -> Boolean:
-        """
-        Check if the current work index is valid for the given query sequence length.
-
-        This method verifies that the current work tile index multiplied by the
-        query tiler size is within the bounds of the query sequence length.
-
-        :param q_tiler: Query tiler size.
-        :type q_tiler: int
-        :param current_idx: Current work index.
-        :type current_idx: Int32
-        :param seqlen_q: Query sequence length.
-        :type seqlen_q: Int32
-
-        :return: True if the work is valid, False otherwise.
-        :rtype: Boolean
-        """
-        return current_idx * q_tiler < seqlen_q
-
-    def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
-        """
-        Get information about the current work tile.
-
-        Determines if the current work is valid and computes the tile coordinates
-        based on whether the kernel is persistent or non-persistent.
-
-        :return: WorkTileInfo containing tile coordinates and validity flag.
-        :rtype: WorkTileInfo
-        """
-        is_valid = (
-            self._current_work_linear_idx < self._num_blocks
-            if self._is_persistent
-            else self._is_first_block
-        )
-
-        blk_coord = (0, 0, 0)
-        if self._is_persistent:
-            blk_coord = self._problem_shape_mbh.get_hier_coord(
-                self._current_work_linear_idx, loc=loc, ip=ip
-            )
-        else:
-            blk_coord = self._blk_coord
-
-        # cur_tile_coord is (mid, 0, (bid, hid))
-        cur_tile_coord = (
-            blk_coord[0],
-            0,
-            (blk_coord[1], blk_coord[2]),
-        )
-
-        return cutlass.utils.WorkTileInfo(cur_tile_coord, is_valid)
-
-    def initial_work_tile_info(self, *, loc=None, ip=None):
-        """
-        Get the initial work tile information.
-
-        :return: Initial WorkTileInfo.
-        :rtype: WorkTileInfo
-        """
-        return self.get_current_work(loc=loc, ip=ip)
-
-    def advance_to_next_work(self, *, advance_count=1, loc=None, ip=None):
-        """
-        Advance to the next work tile and return it.
-
-        For persistent kernels, advances by the number of persistent SMs.
-        For non-persistent kernels, marks that the first block has been processed.
-        """
-        if self._is_persistent:
-            self._current_work_linear_idx += advance_count * self.num_persistent_sm
-        self._is_first_block = False
-        return self.get_current_work()
-
-    def prefetch_next_work(self, *, loc=None, ip=None):
-        """No-op for static scheduler."""
-        pass
-
-    def producer_tail(self, *, loc=None, ip=None):
-        """No-op for static scheduler."""
-        pass
-
-    def __extract_mlir_values__(self):
-        values = extract_mlir_values(self._params)
-        values.extend(extract_mlir_values(self._current_work_linear_idx))
-        values.extend(extract_mlir_values(self._blk_coord))
-        values.extend(extract_mlir_values(self._grid_shape))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        assert len(values) == 10
-        new_params = new_from_mlir_values(self._params, values[0:3])
-        new_current_work_linear_idx = new_from_mlir_values(
-            self._current_work_linear_idx, [values[3]]
-        )
-        new_blk_coord = new_from_mlir_values(self._blk_coord, values[4:7])
-        new_grid_shape = new_from_mlir_values(self._grid_shape, values[7:])
-        scheduler = Sm100FmhaStaticTileScheduler(
-            new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape
-        )
-        # See the note on Python-only attributes in SingleTileScheduler.
-        scheduler._is_first_block = self._is_first_block
-        return scheduler
-
-
-def compute_sm100_fmha_grid(
-    o_shape: cute.Shape,
-    cta_tiler: Tuple[int, int, int],
-    is_persistent: bool,
-) -> Tuple[Sm100FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
-    """Compute grid parameters for FMHA (static scheduler).
-
-    The output tensor o has shape (s, d, ((h_r, h_k), b)).
-    """
-    tile_sched_params = Sm100FmhaStaticTileSchedulerParams(
-        is_persistent,
-        (
-            cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
-            cute.size(o_shape[2][0]),
-            cute.size(o_shape[2][1]),
-        ),
-    )
-    grid = Sm100FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
-    return tile_sched_params, grid
-
-
-def compute_sm100_fmha_varlen_grid(
-    shape: cute.Shape,
-    cu_seqlens: cute.Tensor,
-    tile_shape_mn: Tuple[int, int],
-) -> Tuple[SingleTileVarlenScheduler.Params, Tuple[Int32, Int32, Int32]]:
-    """Build a flat grid with each CTA pair confined to one sequence.
-
-    ``shape`` is (token_capacity, head_dim, ((head_ratio, num_heads), batch)).
-    """
-    args = TileSchedulerArguments(
-        num_block=Int32(0),
-        num_head=cute.size(shape[2][0]),
-        num_batch=cute.size(shape[2][1]),
-        num_splits=Int32(1),
-        seqlen_k=Int32(0),
-        headdim=cute.size(shape[1]),
-        headdim_v=cute.size(shape[1]),
-        total_q=cute.size(shape[0]),
-        tile_shape_mn=tile_shape_mn,
-        cluster_shape_mn=(2, 1),
-        mCuSeqlensQ=cu_seqlens,
-    )
-    params = SingleTileVarlenScheduler.to_underlying_arguments(args)
-    return params, SingleTileVarlenScheduler.get_grid_shape(params)
-
-
-def sm100_fmha_block_coord(work_tile: WorkTileInfo, flat: bool) -> cute.Coord:
-    """Adapt flat-scheduler axes or keep the legacy FMHA coordinate layout."""
-    if not flat:
-        return work_tile.tile_idx
-    block, head, batch, _ = work_tile.tile_idx
-    return block, Int32(0), (head, batch)
-
-
-##############################################################################
-# Fmha CLC dynamic tile scheduler
-##############################################################################
-
-
-class Sm100FmhaClcDynamicTileSchedulerParams:
-    """Parameters for FMHA CLC dynamic persistent tile scheduler.
-
-    This class manages the layout of tiles for CLC (Cluster Launch Control)
-    based dynamic scheduling, adapted for FMHA's (M, B, H) problem shape.
-
-    :ivar problem_shape_mbh: Problem shape in (M, B, H) format.
-    :type problem_shape_mbh: cute.Shape
-    :ivar cluster_shape_mnk: Cluster shape in (M, N, K) format.
-    :type cluster_shape_mnk: cute.Shape
-    """
-
-    def __init__(
-        self,
-        problem_shape_mbh: cute.Shape,
-        cluster_shape_mnk: cute.Shape,
-        *,
-        loc=None,
-        ip=None,
-    ):
-        self.problem_shape_mbh = problem_shape_mbh
-        self._cluster_shape_mnk = cluster_shape_mnk
-        self.cluster_shape_mn = cluster_shape_mnk[:2]
-        self._loc = loc
-        self._ip = ip
-
-        # FMHA uses linear indexing over (M, B, H), convert to (M, N, L) style
-        # For FMHA: M dim is tile count along sequence, N=1, L=(B*H)
-        self.problem_shape_ntile_mnl = (
-            problem_shape_mbh[0],  # M tiles
-            1,  # N tiles (always 1 for FMHA)
-            problem_shape_mbh[1] * problem_shape_mbh[2],  # L = B * H
-        )
-
-        # Create layout for cluster-to-tile mapping
-        self.problem_layout_ncluster_mnl = cute.make_layout(
-            cute.ceil_div(self.problem_shape_ntile_mnl, cluster_shape_mnk[:2]),
-            loc=loc,
-            ip=ip,
-        )
-
-    def __extract_mlir_values__(self):
-        values, self._values_pos = [], []
-        for obj in [
-            self.problem_shape_mbh,
-            self._cluster_shape_mnk,
-        ]:
-            obj_values = extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        obj_list = []
-        values_copy = list(values)
-        for obj, n_items in zip(
-            [self.problem_shape_mbh, self._cluster_shape_mnk],
-            self._values_pos,
-        ):
-            obj_list.append(new_from_mlir_values(obj, values_copy[:n_items]))
-            values_copy = values_copy[n_items:]
-        return Sm100FmhaClcDynamicTileSchedulerParams(*(tuple(obj_list)), loc=self._loc)
-
-    def get_grid_shape(self, *, loc=None, ip=None) -> Tuple[int, int, int]:
-        """Compute grid shape aligned with cluster shape."""
-        return cute.round_up(self.problem_shape_ntile_mnl, self._cluster_shape_mnk)
-
-    def clc_hw_params(self) -> ClcDynamicPersistentTileSchedulerParams:
-        """Return params for the upstream CLC hardware scheduler."""
-        return ClcDynamicPersistentTileSchedulerParams(
-            problem_shape_ntile_mnl=self.problem_shape_ntile_mnl,
-            cluster_shape_mnk=self._cluster_shape_mnk,
-        )
-
-
-class Sm100FmhaClcDynamicTileScheduler:
-    """CLC dynamic persistent tile scheduler for FMHA.
-
-    This scheduler uses Blackwell's Cluster Launch Control hardware mechanism
-    for dynamic tile distribution, providing automatic load balancing.
-    Adapted for FMHA's (M, B, H) problem shape.
-    """
-
-    def __init__(
-        self,
-        params: Sm100FmhaClcDynamicTileSchedulerParams,
-        cta_id_in_cluster: cute.Coord,
-        num_tiles_executed: Int32,
-        clc_response_ptr: cute.Pointer,
-        block_idx: Tuple,
-        clc: ClcSchedulerState = None,
-        *,
-        loc=None,
-        ip=None,
-    ):
-        self.params = params
-        self.cta_id_in_cluster = cta_id_in_cluster
-        self._num_tiles_executed = num_tiles_executed
-        self._clc_response_ptr = clc_response_ptr
-        self._block_idx = block_idx
-        self.clc = clc
-        self._loc = loc
-        self._ip = ip
-
-    def __extract_mlir_values__(self):
-        values = extract_mlir_values(self.cta_id_in_cluster)
-        values.extend(extract_mlir_values(self._num_tiles_executed))
-        values.extend(extract_mlir_values(self._clc_response_ptr))
-        values.extend(extract_mlir_values(self._block_idx))
-        if self.clc is not None:
-            values.extend(extract_mlir_values(self.clc))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        new_cta_id_in_cluster = new_from_mlir_values(self.cta_id_in_cluster, values[0:3])
-        new_num_tiles_executed = new_from_mlir_values(self._num_tiles_executed, [values[3]])
-        new_clc_response_ptr = new_from_mlir_values(self._clc_response_ptr, [values[4]])
-        new_block_idx = new_from_mlir_values(self._block_idx, values[5:8])
-        new_clc = None
-        if self.clc is not None:
-            new_clc = new_from_mlir_values(self.clc, values[8:])
-        return Sm100FmhaClcDynamicTileScheduler(
-            self.params,
-            new_cta_id_in_cluster,
-            new_num_tiles_executed,
-            new_clc_response_ptr,
-            new_block_idx,
-            new_clc,
-        )
-
-    @staticmethod
-    def create(
-        params: Sm100FmhaClcDynamicTileSchedulerParams,
-        block_idx: Tuple,
-        grid_dim: Tuple,
-        clc_response_ptr: cute.Pointer,
-        clc: ClcSchedulerState = None,
-        *,
-        loc=None,
-        ip=None,
-    ):
-        """Create a CLC dynamic tile scheduler instance."""
-        bidx, bidy, bidz = block_idx
-
-        # CTA id in cluster
-        cta_id_in_cluster = (
-            Int32(bidx % params.cluster_shape_mn[0]),
-            Int32(bidy % params.cluster_shape_mn[1]),
-            Int32(0),
-        )
-
-        num_tiles_executed = Int32(0)
-
-        return Sm100FmhaClcDynamicTileScheduler(
-            params,
-            cta_id_in_cluster,
-            num_tiles_executed,
-            clc_response_ptr,
-            block_idx,
-            clc,
-        )
-
-    @staticmethod
-    def get_grid_shape(
-        params: Sm100FmhaClcDynamicTileSchedulerParams,
-        *,
-        loc=None,
-        ip=None,
-    ) -> Tuple[int, int, int]:
-        """Get grid shape for kernel launch."""
-        return params.get_grid_shape(loc=loc, ip=ip)
-
-    def work_tile_info_from_clc_response(self, result_addr: cute.Pointer, *, loc=None, ip=None):
-        """Parse CLC response and convert to FMHA tile coordinates."""
-        m_idx, n_idx, l_idx, vld = cute.arch.clc_response(result_addr, loc=loc, ip=ip)
-        cute.arch.fence_proxy("async.shared", space="cta")
-
-        # CLC returns first CTA coordinates: m_idx=x, l_idx=z
-        # l_idx is the L (batch) dimension; decode to (bid, hid)
-        hid = l_idx % self.params.problem_shape_mbh[2]
-        bid = l_idx // self.params.problem_shape_mbh[2]
-
-        cta_idx_in_cluster, cta_idy_in_cluster, _ = self.cta_id_in_cluster
-        cur_tile_coord = (
-            m_idx + cta_idx_in_cluster,  # M dimension
-            0,  # N always 0 for FMHA
-            (bid, hid),  # (B, H) packed
-        )
-
-        return cutlass.utils.WorkTileInfo(cur_tile_coord, vld)
-
-    def get_current_work(self, *, loc=None, ip=None):
-        """Get current work tile from CLC response."""
-        return self.work_tile_info_from_clc_response(self._clc_response_ptr, loc=loc, ip=ip)
-
-    def initial_work_tile_info(self, *, loc=None, ip=None):
-        """Get initial work tile based on block index."""
-        bidx, bidy, bidz = self._block_idx
-        # bidz is the L (batch) dimension; decode to (bid, hid)
-        hid = bidz % self.params.problem_shape_mbh[2]
-        bid = bidz // self.params.problem_shape_mbh[2]
-        return cutlass.utils.WorkTileInfo((bidx, 0, (bid, hid)), True)
-
-    def advance_to_next_work(self, *, loc=None, ip=None):
-        """Consumer-side advance: wait for next tile, read coordinates, release."""
-        self.clc.consumer_wait(loc=loc, ip=ip)
-        work = self.get_current_work(loc=loc, ip=ip)
-        self.clc.consumer_release(loc=loc, ip=ip)
-        self._num_tiles_executed += Int32(1)
-        return work
-
-    def prefetch_next_work(self, *, loc=None, ip=None):
-        """Producer-side: issue CLC query for next tile."""
-        self.clc.prefetch_next_work(loc=loc, ip=ip)
-
-    def producer_tail(self, *, loc=None, ip=None):
-        """Producer-side cleanup after last tile."""
-        self.clc.producer_tail(loc=loc, ip=ip)
-
-    @property
-    def num_tiles_executed(self) -> Int32:
-        return self._num_tiles_executed
-
-
-def compute_sm100_fmha_grid_clc(
-    o_shape: cute.Shape,
-    cta_tiler: Tuple[int, int, int],
-    cluster_shape_mnk: Tuple[int, int, int],
-) -> Tuple[Sm100FmhaClcDynamicTileSchedulerParams, Tuple[int, int, int]]:
-    """Compute grid parameters for FMHA with CLC dynamic scheduling."""
-    problem_shape_mbh = (
-        cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
-        cute.size(o_shape[2][0]),
-        cute.size(o_shape[2][1]),
-    )
-    tile_sched_params = Sm100FmhaClcDynamicTileSchedulerParams(problem_shape_mbh, cluster_shape_mnk)
-    grid = Sm100FmhaClcDynamicTileScheduler.get_grid_shape(tile_sched_params)
-    return tile_sched_params, grid
-
-
-##############################################################################
-# Fused Mask
-##############################################################################
-
-
-def make_sm100_thread_cooperative_group(size: int):
-    return cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, size)
-
-
-SM100_TMEM_CAPACITY_COLUMNS = 512

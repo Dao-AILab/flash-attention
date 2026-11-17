@@ -1086,6 +1086,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         auto kv_batch_idx = kv_batch_idx_.value();
         CHECK_DEVICE(kv_batch_idx); CHECK_CONTIGUOUS(kv_batch_idx);
         TORCH_CHECK(kv_batch_idx.scalar_type() == torch::kInt32, "kv_batch_idx must have dtype int32");
+        CHECK_SHAPE(kv_batch_idx, batch_size);
         params.kv_batch_idx = reinterpret_cast<int *>(kv_batch_idx.data_ptr());
     }
 
@@ -1164,7 +1165,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
     #endif
 
-    if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
+    // An allocated paged cache can still have no logical keys if its page table is empty.
+    if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0
+        && (!paged_KV || seqlen_k > 0)) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {

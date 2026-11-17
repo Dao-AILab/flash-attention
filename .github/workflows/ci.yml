@@ -21,6 +21,14 @@ env:
     or test_flash_attn_mla_absorbed and 256-256-False-True-64-True-0-False-False-mqa-dtype0
     or test_flash_attn_mla_absorbed and 256-256-False-False-64-False-0-False-False-mqa-dtype0
     or test_flash_attn_mla_absorbed and 256-256-True-True-64-False-0-False-False-mqa-dtype0
+    or 1024-1024-256-True-0-0.0-False-False-False-mha-dtype0
+    or 1024-1024-256-False-0-0.0-False-False-False-gqa-dtype0
+    or 1024-1024-256-True-0-0.0-True-False-False-gqa-dtype0
+    or 1024-1024-256-False-1-0.0-False-False-False-mha-dtype0
+    or 1024-1024-256-False-0-15.0-False-False-True-mqa-dtype0
+    or test_flash_attn_hd256_sm100_deterministic_backward
+    or test_flash_attn_lse_grad and 128-128-256-2-False-dtype0
+    or test_flash_attn_lse_grad and 128-128-256-2-True-dtype0
     or test_cuda_graph
 
 jobs:
@@ -55,6 +63,7 @@ jobs:
       - uses: ./.github/actions/gpu-test
         with:
           test-filter: ${{ env.FA4_TEST_FILTER }}
+          compile-workers: "20"
           fa4_local_sif: ${{ vars.FA4_LOCAL_SIF }}
           fa4_image_cu129: "togethercomputer/training-performance:flash-attn-cu12.9-26.03.25@sha256:304a5c3d2b3a75b151cd2a964cd26d444e0d8b5686d63943df13378c9705f943"
           fa4_image_cu130: "togethercomputer/training-performance:flash-attn-cu13.0-26.06.27@sha256:2c31843c7137cbe909611eb70a9b6940581a2e3018d2c8b629f84dfd04b9bfd7"

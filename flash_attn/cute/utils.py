@@ -4,7 +4,7 @@ import math
 import hashlib
 import inspect
 import os
-from functools import partial
+from functools import cache, partial
 from typing import Type, Callable, Optional, Tuple, overload, NamedTuple
 
 import cutlass
@@ -61,7 +61,6 @@ POLY_EX2 = {
     ),
 }
 
-_fa_clc_enabled: bool = os.environ.get("FA_CLC", "0") == "1"
 _fa_disable_2cta_enabled: bool = os.environ.get("FA_DISABLE_2CTA", "0") == "1"
 _fa_disable_s_ping_pong_enabled: bool = os.environ.get("FA_DISABLE_S_PING_PONG", "0") == "1"
 
@@ -87,10 +86,6 @@ def _is_cuda_12() -> bool:
 _fa_disable_2cta_cuda12: bool = _is_cuda_12()
 
 
-def _get_use_clc_scheduler_default() -> bool:
-    return _fa_clc_enabled
-
-
 def _get_disable_s_ping_pong_default() -> bool:
     return _fa_disable_s_ping_pong_enabled
 
@@ -113,23 +108,38 @@ def _get_sm100_backend_override() -> Optional[bool]:
     return overrides[value]
 
 
-def _get_bwd_pack_gqa_override() -> Optional[bool]:
-    """FLASH_ATTENTION_BWD_PACK_GQA=0/1 forces the SM100 backward GQA head packing off / on
-    (NOTE [bwd pack_gqa] in pack_gqa.py); unset or "auto" leaves it to the heuristic."""
-    value = os.getenv("FLASH_ATTENTION_BWD_PACK_GQA")
+# The backward env knobs below are read once per process (the backward builds its selection
+# inputs on every call); code that changes one at runtime calls its cache_clear().
+
+
+def _env_choice(name: str, choices: tuple[int, ...]) -> Optional[int]:
+    """Integer choice of an environment variable; unset, "" or "auto" is None."""
+    value = os.getenv(name)
     if value is None or value == "" or value == "auto":
         return None
-    assert value in ("0", "1"), f"FLASH_ATTENTION_BWD_PACK_GQA must be 0, 1 or auto, got {value}"
-    return value == "1"
+    assert value.isdigit() and int(value) in choices, (
+        f"{name} must be one of {', '.join(map(str, choices))} or auto, got {value}"
+    )
+    return int(value)
 
 
-def _get_hd256_generic_bwd() -> bool:
-    """FLASH_ATTENTION_HD256_GENERIC_BWD=1 runs the SM100 hdim 256 backward on
-    FlashAttentionBackwardSm100 (64-row KV tile, serial 2CTA schedule) instead of the dedicated
-    kernels."""
-    return os.getenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "0") == "1"
+@cache
+def _get_bwd_pack_gqa_override() -> Optional[int]:
+    """FLASH_ATTENTION_BWD_PACK_GQA: 0 forces the SM100 backward query-head fold off, 1 on (the
+    fold chooser picks the pack), 2 / 4 force that many query heads per tile; unset or "auto"
+    leaves it to the chooser (NOTE [bwd pack_gqa] in pack_gqa.py)."""
+    return _env_choice("FLASH_ATTENTION_BWD_PACK_GQA", (0, 1, 2, 4))
 
 
+@cache
+def _get_bwd_head_loop_override() -> Optional[bool]:
+    """FLASH_ATTENTION_BWD_HEAD_LOOP=0/1 forces the SM100 hdim 256 backward head loop (one tile
+    per KV head over its query-head groups) off / on; unset or "auto" leaves it to the chooser."""
+    value = _env_choice("FLASH_ATTENTION_BWD_HEAD_LOOP", (0, 1))
+    return None if value is None else value == 1
+
+
+@cache
 def _get_bwd_tile_n_override() -> Optional[int]:
     """Test knob: FLASH_ATTENTION_BWD_TILE_N=64 selects the 64-row KV tile per CTA on the SM100
     2CTA backward (the layout the hd256 backward needs). Unset or 128 keeps the default."""
@@ -246,6 +256,17 @@ def compute_softmax_scale_log2(softmax_scale, score_mod):
         return softmax_scale * LOG2_E, None
     else:
         return LOG2_E, softmax_scale
+
+
+@cute.jit
+def clamp_index(idx, seqlen_divmod: FastDivmodDivisorV2):
+    """Clamp a tile index into [0, seqlen) so aux_tensors loads from a partial tile stay in bounds.
+
+    Scores and mask values at clamped (out-of-bounds) positions are masked afterwards, so any
+    in-bounds index works; a min is one instruction per element where a modulo is a fastdivmod.
+    Requires seqlen >= 1, which holds wherever a tile is processed.
+    """
+    return cutlass.min(idx, seqlen_divmod.divisor - 1)
 
 
 def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
@@ -1015,76 +1036,3 @@ def get_batch_from_cu_tensor(idx: Int32, cu_tensor: cute.Tensor) -> Int32:
             hi = mid
 
     return lo
-
-
-def as_bshkrd_tensor(
-    tensor: cute.Tensor,
-    h_k: Int32,
-    h_r: Int32,
-    varlen: bool,
-) -> cute.Tensor:
-    """Normalize (B,S,H,D)/(S,H,D) tensors to (B,S,H_k,H_r,D) view."""
-    if cutlass.const_expr(cute.rank(tensor.layout) == 5):
-        return tensor
-    if cutlass.const_expr(cute.rank(tensor.layout) == 4):
-        return cute.make_tensor(
-            tensor.iterator,
-            cute.make_layout(
-                (tensor.shape[0], tensor.shape[1], h_k, h_r, tensor.shape[3]),
-                stride=(
-                    tensor.stride[0],
-                    tensor.stride[1],
-                    tensor.stride[2] * h_r,
-                    tensor.stride[2],
-                    tensor.stride[3],
-                ),
-            ),
-        )
-    assert cutlass.const_expr(cute.rank(tensor.layout) == 3), "Expected rank-3 varlen tensor"
-    assert cutlass.const_expr(varlen), "Rank-3 input is only valid for varlen"
-    return cute.make_tensor(
-        tensor.iterator,
-        cute.make_layout(
-            (1, tensor.shape[0], h_k, h_r, tensor.shape[2]),
-            stride=(
-                0,
-                tensor.stride[0],
-                tensor.stride[1] * h_r,
-                tensor.stride[1],
-                tensor.stride[2],
-            ),
-        ),
-    )
-
-
-def as_shhb_tensor(
-    tensor: cute.Tensor,
-    h_k: Int32,
-    h_r: Int32,
-    b: Int32,
-    varlen: bool,
-) -> cute.Tensor:
-    """Normalize (B,H,S)/(H,S) tensors to (S, ((H_r, H_k), B)) view."""
-    if cutlass.const_expr(cute.rank(tensor.layout) == 3):
-        return cute.make_tensor(
-            tensor.iterator,
-            cute.make_layout(
-                (tensor.shape[2], ((h_r, h_k), tensor.shape[0])),
-                stride=(
-                    tensor.stride[2],
-                    ((tensor.stride[1], tensor.stride[1] * h_r), tensor.stride[0]),
-                ),
-            ),
-        )
-    assert cutlass.const_expr(cute.rank(tensor.layout) == 2), "Expected rank-2 varlen tensor"
-    assert cutlass.const_expr(varlen), "Rank-2 input is only valid for varlen"
-    return cute.make_tensor(
-        tensor.iterator,
-        cute.make_layout(
-            (tensor.shape[1], ((h_r, h_k), b)),
-            stride=(
-                tensor.stride[1],
-                ((tensor.stride[0], tensor.stride[0] * h_r), 0),
-            ),
-        ),
-    )

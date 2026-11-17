@@ -21,8 +21,8 @@ from flash_attn.cute.pack_gqa import (
     qheads_first_tma_view,
     regroup_padded_qheads,
     select_modes,
-    sparse_mla_qhead_tile,
 )
+from flash_attn.cute.config import sparse_mla_qhead_tile
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils

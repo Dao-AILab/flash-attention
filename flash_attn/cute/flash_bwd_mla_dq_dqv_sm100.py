@@ -44,7 +44,7 @@ from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile
+from flash_attn.cute.config import sparse_mla_qhead_tile
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
 from flash_attn.cute.utils import get_batch_from_cu_tensor
 

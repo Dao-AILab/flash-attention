@@ -195,32 +195,6 @@ def get_sparse_q_block_size(
     return min_block_size
 
 
-def get_kv_subtile_factor(
-    block_sparse_tensors: BlockSparseTensorsTorch | None,
-    n_block_size: int,
-) -> int:
-    """Return the number of physical KV tiles covered by one sparse KV block."""
-    if block_sparse_tensors is None or block_sparse_tensors.block_size is None:
-        return 1
-    sparse_block_size_kv = block_sparse_tensors.block_size[1]
-    if sparse_block_size_kv % n_block_size != 0:
-        raise ValueError(
-            "Block sparsity expects sparse_block_size[1] "
-            f"to be a multiple of tile_n={n_block_size}; got {sparse_block_size_kv}."
-        )
-    return sparse_block_size_kv // n_block_size
-
-
-def block_sparse_bwd_supports_2cta(
-    block_sparse_tensors: BlockSparseTensorsTorch | None,
-    n_block_size: int,
-) -> bool:
-    """Return whether sparse KV metadata constrains backward away from 2CTA."""
-    if block_sparse_tensors is None:
-        return True
-    return get_kv_subtile_factor(block_sparse_tensors, n_block_size) % 2 == 0
-
-
 def _expand_sparsity_tensor(
     tensor: torch.Tensor,
     expected_shape: Tuple[int, ...],

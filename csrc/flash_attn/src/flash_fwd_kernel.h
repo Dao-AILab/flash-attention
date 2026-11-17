@@ -40,8 +40,10 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
         auto gmem_ptr_lse = make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lse_ptr) + lse_offset);
 
         auto lse_shape = varlen_q ? make_shape(1, params.h, params.total_q) : make_shape(params.b, params.h, params.seqlen_q);
-        auto lse_stride = params.seqlenq_ngroups_swapped ? make_stride(1, params.seqlen_q * params.b, params.b) : (
-            params.unpadded_lse ? make_stride(params.h * params.total_q, params.total_q, 1) :  make_stride(params.h * params.seqlen_q, params.seqlen_q, 1)
+        // 64-bit strides: the offset of (bidb, bidh) reaches 2^31 once b * h * seqlen_q (or h * total_q) does.
+        using index_t = typename Params::index_t;
+        auto lse_stride = params.seqlenq_ngroups_swapped ? make_stride(index_t(1), index_t(params.seqlen_q) * params.b, index_t(params.b)) : (
+            params.unpadded_lse ? make_stride(index_t(params.h) * params.total_q, index_t(params.total_q), index_t(1)) :  make_stride(index_t(params.h) * params.seqlen_q, index_t(params.seqlen_q), index_t(1))
             );
 
         auto lse_layout = make_layout(lse_shape, lse_stride);
@@ -139,7 +141,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
     // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
 
-    const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
+    const index_t row_offset_p = ((static_cast<index_t>(bidb) * params.h + bidh) * params.seqlen_q_rounded
         + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
 
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
@@ -547,9 +549,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // or get wrong results when we combine gOaccum from different blocks.
         const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
             + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
-        const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
+        const index_t row_offset_oaccum = (((static_cast<index_t>(n_split_idx) * params.b + bidb) * params.h + bidh) * params.seqlen_q
             + m_block * kBlockM) * params.d_rounded;
-        const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+        // Same offset as the non-empty path below: with unpadded_lse (varlen with a block table), LSE is (h, total_q).
+        const index_t row_offset_lseaccum = (Split || !params.unpadded_lse ?
+                ((static_cast<index_t>(n_split_idx) * params.b + bidb) * params.h + bidh) * params.seqlen_q : static_cast<index_t>(bidh) * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
+            ) + m_block * kBlockM;
         Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
                                       Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                      make_stride(Split ? kHeadDim : params.o_row_stride, _1{}));
@@ -741,7 +746,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             FLASH_NAMESPACE::copy_w_min_idx<Is_even_K>(
                 tVgVnew, tVgV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN, binfo.seqlen_k_cache - n_block * kBlockN
             );
-            tVgVnew.data() = tVgVnew.data() + (-int(kBlockN * params.vnew_row_stride));
+            tVgVnew.data() = tVgVnew.data() + (-index_t(kBlockN * params.vnew_row_stride));
             if (params.rotary_dim == 0) {
                 FLASH_NAMESPACE::copy_w_min_idx<Is_even_K>(
                     tKgKnew, tKgK, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN, binfo.seqlen_k_cache - n_block * kBlockN
@@ -766,10 +771,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
                 }
             }
-            tKgKnew.data() = tKgKnew.data() + (-int(kBlockN * params.knew_row_stride));
+            tKgKnew.data() = tKgKnew.data() + (-index_t(kBlockN * params.knew_row_stride));
             if (block_table == nullptr) {
-                tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                tVgV.data() = tVgV.data() + (-index_t(kBlockN * params.v_row_stride));
+                tKgK.data() = tKgK.data() + (-index_t(kBlockN * params.k_row_stride));
             } else {
                 if (n_block > n_block_copy_min) {
                     const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
@@ -866,7 +871,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // Advance gV
         if (masking_step > 0) {
             if (block_table == nullptr) {
-                tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+                tVgV.data() = tVgV.data() + (-index_t(kBlockN * params.v_row_stride));
             } else {
                 const int block_table_idx_cur = (n_block + 1) * kBlockN / params.page_block_size;
                 const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
@@ -905,7 +910,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         if (n_block > n_block_min) {
             // Advance gK
             if (block_table == nullptr) {
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                tKgK.data() = tKgK.data() + (-index_t(kBlockN * params.k_row_stride));
             } else {
                 const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
                 const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
@@ -948,7 +953,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         __syncthreads();
         // Advance gV
         if (block_table == nullptr) {
-            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+            tVgV.data() = tVgV.data() + (-index_t(kBlockN * params.v_row_stride));
         } else {
             const int block_table_idx_cur = (n_block + 1) * kBlockN / params.page_block_size;
             const int block_table_offset_cur = (n_block + 1) * kBlockN - block_table_idx_cur * params.page_block_size;
@@ -972,7 +977,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         if (n_block > n_block_min) {
             // Advance gK
             if (block_table == nullptr) {
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                tKgK.data() = tKgK.data() + (-index_t(kBlockN * params.k_row_stride));
             } else {
                 const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
                 const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
@@ -1025,10 +1030,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
-    const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
+    const index_t row_offset_oaccum = (((static_cast<index_t>(n_split_idx) * params.b + bidb) * params.h + bidh) * params.seqlen_q
                                          + m_block * kBlockM) * params.d_rounded;
     const index_t row_offset_lseaccum = (Split || !params.unpadded_lse ?
-            ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q : bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
+            ((static_cast<index_t>(n_split_idx) * params.b + bidb) * params.h + bidh) * params.seqlen_q : static_cast<index_t>(bidh) * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
         ) + m_block * kBlockM;
 
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
@@ -1135,7 +1140,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     const int tidx = threadIdx.x;
     const int bidx = blockIdx.x;
 
-    const index_t lse_size = params.b * params.h * params.seqlen_q;
+    const index_t lse_size = static_cast<index_t>(params.b) * params.h * params.seqlen_q;
 
     const index_t row_offset_lse = bidx * kBlockM;
     Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lse),
@@ -1222,7 +1227,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     }
     __syncthreads();
 
-    const index_t row_offset_oaccum = bidx * kBlockM * params.d_rounded;
+    const index_t row_offset_oaccum = static_cast<index_t>(bidx) * kBlockM * params.d_rounded;
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.oaccum_ptr) + row_offset_oaccum),
                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                  Stride<Int<kHeadDim>, _1>{});
@@ -1266,7 +1271,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             }
         // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); }
         }
-        tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_rounded;
+        tOgOaccum.data() = tOgOaccum.data() + lse_size * params.d_rounded;
     }
     // if (cute::thread0()) { print_tensor(tOrO); }
 

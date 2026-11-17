@@ -15,12 +15,14 @@ Examples:
 
 import argparse
 import time
+from functools import lru_cache
 from itertools import product
 
 import torch
 from triton.testing import do_bench
 
-from flash_attn.cute import utils as fa_utils
+from flash_attn.cute import config as fwd_config
+from flash_attn.cute import interface
 from flash_attn.cute.bench_utils import flops
 from flash_attn.cute.interface import (
     flash_attn_func,
@@ -34,6 +36,31 @@ _CLC_MODES = {"clc", "clc-prep"}
 
 def _supports_clc(device):
     return torch.cuda.get_device_capability(device)[0] == 10
+
+
+@lru_cache(maxsize=None)
+def _select_with_clc(inputs, clc):
+    """The default standard-kernel config with CLC explicitly on (where supported) or off;
+    both arms stay off SwapAB."""
+    inputs = inputs._replace(requested_use_swapab=False)
+    config = fwd_config.select_fwd_config(inputs)
+    if clc and not fwd_config.can_use_clc(
+        inputs._replace(pack_gqa=config.pack_gqa),
+        tile_n=config.tile_n,
+        num_splits=config.num_splits,
+        use_2cta_instrs=config.use_2cta_instrs,
+    ):
+        return config
+    return fwd_config.with_clc_scheduler(config, inputs, clc)
+
+
+def _select_clc(clc):
+    """Route the forward calls and metadata that follow to CLC on/off configs, or the default
+    selection for None. The choice stays set for the rest of the benchmark."""
+    if clc is None:
+        interface.select_fwd_config = fwd_config.select_fwd_config
+    else:
+        interface.select_fwd_config = lambda inputs: _select_with_clc(inputs, clc)
 
 
 # ── CLI value parsers ────────────────────────────────────────────────────────
@@ -227,6 +254,7 @@ def setup_dense(ctx):
     batch, seqlen = ctx["batch"], ctx["seqlen"]
     nheads, nheads_kv, headdim = ctx["nheads"], ctx["nheads_kv"], ctx["headdim"]
     dtype, device = torch.bfloat16, "cuda"
+    _select_clc(None)
     q = torch.randn(batch, seqlen, nheads, headdim, device=device, dtype=dtype)
     k = torch.randn(batch, seqlen, nheads_kv, headdim, device=device, dtype=dtype)
     v = torch.randn(batch, seqlen, nheads_kv, headdim, device=device, dtype=dtype)
@@ -248,9 +276,8 @@ def make_varlen_setup(*, clc: bool, prep: str, no_semaphore: bool = False):
     meta_fn = _make_meta_no_semaphore if no_semaphore else _make_meta
 
     def setup(ctx):
-        # CLC scheduler selection is a process-global toggle; set it before
-        # building metadata and keep it set for the duration of the benchmark.
-        fa_utils._fa_clc_enabled = clc
+        # Select CLC on or off before building metadata, so both agree on the scheduler.
+        _select_clc(clc)
         meta_precomputed = meta_fn(ctx) if prep == "precompute" else None
 
         def fn():
