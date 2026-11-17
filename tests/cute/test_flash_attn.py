@@ -3482,6 +3482,59 @@ def test_flash_attn_sm100_unused_v_cache_fp8(dtype, varlen):
     assert torch.allclose(lse.double(), scores.logsumexp(-1), atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged KV forward on SM90 and SM100")
+# 128: TMA pages (page_size == tile_n); 64: cp.async pages
+@pytest.mark.parametrize("page_size", [128, 64])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("has_sink", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_empty_page_table(page_size, causal, has_sink):
+    # A page table with no column holds no key, even though the shared KV pool has pages, so the
+    # result is the empty-KV one: out = 0 and lse = -inf, or the sink with a learnable sink (#3165).
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    q = torch.randn(1, 128, 2, 128, device=device, dtype=dtype)
+    k_cache = torch.randn(4, page_size, 2, 128, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.empty(1, 0, dtype=torch.int32, device=device)
+    sink = torch.randn(2, device=device, dtype=torch.float32) if has_sink else None
+    out, lse = flash_attn_varlen_func(
+        q, k_cache, v_cache, page_table=page_table, causal=causal, learnable_sink=sink,
+        return_lse=True,
+    )
+    if is_fake_mode():
+        return
+    assert (out == 0).all()
+    if sink is None:
+        expected_lse = torch.full_like(lse, float("-inf"))
+    else:
+        expected_lse = sink[:, None].expand_as(lse)
+    assert torch.equal(lse, expected_lse)
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged KV forward on SM90 and SM100")
+# 128: TMA pages (page_size == tile_n); 64: cp.async pages
+@pytest.mark.parametrize("page_size", [128, 64])
+@pytest.mark.parametrize("seqused_k_zeros", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_empty_kv_pool(page_size, seqused_k_zeros):
+    # An empty KV pool (num_pages == 0) holds no key even if the page table has columns, e.g. a
+    # warmup call with an empty cache and seqused_k all zeros: out = 0 and lse = -inf.
+    device, dtype = "cuda", torch.bfloat16
+    q = torch.randn(2, 128, 2, 128, device=device, dtype=dtype)
+    k_cache = torch.empty(0, page_size, 2, 128, device=device, dtype=dtype)
+    v_cache = torch.empty_like(k_cache)
+    page_table = torch.zeros(2, 4, dtype=torch.int32, device=device)
+    seqused_k = torch.zeros(2, dtype=torch.int32, device=device) if seqused_k_zeros else None
+    out, lse = flash_attn_varlen_func(
+        q, k_cache, v_cache, page_table=page_table, seqused_k=seqused_k, return_lse=True
+    )
+    if is_fake_mode():
+        return
+    assert (out == 0).all()
+    assert torch.isneginf(lse).all()
+
+
 @pytest.mark.skipif(not IS_SM100, reason="SM100 paged KV (TMA pages)")
 # Pages of 128 tokens also run on SwapAB decode; it does not support 64-token pages.
 @pytest.mark.parametrize(
@@ -3551,6 +3604,166 @@ def test_flash_attn_paged_padding_contract(
         if s_k == 0:
             assert torch.count_nonzero(out_bad[i]) == 0
             assert torch.isneginf(lse_bad[i]).all()
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged KV forward on SM90 and SM100")
+# 128: TMA pages (page_size == tile_n); 64: cp.async pages
+@pytest.mark.parametrize("page_size", [128, 64])
+@pytest.mark.parametrize("window_right", [None, 256])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_key_count_below_2_31(page_size, window_right):
+    # The kernels count a sequence's keys, page_size * page_table.shape[1], in 32 bits, and local
+    # attention adds window_size_right: at 2**31 it wraps, and the forward crashes (TMA) or silently
+    # returns a wrong result (cp.async), so the host must reject such a page table (#3166). Pages
+    # may repeat, so the cache stays small.
+    device, dtype = "cuda", torch.bfloat16
+    q = torch.randn(1, 128, 1, 128, device=device, dtype=dtype)
+    k_cache = torch.randn(2, page_size, 1, 128, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    if window_right is None:
+        columns, kwargs = 2**31 // page_size, {}
+    else:  # the keys alone stay below 2**31; the window's right edge does not
+        columns, kwargs = (2**31 - 1) // page_size, {"window_size": (256, window_right)}
+    page_table = torch.zeros(1, columns, dtype=torch.int32, device=device)
+    match = r"page_table.shape\[1\] \* page_size .*must be below 2\*\*31"
+    with pytest.raises(AssertionError, match=match):
+        flash_attn_varlen_func(q, k_cache, v_cache, page_table=page_table, **kwargs)
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged KV forward on SM90 and SM100")
+# 128: TMA pages (page_size == tile_n); 64: cp.async pages
+@pytest.mark.parametrize("page_size", [128, 64])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_key_count_boundary(page_size):
+    # At the widest page table the host allows with a local window, page_size * columns +
+    # window_size_right just below 2**31, the result must match a narrow page table exactly: page 1
+    # repeats, and the window only sees its keys, at the same positions modulo the page and tile
+    # sizes since both widths agree modulo 4096 columns (#3166).
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    window = (256, 256)
+    q = torch.randn(1, 128, 1, 128, device=device, dtype=dtype)
+    k_cache = torch.randn(2, page_size, 1, 128, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    widest = (2**31 - 1 - window[1]) // page_size
+    results = []
+    for columns in (4096 + widest % 4096, widest):
+        page_table = torch.ones(1, columns, dtype=torch.int32, device=device)
+        page_table[0, 0] = 0
+        results.append(
+            flash_attn_varlen_func(
+                q, k_cache, v_cache, page_table=page_table, window_size=window, return_lse=True
+            )
+        )
+    if is_fake_mode():
+        return
+    (out_narrow, lse_narrow), (out_wide, lse_wide) = results
+    assert torch.equal(out_wide, out_narrow)
+    assert torch.equal(lse_wide, lse_narrow)
+
+
+HUGE_WINDOWS = [(256, 2**31 - 1), (2**31 - 1, 0), (2**31 - 1, 2**31 - 1)]
+
+
+def _bounded_window(window, seqlen_q, seqlen_k):
+    """The bounded window that masks the same keys: a side of 2**31 - 1 becomes the sequence."""
+    if window == (2**31 - 1, 2**31 - 1):
+        return (None, None)
+    left, right = window
+    return (seqlen_k if left == 2**31 - 1 else left, seqlen_q if right == 2**31 - 1 else right)
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Local backward on SM90 and SM100")
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("nheads_kv", [4, 1])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 1024), (512, 128)])
+@pytest.mark.parametrize("window", HUGE_WINDOWS)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_local_huge_window(window, seqlen_q, seqlen_k, nheads_kv, varlen):
+    # A window side at least as long as the sequence masks nothing, so a huge one, such as the
+    # common "unbounded" sentinel 2**31 - 1, must match a side as long as the sequence. The
+    # kernels add the sides to positions in 32 bits, so the host clamps them first.
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    nheads, d = 4, 128
+    q = torch.randn(2, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(2, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    dout = torch.randn_like(q)
+
+    def run(window_size):
+        q_, k_, v_ = (t.detach().clone().requires_grad_() for t in (q, k, v))
+        if varlen:
+            cu_q = torch.arange(0, 3 * seqlen_q, seqlen_q, device=device, dtype=torch.int32)
+            cu_k = torch.arange(0, 3 * seqlen_k, seqlen_k, device=device, dtype=torch.int32)
+            out, lse = flash_attn_varlen_func(
+                q_.flatten(0, 1), k_.flatten(0, 1), v_.flatten(0, 1),
+                cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k,
+                window_size=window_size, return_lse=True,
+            )
+            out = out.unflatten(0, (2, seqlen_q))
+        else:
+            out, lse = flash_attn_func(q_, k_, v_, window_size=window_size, return_lse=True)
+        grads = torch.autograd.grad(out, (q_, k_, v_), dout)
+        return out, lse, *grads
+
+    results, refs = run(window), run(_bounded_window(window, seqlen_q, seqlen_k))
+    if is_fake_mode():
+        return
+    for name, x, ref in zip(("out", "lse", "dq", "dk", "dv"), results, refs):
+        torch.testing.assert_close(x, ref, atol=1e-2, rtol=1e-2, msg=lambda m: f"{name}: {m}")
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Paged local attention on SM90 and SM100")
+@pytest.mark.parametrize("window", HUGE_WINDOWS)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_local_huge_window(window):
+    # Paged KV checks page_table.shape[1] * page_size + window_size_right < 2**31; a huge right
+    # side is clamped first, so it is accepted and matches the bounded window.
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    seqlen_q, page_size, pages_per_seq, nheads, d = 128, 64, 16, 4, 128
+    num_pages = 2 * pages_per_seq + 8
+    q = torch.randn(2, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(num_pages, page_size, nheads, d, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    page_table = torch.randperm(num_pages, device=device)[: 2 * pages_per_seq]
+    page_table = page_table.to(torch.int32).view(2, pages_per_seq)
+    seqused_k = torch.tensor([700, pages_per_seq * page_size], device=device, dtype=torch.int32)
+
+    def run(window_size):
+        return _flash_attn_fwd(
+            q, k, v, page_table=page_table, seqused_k=seqused_k,
+            window_size_left=window_size[0], window_size_right=window_size[1], return_lse=True,
+        )[:2]
+
+    results = run(window)
+    refs = run(_bounded_window(window, seqlen_q, pages_per_seq * page_size))
+    if is_fake_mode():
+        return
+    for name, x, ref in zip(("out", "lse"), results, refs):
+        torch.testing.assert_close(x, ref, atol=1e-2, rtol=1e-2, msg=lambda m: f"{name}: {m}")
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100), reason="Local attention on SM90 and SM100")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_local_huge_window_config_sees_given_window():
+    # get_scheduler_metadata selects its config from the window as given. The forward must too:
+    # on SM100 the split count depends on the window, and caller-built metadata must match it.
+    torch.random.manual_seed(0)
+    seqlen_q, seqlen_k = 128, 1024
+    q = torch.randn(2 * seqlen_q, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2 * seqlen_k, 4, 128, device="cuda", dtype=torch.bfloat16)
+    cu_q = torch.arange(0, 3 * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32)
+    cu_k = torch.arange(0, 3 * seqlen_k, seqlen_k, device="cuda", dtype=torch.int32)
+    with capture_selected_fwd_config() as selected:
+        flash_attn_varlen_func(
+            q, k, k, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k, window_size=(256, 2**31 - 1),
+        )
+    inputs = selected["inputs"]
+    assert (inputs.window_size_left, inputs.window_size_right) == (256, 2**31 - 1)
 
 
 @pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
