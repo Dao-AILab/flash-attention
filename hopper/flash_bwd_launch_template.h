@@ -46,6 +46,12 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     int batch_q = !is_varlen_q ? params.b : 1;
     int batch_k = !is_varlen_k ? params.b : 1;
 
+    // Ring-attention phased backward: 0 = normal full backward (byte-identical to
+    // before this field existed). Phases run a single stage per call so a ring
+    // driver keeps a persistent fp32 dq_accum across steps: 1 = preprocess only,
+    // 2 = main seqk kernel (+ GQA dK/dV convert) only, 3 = convert dQ only.
+    const int ring_phase = params.ring_bwd_phase;
+
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
     using PreprocessKernel = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, ArchTag, /*Clear_dQaccum=*/true, Varlen>;
     typename PreprocessKernel::Arguments preprocess_args {
@@ -72,7 +78,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
     dim3 grid_m(num_m_block, params.h, params.b);
-    CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
+    if (ring_phase == 0 || ring_phase == 1) {
+        CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
+        if (ring_phase == 1) { return; }
+    }
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;  // Currently doesn't not support cluster
@@ -207,6 +216,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     // int smem_size_lse = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_lse));
     // int smem_size_dpsum = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_dpsum));
     // printf("smem_size = %d, q = %d, k = %d, v = %d, do = %d, ds = %d, dqacc = %d, lse = %d, dpsum = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v, smem_size_do, smem_size_ds, smem_size_dqacc, smem_size_lse, smem_size_dpsum);
+    if (ring_phase == 0 || ring_phase == 2) {
     if constexpr (size(ClusterShape{}) > 1) {
         void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
@@ -220,6 +230,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<AttnKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         CHECK_CUTLASS(cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/));
+    }
     }
 
     using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum, ArchTag,
@@ -245,9 +256,13 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     if (smem_size_postprocess >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
     }
-    CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/));
+    if (ring_phase == 0 || ring_phase == 3) {
+        CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/));
+        if (ring_phase == 3) { return; }
+    }
 
     if constexpr (GQA) {
+      if (ring_phase == 0 || ring_phase == 2) {
         using TileShape_NK = cute::Shape<Int<kBlockN>, Int<kHeadDim>>;
         using PostprocessKerneldKV = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_NK, Element, ElementAccum, ArchTag,
             AttnKernel::CollectiveEpilogue::NumEpilogueThreads,
@@ -286,6 +301,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         }
         CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/));
         CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/));
+      }
     }
 
 }
@@ -348,8 +364,20 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         if constexpr (Arch >= 90) {
             if constexpr (Is_causal || Is_local || Has_softcap) {
-                run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1, false>(params, stream);
+                // Ring mode with PLAIN causal (no local/softcap) uses the tuned 80-block
+                // config so the causal diagonal hop shares the persistent dq_accum layout
+                // with the non-causal hops (which also use 80) -- lets hd128 rings run the
+                // fast 80-block on EVERY hop (matching v4's per-hop non-causal kernel) while
+                // still saving the per-hop preprocess/convert. Non-ring, or local/softcap
+                // (where non-causal also uses 64, so layouts already match), keep 64.
+                if (params.ring_bwd_phase != 0 && Is_causal && !Is_local && !Has_softcap) {
+                    run_mha_bwd_dispatch<Arch, T, 80, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1, false>(params, stream);
+                } else {
+                    run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1, false>(params, stream);
+                }
             } else {
+                // Non-causal, no softcap: always the tuned 80-block (ring or not). The ring's
+                // causal diagonal is pinned to 80 above so the shared dq_accum stays consistent.
                 run_mha_bwd_dispatch<Arch, T, 80, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1, false>(params, stream);
             }
         } else if constexpr (Arch == 86 || Arch == 89) {
