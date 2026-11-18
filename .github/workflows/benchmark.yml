@@ -132,7 +132,7 @@ with open('/tmp/bench_output.txt', 'r') as f:
 # Expected format from benchmark_attn.py:
 # | SeqLen | Causal |   Fwd TFLOPS |   Bwd TFLOPS |   Fwd MFU% |   Bwd MFU% |   Fwd TB/s |   Bwd TB/s |
 pattern = re.compile(
-    r'\|\s*(\d+)\s*\|\s*(True|False)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|'
+    r'\|\s*(\d+)\s*\|\s*(True|False)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)%?\s*\|\s*([\d.]+)%?\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|'
 )
 
 results = []
