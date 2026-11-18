@@ -1175,14 +1175,21 @@ class FlashAttentionBackwardSm100:
             cute.size_in_bytes(self.q_dtype, self.sQ_layout),
             cute.size_in_bytes(self.dk_dtype, self.sdK_layout),
         )
-        # sdO also holds the dV staging; allocate it at the fp32 staging size of the accumulate
+        # sdO also holds the dV staging. Allocate it at the fp32 staging size of the accumulate
         # variant in the direct-store variant too, so the buffers behind it (sdS, sLSE, sdPsum,
-        # sdQaccum) keep the same offsets: with the smaller allocation the hdim 64 kernel's LSE /
-        # dPsum smem loads bank-conflict and it runs 9-14% slower (see #3065).
+        # sdQaccum) sit at the same offsets in both variants. The offsets matter: B200 shared
+        # memory behaves as two 128 KiB halves, and LSU loads (sLSE / sdPsum) and TMA reads (the
+        # dQ reduce from sdQaccum) that land in the same half as the in-flight UMMA operand reads
+        # (sQ / sK / sV / sdO / sdS, all in the lower half) take about twice the wavefronts. With
+        # the 1 KiB reserved smem the line is at CTA offset 130048; the hdim 64 direct-store
+        # layout had sLSE / sdPsum / sdQaccum below it and ran 9-14% slower (measurements and a
+        # microbenchmark in #3065). hdim 96 / 128 are above the line in both variants, and the
+        # 2-CTA kernels stage dK / dV in sK / sV, so only the hdim 64 layout changes (+16 KiB).
+        sdO_layout_floor_bytes = cute.size_in_bytes(Float32, self.sdKV_accum_layout)
         sdO_alloc_bytes = max(
             cute.size_in_bytes(self.dv_dtype, self.sdV_layout),
             cute.size_in_bytes(self.do_dtype, self.sdO_layout),
-            cute.size_in_bytes(Float32, self.sdKV_accum_layout),
+            sdO_layout_floor_bytes,
         )
 
         sdK_bytes = cute.size_in_bytes(self.dk_dtype, self.sdK_layout)
