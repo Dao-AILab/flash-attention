@@ -81,3 +81,33 @@ def test_cross_entropy_loss(
     out_pt.backward(g)
     out.backward(g)
     assert torch.allclose(x.grad, x_pt.grad, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.float32] + ([torch.bfloat16] if is_sm8x else [])
+)
+def test_cross_entropy_loss_strided_labels(dtype):
+    # Regression test: the forward/backward kernels used to load labels_ptr + row_idx,
+    # which assumes labels is contiguous and silently reads the wrong label otherwise.
+    device = "cuda"
+    rtol, atol = (1e-5, 1e-6) if dtype == torch.float32 else (1e-3, 1e-4)
+    torch.random.manual_seed(0)
+    batch_size, seqlen, vocab_size = 4, 128, 256
+    n_rows = batch_size * seqlen
+    x = torch.randn(n_rows, vocab_size, device=device, dtype=dtype, requires_grad=True)
+    x_pt = x.detach().clone().requires_grad_()
+    # A stepped slice gives stride(0) == 2 while the underlying storage stays aligned.
+    y_storage = torch.randint(0, vocab_size, (2 * n_rows,), dtype=torch.long, device=device)
+    y = y_storage[::2]
+    assert y.stride(0) != 1
+
+    model = CrossEntropyLoss()
+    model_pt = torch.nn.CrossEntropyLoss()
+    out = model(x, y)
+    out_pt = model_pt(x_pt, y)
+    assert torch.allclose(out, out_pt, rtol=rtol, atol=atol)
+
+    g = torch.randn_like(out)
+    out_pt.backward(g)
+    out.backward(g)
+    assert torch.allclose(x.grad, x_pt.grad, rtol=rtol, atol=atol)
