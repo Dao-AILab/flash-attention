@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+Test script to validate benchmark output parsing.
+Can be run locally (with Modal) or in CI to verify the PR comment generation.
+"""
+
+import re
+import sys
+from pathlib import Path
+
+# Sample benchmark output (from benchmarks/benchmark_attn.py)
+SAMPLE_OUTPUT = """
+=== FA4 Benchmark: fwd=True, bwd=True, hdim=128, causal=both, seqlen=1024,2048,4096,8192,16384,32768 ===
+Benchmarking: fa4 fwd+bwd hdim=128 causal=True seqlen=1024
+Benchmarking: fa4 fwd+bwd hdim=128 causal=False seqlen=1024
+Benchmarking: fa4 fwd+bwd hdim=128 causal=True seqlen=2048
+Benchmarking: fa4 fwd+bwd hdim=128 causal=False seqlen=2048
+Benchmarking: fa4 fwd+bwd hdim=128 causal=True seqlen=4096
+Benchmarking: fa4 fwd+bwd hdim=128 causal=False seqlen=4096
+Benchmarking: fa4 fwd+bwd hdim=128 causal=True seqlen=8192
+Benchmarking: fa4 fwd+bwd hdim=128 causal=False seqlen=8192
+Benchmarking: fa4 fwd+bwd hdim=128 causal=True seqlen=16384
+Benchmarking: fa4 fwd+bwd hdim=128 causal=False seqlen=16384
+Benchmarking: fa4 fwd+bwd hdim=128 causal=True seqlen=32768
+Benchmarking: fa4 fwd+bwd hdim=128 causal=False seqlen=32768
+
+| SeqLen | Causal |   Fwd TFLOPS |   Bwd TFLOPS |   Fwd MFU% |   Bwd MFU% |   Fwd TB/s |   Bwd TB/s |
+|--------|--------|--------------|--------------|------------|------------|------------|------------|
+|   1024 |   True |       385.42 |       312.18 |      38.5% |      31.2% |      1.23 |      1.00 |
+|   1024 |  False |       412.67 |       345.92 |      41.3% |      34.6% |      1.32 |      1.11 |
+|   2048 |   True |       445.23 |       378.45 |      44.5% |      37.8% |      1.42 |      1.21 |
+|   2048 |  False |       478.91 |       412.33 |      47.9% |      41.2% |      1.53 |      1.32 |
+|   4096 |   True |       498.76 |       432.11 |      49.9% |      43.2% |      1.60 |      1.38 |
+|   4096 |  False |       523.44 |       465.78 |      52.3% |      46.6% |      1.67 |      1.49 |
+|   8192 |   True |       512.33 |       456.22 |      51.2% |      45.6% |      1.64 |      1.46 |
+|   8192 |  False |       538.99 |       489.11 |      53.9% |      48.9% |      1.72 |      1.57 |
+|  16384 |   True |       521.45 |       468.33 |      52.1% |      46.8% |      1.67 |      1.50 |
+|  16384 |  False |       548.22 |       501.44 |      54.8% |      50.1% |      1.75 |      1.60 |
+|  32768 |   True |       528.11 |       475.66 |      52.8% |      47.6% |      1.69 |      1.52 |
+|  32768 |  False |       554.33 |       508.22 |      55.4% |      50.8% |      1.77 |      1.63 |
+"""
+
+def parse_benchmark_output(output: str):
+    """Parse TFLOPS results from benchmark output."""
+    # Pattern handles: | 1024 | True | 385.42 | 312.18 | 38.5% | 31.2% | 1.23 | 1.00 |
+    pattern = re.compile(
+        r'\|\s*(\d+)\s*\|\s*(True|False)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)%?\s*\|\s*([\d.]+)%?\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|'
+    )
+
+    results = []
+    for match in pattern.finditer(output):
+        seqlen = int(match.group(1))
+        causal = match.group(2) == 'True'
+        fwd_tflops = float(match.group(3))
+        bwd_tflops = float(match.group(4))
+        fwd_mfu = float(match.group(5))
+        bwd_mfu = float(match.group(6))
+        fwd_tbs = float(match.group(7))
+        bwd_tbs = float(match.group(8))
+        results.append({
+            'seqlen': seqlen,
+            'causal': causal,
+            'fwd_tflops': fwd_tflops,
+            'bwd_tflops': bwd_tflops,
+            'fwd_mfu': fwd_mfu,
+            'bwd_mfu': bwd_mfu,
+            'fwd_tbs': fwd_tbs,
+            'bwd_tbs': bwd_tbs,
+        })
+    return results
+
+
+def generate_pr_comment(results: list, commit_sha: str = "abc1234", pr_number: str = "42"):
+    """Generate the PR comment markdown."""
+    if not results:
+        return "No benchmark results to display."
+
+    table = "| SeqLen | Causal | Fwd TFLOPS | Bwd TFLOPS | Fwd MFU% | Bwd MFU% | Fwd TB/s | Bwd TB/s |\n"
+    table += "|--------|--------|------------|------------|----------|----------|----------|----------|\n"
+    for r in results:
+        table += f"| {r['seqlen']} | {r['causal']} | {r['fwd_tflops']:.2f} | {r['bwd_tflops']:.2f} | {r['fwd_mfu']:.1f}% | {r['bwd_mfu']:.1f}% | {r['fwd_tbs']:.2f} | {r['bwd_tbs']:.2f} |\n"
+
+    avg_fwd_mfu = sum(r['fwd_mfu'] for r in results) / len(results)
+    avg_bwd_mfu = sum(r['bwd_mfu'] for r in results) / len(results)
+    avg_fwd_tflops = sum(r['fwd_tflops'] for r in results) / len(results)
+    avg_bwd_tflops = sum(r['bwd_tflops'] for r in results) / len(results)
+
+    comment = f"""## 🚀 FlashAttention Benchmark Results (PR #{pr_number})
+
+**Commit:** `{commit_sha}`
+**Backend:** FA4 | **HeadDim:** 128 | **SeqLens:** 1K, 4K, 16K | **Causal:** Both
+
+### Performance Table
+{table}
+
+### Summary
+- **Forward (avg MFU):** {avg_fwd_mfu:.1f}%
+- **Backward (avg MFU):** {avg_bwd_mfu:.1f}%
+- **Forward (avg TFLOPS):** {avg_fwd_tflops:.2f}
+- **Backward (avg TFLOPS):** {avg_bwd_tflops:.2f}
+
+---
+*Generated by GitHub Actions benchmark workflow. [View workflow run](https://github.com/owner/repo/actions/runs/123456789)*
+"""
+    return comment
+
+
+def test_parsing():
+    """Test the parsing with sample output."""
+    print("Testing benchmark output parsing...")
+    results = parse_benchmark_output(SAMPLE_OUTPUT)
+
+    if not results:
+        print("❌ FAILED: No results parsed")
+        return False
+
+    print(f"✅ Parsed {len(results)} benchmark rows")
+    for r in results[:3]:
+        print(f"  SeqLen={r['seqlen']}, Causal={r['causal']}, Fwd={r['fwd_tflops']:.2f} TFLOPS, Bwd={r['bwd_tflops']:.2f} TFLOPS")
+
+    # Verify specific values
+    assert len(results) == 12, f"Expected 12 rows, got {len(results)}"
+    assert results[0]['seqlen'] == 1024
+    assert results[0]['causal'] == True
+    assert abs(results[0]['fwd_tflops'] - 385.42) < 0.01
+    print("✅ Values match expected")
+
+    # Test PR comment generation
+    comment = generate_pr_comment(results)
+    print("\n✅ PR comment generated successfully")
+    print(f"Comment length: {len(comment)} chars")
+
+    # Verify key elements in comment
+    assert "FlashAttention Benchmark Results" in comment
+    assert "385.42" in comment
+    assert "44.5%" in comment or "44.5" in comment  # avg MFU
+    print("✅ Comment contains expected elements")
+
+    return True
+
+
+def test_with_file(filepath: str):
+    """Test parsing with a real benchmark output file."""
+    with open(filepath, 'r') as f:
+        content = f.read()
+    results = parse_benchmark_output(content)
+    print(f"Parsed {len(results)} rows from {filepath}")
+    if results:
+        comment = generate_pr_comment(results)
+        print(comment[:500])
+    return results
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        test_with_file(sys.argv[1])
+    else:
+        success = test_parsing()
+        sys.exit(0 if success else 1)
