@@ -9,7 +9,7 @@ from einops import rearrange
 import triton
 
 from flash_attn.layers.rotary import apply_rotary_emb, apply_rotary_emb_torch
-from flash_attn.layers.rotary import apply_rotary_emb_qkv_, apply_rotary_emb_kv_
+from flash_attn.layers.rotary import apply_rotary_emb_qkv_, apply_rotary_emb_kv_, RotaryEmbedding
 from flash_attn.bert_padding import pad_input, unpad_input
 
 is_sm8x = torch.cuda.get_device_capability("cuda") >= (8, 0)
@@ -72,8 +72,9 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
     x_pt = x.detach().clone().requires_grad_()
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
     seqlen_offsets = generate_seqlen_offsets(seqlen_offsets_type, batch_size, seqlen, device)
+    x_in = x.clone() if inplace else x
     out = apply_rotary_emb(
-        x, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved, inplace=inplace
+        x_in, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved, inplace=inplace
     )
     cos_pt, sin_pt = index_cos_sin(cos, sin, seqlen_offsets, seqlen)
     out_pt = apply_rotary_emb_torch(
@@ -82,13 +83,16 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
     print(f"Output max diff: {(out - out_pt).abs().max().item()}")
 
     g = torch.randn_like(out)
-    g_pt = g.clone()  # If inplace=True, we might modify the gradient inplace
+    g_pt = g.clone()
     out.backward(g)
     out_pt.backward(g_pt)
     print(f"Grad max diff: {(x.grad - x_pt.grad).abs().max().item()}")
 
+    assert torch.equal(g, g_pt)
     if not inplace:
         assert torch.equal(x, x_pt)
+    else:
+        assert out.data_ptr() == x_in.data_ptr()
     # Numerical error if we just do any arithmetic
     atol = ((out_pt + 0.3 - 0.3) - out_pt).abs().max().item()
     assert torch.allclose(out, out_pt, rtol=rtol, atol=2 * atol)
@@ -134,8 +138,9 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
     seqlen_offsets = generate_seqlen_offsets(seqlen_offsets_type, batch_size, seqlen, device)
     fn = apply_rotary_emb_qkv_ if not compiled else torch.compile(apply_rotary_emb_qkv_)
+    qkv_in = qkv.clone()
     out = fn(
-        qkv, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved,
+        qkv_in, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved,
         num_heads_q=None if not gqa else nheads
     )
     cos_pt, sin_pt = index_cos_sin(cos, sin, seqlen_offsets, seqlen)
@@ -156,10 +161,13 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
     print(f"Output max diff: {(out - out_pt).abs().max().item()}")
 
     g = torch.randn_like(out)
-    g_pt = g.clone()  # Since inplace=True, we modify the gradient inplace
+    g_pt = g.clone()
     out.backward(g)
     out_pt.backward(g_pt)
     print(f"Grad max diff: {(qkv.grad - qkv_pt.grad).abs().max().item()}")
+
+    assert out.data_ptr() == qkv_in.data_ptr()
+    assert torch.equal(g, g_pt)
 
     # Numerical error if we just do any arithmetic
     atol = ((out_pt + 0.3 - 0.3) - out_pt).abs().max().item()
@@ -193,7 +201,8 @@ def test_rotary_emb_kv(interleaved, rotary_fraction, seqlen_offsets_type, dtype)
     kv_pt = kv.detach().clone().requires_grad_()
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
     seqlen_offsets = generate_seqlen_offsets(seqlen_offsets_type, batch_size, seqlen, device)
-    out = apply_rotary_emb_kv_(kv, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved)
+    kv_in = kv.clone()
+    out = apply_rotary_emb_kv_(kv_in, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved)
     cos_pt, sin_pt = index_cos_sin(cos, sin, seqlen_offsets, seqlen)
     k_pt = apply_rotary_emb_torch(
         kv_pt[:, :, 0].float(), cos_pt.float(), sin_pt.float(), interleaved=interleaved
@@ -202,10 +211,13 @@ def test_rotary_emb_kv(interleaved, rotary_fraction, seqlen_offsets_type, dtype)
     print(f"Output max diff: {(out - out_pt).abs().max().item()}")
 
     g = torch.randn_like(out)
-    g_pt = g.clone()  # Since inplace=True, we modify the gradient inplace
+    g_pt = g.clone()
     out.backward(g)
     out_pt.backward(g_pt)
     print(f"Grad max diff: {(kv.grad - kv_pt.grad).abs().max().item()}")
+
+    assert out.data_ptr() == kv_in.data_ptr()
+    assert torch.equal(g, g_pt)
 
     # Numerical error if we just do any arithmetic
     atol = ((out_pt + 0.3 - 0.3) - out_pt).abs().max().item()
@@ -242,10 +254,11 @@ def test_rotary_emb_varlen_func(inplace, interleaved, rotary_fraction, seqlen_of
     x_unpad, indices, cu_seqlens, max_seqlen, _ = unpad_input(x, padding_mask)
     x_unpad_clone = x_unpad.clone()
     x_unpad = x_unpad.requires_grad_()
+    x_unpad_in = x_unpad.clone() if inplace else x_unpad
     cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
     seqlen_offsets = generate_seqlen_offsets(seqlen_offsets_type, batch_size, seqlen, device)
     out_unpad = apply_rotary_emb(
-        x_unpad,
+        x_unpad_in,
         cos,
         sin,
         seqlen_offsets=seqlen_offsets,
@@ -263,14 +276,17 @@ def test_rotary_emb_varlen_func(inplace, interleaved, rotary_fraction, seqlen_of
     print(f"Output max diff: {(out - out_pt).abs().max().item()}")
 
     g = torch.randn_like(out)
-    g_pt = g.clone()  # If inplace=True, we might modify the gradient inplace
+    g_pt = g.clone()
     out.backward(g)
     out_pt.backward(g_pt)
     x_grad = pad_input(x_unpad.grad, indices, batch_size, seqlen)
     print(f"Grad max diff: {(x_grad - x_pt.grad).abs().max().item()}")
 
+    assert torch.equal(g, g_pt)
     if not inplace:
         assert torch.equal(x_unpad, x_unpad_clone)
+    else:
+        assert out_unpad.data_ptr() == x_unpad_in.data_ptr()
     # Numerical error if we just do any arithmetic
     atol = ((out_pt + 0.3 - 0.3) - out_pt).abs().max().item()
     assert torch.allclose(out, out_pt, rtol=rtol, atol=2 * atol)
@@ -319,3 +335,100 @@ def test_compilation_count():
         assert compilation_count == 2
     finally:
         JITFunction.cache_hook = old_cache_func
+
+
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_rotary_inplace_autograd(interleaved):
+    device = "cuda"
+    dtype = torch.float32
+    cos = torch.zeros(2, 2, device=device, dtype=dtype)
+    sin = torch.ones_like(cos)
+
+    def rotate_ref(t):
+        return apply_rotary_emb_torch(t, cos, sin, interleaved=interleaved)
+
+    rotary_mod = RotaryEmbedding(dim=4, interleaved=interleaved, device=device)
+    rotary_mod._cos_cached = cos
+    rotary_mod._sin_cached = sin
+
+    cases = [
+        (
+            "apply_rotary_emb",
+            (1, 2, 2, 4),
+            lambda t: apply_rotary_emb(t, cos, sin, interleaved=interleaved, inplace=True),
+            rotate_ref,
+        ),
+        (
+            "apply_rotary_emb_qkv_5d",
+            (1, 2, 3, 2, 4),
+            lambda t: apply_rotary_emb_qkv_(t, cos, sin, interleaved=interleaved),
+            lambda t: torch.stack([rotate_ref(t[:, :, 0]), rotate_ref(t[:, :, 1]), t[:, :, 2]], dim=2),
+        ),
+        (
+            "rotary_embedding_module",
+            (1, 2, 3, 2, 4),
+            lambda t: apply_rotary_emb_qkv_(
+                t, rotary_mod._cos_cached, rotary_mod._sin_cached, interleaved=rotary_mod.interleaved
+            ),
+            lambda t: torch.stack([rotate_ref(t[:, :, 0]), rotate_ref(t[:, :, 1]), t[:, :, 2]], dim=2),
+        ),
+        (
+            "apply_rotary_emb_qkv_gqa",
+            (1, 2, 4, 4),
+            lambda t: apply_rotary_emb_qkv_(t, cos, sin, interleaved=interleaved, num_heads_q=2),
+            lambda t: torch.cat([rotate_ref(t[:, :, :2]), rotate_ref(t[:, :, 2:3]), t[:, :, 3:]], dim=2),
+        ),
+        (
+            "apply_rotary_emb_kv",
+            (1, 2, 2, 2, 4),
+            lambda t: apply_rotary_emb_kv_(t, cos, sin, interleaved=interleaved),
+            lambda t: torch.stack([rotate_ref(t[:, :, 0]), t[:, :, 1]], dim=2),
+        ),
+    ]
+
+    for _, shape, rotate_fn, ref_fn in cases:
+        # Case A1: shared upstream gradient tensor must not be mutated in backward
+        x = torch.randn(shape, device=device, dtype=dtype, requires_grad=True)
+        other = torch.ones(shape, device=device, dtype=dtype, requires_grad=True)
+        loss = ((rotate_fn(x.clone()) + 2.0 * other) * torch.ones(shape, device=device, dtype=dtype)).sum()
+        dx, d_other = torch.autograd.grad(loss, (x, other))
+
+        x_ref = x.detach().clone().requires_grad_(True)
+        dx_ref, = torch.autograd.grad(ref_fn(x_ref).sum(), x_ref)
+        torch.testing.assert_close(d_other, torch.full_like(other, 2.0), rtol=0, atol=0)
+        torch.testing.assert_close(dx, dx_ref, rtol=1e-5, atol=1e-5)
+
+        # Case A2: 0-stride expanded upstream gradient from direct .sum()
+        x_sum = x.detach().clone().requires_grad_(True)
+        dx_sum, = torch.autograd.grad(rotate_fn(x_sum.clone()).sum(), x_sum)
+        torch.testing.assert_close(dx_sum, dx_ref, rtol=1e-5, atol=1e-5)
+
+        # Case B1: input saved by upstream op (tanh saves its output) detects inplace mutation
+        z = torch.linspace(-0.9, 0.8, torch.Size(shape).numel(), device=device, dtype=dtype).reshape(shape)
+        z.requires_grad_(True)
+        y_tanh = z.tanh()
+        ver_before = y_tanh._version
+        out_tanh = rotate_fn(y_tanh)
+        assert out_tanh._version > ver_before
+        with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+            out_tanh.sum().backward()
+
+        # Case B2: upstream op that saves its own input (sin saves z, not sin(z)) still differentiates cleanly
+        z_sin = z.detach().clone().requires_grad_(True)
+        z_sin_ref = z.detach().clone().requires_grad_(True)
+        dz_actual, = torch.autograd.grad(rotate_fn(z_sin.sin()), z_sin, torch.ones_like(z_sin))
+        dz_expected, = torch.autograd.grad(ref_fn(z_sin_ref.sin()), z_sin_ref, torch.ones_like(z_sin_ref))
+        torch.testing.assert_close(dz_actual, dz_expected, rtol=1e-5, atol=1e-5)
+
+    # Also cover varlen cu_seqlens inplace=True shared upstream gradient and version tracking
+    cu_seqlens = torch.tensor([0, 2, 3], device=device, dtype=torch.int32)
+    x_var = torch.randn(3, 2, 4, device=device, dtype=dtype, requires_grad=True)
+    other_var = torch.ones_like(x_var, requires_grad=True)
+    loss_var = (
+        apply_rotary_emb(
+            x_var.clone(), cos, sin, interleaved=interleaved, inplace=True, cu_seqlens=cu_seqlens, max_seqlen=2
+        )
+        + 2.0 * other_var
+    ).sum()
+    _, d_other_var = torch.autograd.grad(loss_var, (x_var, other_var))
+    torch.testing.assert_close(d_other_var, torch.full_like(other_var, 2.0), rtol=0, atol=0)
