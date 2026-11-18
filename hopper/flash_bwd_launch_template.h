@@ -62,8 +62,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         static_cast<float*>(params.softmax_lse_log2_ptr),
         {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
         static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
-        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * seqlen_q_rounded * params.h : 0},  // stride_dQaccum
+        {int64_t(seqlen_q_rounded) * params.d_rounded, params.h, batch_q},  // shape_dQaccum
+        {_1{}, int64_t(seqlen_q_rounded) * params.d_rounded, !is_varlen_q ? int64_t(params.d_rounded) * seqlen_q_rounded * params.h : 0},  // stride_dQaccum
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q,
@@ -118,8 +118,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {seqlen_q, params.dv, params.h, batch_q},  // shape_dO
         {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen_q ? params.do_batch_stride : 0},  // stride_dO
         static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
-        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+        {int64_t(seqlen_q_rounded) * params.d_rounded, params.h, batch_q},  // shape_dQaccum
+        {_1{}, int64_t(seqlen_q_rounded) * params.d_rounded, !is_varlen_q ? int64_t(params.d_rounded) * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
         static_cast<float*>(params.softmax_lse_log2_ptr),
         {seqlen_q_rounded, params.h, batch_q},  // shape_LSE
         {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
@@ -140,14 +140,14 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             if constexpr (!GQA) {
                 return typename CollectiveEpilogue::ShapedKV {seqlen_k, params.d, params.h, batch_k};  // shape_dK
             } else {
-                return typename CollectiveEpilogue::ShapedKV {seqlen_k_rounded * params.d_rounded, params.h_k, batch_k};  // shape_dKaccum
+                return typename CollectiveEpilogue::ShapedKV {int64_t(seqlen_k_rounded) * params.d_rounded, params.h_k, batch_k};  // shape_dKaccum
             }
         }(),
         [&] {
             if constexpr (!GQA) {
                 return typename CollectiveEpilogue::StridedKV {params.dk_row_stride, _1{}, params.dk_head_stride, !is_varlen_k ? params.dk_batch_stride : 0};  // stride_dK
             } else {
-                return typename CollectiveEpilogue::StridedKV {_1{}, params.d_rounded * seqlen_k_rounded, !is_varlen_k ? params.h_k * params.d_rounded * params.seqlen_k_rounded : 0};  // stride_dKaccum
+                return typename CollectiveEpilogue::StridedKV {_1{}, int64_t(params.d_rounded) * seqlen_k_rounded, !is_varlen_k ? int64_t(params.h_k) * params.d_rounded * params.seqlen_k_rounded : 0};  // stride_dKaccum
             }
         }(),
         static_cast<typename CollectiveEpilogue::Element*>(!GQA ? params.dv_ptr : params.dv_accum_ptr),
@@ -155,14 +155,14 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             if constexpr (!GQA) {
                 return typename CollectiveEpilogue::ShapedKV {seqlen_k, params.dv, params.h, batch_k};  // shape_dV
             } else {
-                return typename CollectiveEpilogue::ShapedKV {seqlen_k_rounded * params.dv_rounded, params.h_k, batch_k};  // shape_dVaccum
+                return typename CollectiveEpilogue::ShapedKV {int64_t(seqlen_k_rounded) * params.dv_rounded, params.h_k, batch_k};  // shape_dVaccum
             }
         }(),
         [&] {
             if constexpr (!GQA) {
                 return typename CollectiveEpilogue::StridedKV {params.dv_row_stride, _1{}, params.dv_head_stride, !is_varlen_k ? params.dv_batch_stride : 0};  // stride_dV
             } else {
-                return typename CollectiveEpilogue::StridedKV {_1{}, params.dv_rounded * seqlen_k_rounded, !is_varlen_k ? params.h_k * params.dv_rounded * params.seqlen_k_rounded : 0};  // stride_dVaccum
+                return typename CollectiveEpilogue::StridedKV {_1{}, int64_t(params.dv_rounded) * seqlen_k_rounded, !is_varlen_k ? int64_t(params.h_k) * params.dv_rounded * params.seqlen_k_rounded : 0};  // stride_dVaccum
             }
         }(),
         params.b,
@@ -229,8 +229,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         >;
     typename PostprocessKernel::Arguments postprocess_args {
         static_cast<ElementAccum const*>(params.dq_accum_ptr),
-        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
-        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+        {int64_t(seqlen_q_rounded) * params.d_rounded, params.h, batch_q},  // shape_dQaccum
+        {_1{}, int64_t(seqlen_q_rounded) * params.d_rounded, !is_varlen_q ? int64_t(params.d_rounded) * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
         static_cast<Element*>(params.dq_ptr),
         {seqlen_q, params.d, params.h, batch_q},  // shape_dQ
         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
@@ -256,8 +256,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             >;
         typename PostprocessKerneldKV::Arguments postprocess_dK_args {
             static_cast<ElementAccum const*>(params.dk_accum_ptr),
-            {seqlen_k_rounded * params.d_rounded, params.h_k, batch_k},  // shape_dKaccum
-            {_1{}, seqlen_k_rounded * params.d_rounded, !is_varlen_k ? params.d_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dKaccum
+            {int64_t(seqlen_k_rounded) * params.d_rounded, params.h_k, batch_k},  // shape_dKaccum
+            {_1{}, int64_t(seqlen_k_rounded) * params.d_rounded, !is_varlen_k ? int64_t(params.d_rounded) * params.seqlen_k_rounded * params.h_k : 0},  // stride_dKaccum
             static_cast<Element*>(params.dk_ptr),
             {seqlen_k, params.d, params.h_k, batch_k},  // shape_dK
             {params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride},  // stride_dK
@@ -268,8 +268,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         typename PostprocessKerneldKV::Params postprocess_dK_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dK_args);
         typename PostprocessKerneldKV::Arguments postprocess_dV_args {
             static_cast<ElementAccum const*>(params.dv_accum_ptr),
-            {seqlen_k_rounded * params.dv_rounded, params.h_k, batch_k},  // shape_dVaccum
-            {_1{}, seqlen_k_rounded * params.dv_rounded, !is_varlen_k ? params.dv_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dVaccum
+            {int64_t(seqlen_k_rounded) * params.dv_rounded, params.h_k, batch_k},  // shape_dVaccum
+            {_1{}, int64_t(seqlen_k_rounded) * params.dv_rounded, !is_varlen_k ? int64_t(params.dv_rounded) * params.seqlen_k_rounded * params.h_k : 0},  // stride_dVaccum
             static_cast<Element*>(params.dv_ptr),
             {seqlen_k, params.dv, params.h_k, batch_k},  // shape_dV
             {params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride},  // stride_dV
