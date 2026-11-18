@@ -104,7 +104,7 @@ def test_cross_entropy_loss_strided_labels(dtype):
     model = CrossEntropyLoss()
     model_pt = torch.nn.CrossEntropyLoss()
     out = model(x, y)
-    out_pt = model_pt(x_pt, y)
+    out_pt = model_pt(x_pt.float(), y)
     assert torch.allclose(out, out_pt, rtol=rtol, atol=atol)
 
     g = torch.randn_like(out)
