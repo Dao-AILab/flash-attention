@@ -372,3 +372,135 @@ def test_layer_norm_linear(
     assert allclose(linear_weight.grad, linear_weight_pt.grad, linear_weight_ref.grad)
     if linear_bias is not None:
         assert allclose(linear_bias.grad, linear_bias_pt.grad, linear_bias_ref.grad)
+
+
+def test_layer_norm_large_row_offset():
+    device = "cuda"
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if free_bytes < 10 * (1024**3):
+        pytest.skip("Requires >= 10 GiB free CUDA memory for >= 2^31 element offset buffer")
+
+    torch.random.manual_seed(0)
+    rows, cols = 3, 128
+    # stride_row fits in signed int32 (< 2**31), while row 2 is at offset
+    # 2 * stride_row = 2**32 - 2048 >= 2**31 (which wraps to -2048 in int32,
+    # inside the 2048-element prefix guard).
+    stride_row = 2**31 - 1024
+    prefix = 2048
+    total_elems = prefix + (rows - 1) * stride_row + 1024
+    storage = torch.zeros(total_elems, dtype=torch.float16, device=device)
+    storage[:prefix] = torch.linspace(-5.0, 5.0, prefix, device=device, dtype=torch.float32).half()
+
+    def make_slot(slot_idx, n_rows=rows, row_stride=stride_row, requires_grad=False):
+        offset = prefix + slot_idx * cols
+        view = torch.as_strided(
+            storage, (n_rows, cols), (row_stride, 1), storage_offset=offset
+        )
+        if requires_grad:
+            view = view.detach().requires_grad_(True)
+        return view
+
+    # 1. Forward with strided x, residual, x1, and preallocated out + guard check
+    x_fwd = make_slot(0)
+    res_fwd = make_slot(1)
+    x1_fwd = make_slot(2)
+    out_fwd = make_slot(3)
+    guard_out_slice = storage[prefix + 3 * cols - 2048 : prefix + 3 * cols - 2048 + cols]
+    guard_out_slice.fill_(-7.0)
+
+    x_vals = torch.randn(rows, cols, device=device, dtype=torch.float16)
+    res_vals = torch.randn(rows, cols, device=device, dtype=torch.float16)
+    x1_vals = torch.randn(rows, cols, device=device, dtype=torch.float16)
+    x_fwd.copy_(x_vals)
+    res_fwd.copy_(res_vals)
+    x1_fwd.copy_(x1_vals)
+    out_fwd.fill_(-7.0)
+
+    weight = torch.randn(cols, device=device, dtype=torch.float32, requires_grad=True)
+    bias = torch.randn(cols, device=device, dtype=torch.float32, requires_grad=True)
+
+    with torch.no_grad():
+        y_fwd = layer_norm_fn(
+            x_fwd, weight, bias, residual=res_fwd, x1=x1_fwd, eps=1e-5, out=out_fwd
+        )
+    ref_fwd = F.layer_norm(
+        (x_vals + x1_vals + res_vals).float(), (cols,), weight, bias, eps=1e-5
+    ).half()
+    assert not bool((guard_out_slice != -7.0).any())
+    torch.testing.assert_close(y_fwd, ref_fwd, atol=5e-3, rtol=5e-3)
+
+    # 2. Forward + backward with strided x, dy, dy1, and dresidual
+    x_bwd = make_slot(4, requires_grad=True)
+    dy_bwd = make_slot(5)
+    dy1_bwd = make_slot(6)
+    dres_bwd = make_slot(7)
+
+    dy_vals = torch.randn(rows, cols, device=device, dtype=torch.float16)
+    dy1_vals = torch.randn(rows, cols, device=device, dtype=torch.float16)
+    dres_vals = torch.randn(rows, cols, device=device, dtype=torch.float16)
+    with torch.no_grad():
+        x_bwd.copy_(x_vals)
+        dy_bwd.copy_(dy_vals)
+        dy1_bwd.copy_(dy1_vals)
+        dres_bwd.copy_(dres_vals)
+
+    weight1 = torch.randn(cols, device=device, dtype=torch.float32, requires_grad=True)
+    bias1 = torch.randn(cols, device=device, dtype=torch.float32, requires_grad=True)
+
+    y, y1, res_out = layer_norm_fn(
+        x_bwd, weight, bias, weight1=weight1, bias1=bias1, eps=1e-5, prenorm=True
+    )
+    dx, dw, db, dw1, db1 = torch.autograd.grad(
+        (y, y1, res_out),
+        (x_bwd, weight, bias, weight1, bias1),
+        (dy_bwd, dy1_bwd, dres_bwd),
+    )
+
+    x_ref = x_vals.detach().clone().float().requires_grad_(True)
+    w_ref = weight.detach().clone().requires_grad_(True)
+    b_ref = bias.detach().clone().requires_grad_(True)
+    w1_ref = weight1.detach().clone().requires_grad_(True)
+    b1_ref = bias1.detach().clone().requires_grad_(True)
+    y_ref = F.layer_norm(x_ref, (cols,), w_ref, b_ref, eps=1e-5)
+    y1_ref = F.layer_norm(x_ref, (cols,), w1_ref, b1_ref, eps=1e-5)
+    dx_ref, dw_ref, db_ref, dw1_ref, db1_ref = torch.autograd.grad(
+        (y_ref, y1_ref, x_ref),
+        (x_ref, w_ref, b_ref, w1_ref, b1_ref),
+        (dy_vals.float(), dy1_vals.float(), dres_vals.float()),
+    )
+    torch.testing.assert_close(y.float(), y_ref, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(y1.float(), y1_ref, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(dx.float(), dx_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dw, dw_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(db, db_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dw1, dw1_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(db1, db1_ref, atol=1e-2, rtol=1e-2)
+
+    # 3. Multi-row-per-program backward crossing 2^31 mid-loop (RMSNorm)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * 8
+    rows_loop = sm_count + 2
+    k = sm_count - 2
+    stride_loop = ((2**31 // (k + 1)) + 8) & ~7
+    assert k * stride_loop < 2**31 <= (k + 1) * stride_loop
+    assert prefix + (rows_loop - 1) * stride_loop + 2 * cols <= total_elems
+
+    x_loop = make_slot(0, n_rows=rows_loop, row_stride=stride_loop, requires_grad=True)
+    dy_loop = make_slot(1, n_rows=rows_loop, row_stride=stride_loop)
+    x_loop_vals = torch.randn(rows_loop, cols, device=device, dtype=torch.float16)
+    dy_loop_vals = torch.randn(rows_loop, cols, device=device, dtype=torch.float16)
+    with torch.no_grad():
+        x_loop.copy_(x_loop_vals)
+        dy_loop.copy_(dy_loop_vals)
+
+    w_rms = torch.randn(cols, device=device, dtype=torch.float32, requires_grad=True)
+    y_rms = layer_norm_fn(x_loop, w_rms, None, eps=1e-5, is_rms_norm=True)
+    dx_rms, dw_rms = torch.autograd.grad(y_rms, (x_loop, w_rms), dy_loop)
+
+    x_rms_ref = x_loop_vals.detach().clone().requires_grad_(True)
+    w_rms_ref = w_rms.detach().clone().requires_grad_(True)
+    y_rms_ref = rms_norm_ref(x_rms_ref, w_rms_ref, None, eps=1e-5, upcast=True)
+    dx_rms_ref, dw_rms_ref = torch.autograd.grad(y_rms_ref, (x_rms_ref, w_rms_ref), dy_loop_vals)
+    torch.testing.assert_close(y_rms, y_rms_ref, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(dx_rms, dx_rms_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(dw_rms, dw_rms_ref, atol=2e-2, rtol=2e-2)
+    del storage
