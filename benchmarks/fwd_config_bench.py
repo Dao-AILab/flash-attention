@@ -10,8 +10,9 @@ campaign.yaml:
   experiments:
     - name: d64_direct_o
       baseline: {use_tma_o: true}
-      candidate: {use_tma_o: false}
+      candidate: {use_tma_o: false}  # registers: {softmax: 168, correction: 96, other: 80}
       varlen: false
+      dtype: bfloat16  # optional torch dtype name; float8_e4m3fn or float8_e5m2 for FP8
       cases:  # [batch, q_heads, kv_heads, head_dim, seqlen_q, seqlen_k, causal, label?]
         - [4, 16, 16, 64, 8192, 8192, false]
 
@@ -35,9 +36,14 @@ from flash_attn.cute import config as fwd_config
 from flash_attn.cute import interface
 
 
-def make_kwargs(batch, q_heads, kv_heads, head_dim, seqlen_q, seqlen_k, causal, *, varlen):
+def make_kwargs(
+    batch, q_heads, kv_heads, head_dim, seqlen_q, seqlen_k, causal, *, varlen, dtype="bfloat16"
+):
+    dtype = getattr(torch, dtype)
+
     def rand(*shape):
-        return torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+        # torch.randn has no FP8 path: draw BF16 and quantize (unit descales).
+        return torch.randn(*shape, device="cuda", dtype=torch.bfloat16).to(dtype)
 
     if not varlen:
         return {
@@ -79,14 +85,19 @@ def default_config(kwargs):
 def run_case(experiment, kwargs, rounds):
     selected, inputs = default_config(kwargs)
     # Overrides re-derive registers and the SMEM layout unless they set them.
-    arms = [
-        fwd_config.derive_fwd_config(selected, inputs, **(experiment.get(name) or {}))
-        for name in ("baseline", "candidate")
-    ]
+    arms = []
+    for name in ("baseline", "candidate"):
+        changes = dict(experiment.get(name) or {})
+        # YAML gives registers as a mapping; the config takes the selected record's type.
+        if isinstance(changes.get("registers"), dict):
+            changes["registers"] = type(selected.registers)(**changes["registers"])
+        arms.append(fwd_config.derive_fwd_config(selected, inputs, **changes))
     if arms[0] == arms[1]:
         raise ValueError(f"{experiment['name']}: baseline and candidate resolve to {arms[0]}")
     fns = [lambda config=config: interface._flash_attn_fwd(**kwargs, config=config)[0] for config in arms]
-    torch.testing.assert_close(fns[1](), fns[0](), atol=2e-2, rtol=2e-2)
+    # Arms that round P differently differ by an FP8 ulp of P; e5m2's is 4x e4m3's.
+    tol = 8e-2 if kwargs["q"].dtype == torch.float8_e5m2 else 2e-2
+    torch.testing.assert_close(fns[1](), fns[0](), atol=tol, rtol=tol)
     times = [[], []]
     for round_idx in range(rounds):
         for arm in (round_idx % 2, 1 - round_idx % 2):
@@ -110,7 +121,11 @@ def main():
         speedups = []
         for case in experiment["cases"]:
             torch.manual_seed(0)
-            kwargs = make_kwargs(*case[:7], varlen=experiment.get("varlen", False))
+            kwargs = make_kwargs(
+                *case[:7],
+                varlen=experiment.get("varlen", False),
+                dtype=experiment.get("dtype", "bfloat16"),
+            )
             speedup = run_case(experiment, kwargs, args.rounds)
             speedups.append(speedup)
             print(f"{experiment['name']} {case}: {speedup:.3f}x", flush=True)
