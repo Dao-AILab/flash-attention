@@ -64,7 +64,7 @@ def cross_entropy_fwd_kernel(
         tl.store(lse_ptr + row_idx, lse)
     else:
         lse = tl.load(lse_ptr + row_idx)
-    label_idx = tl.load(labels_ptr + row_idx * labels_row_stride.to(tl.int64))
+    label_idx = tl.load(labels_ptr + row_idx.to(tl.int64) * labels_row_stride)
     if label_idx == ignore_index:
         loss = 0.0
         z_loss = 0.0
@@ -127,7 +127,7 @@ def cross_entropy_bwd_kernel(
     logits_ptr = logits_ptr + row_idx * logits_row_stride.to(tl.int64)
     dlogits_ptr = dlogits_ptr + row_idx * dlogits_row_stride.to(tl.int64)
     col_offsets = col_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    label_idx = tl.load(labels_ptr + row_idx * labels_row_stride.to(tl.int64))
+    label_idx = tl.load(labels_ptr + row_idx.to(tl.int64) * labels_row_stride)
     if label_idx != ignore_index:
         dloss = tl.load(dloss_ptr + row_idx * dloss_row_stride)
     else:
