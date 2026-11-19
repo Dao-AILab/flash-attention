@@ -1076,3 +1076,27 @@ def get_batch_from_cu_tensor(idx: Int32, cu_tensor: cute.Tensor) -> Int32:
             hi = mid
 
     return lo
+
+
+@dsl_user_op
+def order_after(x: Float32, dep: Float32, zero: cutlass.Int32, *, loc=None, ip=None) -> Float32:
+    """Return x bitwise unchanged with a data dependency on dep.
+
+    zero must be 0 at runtime without being provably constant to the compiler.
+    This orders dependent computation, not stores or barrier arrivals.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(x).ir_value(loc=loc, ip=ip),
+                Float32(dep).ir_value(loc=loc, ip=ip),
+                cutlass.Int32(zero).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n.reg .b32 t;\nand.b32 t, $2, $3;\nor.b32 $0, $1, t;\n}",
+            "=f,f,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
