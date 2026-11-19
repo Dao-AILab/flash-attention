@@ -147,6 +147,45 @@ def with_stage_stride(layout: cute.ComposedLayout, stage_stride: int) -> cute.Co
     )
 
 
+class OnesSpec(NamedTuple):
+    """One P @ ones MMA and the SMEM layout of its all-ones B tile, for one P dtype."""
+
+    tiled_mma: cute.TiledMma
+    smem_layout: cute.ComposedLayout
+
+
+class OnesMma(NamedTuple):
+    """One P @ ones MMA: the tiled MMA, its TMEM A fragments (last mode: S stage) and SMEM B."""
+
+    tiled_mma: cute.TiledMma
+    tA: cute.Tensor
+    tB: cute.Tensor
+
+
+class PvOnes(NamedTuple):
+    """P @ ones row-sum MMAs: E4M3 P, BF16 P (causal diagonal, sm_107) and the accumulator tiles
+    (last mode: holding stage; see ones_tile)."""
+
+    fp8: OnesMma
+    bf16: OnesMma | None
+    acc: cute.Tensor
+
+
+class OnesLoad(NamedTuple):
+    """TMEM -> RMEM load of the ones MMA's row sum: thread copy, TMEM source, RMEM shape."""
+
+    thr_copy: cute.TiledCopy
+    src: cute.Tensor
+    dst_shape: tuple
+
+
+class DelayedRowSum(NamedTuple):
+    """A row sum the ones MMA supplies some steps late: its load and the per-tile pending registers."""
+
+    load: OnesLoad
+    pending: cute.Tensor
+
+
 class BlockScaledSf(NamedTuple):
     """TMEM scale factors of one block-scaled MMA (A and B) and their SMEM -> TMEM copies."""
 
@@ -250,6 +289,28 @@ class FlashAttentionForwardSm100:
         if self.dedicated_sf:
             # The K=64 PV MMAs wait for the whole P; sm_100/sm_103 split P arrival as for BF16.
             self.split_P_arrive = 0
+        # NOTE [Rounded-P PV row sums in TMEM]
+        # Rounded-P mode normalizes with the sum of the same quantized P that PV reads. The MMA warp
+        # issues P @ ones on PV's TMEM P operand and an all-ones SMEM B tile (N=pv_ones_n), so each
+        # of the 16 accumulator columns holds that row sum. The accumulator tile of stage s:
+        #
+        # sm_100/sm_103 (pv_ones_step_sum, two Q stages, no spare TMEM): the last 16 columns of
+        # S_{1-s}, dead from softmax_{1-s}'s S load until QK_{1-s}(i+1). Stage s's sum MMA follows
+        # that load (the sf_overlap acquire) and precedes QK_s(i+1), so softmax_s reads it with
+        # S_s(i+1), one step late, before its own sf_overlap release. The tile's last PV has no
+        # next QK to precede, and BF16-band P covers the borrowed columns, so those steps sum P in
+        # software; the first E4M3 step after the band, with nothing pending, does not read them.
+        # E4M3 sums are exact in FP32, so O is bitwise unchanged.
+        #     S_t columns: [0,8) SF of QK_{1-t} | [64,96) E4M3 P_t | [96,104) SF of P_t/V
+        #                  | [112,128) sum(P_{1-t})
+        #
+        # sm_107 (pv_ones_acc_sum): dedicated 16 columns after the scale factors. Every PV,
+        # BF16 band included, accumulates its sum there as it accumulates O, so the correction
+        # warps rescale column 0 with O; column 0 is then the running sum they normalize by.
+        self.pv_ones_step_sum = pv_blockscaled and self.sf_overlap and not self.pv_fp32_normalizer
+        self.pv_ones_acc_sum = self.dedicated_sf and not self.pv_fp32_normalizer
+        self.pv_ones_sum = self.pv_ones_step_sum or self.pv_ones_acc_sum
+        self.pv_ones_n = 16
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M covers one CTA; a scheduler work tile spans cta_group_size CTAs (work_q_block).
@@ -452,8 +513,18 @@ class FlashAttentionForwardSm100:
         ]  # e.g., 256, 384
         self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
         self.tmem_sf_base = self.tmem_total
+        # P @ ones accumulator tiles, indexed by the TMEM stage holding them (ones_tile maps a
+        # stage to its tile; NOTE [Rounded-P PV row sums in TMEM]): the first column of holder 0,
+        # then (number of holders, column stride between them).
+        if self.pv_ones_step_sum:
+            self.tmem_ones_offset = self.tmem_s_offset[0] + self.n_block_size - self.pv_ones_n
+            self.tmem_ones_stages = (2, self.tmem_s_offset[1] - self.tmem_s_offset[0])
         if self.dedicated_sf:
             self.tmem_total += 16
+        if self.pv_ones_acc_sum:
+            self.tmem_ones_offset = self.tmem_total
+            self.tmem_ones_stages = (self.q_stage, self.pv_ones_n)
+            self.tmem_total += self.q_stage * self.pv_ones_n
         assert self.tmem_total <= self.tmem_alloc_cols
         self.tmem_s_to_p_offset = self.n_block_size // 2
         self.tmem_p_offset = [
@@ -646,6 +717,38 @@ class FlashAttentionForwardSm100:
                 self.mma_tiler_pv[:2],
                 p_source,
             )
+
+        # P @ ones for the tensor-core row sum: a non-scaled MMA with the same TMEM A operand as PV
+        # and a K-major all-ones B tile (PV's P scale is the constant 2^0).
+        ones_fp8, ones_bf16 = None, None
+        if const_expr(self.pv_ones_sum):
+            ones_tiler = (self.mma_tiler_pv[0], self.pv_ones_n, self.n_block_size)
+            if const_expr(self.dedicated_sf):
+                from cutlass.utils import rubin_helpers
+                tiled_mma_ones = rubin_helpers.make_trivial_tiled_mma(
+                    self.v_dtype, self.v_dtype, p_major_mode, k_major_mode, self.pv_acc_dtype,
+                    cta_group, (*ones_tiler[:2], 64), a_source=p_source,
+                )
+            else:
+                tiled_mma_ones = sm100_utils_basic.make_trivial_tiled_mma(
+                    self.v_dtype, self.v_dtype, p_major_mode, k_major_mode, self.pv_acc_dtype,
+                    cta_group, ones_tiler[:2], p_source,
+                )
+            ones_fp8 = OnesSpec(
+                tiled_mma_ones,
+                sm100_utils_basic.make_smem_layout_b(tiled_mma_ones, ones_tiler, self.v_dtype, 1),
+            )
+            if const_expr(self.pv_ones_acc_sum and self.pv_causal_bf16):
+                tiled_mma_ones_bf16 = sm100_utils_basic.make_trivial_tiled_mma(
+                    cutlass.BFloat16, cutlass.BFloat16, p_major_mode, k_major_mode, self.pv_acc_dtype,
+                    cta_group, ones_tiler[:2], p_source,
+                )
+                ones_bf16 = OnesSpec(
+                    tiled_mma_ones_bf16,
+                    sm100_utils_basic.make_smem_layout_b(
+                        tiled_mma_ones_bf16, ones_tiler, cutlass.BFloat16, 1
+                    ),
+                )
 
         tiled_mma_pv_bf16 = None
         if const_expr(self.pv_causal_bf16):
@@ -947,6 +1050,9 @@ class FlashAttentionForwardSm100:
         load_epi_mbar_size = 2 if const_expr(self.overlap_sO_sQ) else 0
         sf_overlap_mbar_size = 4 if const_expr(self.sf_overlap) else 0
         sfp_size = 512 if const_expr(self.pv_blockscaled) else 0
+        ones_size = cute.cosize(ones_fp8.smem_layout) if const_expr(ones_fp8 is not None) else 0
+        onesb_size = cute.cosize(ones_bf16.smem_layout) if const_expr(ones_bf16 is not None) else 0
+        ones_align = 1024 if const_expr(self.pv_ones_sum) else 128
         # Track the FP32 sum for LSE or the FP32 normalizer.
         self.track_unquantized_sum = self.pv_blockscaled and (mLSE is not None or self.pv_fp32_normalizer)
         self.num_stats = sm100_num_softmax_stats(
@@ -997,6 +1103,8 @@ class FlashAttentionForwardSm100:
             sSFQ: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E8M0FNU, sSFQ_size], 128]
             sSFK: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E8M0FNU, sSFK_size], 128]
             sSFP: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E8M0FNU, sfp_size], 128]
+            sOnes: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E4M3FN, ones_size], ones_align]
+            sOnesB: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, onesb_size], ones_align]
 
         self.shared_storage = SharedStorage
         smem_capacity = sm100_smem_capacity(self.arch.major * 10 + self.arch.minor)
@@ -1069,6 +1177,7 @@ class FlashAttentionForwardSm100:
             mSFQ, mSFK, tma_atom_SFQ, tma_atom_SFK, sSFQ_layout, sSFK_layout,
             mSFV, tma_atom_SFV, sSFP_layout, sSFV_layout,
             mV_bf16, tma_atom_V_bf16, sV_bf16_layout, tP_bf16_layout, tiled_mma_pv_bf16,
+            ones_fp8, ones_bf16,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1149,6 +1258,8 @@ class FlashAttentionForwardSm100:
         sV_bf16_layout: cute.ComposedLayout | None = None,
         tP_bf16_layout: cute.ComposedLayout | None = None,
         tiled_mma_pv_bf16: cute.TiledMma | None = None,
+        ones_fp8: OnesSpec | None = None,
+        ones_bf16: OnesSpec | None = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1400,6 +1511,13 @@ class FlashAttentionForwardSm100:
             # Each CTA thread writes one unit E8M0 scale (0x7F); fence before pipeline_init_wait.
             sfp_bytes = cute.make_tensor(cute.recast_ptr(sSFP.iterator, dtype=cutlass.Uint8), cute.make_layout(512))
             sfp_bytes[cute.arch.thread_idx()[0]] = cutlass.Uint8(0x7F)
+            if const_expr(self.pv_ones_sum):
+                # Every element is 1.0 (E4M3 0x38, BF16 0x3F80), so the swizzle does not matter.
+                self.fill_smem_words(storage.sOnes.data_ptr(), cute.cosize(ones_fp8.smem_layout) // 4, 0x38383838)
+                if const_expr(ones_bf16 is not None):
+                    self.fill_smem_words(
+                        storage.sOnesB.data_ptr(), cute.cosize(ones_bf16.smem_layout) // 2, 0x3F803F80
+                    )
             cute.arch.fence_view_async_shared()
         sScale = storage.sScale.get_tensor(cute.make_layout(self.s_p_o_stage * self.m_block_size * self.num_stats))
 
@@ -1419,6 +1537,34 @@ class FlashAttentionForwardSm100:
         if const_expr(self.pv_causal_bf16):
             thr_mma_pv_bf16 = tiled_mma_pv_bf16.get_slice(mma_tile_coord_v)
             tOrP_bf16 = self.staged_p_fragment_A(thr_mma_pv_bf16, tStS, tP_bf16_layout, cutlass.BFloat16)
+
+        pv_ones = None
+        if const_expr(self.pv_ones_sum):
+
+            def ones_mma(spec: OnesSpec, smem, p_layout: cute.ComposedLayout, p_dtype) -> OnesMma:
+                sB = smem.get_tensor(spec.smem_layout.outer, swizzle=spec.smem_layout.inner)
+                return OnesMma(
+                    spec.tiled_mma,
+                    self.staged_p_fragment_A(
+                        spec.tiled_mma.get_slice(mma_tile_coord_v), tStS, p_layout, p_dtype
+                    ),
+                    spec.tiled_mma.make_fragment_B(sB)[None, None, None, 0],
+                )
+
+            thr_mma_ones = ones_fp8.tiled_mma.get_slice(mma_tile_coord_v)
+            ones_acc = thr_mma_ones.make_fragment_C(
+                thr_mma_ones.partition_shape_C((self.mma_tiler_pv[0], self.pv_ones_n))
+            )
+            num_ones_stages, ones_stage_stride = self.tmem_ones_stages
+            pv_ones = PvOnes(
+                ones_mma(ones_fp8, storage.sOnes, tP_layout, self.v_dtype),
+                ones_mma(ones_bf16, storage.sOnesB, tP_bf16_layout, cutlass.BFloat16)
+                if const_expr(ones_bf16 is not None) else None,
+                cute.make_tensor(
+                    ones_acc.iterator + self.tmem_ones_offset,
+                    cute.append(ones_acc.layout, cute.make_layout(num_ones_stages, stride=ones_stage_stride)),
+                ),
+            )
 
         block_info = BlockInfo(
             # A 2CTA pair shares one cluster-wide K/V range.
@@ -1607,6 +1753,7 @@ class FlashAttentionForwardSm100:
                 sSFQ=sSFQ, sSFK=sSFK, tmem_ptr=tmem_ptr,
                 sSFP=sSFP, sSFV=sSFV,
                 tiled_mma_pv_bf16=tiled_mma_pv_bf16, sV_bf16=sV_bf16, tOrP_bf16=tOrP_bf16,
+                pv_ones=pv_ones,
                 pipeline_sf_overlap=pipeline_sf_overlap,
             )
             # Dealloc the tensor memory buffer
@@ -1671,6 +1818,7 @@ class FlashAttentionForwardSm100:
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                tOnes=None if const_expr(pv_ones is None) else pv_ones.acc,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1722,6 +1870,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                tOnes=None if const_expr(pv_ones is None) else pv_ones.acc,
             )
             tmem_alloc_barrier.arrive_unaligned()
 
@@ -2145,6 +2294,7 @@ class FlashAttentionForwardSm100:
         tiled_mma_pv_bf16: cute.TiledMma | None = None,
         sV_bf16: cute.Tensor | None = None,
         tOrP_bf16: cute.Tensor | None = None,
+        pv_ones: PvOnes | None = None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -2418,7 +2568,7 @@ class FlashAttentionForwardSm100:
                                 const_expr(self.pv_causal_bf16)
                                 and n_block_max - 1 - i >= n_block_min_bf16,
                                 not O_should_accumulate, P_full_O_rescaled_phase,
-                                tV_bf16=tOrV_bf16, sV_bf16=sV_bf16,
+                                tV_bf16=tOrV_bf16, sV_bf16=sV_bf16, ones=pv_ones,
                             )
                             # Don't need to signal O_full to the correction warps since the
                             # correction warps wait for the softmax warps anyway. By the time the softmax
@@ -2449,6 +2599,15 @@ class FlashAttentionForwardSm100:
                             if const_expr(self.qk_blockscaled):
                                 if const_expr(self.sf_overlap):
                                     pipeline_sf_overlap.producer_acquire_w_index_phase(stage, sf_overlap_phase ^ stage)
+                                if const_expr(self.pv_ones_step_sum):
+                                    # For stage 0, softmax has finished reading stage 1's scores. Store
+                                    # stage 0's row sum in the last 16 columns of stage 1 before the next
+                                    # QK overwrites stage 0's P. Swap the stages for stage 1. BF16-band
+                                    # PVs have no sum MMA (NOTE [Rounded-P PV row sums in TMEM]).
+                                    if const_expr(not self.pv_causal_bf16) or n_block_max - 1 - i < n_block_min_bf16:
+                                        self.gemm_p_ones(
+                                            pv_ones.fp8, self.ones_tile(pv_ones.acc, stage), stage, True
+                                        )
                                 self.copy_sf_to_tmem(sf_copies[stage], stage, Ki_index)
                                 gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index])
                             else:
@@ -2486,7 +2645,7 @@ class FlashAttentionForwardSm100:
                             pipeline_p_lastsplit, stage, mma_kv_consumer_state,
                             const_expr(self.pv_causal_bf16) and n_block_min >= n_block_min_bf16,
                             not O_should_accumulate, P_full_O_rescaled_phase,
-                            tV_bf16=tOrV_bf16, sV_bf16=sV_bf16,
+                            tV_bf16=tOrV_bf16, sV_bf16=sV_bf16, ones=pv_ones,
                         )
                         # 4. release accumulated O0_partial
                         # We do need O_full here since for the last tile, by the time the softmax warp
@@ -2629,6 +2788,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        tOnes: cute.Tensor | None = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2677,6 +2837,18 @@ class FlashAttentionForwardSm100:
             self.tmem_p_store(tSAcc, tidx, cutlass.BFloat16) if const_expr(self.pv_causal_bf16)
             else (None, None)
         )
+
+        ones_load = None
+        if const_expr(self.pv_ones_step_sum):
+            # This stage's per-step sum(P) (stage is a run-time value here).
+            tStOnes = self.ones_sum_column(tOnes, stage)
+            thr_tmem_load_ones = tcgen05.make_tmem_copy(
+                cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)), Float32), tStOnes
+            ).get_slice(tidx)
+            ones_load = OnesLoad(
+                thr_tmem_load_ones, thr_tmem_load_ones.partition_S(tStOnes),
+                thr_tmem_load_ones.partition_D(tScScale).shape,
+            )
 
         s_p_o_consumer_count = Int32(0)
         sm_stats_producer_phase = Int32(1)
@@ -2778,6 +2950,13 @@ class FlashAttentionForwardSm100:
                 track_unquantized_sum=self.track_unquantized_sum,
             )
             softmax.reset()
+            delayed_sum = None
+            if const_expr(self.pv_ones_step_sum):
+                # (pending, scale): a step whose sum comes from the ones MMA adds it one step later.
+                ones_pend = cute.make_rmem_tensor(2, Float32)
+                ones_pend[0] = Float32(0.0)
+                ones_pend[1] = Float32(1.0)
+                delayed_sum = DelayedRowSum(ones_load, ones_pend)
 
             if const_expr(self.use_block_sparsity):
                 tile_block_count = get_total_block_count(
@@ -2822,6 +3001,8 @@ class FlashAttentionForwardSm100:
                 aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
+                delayed_sum=delayed_sum,
+                n_block_min=n_block_min,
             )
 
             softmax_step_masked = softmax_step
@@ -2917,9 +3098,19 @@ class FlashAttentionForwardSm100:
                     n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
                         seqlen, work_m, n_block_min
                     )
-                    for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
+                    n_unmasked = n_block_max - n_block_min_before_local_mask
+                    if const_expr(self.pv_ones_step_sum):
+                        # Peel the tile's last step (it sums its own P): a runtime last-step
+                        # branch in the loop body is measurably slower.
+                        n_unmasked -= 1
+                    for n_tile in cutlass.range(n_unmasked, unroll=1):
                         n_block = n_block_max - n_tile - 1
-                        if const_expr(self.mask_mod is not None):
+                        if const_expr(self.pv_ones_step_sum):
+                            s_p_o_consumer_count, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
+                                s_p_o_consumer_count, sm_stats_producer_phase, s0_s1_sequence_phase, n_block,
+                                tile_last=False,
+                            )
+                        elif const_expr(self.mask_mod is not None):
                             s_p_o_consumer_count, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
                                 s_p_o_consumer_count, sm_stats_producer_phase, s0_s1_sequence_phase, n_block,
                                 mask_fn=partial(mask_fn, mask_seqlen=False),
@@ -2927,6 +3118,12 @@ class FlashAttentionForwardSm100:
                         else:
                             s_p_o_consumer_count, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
                                 s_p_o_consumer_count, sm_stats_producer_phase, s0_s1_sequence_phase, n_block,
+                            )
+                    if const_expr(self.pv_ones_step_sum):
+                        if n_unmasked >= 0:
+                            s_p_o_consumer_count, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
+                                s_p_o_consumer_count, sm_stats_producer_phase, s0_s1_sequence_phase,
+                                n_block_max - n_unmasked - 1, tile_last=True,
                             )
                     # Separate iterations with local masking on the left
                     if const_expr(self.is_local and block_info.window_size_left is not None):
@@ -3027,11 +3224,16 @@ class FlashAttentionForwardSm100:
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
         p_dtype: cutlass.Constexpr = None,
+        delayed_sum: DelayedRowSum | None = None,
+        n_block_min: Int32 | None = None,
+        tile_last: cutlass.Constexpr[bool | None] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Update online-softmax statistics and publish P for one KV block.
 
         mask_fn=None permits the tcgen05.ld.red maximum when enabled.
         s_p_o_consumer_count is the block count with S ping-pong, otherwise the S phase.
+        tile_last (pv_ones_step_sum): this block is the tile's last, so its softmax sums its own
+        P; None decides at run time from n_block == n_block_min.
         """
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         p_dtype = self.v_dtype if const_expr(p_dtype is None) else p_dtype
@@ -3064,6 +3266,22 @@ class FlashAttentionForwardSm100:
                 hw_row_max = cute.arch.fmax(hw_row_max, tSrS_red[i])
         else:
             cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        tSrOnes = None
+        if const_expr(self.pv_ones_step_sum and not is_first and p_dtype.width == 8):
+            # The previous step's sum(P), valid iff pending. Read before the sf_overlap release
+            # below, which lets the other stage's next QK overwrite these columns.
+            ones_load = delayed_sum.load
+            tStOnes = ones_load.src
+            if const_expr(self.pv_causal_bf16):
+                # After the BF16 band nothing is pending, and the other stage may still write P
+                # here. The discarded read is harmless, but we guard it regardless: read this
+                # stage's own S columns (a branch was slower). NOTE [Rounded-P PV row sums in TMEM].
+                idle = Int32(delayed_sum.pending[0] == Float32(0.0))
+                tStOnes = cute.make_tensor(
+                    tStOnes.iterator + idle * (2 * stage - 1) * self.tmem_ones_stages[1], tStOnes.layout
+                )
+            tSrOnes = cute.make_rmem_tensor(ones_load.dst_shape, Float32)
+            cute.copy(ones_load.thr_copy, tStOnes, tSrOnes)
         if const_expr(self.sf_overlap):
             # All lanes must finish the asynchronous S load before tcgen05.cp can reuse it.
             cute.arch.fence_view_async_tmem_load()
@@ -3122,7 +3340,7 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=p_dtype), tSrS_t2r.layout
         )
         unquantized_sum_init = None
-        if const_expr(self.track_unquantized_sum and (not self.dedicated_sf or self.pv_fp32_normalizer)):
+        if const_expr(self.track_unquantized_sum):
             unquantized_sum_init = Float32(0.0)
             if const_expr(not is_first):
                 unquantized_sum_init = softmax.row_sum_unquantized[0] * acc_scale
@@ -3164,16 +3382,29 @@ class FlashAttentionForwardSm100:
         if const_expr(self.pv_fp32_normalizer):
             # O and LSE share the FP32 sum reduced per fragment in apply_exp2_convert.
             softmax.row_sum[0] = softmax.row_sum_unquantized[0]
-        elif const_expr(self.pv_blockscaled and not self.dedicated_sf):
-            softmax.update_row_sum_quantized_streaming(tSrP_r2t_f32, p_dtype, acc_scale, is_first)
+        elif const_expr(self.pv_ones_acc_sum):
+            pass  # The correction warps read the tensor-core sum of the quantized P.
+        elif const_expr(self.pv_ones_step_sum and p_dtype.width == 8):
+            # row_sum = row_sum * acc_scale + sum(P), as update_row_sum_quantized_streaming, but one
+            # step late when the ones MMA supplies sum(P) (NOTE [Rounded-P PV row sums in TMEM]).
+            # BF16 diagonal steps precede every E4M3 step and keep the software sum (next branch).
+            ones_pend = delayed_sum.pending
+            if const_expr(is_first):
+                softmax.row_sum[0] = Float32(0.0)
+            else:
+                if ones_pend[0] != Float32(0.0):
+                    softmax.row_sum[0] = softmax.row_sum[0] * ones_pend[1] + tSrOnes[0]
+            # The tile's last PV has no ones MMA, so that step sums its own P.
+            sums_own_p = n_block == n_block_min if const_expr(tile_last is None) else tile_last
+            if sums_own_p:
+                ones_pend[0] = Float32(0.0)
+                ones_pend[1] = Float32(1.0)
+                softmax.update_row_sum_quantized_streaming(tSrP_r2t_f32, p_dtype, acc_scale, False)
+            else:
+                ones_pend[0] = Float32(1.0)
+                ones_pend[1] = acc_scale
         elif const_expr(self.pv_blockscaled):
-            # E4M3 is exact in FP16, but BF16's small probabilities are not.
-            mixed_sum = self.dedicated_sf and p_dtype.width == 8
-            softmax.update_row_sum_quantized(
-                tSrS_t2r.load(),
-                tSrP_r2t.load().to(cutlass.Float16 if const_expr(mixed_sum) else Float32),
-                acc_scale, is_first, use_mixed_sum=mixed_sum,
-            )
+            softmax.update_row_sum_quantized_streaming(tSrP_r2t_f32, p_dtype, acc_scale, is_first)
         else:
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
@@ -3208,6 +3439,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        tOnes: cute.Tensor | None = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -3227,6 +3459,16 @@ class FlashAttentionForwardSm100:
 
         tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
+        tStOnes_t2r, tStOnes_r2t, thr_tmem_store_vec = None, None, None
+        if const_expr(self.pv_ones_acc_sum):
+            # This thread's running row sum of P (NOTE [Rounded-P PV row sums in TMEM]).
+            tStOnes = [self.ones_sum_column(tOnes, stage) for stage in range(self.q_stage)]
+            tmem_store_v_atom = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(1)), self.qk_acc_dtype
+            )
+            thr_tmem_store_vec = tcgen05.make_tmem_copy(tmem_store_v_atom, tStOnes[0]).get_slice(tidx)
+            tStOnes_t2r = [thr_tmem_load_vec.partition_S(t) for t in tStOnes]
+            tStOnes_r2t = [thr_tmem_store_vec.partition_D(t) for t in tStOnes]
 
         # First iter: no correction is required
         # Notify mma warp that O has been rescaled
@@ -3344,6 +3586,14 @@ class FlashAttentionForwardSm100:
                                     o_acc_consumer_count & 1, (o_acc_consumer_count >> 1) & 1
                                 )
                             self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
+                            if const_expr(self.pv_ones_acc_sum):
+                                # The P row sum accumulates like O, so it takes the same rescale
+                                # (NOTE [Rounded-P PV row sums in TMEM]).
+                                tSrOnes = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
+                                cute.copy(thr_tmem_load_vec, tStOnes_t2r[stage], tSrOnes)
+                                tSrOnes[0] = tSrOnes[0] * scale
+                                cute.copy(thr_tmem_store_vec, tSrOnes, tStOnes_r2t[stage])
+                                cute.arch.fence_view_async_tmem_store()
                         # Notify mma warp that O has been rescaled
                         if const_expr(self.use_s_ping_pong):
                             pipeline_s_p_o.consumer_release_w_index((o_acc_consumer_count + 1) & 1)
@@ -3395,6 +3645,13 @@ class FlashAttentionForwardSm100:
                     else:
                         row_sum_lse = row_sum
                     pipeline_sm_stats.consumer_release_w_index(sm_stats_index)
+                    if const_expr(self.pv_ones_acc_sum):
+                        # Normalize by the running sum of the quantized P once the last PV is done
+                        # (NOTE [Rounded-P PV row sums in TMEM]).
+                        pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
+                        tSrOnes = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
+                        cute.copy(thr_tmem_load_vec, tStOnes_t2r[stage], tSrOnes)
+                        row_sum = tSrOnes[0]
                     if const_expr(learnable_sink is not None):
                         # Only the first split owns the sink column; empty rows occur with splitKV.
                         if const_expr(not self.is_split_kv) or split_idx == 0:
@@ -3416,7 +3673,7 @@ class FlashAttentionForwardSm100:
                         pipeline_o_acc.consumer_wait_w_index_phase(
                             o_acc_consumer_count & 1, (o_acc_consumer_count >> 1) & 1
                         )
-                    else:
+                    elif const_expr(not self.pv_ones_acc_sum):
                         pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     if const_expr(not self.use_correction_warps_for_epi):
                         pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
@@ -4026,13 +4283,14 @@ class FlashAttentionForwardSm100:
     def gemm_pv(
         self, gemm_Pi: list, tiled_mma, tO, tP, tV, sV, sf_copies, pipeline_p_lastsplit,
         stage: cutlass.Constexpr, v_state: pipeline.PipelineState, use_bf16, zero_init, mbar_phase,
-        tV_bf16=None, sV_bf16=None,
+        tV_bf16=None, sV_bf16=None, ones: PvOnes | None = None,
     ):
         """O[stage] (+)= P[stage] @ V for the V stage v_state, on native MXFP8 or gemm_Pi.
 
         Causal native PV runs its BF16 band (use_bf16) on gemm_Pi with the original V
         (tV_bf16, sV_bf16). With split P arrival, the MMA waits on the stage's last-split
-        barrier at mbar_phase.
+        barrier at mbar_phase. With pv_ones_acc_sum, each native PV is followed by P @ ones
+        (ones) into the stage's row-sum columns, in the P dtype of that block.
         """
         mbar_ptr = (
             pipeline_p_lastsplit.sync_object_full.get_barrier(stage)
@@ -4045,15 +4303,17 @@ class FlashAttentionForwardSm100:
                     tCrB=tV_bf16[None, None, None, v_state.index],
                     sB=sV_bf16[None, None, None, v_state.index],
                 )
+                if const_expr(self.pv_ones_acc_sum):
+                    self.gemm_p_ones(ones.bf16, self.ones_tile(ones.acc, stage), stage, zero_init)
             else:
                 self.gemm_pv_native(
                     tiled_mma, tO, tP, tV, sf_copies[stage], stage, v_state.index, zero_init,
-                    mbar_ptr=mbar_ptr, mbar_phase=mbar_phase,
+                    mbar_ptr=mbar_ptr, mbar_phase=mbar_phase, ones=ones,
                 )
         elif const_expr(self.pv_blockscaled):
             self.gemm_pv_native(
                 tiled_mma, tO, tP, tV, sf_copies[stage], stage, v_state.index, zero_init,
-                mbar_ptr=mbar_ptr, mbar_phase=mbar_phase,
+                mbar_ptr=mbar_ptr, mbar_phase=mbar_phase, ones=ones,
             )
         else:
             gemm_dense(tCrB=tV[None, None, None, v_state.index], sB=self.kv_smem_stage(sV, v_state))
@@ -4061,11 +4321,12 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def gemm_pv_native(
         self, tiled_mma, tO, tP, tV, sf: BlockScaledSf, stage: cutlass.Constexpr, v_index,
-        zero_init, mbar_ptr=None, mbar_phase=None,
+        zero_init, mbar_ptr=None, mbar_phase=None, ones: PvOnes | None = None,
     ):
         """O[stage] (+)= P[stage] @ V[v_index] with E4M3 P and MXFP8 V.
 
-        With split P arrival, mbar_ptr is the stage's last-split barrier.
+        With split P arrival, mbar_ptr is the stage's last-split barrier. With pv_ones_acc_sum,
+        P[stage] @ ones follows into the stage's row-sum columns.
         """
         self.copy_sf_to_tmem(sf, 0, v_index)
         sm100_utils.gemm_blockscaled(
@@ -4074,6 +4335,8 @@ class FlashAttentionForwardSm100:
             mbar_ptr=mbar_ptr, mbar_phase=mbar_phase,
             split_k=self.split_P_arrive // tiled_mma.op.shape_mnk[2],
         )
+        if const_expr(self.pv_ones_acc_sum):
+            self.gemm_p_ones(ones.fp8, self.ones_tile(ones.acc, stage), stage, zero_init)
 
     def staged_p_fragment_A(
         self, thr_mma: cute.ThrMma, tStS: cute.Tensor, tP_layout: cute.ComposedLayout,
@@ -4107,6 +4370,42 @@ class FlashAttentionForwardSm100:
         )
         thr_tmem_store = tcgen05.make_tmem_copy(atom, tStP).get_slice(tidx)
         return thr_tmem_store, thr_tmem_store.partition_D(tStP)
+
+    def ones_tile(self, tOnes: cute.Tensor, stage: int | Int32) -> cute.Tensor:
+        """Stage's slice of tOnes, whose last mode is the TMEM stage holding each P @ ones tile:
+        S_{1-stage} on sm_100/sm_103, the stage's own dedicated tile on sm_107
+        (NOTE [Rounded-P PV row sums in TMEM])."""
+        holder = stage if const_expr(self.pv_ones_acc_sum) else 1 - stage
+        return tOnes[(None,) * (cute.rank(tOnes) - 1) + (holder,)]
+
+    def ones_sum_column(self, tOnes: cute.Tensor, stage: int | Int32) -> cute.Tensor:
+        """(m_block_size, 1) TMEM view of column 0 of stage's P @ ones tile: each row's sum(P)."""
+        tile = self.ones_tile(tOnes, stage)
+        return cute.make_tensor(
+            tile.iterator, cute.composition(tile.layout, cute.make_layout((self.m_block_size, 1)))
+        )
+
+    @cute.jit
+    def gemm_p_ones(self, ones: OnesMma, acc, stage: cutlass.Constexpr, zero_init):
+        """Add this P block's row sum to each accumulator column (zero_init: store it).
+
+        On sm_107, correction rescales only column 0, so that's the column to read for normalization.
+        """
+        tA = ones.tA[None, None, None, stage]
+        for k in cutlass.range(cute.size(tA.shape[2]), unroll_full=True):
+            ones.tiled_mma.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
+            cute.gemm(ones.tiled_mma, acc, tA[None, None, k], ones.tB[None, None, k], acc)
+
+    @cute.jit
+    def fill_smem_words(self, ptr: cute.Pointer, num_words: cutlass.Constexpr, value: cutlass.Constexpr):
+        """All CTA threads fill num_words 32-bit words at ptr with value (caller fences)."""
+        assert num_words % self.threads_per_cta == 0, (num_words, self.threads_per_cta)
+        words = cute.make_tensor(cute.recast_ptr(ptr, dtype=cutlass.Uint32), cute.make_layout(num_words))
+        # (threads_per_cta, tiles): each thread stores one word per threads_per_cta-word tile.
+        tiles = cute.zipped_divide(words, (self.threads_per_cta,))
+        thread_words = tiles[cute.arch.thread_idx()[0], None]
+        for w in cutlass.range_constexpr(cute.size(thread_words)):
+            thread_words[w] = cutlass.Uint32(value)
 
     @cute.jit
     def offset_kv_smem(self, sX: cute.Tensor, stage: Int32, phase: Int32):

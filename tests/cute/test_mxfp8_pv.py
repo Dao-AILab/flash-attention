@@ -304,3 +304,39 @@ def test_mxfp8_pv_causal_no_future_leakage(dim, sq, sk, hq, hk, pv_normalizer):
             out2, lse2, _ = run(v2)
             assert torch.equal(out2[:, :rows].view(torch.uint8), out[:, :rows].view(torch.uint8))
             assert torch.equal(lse2[..., :rows].view(torch.uint8), lse[..., :rows].view(torch.uint8))
+
+
+@pytest.mark.parametrize("dim,sq,sk", [(128, 1024, 1024), (64, 1000, 1100)])
+@pytest.mark.parametrize("pv_normalizer", ["rounded_p", "fp32"])
+def test_mxfp8_pv_causal_new_max_after_band(dim, sq, sk, pv_normalizer):
+    """Each KV block raises the row maximum, including the first E4M3 block after the BF16 band.
+
+    Its rescale crosses the BF16-to-E4M3 transition of the row sum: V = 1 must return 1 on every
+    visible row for "rounded_p", and LSE must match the FP64 logits.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family GPU")
+    # Logit of key j: about -floor(j / 16) / 8. Block n's largest key, -n, is exact in E4M3, and
+    # rounding is monotonic, so every key of block n + 1 stays at or below -(n + 1).
+    q = torch.zeros(1, sq, 2, dim, device="cuda")
+    q[..., 0] = math.sqrt(dim)
+    k = torch.zeros(1, sk, 2, dim, device="cuda")
+    k[..., 0] = (-(torch.arange(sk, device="cuda") // 16) / 8)[None, :, None]
+    ones = torch.ones(1, sk, 2, dim, device="cuda", dtype=torch.bfloat16)
+    q8, sfq, qs = quantize_to_fp8_with_sf(q)
+    k8, sfk, ks = quantize_to_fp8_with_sf(k)
+    v8, sfv, vs = quantize_v_to_fp8_with_sf(ones)
+    out, lse = flash_attn_func(
+        q8, k8, v8, causal=True, return_lse=True,
+        scales=BlockScales(
+            interleave_sf(sfq), interleave_sf(sfk), sfv, v_bf16=ones, pv_normalizer=pv_normalizer
+        ),
+    )
+    _, _, lse_ref = reference(
+        dequantize_fp8_with_sf(q8, qs), dequantize_fp8_with_sf(k8, ks),
+        dequantize_v_fp8_with_sf(v8, vs), pv_normalizer=pv_normalizer, causal=True, v_bf16=ones,
+    )
+    visible = out[:, max(sq - sk, 0):].float()
+    atol = 1e-5 if pv_normalizer == "rounded_p" else 2**-4
+    torch.testing.assert_close(visible, torch.ones_like(visible), atol=atol, rtol=0)
+    torch.testing.assert_close(lse, lse_ref.float(), atol=2e-4, rtol=2e-5, equal_nan=True)

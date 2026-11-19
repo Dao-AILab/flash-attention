@@ -406,43 +406,6 @@ class SoftmaxSm100(Softmax):
         # self.row_sum[0] = self.row_sum[0] * row_scale + tmp
 
     @cute.jit
-    def update_row_sum_quantized(
-        self,
-        p_fp32: cute.TensorSSA,
-        p_quantized: cute.TensorSSA,
-        row_scale: Float32,
-        is_first: int = False,
-        use_mixed_sum: cutlass.Constexpr[bool] = False,
-    ) -> None:
-        """Normalize O with the P consumed by PV, while retaining FP32 LSE statistics."""
-        if cutlass.const_expr(self.row_sum_unquantized is not None):
-            init_val = (
-                self.row_sum_unquantized[0] * row_scale
-                if cutlass.const_expr(not is_first)
-                else None
-            )
-            self.row_sum_unquantized[0] = self._compute_row_sum(p_fp32, init_val=init_val)
-        if cutlass.const_expr(use_mixed_sum):
-            # E4M3 is exact in FP16. sm_107 can add each FP16 pair directly into
-            # FP32, avoiding a scalar half->float conversion for every key.
-            p = cute.make_rmem_tensor(p_quantized.shape, cutlass.Float16)
-            p.store(p_quantized)
-            init = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else Float32(0.0)
-            sums = [(init, Float32(0.0))] + [(Float32(0.0), Float32(0.0))] * 3
-            for i in cutlass.range_constexpr(0, cute.size(p), 8):
-                for j in cutlass.range_constexpr(4):
-                    sums[j] = cute.arch.add_packed_f32x2_f16x2_f32x2(
-                        (p[i + 2 * j], p[i + 2 * j + 1]),
-                        sums[j],
-                    )
-            sums[0] = cute.arch.add_packed_f32x2(sums[0], sums[1])
-            sums[2] = cute.arch.add_packed_f32x2(sums[2], sums[3])
-            sums[0] = cute.arch.add_packed_f32x2(sums[0], sums[2])
-            self.row_sum[0] = sums[0][0] + sums[0][1]
-        else:
-            self.update_row_sum(p_quantized, row_scale, is_first)
-
-    @cute.jit
     def update_row_sum_quantized_streaming(
         self,
         p_packed: cute.Tensor,
@@ -450,7 +413,7 @@ class SoftmaxSm100(Softmax):
         row_scale: Float32,
         is_first: int = False,
     ) -> None:
-        """update_row_sum_quantized for sm_100, after apply_exp2_convert reduced the FP32 P.
+        """Row sum of the quantized P that PV consumes, after apply_exp2_convert reduced the FP32 P.
 
         p_packed holds P in its 32-bit storage registers. Sums of E4M3 P (multiples of 2^-9 below
         2^15) are exact in FP32 in any order; the previous row sum is added once at the end.
