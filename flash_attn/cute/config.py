@@ -416,6 +416,7 @@ class PvFp32Tuning(NamedTuple):
 
     registers: Sm100Registers | None = None  # None: native-PV split
     ex2_emu_freq: int = 0
+    ex2_emu_start_frg: int | None = None  # None: the dtype tuning's start fragment
 
 
 # Keyed by arch, then (head_dim_padded, is_causal); missing keys keep the defaults. sm_107 is tuned
@@ -428,9 +429,17 @@ MXFP8_PV_FP32_TUNING = {
         (128, True): PvFp32Tuning(Sm100Registers(192, 64, 64), ex2_emu_freq=8),
         (64, False): PvFp32Tuning(ex2_emu_freq=8),
         (64, True): PvFp32Tuning(ex2_emu_freq=8),
+        (256, False): PvFp32Tuning(
+            Sm100Registers(208, 64, 120), ex2_emu_freq=8, ex2_emu_start_frg=1
+        ),
+        (256, True): PvFp32Tuning(
+            Sm100Registers(208, 64, 120), ex2_emu_freq=8, ex2_emu_start_frg=1
+        ),
     },
-    # The "rounded_p" registers are already the best choice.
-    "sm_103": {},
+    "sm_103": {
+        # hd64/hd128 keep the "rounded_p" registers; hd256 non-causal takes the sm_100 split.
+        (256, False): PvFp32Tuning(Sm100Registers(208, 64, 120)),
+    },
 }
 
 
@@ -474,6 +483,9 @@ SM107_MXFP8_PV_TUNING = {
     ),
     (PvNormalizer.FP32, 64, False): Sm107PvTuning(Sm100Registers(168, 96, 80), stats_mbarrier=True),
     (PvNormalizer.FP32, 64, True): Sm107PvTuning(Sm100Registers(192, 64, 64), stats_mbarrier=True),
+    # hd256 (S ping-pong) keeps the per-warp stats barriers, which its slot protocol uses.
+    (PvNormalizer.FP32, 256, False): Sm107PvTuning(split_p=True),
+    (PvNormalizer.FP32, 256, True): Sm107PvTuning(split_p=True),
 }
 # NOTE [softmax stats release order]
 # The SM100 correction warpgroup frees softmax stage s's pipeline_sm_stats slot in either order:
@@ -604,6 +616,11 @@ def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs, *, q_stage: int) -> Sm
         return sm107_pv_tuning(inputs).registers
     if fp32_registers := mxfp8_pv_fp32_tuning(inputs).registers:
         return fp32_registers
+    if inputs.is_hdim256 and family == "sm_100":
+        # S ping-pong has one softmax warpgroup, which the splits below (sized for two) do not
+        # use fully; sm_100 is softmax-bound. On sm_103 "rounded_p" this split measured flat, so it
+        # keeps the splits below.
+        return Sm100Registers(208, 64, 120)
     rounded_p = inputs.pv_normalizer is PvNormalizer.ROUNDED_P
     if rounded_p and q_stage == 2 and inputs.head_dim_padded >= 96:
         # The ones MMA (pv_ones_step_sum) adds register pressure outside the softmax warps: hd128
@@ -681,7 +698,10 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
     if sm100_native_pv(inputs):
         # "rounded_p" keeps MUFU.EX2: polynomial exp2 can cross E4M3 rounding boundaries.
         # "fp32" permits emulation according to its tuning row.
-        freq = mxfp8_pv_fp32_tuning(inputs).ex2_emu_freq
+        tuning = mxfp8_pv_fp32_tuning(inputs)
+        freq = tuning.ex2_emu_freq
+        if tuning.ex2_emu_start_frg is not None:
+            start_frg = tuning.ex2_emu_start_frg
         return (freq, start_frg) if freq else (0, 0)
     if "ex2_emu_freq" in tune:
         enabled = tune["ex2_emu_freq"] > 0
@@ -1227,22 +1247,32 @@ def sm100_fwd_scale_bytes(inputs: FwdHeuristicInputs, *, q_stage: int) -> tuple[
     """
     if inputs.mxfp8_path is None:
         return 0, 0, 0
-    chunk_bytes = 128 * 4 * ceil_div(inputs.head_dim, 128)
-    return q_stage * chunk_bytes, chunk_bytes, 512 if sm100_native_pv(inputs) else 0
+    native_pv = sm100_native_pv(inputs)
+    # A K/V stage holds K's scales, and native PV's V scales in the same slot.
+    kv_dim = max(inputs.head_dim, inputs.head_dim_v) if native_pv else inputs.head_dim
+    return (
+        q_stage * 512 * ceil_div(inputs.head_dim, 128),
+        512 * ceil_div(kv_dim, 128),
+        512 if native_pv else 0,
+    )
 
 
-def sm100_pv_ones_bytes(inputs: FwdHeuristicInputs, *, q_stage: int) -> tuple[int, ...]:
-    """Bytes of each all-ones SMEM field of "rounded_p" native PV, in declaration order.
+def sm100_pv_ones_bytes(
+    inputs: FwdHeuristicInputs, *, q_stage: int, use_2cta_instrs: bool
+) -> tuple[int, ...]:
+    """Per-CTA bytes of each all-ones SMEM field of "rounded_p" native PV, in declaration order
+    (2CTA splits each B tile across the pair).
 
     sm_107 (pv_ones_acc_sum): the E4M3 tile, then the BF16 one, empty without causal.
-    sm_100/sm_103: the E4M3 tile with two Q stages (pv_ones_step_sum), otherwise none.
+    sm_100/sm_103: the E4M3 tile with two Q stages (pv_ones_step_sum) or hd256's S ping-pong
+    (pv_ones_pp_sum), otherwise none.
     """
     if not sm100_native_pv(inputs) or inputs.pv_normalizer is PvNormalizer.FP32:
         return ()
-    tile = SM100_PV_ONES_TILE_ELEMS
+    tile = SM100_PV_ONES_TILE_ELEMS // (2 if use_2cta_instrs else 1)
     if sm100_arch_family(inputs.device_arch) == "sm_107":
         return tile, 2 * tile if inputs.causal else 0
-    return (tile,) if q_stage == 2 else ()
+    return (tile,) if q_stage == 2 or inputs.is_hdim256 else ()
 
 
 def select_sm100_smem_layout(
@@ -1283,7 +1313,10 @@ def select_sm100_smem_layout(
     # MXFP8 Q scales count with sQ, and each K/V stage holds its scales. The budget charges each
     # all-ones field a full alignment pad.
     sfq, sfkv, sfp = sm100_fwd_scale_bytes(inputs, q_stage=q_stage)
-    ones = sum(b + SM100_PV_ONES_ALIGN_BYTES for b in sm100_pv_ones_bytes(inputs, q_stage=q_stage))
+    ones = sum(
+        b + SM100_PV_ONES_ALIGN_BYTES
+        for b in sm100_pv_ones_bytes(inputs, q_stage=q_stage, use_2cta_instrs=use_2cta_instrs)
+    )
     q_o = (max(q + sfq, o) if overlap_sO_sQ else q + sfq + o) + sfp + ones
     budget_kib = sm107_pv_tuning(inputs).smem_budget_kib
     budget = _SM100_KV_STAGE_BUDGET_BYTES if budget_kib is None else budget_kib * 1024
@@ -1356,7 +1389,9 @@ def sm100_fwd_smem_bytes(config: FwdConfig, inputs: FwdHeuristicInputs) -> int:
     sfq, sfkv, sfp = sm100_fwd_scale_bytes(inputs, q_stage=q_stage)
     if sfq:
         total = round_up(round_up(total + sfq, 128) + kv_stage * sfkv, 128) + sfp
-        for ones in sm100_pv_ones_bytes(inputs, q_stage=q_stage):
+        for ones in sm100_pv_ones_bytes(
+            inputs, q_stage=q_stage, use_2cta_instrs=config.use_2cta_instrs
+        ):
             total = round_up(total, SM100_PV_ONES_ALIGN_BYTES) + ones
         total = round_up(total, align)
     return total
