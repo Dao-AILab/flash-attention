@@ -248,7 +248,7 @@ def _flash_attn_forward_fake(
             out_accum = torch.empty((num_splits, batch_size, num_heads, seqlen_q, head_size_v), dtype=torch.float32, device=q.device)
             softmax_lse_accum = torch.empty((num_splits, batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device)
     else:
-        # Tensors are not set when num_splits < 1
+        # num_splits == 1: no accumulator needed, pass empty placeholders to the kernel
         out_accum = torch.tensor([], device=out.device)
         softmax_lse_accum = torch.tensor([], device=out.device)
 
