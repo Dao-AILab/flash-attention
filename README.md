@@ -1,4 +1,9 @@
 # FlashAttention
+
+<p align="center">
+  <b>English</b> · <a href="README.zh.md">简体中文</a>
+</p>
+
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
 following papers.
