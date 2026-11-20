@@ -261,7 +261,9 @@ struct CollectiveMainloopBwdSm90 {
     // statistic for 2 rows.
     static constexpr bool ShuffleLSE = SdP_swapAB && kHeadDim <= 64;
     static constexpr bool ShuffledPsum = SdP_swapAB && kHeadDim <= 64;
-    static constexpr bool dQacc_use_TMA = kHeadDim < 256;
+    // Deterministic hdim256 uses a smaller tile to leave room for the
+    // shared-memory dQ buffer and reuse the ordered TMA reduction.
+    static constexpr bool dQacc_use_TMA = kHeadDim < 256 || Deterministic;
     // For hdim256, we want to slice the dQ MMA (64 x 256 on 2 WGs) into two (64 x 128 on 2 WGs) so that we can
     // do atomic add on one half before doing the other half of the MMA, to reduce register pressure.
     static constexpr bool Slice_dQKV_Mma = kHeadDim == 256 && !dQacc_use_TMA && dQ_swapAB && AtomLayoutMdQ == 1 && NumMmaWarpGroups == 2;
