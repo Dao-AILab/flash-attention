@@ -6,6 +6,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Boolean, Int8, Int32, const_expr
 
+from flash_attn.cute.compat import SmemAllocator
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensors,
     BlockSparseTensorsTorch,
@@ -144,7 +145,7 @@ class BlockSparsityKernel:
                 cute.struct.MemRange[cutlass.Int8, 2 * self.num_warps], 1024
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage, 16)
 
         reduction_buffer = storage.reduction_buffer_smem.get_tensor(
