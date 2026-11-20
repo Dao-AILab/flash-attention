@@ -32,6 +32,7 @@ from flash_attn_interface import flash_attn_with_kvcache, get_scheduler_metadata
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV", "FALSE") == "TRUE"
+DISABLE_VARLEN = os.getenv("FLASH_ATTENTION_DISABLE_VARLEN", "FALSE") == "TRUE"
 DISABLE_APPENDKV = os.getenv("FLASH_ATTENTION_DISABLE_APPENDKV", "FALSE") == "TRUE"
 DISABLE_LOCAL = os.getenv("FLASH_ATTENTION_DISABLE_LOCAL", "FALSE") == "TRUE"
 DISABLE_SOFTCAP = os.getenv("FLASH_ATTENTION_DISABLE_SOFTCAP", "FALSE") == "TRUE"
@@ -1051,6 +1052,51 @@ def test_flash_attn_kvcache(
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
 
 
+@pytest.mark.skipif(
+    DISABLE_PAGEDKV or DISABLE_HDIM128,
+    reason="Requires paged KV and head dimension 128",
+)
+@pytest.mark.parametrize("page_size", [176, 256])
+@pytest.mark.parametrize("page_table_view", [False, True], ids=["empty", "view"])
+@pytest.mark.parametrize("cache_seqlens", [None] + ([0] if not DISABLE_VARLEN else []))
+@pytest.mark.parametrize("num_splits", [0, 1, 3] if not DISABLE_SPLIT else [1])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_kvcache_empty_page_table(
+    page_size, page_table_view, cache_seqlens, num_splits, causal,
+):
+    torch.random.manual_seed(0)
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, nheads, d = 2, 256, 2, 128
+    # Reproduce the Hopper paged-TMA (176) and non-TMA (256) configurations.
+    # The empty-KV path should bypass both attention kernels.
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(4, page_size, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    if page_table_view:
+        # Preserve backing storage, as in the original out-of-bounds reproducer.
+        page_table = torch.zeros(batch_size, 4, dtype=torch.int32, device=device)[:, :0]
+    else:
+        page_table = torch.empty(batch_size, 0, dtype=torch.int32, device=device)
+
+    out, lse, *_ = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        num_splits=num_splits,
+        causal=causal,
+        return_softmax_lse=True,
+    )
+
+    assert out.shape == q.shape
+    assert lse.shape == (batch_size, nheads, seqlen_q)
+    assert (out == 0).all().item()
+    # Match the existing host-side empty-KV behavior, including the LSE sign.
+    assert torch.isposinf(lse).all().item()
+
+
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref):
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
     k_cache_paged = torch.randn(
@@ -1075,6 +1121,107 @@ def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, de
         b=batch_size,
     )[:, :seqlen_k]
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
+
+
+def test_flash_attn_kvcache_cache_batch_idx_length():
+    # The forward mainloops read kv_batch_idx[b] for every b < batch_size, so mha_fwd must
+    # reject a cache_batch_idx whose length is not batch_size instead of reading past its end.
+    # Same check as FA2's mha_fwd_kvcache (#3097).
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen_k, nheads, d = 4, 256, 2, 128
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    # Slices of one buffer: the memory right after a short slice holds valid indices.
+    buf = torch.tensor([1, 0, 3, 2, 3], device=device, dtype=torch.int32)
+    # flash_api.cpp and flash_api_stable.cpp word the shape error differently.
+    match = r"kv_batch_idx (must have shape|dimension 0 must have size)"
+
+    for cache_batch_idx in (buf[:2], buf):  # 2 and 5 indices for 4 sequences
+        with pytest.raises(RuntimeError, match=match):
+            flash_attn_with_kvcache(q, k_cache, v_cache, cache_batch_idx=cache_batch_idx)
+
+    # Positive control: one index per sequence must NOT raise.
+    out = flash_attn_with_kvcache(q, k_cache, v_cache, cache_batch_idx=buf[:batch_size])
+    assert out.shape == (batch_size, 1, nheads, d)
+    assert not out.isnan().any()
+
+
+@pytest.mark.skipif(DISABLE_VARLEN, reason="varlen is disabled")
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+@pytest.mark.parametrize("d", COMPILED_HDIMS)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("seqlen_q", [1, 256])
+@pytest.mark.parametrize(
+    "varlen,page_size",
+    [(True, None), (False, None)] + ([(False, p) for p in [128, 176, 256]] if not DISABLE_PAGEDKV else []),
+)
+def test_flash_attn_unused_kv_tail(varlen, page_size, seqlen_q, causal, d, dtype):
+    # Keys past seqused_k / cache_seqlens can hold anything, e.g. NaN in unused KV cache entries, and
+    # must not change the output. varlen is a packed K/V buffer with seqused_k, otherwise a KV cache.
+    # The page sizes cover both the TMA and the cp.async paged KV paths.
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size, nheads, nheads_kv, cap = 4, 8, 2, 2816  # cap is a multiple of every page size
+    seqlens_k = torch.tensor([100, 1000, 37, 2000], device=device, dtype=torch.int32)
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device).to(dtype)
+    k = torch.randn(batch_size, cap, nheads_kv, d, device=device)
+    v = torch.randn(batch_size, cap, nheads_kv, d, device=device)
+    unused = (torch.arange(cap, device=device) >= seqlens_k[:, None])[..., None, None]
+
+    def attention(fill):
+        k_cache, v_cache = k.masked_fill(unused, fill).to(dtype), v.masked_fill(unused, fill).to(dtype)
+        if varlen:
+            cu_seqlens_q = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * seqlen_q
+            cu_seqlens_k = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * cap
+            out = flash_attn_varlen_func(
+                q.flatten(0, 1), k_cache.flatten(0, 1), v_cache.flatten(0, 1), cu_seqlens_q, cu_seqlens_k,
+                seqlen_q, cap, seqused_k=seqlens_k, causal=causal,
+            )
+            return out.unflatten(0, (batch_size, seqlen_q))
+        page_table = None
+        if page_size is not None:
+            k_cache, v_cache = (rearrange(x, "b (n p) h d -> (b n) p h d", p=page_size) for x in (k_cache, v_cache))
+            page_table = torch.arange(k_cache.shape[0], device=device, dtype=torch.int32).view(batch_size, -1)
+        return flash_attn_with_kvcache(
+            q, k_cache, v_cache, cache_seqlens=seqlens_k, page_table=page_table, causal=causal
+        )
+
+    assert torch.equal(attention(float("nan")), attention(0.0))
+
+
+@pytest.mark.skipif(DISABLE_VARLEN or DISABLE_BACKWARD, reason="varlen or backward is disabled")
+@pytest.mark.parametrize("d", COMPILED_HDIMS)
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_unused_kv_tail_bwd(causal, d):
+    # Backward counterpart of test_flash_attn_unused_kv_tail: dP = dO @ V^T and dQ = dS @ K also read
+    # the keys past seqused_k.
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size, seqlen_q, nheads, cap = 4, 128, 4, 256
+    seqlens_k = torch.tensor([100, 256, 37, 200], device=device, dtype=torch.int32)
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size * cap, nheads, d, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    dout = torch.randn_like(q)
+    unused = (torch.arange(cap, device=device) >= seqlens_k[:, None]).flatten()[:, None, None]
+    cu_seqlens_q = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * seqlen_q
+    cu_seqlens_k = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * cap
+
+    def attention_and_grads(fill):
+        q_ = q.clone().requires_grad_()
+        k_, v_ = (x.masked_fill(unused, fill).requires_grad_() for x in (k, v))
+        out = flash_attn_varlen_func(
+            q_, k_, v_, cu_seqlens_q, cu_seqlens_k, seqlen_q, cap, seqused_k=seqlens_k, causal=causal,
+        )
+        out.backward(dout)
+        return out, q_.grad, k_.grad.masked_fill(unused, 0.0), v_.grad.masked_fill(unused, 0.0)
+
+    # dQ is summed over K/V tiles with atomic adds in no fixed order, so compare with a tolerance.
+    # assert_close still fails on NaN.
+    for x, x_ref in zip(attention_and_grads(float("nan")), attention_and_grads(0.0)):
+        torch.testing.assert_close(x, x_ref)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])

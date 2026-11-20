@@ -40,8 +40,10 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
         auto gmem_ptr_lse = make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.softmax_lse_ptr) + lse_offset);
 
         auto lse_shape = varlen_q ? make_shape(1, params.h, params.total_q) : make_shape(params.b, params.h, params.seqlen_q);
-        auto lse_stride = params.seqlenq_ngroups_swapped ? make_stride(1, params.seqlen_q * params.b, params.b) : (
-            params.unpadded_lse ? make_stride(params.h * params.total_q, params.total_q, 1) :  make_stride(params.h * params.seqlen_q, params.seqlen_q, 1)
+        // 64-bit strides: the offset of (bidb, bidh) reaches 2^31 once b * h * seqlen_q (or h * total_q) does.
+        using index_t = typename Params::index_t;
+        auto lse_stride = params.seqlenq_ngroups_swapped ? make_stride(index_t(1), index_t(params.seqlen_q) * params.b, index_t(params.b)) : (
+            params.unpadded_lse ? make_stride(index_t(params.h) * params.total_q, index_t(params.total_q), index_t(1)) :  make_stride(index_t(params.h) * params.seqlen_q, index_t(params.seqlen_q), index_t(1))
             );
 
         auto lse_layout = make_layout(lse_shape, lse_stride);
@@ -139,7 +141,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
     // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
 
-    const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
+    const index_t row_offset_p = ((static_cast<index_t>(bidb) * params.h + bidh) * params.seqlen_q_rounded
         + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
 
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
@@ -549,7 +551,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
         const index_t row_offset_oaccum = (((static_cast<index_t>(n_split_idx) * params.b + bidb) * params.h + bidh) * params.seqlen_q
             + m_block * kBlockM) * params.d_rounded;
-        const index_t row_offset_lseaccum = ((static_cast<index_t>(n_split_idx) * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+        // Same offset as the non-empty path below: with unpadded_lse (varlen with a block table), LSE is (h, total_q).
+        const index_t row_offset_lseaccum = (Split || !params.unpadded_lse ?
+                ((static_cast<index_t>(n_split_idx) * params.b + bidb) * params.h + bidh) * params.seqlen_q : static_cast<index_t>(bidh) * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
+            ) + m_block * kBlockM;
         Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
                                       Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                      make_stride(Split ? kHeadDim : params.o_row_stride, _1{}));
@@ -1028,7 +1033,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     const index_t row_offset_oaccum = (((static_cast<index_t>(n_split_idx) * params.b + bidb) * params.h + bidh) * params.seqlen_q
                                          + m_block * kBlockM) * params.d_rounded;
     const index_t row_offset_lseaccum = (Split || !params.unpadded_lse ?
-            ((static_cast<index_t>(n_split_idx) * params.b + bidb) * params.h + bidh) * params.seqlen_q : bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
+            ((static_cast<index_t>(n_split_idx) * params.b + bidb) * params.h + bidh) * params.seqlen_q : static_cast<index_t>(bidh) * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb)
         ) + m_block * kBlockM;
 
     Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),

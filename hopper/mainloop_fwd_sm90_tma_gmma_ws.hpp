@@ -773,12 +773,19 @@ struct CollectiveMainloopFwdSm90 {
             }
         };
 
-        auto copy_Vt_to_V = [&] (auto const& smem_pipe_write) {
+        auto copy_Vt_to_V = [&] (auto const& smem_pipe_write, int const n_block) {
             // Instead of maintaining smem_pipe_read as a separate variable, we can just use smem_pipe_write,
             // and exploit the invariance that smem_pipe_write.phase() == smem_pipe_read.phase() ^ 1.
             // This saves 1 or 2 registers.
             PipelineState smem_pipe_read{smem_pipe_write.index(), smem_pipe_write.phase() ^ 1, smem_pipe_write.count()};
             pipeline_vt.consumer_wait(smem_pipe_read);
+            if constexpr (Varlen && Use_TMA_KV) {  // Same as clear_V_tail
+                int const row_limit = seqlen_info.seqlen_k - n_block * kBlockN;
+                if (row_limit < kBlockN) {
+                    flash::clear_rows_from<NumProducerThreads>(sVcpasync(_, _, smem_pipe_read.index()), row_limit, thread_idx);
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, cutlass::arch::ReservedNamedBarriers::TransposeBarrier /*id*/);
+                }
+            }
             pipeline_v.producer_acquire(smem_pipe_write);
             transpose_V(smem_pipe_write.index());
             // SMEM fence to make sure V is transposed before math
@@ -878,13 +885,13 @@ struct CollectiveMainloopFwdSm90 {
                 }
             }
             n_block_prev = n_block;
-            if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
+            if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v, n_block + 1); }
         }
         scheduler_prefetch();
         if constexpr (!Transpose_V && IntraWGOverlap) {
             if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
-        if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
+        if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write, n_block_prev); }
         ++smem_pipe_write;
         // At the end, all threads have the correct smem_pipe_write.
         ++work_idx;
@@ -946,6 +953,27 @@ struct CollectiveMainloopFwdSm90 {
             // WG1 needs the very first signal to start
             if (warp_group_idx == 1) {
                 cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
+            }
+        }
+    }
+
+    // Zero the rows of V block n_block past seqlen_k (see flash::clear_rows_from). Called just before
+    // the first GEMM that reads V. All MMA threads meet here, so not between a warp group's
+    // warp_scheduler_barrier_sync and its warp_scheduler_barrier_arrive. With FP8, the producer does
+    // this before transposing V.
+    template <typename SharedStorage>
+    CUTLASS_DEVICE void
+    clear_V_tail(MainloopPipelineV& pipeline_v, PipelineState const& smem_pipe_read, int const n_block,
+                 SeqlenInfo_t const& seqlen_info, int const thread_idx, SharedStorage& shared_storage) {
+        if constexpr (Varlen && Use_TMA_KV && !Is_FP8 && !V_colmajor) {
+            int const row_limit = seqlen_info.seqlen_k - n_block * kBlockN;
+            if (row_limit < kBlockN) {
+                Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVCpAsync{});
+                pipeline_v.consumer_wait(smem_pipe_read);
+                flash::clear_rows_from<NumMmaThreads>(sV(_, _, smem_pipe_read.index()), row_limit, thread_idx);
+                // SMEM fence to make sure the zeros are visible to GMMA
+                cutlass::arch::fence_view_async_shared();
+                flash::named_barrier_sync(NumMmaThreads, cutlass::arch::ReservedNamedBarriers::TransformBarrier);
             }
         }
     }
@@ -1143,6 +1171,7 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_k.consumer_release(smem_pipe_read);
             if constexpr (HasQv) {
                 shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
+                clear_V_tail(pipeline_v, smem_pipe_read, n_block, seqlen_info, thread_idx, shared_storage);
                 consumer_wait(pipeline_v, smem_pipe_read);
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
             }
@@ -1160,6 +1189,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
             if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
             if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
+            if constexpr (!HasQv) { clear_V_tail(pipeline_v, smem_pipe_read, n_block, seqlen_info, thread_idx, shared_storage); }
             --n_block;
 
             // Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
@@ -1253,6 +1283,8 @@ struct CollectiveMainloopFwdSm90 {
 
         } else {  // No intra-WG overlap
 
+            // The Qv GEMM reads V before this warp group's warp_scheduler_barrier_arrive
+            if constexpr (HasQv) { clear_V_tail(pipeline_v, smem_pipe_read, n_block, seqlen_info, thread_idx, shared_storage); }
             warp_scheduler_barrier_sync();
 
             auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
@@ -1291,6 +1323,7 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
                 if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
+                if constexpr (Is_first_iter && !HasQv) { clear_V_tail(pipeline_v, smem_pipe_read, n_block, seqlen_info, thread_idx, shared_storage); }
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
                 if constexpr (!MmaPV_use_RS_WG1) {
@@ -1411,6 +1444,7 @@ struct CollectiveMainloopFwdSm90 {
         typename Softmax::TensorT scores_scale;
 
         int n_block = n_block_max - 1;
+        clear_V_tail(pipeline_v, smem_pipe_read, n_block, seqlen_info, thread_idx, shared_storage);
         // If HasQv, then by the time P is ready, V must have been ready as well
         if constexpr (!HasQv) { pipeline_v.consumer_wait(smem_pipe_read); }
         cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);

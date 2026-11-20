@@ -449,6 +449,39 @@ CUTLASS_DEVICE void copy(TiledCopy<CopyAtom, TV, Tiler> const &tiled_copy, Tenso
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Zero rows [row_limit, kBlockN) of a (kBlockN, kHeadDim) K or V tile in smem.
+// With varlen, TMA loads the last K/V tile in full, so its rows past seqlen_k hold whatever the buffer
+// has there (e.g. NaN in unused KV cache entries). Masking makes P and dS zero on those rows, but
+// 0 * NaN = NaN in the GEMMs that read K or V.
+template <int NumThreads, typename Engine, typename Layout>
+CUTLASS_DEVICE void clear_rows_from(Tensor<Engine, Layout> const &sX, int const row_limit, int const thread_idx) {
+    using Element = typename Engine::value_type;
+    static constexpr int kBlockN = decltype(size<0>(sX))::value;
+    static constexpr int kHeadDim = decltype(size<1>(sX))::value;
+    static constexpr int kElemsPerStore = sizeof(cute::uint128_t) / sizeof(Element);
+    static_assert(kHeadDim % kElemsPerStore == 0);
+    static constexpr int kThreadsPerRow = cute::gcd(kHeadDim / kElemsPerStore, 8);
+    auto tiled_copy = make_tiled_copy(
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+        cute::Layout<Shape<Int<NumThreads / kThreadsPerRow>, Int<kThreadsPerRow>>, Stride<Int<kThreadsPerRow>, _1>>{},
+        cute::Layout<Shape<_1, Int<kElemsPerStore>>>{});
+    auto thr_copy = tiled_copy.get_thread_slice(thread_idx);
+    Tensor tXsX = thr_copy.partition_D(sX);
+    Tensor tXcX = thr_copy.partition_D(cute::make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+    Tensor tXrX = make_tensor<Element>(shape(tXsX(_, _0{}, _0{})));
+    clear(tXrX);
+    #pragma unroll
+    for (int m = 0; m < size<1>(tXsX); ++m) {
+        int const row = get<0>(tXcX(_0{}, m, _0{}));
+        if (row >= row_limit && row < kBlockN) {
+            #pragma unroll
+            for (int k = 0; k < size<2>(tXsX); ++k) { cute::copy(tiled_copy, tXrX, tXsX(_, m, k)); }
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Byte permute and shuffle to match register layout of
 // (FP8 downcasted) accumulator of GEMM-I to FP8 operand A of GEMM-II.
 template <typename Fragment>

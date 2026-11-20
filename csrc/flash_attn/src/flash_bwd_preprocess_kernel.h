@@ -83,7 +83,7 @@ inline __device__ void compute_dot_do_o(const Params &params) {
     const index_t row_offset_dq_accum = binfo.q_offset(dq_accum_batch_stride, dq_accum_row_stride, bidb)
         + (m_block * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128ll * bidb)) * dq_accum_row_stride + bidh * params.d_rounded;
     // Regarding 128 * params.b see a comment in mha_varlen_bwd about padding of dq_accum and softmax_d
-    const index_t row_offset_dpsum = (params.unpadded_lse ? (bidh * (params.total_q + 128 * params.b) + binfo.q_offset(params.seqlen_q_rounded, 1, bidb) + 128 * bidb): (bidb * params.h + bidh) * params.seqlen_q_rounded) + m_block * kBlockM;
+    const index_t row_offset_dpsum = (params.unpadded_lse ? (static_cast<index_t>(bidh) * (params.total_q + 128 * params.b) + binfo.q_offset(params.seqlen_q_rounded, 1, bidb) + 128 * bidb): (static_cast<index_t>(bidb) * params.h + bidh) * params.seqlen_q_rounded) + m_block * kBlockM;
 
     Tensor gdO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.do_ptr) + row_offset_do),
                              Shape<Int<kBlockM>, Int<kHeadDim>>{},

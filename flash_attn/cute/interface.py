@@ -300,6 +300,21 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
     return causal, local, window_size_left, window_size_right
 
 
+def _clamp_local_window(local, window_size_left, window_size_right, max_seqlen_q, max_seqlen_k):
+    """Clamp each local window side to the longest sequence it can see.
+
+    A left side of at least seqlen_k - 1, or a right side of at least seqlen_q - 1, masks nothing,
+    so clamping keeps the result. The kernels add the sides to positions in 32 bits
+    (block_info.py, mask.py), so an unclamped huge side such as 2**31 - 1 would wrap.
+    """
+    if local:
+        if window_size_left is not None:
+            window_size_left = min(window_size_left, max_seqlen_k)
+        if window_size_right is not None:
+            window_size_right = min(window_size_right, max_seqlen_q)
+    return window_size_left, window_size_right
+
+
 # Set by the autotuner's fake-tensor probe to collect the kernels a call would compile.
 _compile_misses: contextvars.ContextVar[set | None] = contextvars.ContextVar(
     "_compile_misses", default=None
@@ -443,13 +458,16 @@ class TensorwiseScales(NamedTuple):
 
 
 class BlockScales(NamedTuple):
-    """MXFP8 UE8M0 block scales, each the contiguous interleave_sf buffer of its operand.
+    """Contiguous interleave_sf buffers of MXFP8 UE8M0 scales.
 
-    q and k scale 32-element blocks of e4m3 Q and K along head_dim; V stays BF16.
+    q/k: E4M3 Q/K, scaled in 32-element head_dim blocks.
+    v: optional E4M3 V scales for native PV, in 32-key blocks
+       (MN=head_dim_v, K=seqlen_k). Without v, V is BF16.
     """
 
     q: torch.Tensor
     k: torch.Tensor
+    v: torch.Tensor | None = None
 
 
 def _check_shared_kv_scales(scales) -> None:
@@ -508,32 +526,56 @@ def _validate_block_scales(
     qv: torch.Tensor | None,
     *,
     requires_grad: bool,
+    causal: bool,
+    window_size_left: int | None,
+    window_size_right: int | None,
     num_splits: int,
+    softcap: float | None,
+    gather_kv_indices: torch.Tensor | None,
     layout_inputs: tuple,
+    pv_unsupported: tuple,
 ) -> BlockScales:
-    """Check MXFP8 block scales and the modes they support; return the buffers flattened.
+    """Validate MXFP8 modes and return flattened scale buffers.
 
-    layout_inputs are the varlen, paged, and block-sparse inputs, which MXFP8 does not support.
+    layout_inputs groups unsupported varlen, paged, and block-sparse inputs.
+    pv_unsupported groups sinks, modifiers, and auxiliary data rejected by native PV.
     """
+    pv = scales.v is not None
+    mode = "Native MXFP8 PV" if pv else "QK MXFP8"
     if scales.q is None or scales.k is None:
-        raise ValueError("QK MXFP8 requires both scales.q and scales.k")
+        raise ValueError(f"{mode} requires both scales.q and scales.k")
     if qv is not None or q is None or k is None:
-        raise NotImplementedError("QK MXFP8 does not support MLA")
+        raise NotImplementedError(f"{mode} does not support MLA")
+    if pv:
+        pv_causal, pv_local, _, _ = _resolve_causal_local_window(
+            causal, window_size_left, window_size_right
+        )
+        if pv_causal or pv_local:
+            raise NotImplementedError("Native MXFP8 PV supports only noncausal, nonlocal attention")
+        layout_inputs += (gather_kv_indices,)
     if any(t is not None for t in layout_inputs) or num_splits != 1:
-        raise NotImplementedError("QK MXFP8 supports only dense, unsplit attention")
+        raise NotImplementedError(f"{mode} supports only dense, unsplit attention")
+    if pv and (any(t is not None for t in pv_unsupported) or softcap not in (None, 0.0)):
+        raise NotImplementedError(
+            "Native MXFP8 PV does not support sinks, softcap, modifiers, or auxiliary data"
+        )
     if any(t.ndim != 4 for t in (q, k, v)):
-        raise ValueError("QK MXFP8 requires Q/K/V in (batch, seqlen, heads, dim) layout")
-    if q.dtype != torch.float8_e4m3fn or k.dtype != q.dtype or v.dtype != torch.bfloat16:
-        raise ValueError("QK MXFP8 requires e4m3 Q/K and bf16 V")
+        raise ValueError(f"{mode} requires Q/K/V in (batch, seqlen, heads, dim) layout")
+    v_dtype = torch.float8_e4m3fn if pv else torch.bfloat16
+    if q.dtype != torch.float8_e4m3fn or k.dtype != q.dtype or v.dtype != v_dtype:
+        raise ValueError("Native MXFP8 PV requires e4m3 Q/K/V" if pv
+                         else "QK MXFP8 requires e4m3 Q/K and bf16 V")
     if q.shape[-1] not in (64, 128) or v.shape[-1] not in (64, 128):
-        raise NotImplementedError("QK MXFP8 supports head dimensions 64 and 128")
+        raise NotImplementedError(f"{mode} supports head dimensions 64 and 128")
     if requires_grad:
-        raise NotImplementedError("QK MXFP8 is forward-only")
+        raise NotImplementedError(f"{mode} is forward-only")
     # (scales, operand, name, MN extent, K extent); K is the scaled (reduction) axis.
     sf_layouts = [
         (scales.q, q, "scales.q", q.shape[1], q.shape[3]),
         (scales.k, k, "scales.k", k.shape[1], k.shape[3]),
     ]
+    if pv:  # V is scaled along keys
+        sf_layouts.append((scales.v, v, "scales.v", v.shape[3], v.shape[1]))
     for sf, x, name, mn, k_extent in sf_layouts:
         # interleave_sf stores 512 scales per (batch, head, 128 MN x 128 K tile).
         num_tiles = math.ceil(mn / 128) * math.ceil(k_extent / 128)
@@ -546,7 +588,7 @@ def _validate_block_scales(
                 f"K={k_extent} ({expected} elements)"
             )
     # Flatten physical chunks; the kernel constructs their logical operand views.
-    return BlockScales(*(maybe_contiguous(t.reshape(-1)) for t in scales))
+    return BlockScales(*(t if t is None else maybe_contiguous(t.reshape(-1)) for t in scales))
 
 
 def _flash_attn_fwd(
@@ -608,7 +650,8 @@ def _flash_attn_fwd(
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
         scales: Dequantization scales of low-precision Q/K/V (see TensorwiseScales and
             BlockScales). BlockScales give BF16 output and support only dense, unsplit,
-            forward-only attention.
+            forward-only attention. BlockScales.v selects native MXFP8 PV with e4m3 V, which
+            is also noncausal and unmodified.
         config: Fully resolved forward config, or None for the default: an MlaFwdConfig with qv,
             else a FwdConfig.
     """
@@ -659,9 +702,12 @@ def _flash_attn_fwd(
             )
         case BlockScales():
             block_scales = _validate_block_scales(
-                scales, q, k, v, qv, requires_grad=requires_grad, num_splits=num_splits,
+                scales, q, k, v, qv, requires_grad=requires_grad, causal=causal,
+                window_size_left=window_size_left, window_size_right=window_size_right,
+                num_splits=num_splits, softcap=softcap, gather_kv_indices=gather_kv_indices,
                 layout_inputs=(cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table,
                                block_sparse_tensors),
+                pv_unsupported=(learnable_sink, score_mod, mask_mod, aux_tensors, aux_scalars),
             )
         case _:
             raise TypeError(
@@ -669,7 +715,10 @@ def _flash_attn_fwd(
             )
     has_descale = any(t is not None for t in descales)
     qk_blockscaled = block_scales is not None
-    sf_operands = (block_scales.q, block_scales.k) if qk_blockscaled else (None, None)
+    pv_blockscaled = qk_blockscaled and block_scales.v is not None
+    sf_operands = (
+        (block_scales.q, block_scales.k, block_scales.v) if qk_blockscaled else (None, None, None)
+    )
     if cu_seqlens_k is None:
         if page_table is None:
             assert k is None or k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -791,7 +840,10 @@ def _flash_attn_fwd(
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
         validate_output_layout(lse, "lse", align_bytes=4)
 
-    if seqlen_k == 0 or total_q == 0:
+    # A paged sequence is bounded by its page-table row, not the shared KV pool, so there is no
+    # key if either the pool (seqlen_k) or the page-table row (k_capacity) is empty.
+    k_capacity = page_table.shape[1] * page_size if page_table is not None else seqlen_k
+    if seqlen_k == 0 or k_capacity == 0 or total_q == 0:
         out.zero_()
         if lse is not None:
             if learnable_sink is None:
@@ -810,13 +862,27 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
+    q_capacity = seqlen_q if cu_seqlens_q is None else total_q
+    # The kernels get the clamped sides. Config selection keeps the window as given, as
+    # get_scheduler_metadata sees it, so caller-built metadata matches the forward's split count.
+    kernel_window_left, kernel_window_right = _clamp_local_window(
+        local, window_size_left, window_size_right, q_capacity, k_capacity
+    )
+    if page_table is not None:
+        # The kernels count a paged sequence's keys, page_table.shape[1] * page_size, in 32 bits,
+        # and local attention adds window_size_right to that count (block_info.py).
+        page_keys = page_table.shape[1] * page_size
+        window_right = (
+            max(kernel_window_right, 0) if local and kernel_window_right is not None else 0
+        )
+        assert page_keys + window_right < 2**31, (
+            "page_table.shape[1] * page_size (+ window_size_right with local attention) must be "
+            f"below 2**31, got {page_table.shape[1]} * {page_size} + {window_right}"
+        )
 
     # Tensor hints cannot drive host selection or count as a caller-provided Q bound.
     has_max_seqlen_q_hint = max_seqlen_q is not None and not torch.is_tensor(max_seqlen_q)
     total_k = math.prod(v.shape[:-2])  # K/V tokens stored: dense b*s, varlen total, paged pool
-    q_capacity = seqlen_q if cu_seqlens_q is None else total_q
-    # A paged sequence is bounded by its page-table row, not the shared KV pool.
-    k_capacity = page_table.shape[1] * page_size if page_table is not None else seqlen_k
     if max_seqlen_q is None:
         max_seqlen_q = q_capacity
     if max_seqlen_k is None:
@@ -854,13 +920,15 @@ def _flash_attn_fwd(
         seqlen_k_capacity=k_capacity,
         requires_grad=requires_grad or any(t.requires_grad for t in aux_tensors or ()),
         has_aux_scalars=aux_scalars is not None,
-        mxfp8_path="qk" if qk_blockscaled else None,
+        mxfp8_path="pv" if pv_blockscaled else "qk" if qk_blockscaled else None,
         mla=None if qv is None else dict(
             is_topk_gather=gather_kv_indices is not None,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             has_descale=has_descale,
         ),
     )
+    # The config is chosen; from here on the window only reaches the kernels, so use the clamped sides.
+    window_size_left, window_size_right = kernel_window_left, kernel_window_right
     num_splits = config.num_splits
     mla_kernel = config.kernel if isinstance(config, MlaFwdConfig) else None
     mla_1cta = mla_kernel in ("1cta", "1cta_kb64")
@@ -1225,7 +1293,7 @@ def _flash_attn_fwd(
     )
 
     if qk_blockscaled:
-        compile_key += ("mxfp8_qk", v.dtype)
+        compile_key += ("mxfp8_qk", v.dtype, pv_blockscaled)
 
     if _needs_compile(_flash_attn_fwd.compile_cache, compile_key):
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1425,7 +1493,9 @@ def _flash_attn_fwd(
             else:
                 fwd_cls = FlashAttentionForwardSm100
                 # SwapAB never runs block scales (config.SWAPAB.rejection).
-                mxfp8_kwargs = dict(qk_blockscaled=True) if qk_blockscaled else {}
+                mxfp8_kwargs = (
+                    dict(qk_blockscaled=True, pv_blockscaled=pv_blockscaled) if qk_blockscaled else {}
+                )
                 if use_swapab:
                     from flash_attn.cute.flash_fwd_decode_sm100 import FlashAttentionForwardSm100SwapAB
                     fwd_cls = FlashAttentionForwardSm100SwapAB
@@ -2102,6 +2172,11 @@ def _flash_attn_bwd(
         batch_size = cu_seqlens_k.shape[0] - 1
         total_k = k.shape[0]
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
+    window_size_left, window_size_right = _clamp_local_window(
+        local, window_size_left, window_size_right,
+        seqlen_q if cu_seqlens_q is None else total_q,
+        seqlen_k if cu_seqlens_k is None else total_k,
+    )
 
     def heuristic_seqlen(seqlen, total, has_host_bound):
         # The fold chooser wants the longest sequence. A bound given as a device tensor falls
@@ -3774,7 +3849,12 @@ def flash_attn_func(
     scales: dequantization scales of low-precision Q/K/V, forward-only; None for unscaled inputs
         (FP8 then uses descale 1).
         - TensorwiseScales: FP8 Q/K/V.
-        - BlockScales(q, k): MXFP8 Q/K with BF16 V; BF16 output, dense, unsplit attention.
+        - BlockScales(q, k): MXFP8 Q/K with BF16 V.
+        - BlockScales(q, k, v): native, noncausal MXFP8 PV with e4m3 V. v is the contiguous
+          UE8M0 buffer from quantize_v_to_fp8_with_sf (MN=V channels, K=key positions, groups
+          of 32 keys). Local and modified attention are not supported.
+        BlockScales return BF16 output and optional FP32 LSE, and support only dense, unsplit
+        attention.
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk

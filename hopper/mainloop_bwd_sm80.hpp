@@ -228,7 +228,7 @@ struct CollectiveMainloopBwdSm80 {
     using StrideQKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using ShapeLSE = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen, head, batch)
     using StrideLSE = cute::Stride<_1, int64_t, int64_t>;  // (seqlen, head, batch)
-    using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
+    using ShapedQaccum = cute::Shape<int64_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
     using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
 
     // These are tuned for speed. They don't affect correctness.
@@ -435,7 +435,7 @@ struct CollectiveMainloopBwdSm80 {
         Tensor gV = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
         Tensor gLSE = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mLSE), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
         Tensor gdPsum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mdPsum), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
-        Tensor gdQaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
+        Tensor gdQaccum = local_tile(domain_offset(make_coord(int64_t(seqlen_info.offset_q_padded) * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
 
         GmemTiledCopyQKV gmem_tiled_copy_QKV;
         auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(thread_idx);
@@ -842,7 +842,7 @@ struct CollectiveMainloopBwdSm80 {
                 // if (cute::thread0()) { print_tensor(tdQrdQ); }
                 // We can reuse r2s_thr_copy_dQaccum for this partitioning
                 Tensor tdQrdQ_atomic = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);
-                Tensor tdQgdQaccum_atomic = tdQgdQaccum(_, _, m_block);
+                Tensor tdQgdQaccum_atomic = tdQgdQaccum(_, _, int64_t(m_block));
                 static_assert(CUTE_STATIC_V(size(tdQrdQ_atomic)) == CUTE_STATIC_V(size(tdQgdQaccum_atomic)));
                 #pragma unroll
                 for (int i = 0; i < size(tdQrdQ_atomic); ++i) { atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i)); }
