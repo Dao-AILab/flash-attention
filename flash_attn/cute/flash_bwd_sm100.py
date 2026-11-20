@@ -21,7 +21,12 @@ from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
 from flash_attn.cute import pipeline
 from flash_attn.cute.bwd_accum_tile import AccumTileOrder, accum_tile_layout
-from flash_attn.cute.config import Sm100BwdRegisters
+from flash_attn.cute.config import (
+    MXFP8_BAND_BLOCK_N,
+    MXFP8_BAND_ROWS,
+    Mxfp8Mirror,
+    Sm100BwdRegisters,
+)
 from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.pack_gqa import pack_gqa_layout
@@ -103,18 +108,32 @@ from flash_attn.cute.block_sparse_utils import (
 # this kernel: its quantizers and P roundings are straight-through, and its saved row max and
 # normalizer replace recomputing them (the derivative flows through the normalizer as the D term
 # and vanishes through the max by shift invariance). The interface feeds the forward's dequantized
-# payloads Q-hat / K-hat (exact in BF16) as Q / K, and the preprocess's mirror mode turns
-# BlockScales.stats_out (m, L) into one stat slot and a scaled dO:
+# payloads Q-hat / K-hat / V-hat (exact in BF16) as Q / K / V (V itself for QK-only), and the
+# preprocess's mirror mode turns BlockScales.stats_out (m, L) into one stat slot and a scaled dO:
 #   LSE slot = fp32(m * scale_log2) - off   (off = Mxfp8Mirror.p_offset), so the kernel's
 #              P~ = exp2(S * scale_log2 - slot) is the forward's exponent up to the S
 #              accumulation order (and, with the hdim64 LSE fold, the fold's MMA rounding);
 #   dO' = bf16(dO / L),  dPsum = rowsum(dO' * O)   (L folded into dO: no second stat slot).
-# Then dV = P^T dO', dS = P~ (dP - dPsum) with dP = dO' V^T, dK = scale dS^T Q-hat, and
-# dQ = scale dS K-hat come out at true scale. QK-only (Mxfp8Mirror.QK: BF16 P and V) needs no
-# kernel change: bf16(P~) is already the forward's PV operand.
+# Then dV = P-hat^T dO', dS = P~ (dP - dPsum) with dP = dO' V^T, dK = scale dS^T Q-hat, and
+# dQ = scale dS K-hat come out at true scale (P~ <= 2^off and L carry the same 2^off).
+#
+# QK-only (Mxfp8Mirror.QK: BF16 P and V) needs no kernel change: bf16(P~) is already the
+# forward's PV operand. Native PV (Mxfp8Mirror.PV) rounds the dV copy of P through E4M3
+# (mirror_pv_round; dS keeps the FP32 P~), and its causal BF16 band (mirror_band) runs bf16(P~)
+# for dV and the original V in dP: KV block b (MXFP8_BAND_BLOCK_N keys) is BF16 for forward
+# query tile t (MXFP8_BAND_ROWS rows) iff (b + 1) * 128 > 256 t + seqlen_k - seqlen_q. Visited
+# in ascending m_block order, the band steps of a KV tile are a prefix [m_block_min, m_band_end)
+# (mirror_band_m_block_end). There is no SMEM for a second V tile, so the load warp loads the
+# original V (mV_band) for the prefix, then V-hat into the same sV at step m_band_end, on that
+# step's dO stage barrier: dO has one stage and the MMA warp releases it with a commit issued
+# after the step's dP MMA, so acquiring the slot for step m proves dP(m - 1), the last reader of
+# the old V, done. With 2CTA both CTAs must swap at the same step (the leader's barrier counts
+# both CTAs' V bytes), see config.mxfp8_band_splits_pair.
+#
 # P~ is recomputed at the final max. Blocks the forward visited under an earlier running max were
-# rounded at that max and rescaled, so their P is reproduced only up to that rounding
-# (BlockScales.stats_out); that difference is the mirror's inherent error.
+# rounded at that max and rescaled (native PV updates the max at every block), so their P-hat is
+# reproduced only up to that rounding (BlockScales.stats_out). That is the mirror's inherent
+# error, and it dominates native PV's dV error against the FP64 derivative of the online forward.
 
 
 # NOTE [SM100 backward coordinate spaces]
@@ -253,6 +272,7 @@ class FlashAttentionBackwardSm100:
         Q_stage: int,
         dO_stage: int,
         fold_LSE_dPsum: bool,
+        mxfp8_mirror: Mxfp8Mirror | None = None,
     ):
         # Pad head_dim to a multiple of 32 (k_block_size). Must stay a multiple of 32 so
         # that the dQ accumulator reduce (dQ_reduce_ncol up to 32) tiles evenly and matches
@@ -377,6 +397,15 @@ class FlashAttentionBackwardSm100:
         self.spt = spt
         # See NOTE [hdim64 LSE / dPsum fold into the S / dP MMA]
         self.fold_LSE_dPsum = fold_LSE_dPsum
+        # See NOTE [MXFP8 mirrored BF16 backward]
+        self.mirror_pv_round = mxfp8_mirror is Mxfp8Mirror.PV
+        self.mirror_band = self.mirror_pv_round and is_causal
+        assert not self.mirror_band or (
+            self.cta_schedule != CtaSchedule.TWO_CTA_SERIAL
+            and dO_stage == 1
+            and MXFP8_BAND_BLOCK_N % tile_n == 0
+            and (MXFP8_BAND_ROWS * pack_factor) % tile_m == 0
+        ), "the MXFP8 band's V swap needs a pipelined schedule, one dO stage, and aligned tiles"
 
         # Score mod and mask mod support
         self.score_mod = score_mod
@@ -864,9 +893,13 @@ class FlashAttentionBackwardSm100:
         tensormap_workspace: Optional[
             cute.Tensor
         ] = None,  # (num_ctas, 3, 16) Int64: K, V, Kt descriptors per CTA
+        # the original V of the MXFP8 causal band, mV holding V-hat (NOTE [MXFP8 mirrored BF16
+        # backward]); same shape and layout as mV
+        mV_band: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
+        assert (mV_band is not None) == self.mirror_band, "mV_band is the MXFP8 causal band's V"
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
@@ -905,6 +938,8 @@ class FlashAttentionBackwardSm100:
 
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         mK, mV = [layout_utils.select(t, mode=KV_layout_transpose) for t in (mK, mV)]
+        if const_expr(mV_band is not None):
+            mV_band = layout_utils.select(mV_band, mode=KV_layout_transpose)
 
         # (b, n, s) --> (s, n, b) or (n, t) --> (t, n)
         LSE_dPsum_dQaccum_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
@@ -1074,6 +1109,17 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_dP,
             self.cluster_layout_vmnk.shape,
         )
+        tma_atom_V_band = tma_tensor_V_band = None
+        if const_expr(mV_band is not None):
+            assert not self.ragged_kv_tma and blocksparse_tensors is None
+            tma_atom_V_band, tma_tensor_V_band = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                mV_band,
+                cute.select(self.sV_layout, mode=[0, 1, 2]),
+                self.mma_tiler_vdo,
+                self.tiled_mma_dP,
+                self.cluster_layout_vmnk.shape,
+            )
         # dV = P.T @ dO
         dO_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
             self.cluster_shape_mnk, self.tiled_mma_dV.thr_id
@@ -1508,6 +1554,8 @@ class FlashAttentionBackwardSm100:
             aux_data,
             fastdiv_mods,
             blocksparse_tensors,
+            tma_tensor_V_band,
+            tma_atom_V_band,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1599,6 +1647,8 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mV_band: Optional[cute.Tensor] = None,
+        tma_atom_V_band: Optional[cute.CopyAtom] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1616,6 +1666,8 @@ class FlashAttentionBackwardSm100:
                 if const_expr(tma_atom_Kt is not None):
                     cpasync.prefetch_descriptor(tma_atom_Kt)
                 cpasync.prefetch_descriptor(tma_atom_V)
+                if const_expr(tma_atom_V_band is not None):
+                    cpasync.prefetch_descriptor(tma_atom_V_band)
                 if const_expr(tma_atom_dOt is not None):
                     cpasync.prefetch_descriptor(tma_atom_dOt)
                 cpasync.prefetch_descriptor(tma_atom_dO)
@@ -2102,6 +2154,8 @@ class FlashAttentionBackwardSm100:
                 blocksparse_tensors,
                 should_load_Q=True,
                 should_load_dO=True,
+                mV_band=mV_band,
+                tma_atom_V_band=tma_atom_V_band,
             )
 
         #  MMA
@@ -2467,6 +2521,8 @@ class FlashAttentionBackwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         should_load_Q: bool = True,
         should_load_dO: bool = True,
+        mV_band: Optional[cute.Tensor] = None,
+        tma_atom_V_band: Optional[cute.CopyAtom] = None,
     ):
         producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
@@ -2615,6 +2671,25 @@ class FlashAttentionBackwardSm100:
                 single_stage=True,
                 **({"tma_desc_ptr": desc_ptrs[1]} if const_expr(self.ragged_kv_tma) else {}),
             )
+            # The MXFP8 causal band: the original V for the steps before m_band_end, V-hat
+            # (load_V) from there on (NOTE [MXFP8 mirrored BF16 backward])
+            m_band_end = m_block_min
+            if const_expr(self.mirror_band):
+                mV_band_cur = mV_band[None, None, kv_head, batch_idx]
+                gV_band = cute.local_tile(
+                    mV_band_cur, cute.select(self.mma_tiler_vdo, mode=[0, 2]), (work_n, 0)
+                )
+                load_V_band, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_V_band,
+                    0,
+                    cute.make_layout(1),
+                    thr_mma_dP.partition_A(gV_band),
+                    sV,
+                    single_stage=True,
+                )
+                m_band_end = self.mirror_band_m_block_end(
+                    seqlen, kv_block, m_block_min, m_block_max
+                )
 
             # (5) dQ = dS @ K
             load_Kt = None
@@ -2840,11 +2915,14 @@ class FlashAttentionBackwardSm100:
                                 if const_expr(load_dOt is not None)
                                 else self.tma_copy_bytes["V"],
                             )
-                            load_V(
-                                tma_bar_ptr=pipeline_dO.producer_get_barrier(
-                                    producer_state_dO_dPsum
-                                )
-                            )
+                            V_bar = pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
+                            if const_expr(self.mirror_band):
+                                if m_band_end > m_block_min:
+                                    load_V_band(tma_bar_ptr=V_bar)
+                                else:
+                                    load_V(tma_bar_ptr=V_bar)
+                            else:
+                                load_V(tma_bar_ptr=V_bar)
                             load_dO(first_m_block, producer_state=producer_state_dO_dPsum)
                             if const_expr(load_dOt is not None):
                                 load_dOt(first_m_block, producer_state=producer_state_dO_dPsum)
@@ -2896,12 +2974,31 @@ class FlashAttentionBackwardSm100:
                                 producer_state_Q_LSE.advance()
 
                             if const_expr(should_load_dO):
-                                pipeline_dO.producer_acquire(
-                                    producer_state_dO_dPsum,
-                                    extra_tx_count=self.tma_copy_bytes["dO"]
+                                dOt_bytes = (
+                                    self.tma_copy_bytes["dO"]
                                     if const_expr(load_dOt is not None)
-                                    else 0,
+                                    else 0
                                 )
+                                if const_expr(self.mirror_band):
+                                    # V-hat replaces the band's V once the band steps are done
+                                    if m_block == m_band_end:
+                                        pipeline_dO.producer_acquire(
+                                            producer_state_dO_dPsum,
+                                            extra_tx_count=dOt_bytes + self.tma_copy_bytes["V"],
+                                        )
+                                        load_V(
+                                            tma_bar_ptr=pipeline_dO.producer_get_barrier(
+                                                producer_state_dO_dPsum
+                                            )
+                                        )
+                                    else:
+                                        pipeline_dO.producer_acquire(
+                                            producer_state_dO_dPsum, extra_tx_count=dOt_bytes
+                                        )
+                                else:
+                                    pipeline_dO.producer_acquire(
+                                        producer_state_dO_dPsum, extra_tx_count=dOt_bytes
+                                    )
                                 load_dO(m_block, producer_state=producer_state_dO_dPsum)
                                 if const_expr(load_dOt is not None):
                                     load_dOt(m_block, producer_state=producer_state_dO_dPsum)
@@ -3709,6 +3806,31 @@ class FlashAttentionBackwardSm100:
         )
 
     @cute.jit
+    def cvt_P_for_dV(self, src: cute.Tensor, dst: cute.Tensor, band_step: cutlass.Boolean):
+        """Native PV's dV operand: the forward's E4M3 P, or bf16(P) on the causal band's steps
+        (NOTE [MXFP8 mirrored BF16 backward])."""
+        if const_expr(self.mirror_band):
+            # a select, not a branch: both conversions in one branch-free sequence spill less
+            utils.cvt_bf16_maybe_through_e4m3(src, dst, Int32(band_step))
+        else:
+            utils.cvt_bf16_through_e4m3(src, dst)
+
+    @cute.jit
+    def mirror_band_m_block_end(self, seqlen, kv_block, m_block_min, m_block_max):
+        """End of the MXFP8 causal band prefix [m_block_min, end) of this CTA's KV block (NOTE
+        [MXFP8 mirrored BF16 backward]): forward block b is in the band of query tile t iff
+        (b + 1) * 128 > 256 t + seqlen_k - seqlen_q, so the first non-band tile is
+        t_end = ceil(((b + 1) * 128 - (seqlen_k - seqlen_q)) / 256), whose first m_block (of
+        tile_m rows, pack_factor per token) is t_end * 256 * pack_factor / tile_m."""
+        fwd_block = kv_block * self.tile_n // MXFP8_BAND_BLOCK_N
+        first_non_band_row = (fwd_block + 1) * MXFP8_BAND_BLOCK_N - (
+            seqlen.seqlen_k - seqlen.seqlen_q
+        )
+        t_end = (cutlass.max(first_non_band_row, 0) + MXFP8_BAND_ROWS - 1) // MXFP8_BAND_ROWS
+        m_end = t_end * (MXFP8_BAND_ROWS * self.pack_factor // self.tile_m)
+        return cutlass.min(cutlass.max(m_end, m_block_min), m_block_max)
+
+    @cute.jit
     def _cluster_S_coords(self, thr_mma_S, work_n, m_block):
         """Identity coordinates of this CTA's part of the (C * tile_n, tile_m) S tile of a
         work tile: (kv_row, packed_q_row) per accumulator element."""
@@ -4212,6 +4334,11 @@ class FlashAttentionBackwardSm100:
                     if not recompute_fastdiv_mods_k
                     else FastDivmodDivisorV2(seqlen.seqlen_k),
                 )
+            m_band_end = m_block_min  # no band steps unless mirror_band
+            if const_expr(self.mirror_band):
+                m_band_end = self.mirror_band_m_block_end(
+                    seqlen, kv_block, m_block_min, m_block_max
+                )
             mask = AttentionMaskCls(seqlen)
             # TODO: condition mask_seqlen
             mask_fn = partial(
@@ -4394,10 +4521,18 @@ class FlashAttentionBackwardSm100:
                         # P^T goes to SMEM; S stays untouched in TMEM until the dS pipeline
                         # releases it, so no cross-warp barrier is needed before the store.
                         tSrP_cvt = cute.make_fragment_like(tSrS_cur, self.q_dtype)
-                        utils.cvt_f16(tSrS_cur, tSrP_cvt)
+                        if const_expr(self.mirror_pv_round):
+                            self.cvt_P_for_dV(tSrS_cur, tSrP_cvt, m_block < m_band_end)
+                        else:
+                            utils.cvt_f16(tSrS_cur, tSrP_cvt)
                         cute.autovec_copy(tSrP_cvt, tRS_sP[None, 0, 0, 0])
                     else:
-                        utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
+                        if const_expr(self.mirror_pv_round):
+                            self.cvt_P_for_dV(
+                                tSrS_cur, tSrP_r2t[None, stage, 0, 0], m_block < m_band_end
+                            )
+                        else:
+                            utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
                         if const_expr(stage == 0):
                             if const_expr(self.split_P_dS):
                                 # wait until the previous pdo UMMA has consumed the P slot

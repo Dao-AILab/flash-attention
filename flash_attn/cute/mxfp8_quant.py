@@ -9,6 +9,7 @@ payloads and scales (the same 2^ceil(log2(amax / 448)) scale rule, exact power-o
 round-to-nearest-even E4M3 with satfinite).
 
 - `quantize_rows(x)`: Q / K, one scale per 32 elements along head_dim (MN = seqlen).
+- `quantize_keys(v)`: native PV's V, one scale per 32 keys and channel (MN = head_dim).
 
 The `mx_exponent`, `exp2_int`, `to_e4m3`, and `interleaved_sf_offset` helpers are the shared
 MXFP8 primitives of the Triton preps.
@@ -84,6 +85,28 @@ def _quantize_rows_kernel(
     tl.store(sf_ptr + sf_offs, (e + 127).to(tl.uint8), mask=valid[:, None])
 
 
+@triton.jit
+def _quantize_keys_kernel(x_ptr, x8_ptr, sf_ptr, hat_ptr, S, H, DIM: tl.constexpr):
+    """One (batch, 32-key group, head) tile of a (batch, S, H, DIM) V: E4M3 payload, UE8M0 scales
+    per (32 keys, channel) into the interleave_sf buffer (MN = DIM, K = key groups), and the
+    dequantized payload in BF16. Keys past S are zero, as the eager quantizer pads them."""
+    group, bh = tl.program_id(0), tl.program_id(1)
+    b, h = bh // H, bh % H
+    token = group * 32 + tl.arange(0, 32)
+    valid = (token < S)[:, None]
+    channel = tl.arange(0, DIM)
+    offs = ((b * S + token) * H + h).to(tl.int64)[:, None] * DIM + channel[None, :]
+    x = tl.load(x_ptr + offs, mask=valid, other=0.0).to(tl.float32)
+    e = mx_exponent(tl.max(tl.abs(x), axis=0))
+    x8 = to_e4m3(x, e[None, :])
+    tl.store(x8_ptr + offs, x8, mask=valid)
+    tl.store(hat_ptr + offs, (x8.to(tl.float32) * exp2_int(e)[None, :]).to(tl.bfloat16), mask=valid)
+    sf_offs = interleaved_sf_offset(
+        bh, channel, group, tl.cdiv(DIM, 128), tl.cdiv(tl.cdiv(S, 32), 4)
+    )
+    tl.store(sf_ptr + sf_offs, (e + 127).to(tl.uint8))
+
+
 def _interleaved_buffer(batch: int, nheads: int, mn: int, sf_k: int, device) -> torch.Tensor:
     """An interleave_sf byte buffer; zeroed (the padding interleave_sf writes) only when MN or K
     leaves a partial tile."""
@@ -105,3 +128,17 @@ def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Te
         x, x8, sf, hat, rows, seqlen, nheads, dim, rows_per_program, num_warps=4
     )
     return x8, sf.view(torch.float8_e8m0fnu), hat
+
+
+def quantize_keys(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MXFP8 of a contiguous (batch, seqlen, heads, dim) V along keys (native PV): (E4M3 payload,
+    flat interleave_sf UE8M0 scales with MN = dim, BF16 dequantized payload)."""
+    batch, seqlen, nheads, dim = v.shape
+    assert v.is_contiguous() and dim in (64, 128, 256)
+    v8 = torch.empty(v.shape, dtype=torch.float8_e4m3fn, device=v.device)
+    hat = torch.empty(v.shape, dtype=torch.bfloat16, device=v.device)
+    sf = _interleaved_buffer(batch, nheads, dim, math.ceil(seqlen / SF_VEC), v.device)
+    _quantize_keys_kernel[(triton.cdiv(seqlen, SF_VEC), batch * nheads)](
+        v, v8, sf, hat, seqlen, nheads, dim, num_warps=4
+    )
+    return v8, sf.view(torch.float8_e8m0fnu), hat
