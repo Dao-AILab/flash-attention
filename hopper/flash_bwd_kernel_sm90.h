@@ -79,6 +79,8 @@ public:
 
         struct PipelineStorage : cute::aligned_struct<16> {
             alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_KV;
+            alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_Q_tail;
+            alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_dO_tail;
             alignas(16) typename CollectiveMainloop::MainloopPipeline::SharedStorage pipeline_q;
             alignas(16) typename CollectiveMainloop::MainloopPipeline_dO::SharedStorage pipeline_do;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
@@ -186,6 +188,8 @@ public:
 
         if (warp_idx == 0 && lane_predicate) {
             shared_storage.pipelines.barrier_KV.init(1 /*numThreads*/);
+            shared_storage.pipelines.barrier_Q_tail.init(1 /*numThreads*/);
+            shared_storage.pipelines.barrier_dO_tail.init(1 /*numThreads*/);
         }
         // We're counting on pipeline_q to call cutlass::arch::fence_barrier_init();
         MainloopPipeline pipeline_q(shared_storage.pipelines.pipeline_q, pipeline_params, ClusterShape{});
