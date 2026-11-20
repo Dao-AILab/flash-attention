@@ -83,14 +83,15 @@ CUTE_DSL_LINEINFO=1 compute-sanitizer --tool=racecheck python AI/racecheck_repro
 compute-sanitizer --tool=racecheck python AI/racecheck_repro_1d_tensor.py         # 0 hazards
 ```
 
-### `benchmarks/` (earlier, more variants)
+### Earlier local variants (not in tree)
 
-| File | What it tests | Result |
-|------|--------------|--------|
-| `racecheck_false_positive_repro.py` | `cp.async.bulk` + mbarrier in cross-warp loop | 1 error |
-| `racecheck_1d_raw_ptx.py` | Inline PTX `cp.async.bulk.shared::cta.global` | 1 error |
-| `racecheck_tma2d_repro.py` | `cp.async.bulk.tensor.2d` via `make_tiled_tma_atom` | 0 hazards |
-| `racecheck_tma1d_descriptor.py` | `cp.async.bulk.tensor.1d` via `make_tiled_tma_atom` | 0 hazards |
+Before the `AI/` reproducers above, several local kernels were used to bisect
+the same false positive; they are not checked into this repository. Findings:
+
+- `cp.async.bulk` + mbarrier in a cross-warp loop → 1 error
+- Inline PTX `cp.async.bulk.shared::cta.global` → 1 error
+- `cp.async.bulk.tensor.2d` via `make_tiled_tma_atom` → 0 hazards
+- `cp.async.bulk.tensor.1d` via `make_tiled_tma_atom` → 0 hazards
 
 ## PTX-level analysis
 
@@ -144,9 +145,9 @@ consumer_release) remains identical.
 
 ## Backup
 
-`flash_attn/cute/flash_bwd_sm100_gmem_fix.py` contains a working but slower
-fix where compute warps read LSE/dPsum directly from global memory, bypassing
-the TMA smem pipeline entirely.
+A slower backup approach (not checked into this repository) is for compute
+warps to read LSE/dPsum directly from global memory, bypassing the TMA smem
+pipeline entirely.
 
 ## Investigation timeline
 
