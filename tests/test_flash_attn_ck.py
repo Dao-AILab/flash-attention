@@ -2,6 +2,9 @@ import math
 
 import pytest
 import torch
+# The CK (Composable Kernel) backend is AMD ROCm only; skip the whole module on CUDA.
+if torch.version.hip is None:
+    pytest.skip("test_flash_attn_ck.py targets the AMD ROCm CK backend", allow_module_level=True)
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from flash_attn import (
