@@ -10,7 +10,7 @@ from tqdm import tqdm
 import itertools
 
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.testing import benchmark as cute_benchmark
+from cutlass.testing import benchmark as cute_benchmark
 import cutlass.cute as cute
 from flash_attn.cute.compute_block_sparsity import BlockSparsityKernel
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -166,7 +166,7 @@ def benchmark_cute_block_sparsity(
         )
 
         def generate_tensors():
-            from cutlass.cute.testing import JitArguments
+            from cutlass.testing import JitArguments
 
             return JitArguments(
                 blocksparse_tensors,

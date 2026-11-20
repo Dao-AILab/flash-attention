@@ -46,6 +46,12 @@ from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from flash_attn.cute.compat import (
+    LayoutEnum,
+    SmemAllocator,
+    TmemAllocator,
+    get_smem_capacity_in_bytes,
+)
 from flash_attn.cute.config import sparse_mla_qhead_tile
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManagerH64
 from flash_attn.cute.utils import get_batch_from_cu_tensor
@@ -211,13 +217,13 @@ class dQdQvGemmKernelH64:
             mK = rows_static_hdim(mK, self.head_dim_k)
 
         # ---- layout info ----
-        self.ds_major_mode = utils.LayoutEnum.from_tensor(mdS).mma_major_mode()
-        assert self.ds_major_mode == tcgen05.OperandMajorMode.K
+        self.ds_major_mode = LayoutEnum.from_tensor(mdS).mma_major_mode()
+        assert self.ds_major_mode == cute.nvgpu.OperandMajorMode.K
         # gathered rows are dims-contiguous: MN-major B of both GEMMs
-        self.kv_major_mode = tcgen05.OperandMajorMode.MN
-        self.dq_layout = utils.LayoutEnum.from_tensor(mdQv)
+        self.kv_major_mode = cute.nvgpu.OperandMajorMode.MN
+        self.dq_layout = LayoutEnum.from_tensor(mdQv)
         if const_expr(self.compute_dQ):
-            assert self.dq_layout == utils.LayoutEnum.from_tensor(mdQ)
+            assert self.dq_layout == LayoutEnum.from_tensor(mdQ)
 
         # ------------------------------------------------------------------ #
         # Setup attributes that depend on kernel inputs                      #
@@ -247,8 +253,8 @@ class dQdQvGemmKernelH64:
         tiled_mma_gather_v = utils.sm100.make_trivial_tiled_mma(
             self.kv_dtype,
             self.kv_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_dtype,
             self.cta_group,
             (self.tile_m, self.tile_k),
@@ -279,7 +285,7 @@ class dQdQvGemmKernelH64:
             )
 
         # ---- Device-specific attributes ----
-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
+        self.smem_capacity = get_smem_capacity_in_bytes()
 
         self.num_tmem_alloc_cols = 512
 
@@ -530,7 +536,7 @@ class dQdQvGemmKernelH64:
         # ------------------------------------------------------------------ #
         # Shared storage allocation                                          #
         # ------------------------------------------------------------------ #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # ------------------------------------------------------------------ #
@@ -596,7 +602,7 @@ class dQdQvGemmKernelH64:
             num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_ids)),
         )
         # ---- Tensor memory dealloc barrier init ----
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_ids[0],

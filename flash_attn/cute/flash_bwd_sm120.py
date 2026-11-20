@@ -6,8 +6,8 @@
 # FlashAttentionBackwardSm80 and overrides the SMEM capacity check accordingly.
 
 import cutlass
-import cutlass.utils as utils_basic
 
+from flash_attn.cute.compat import get_smem_capacity_in_bytes
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 
 
@@ -49,7 +49,7 @@ class FlashAttentionBackwardSm120(FlashAttentionBackwardSm80):
         )
         smem_usage = smem_usage_QV + smem_usage_dO + smem_usage_K
         # SM120 has 99 KB shared memory (vs 163 KB on SM80)
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
+        smem_capacity = get_smem_capacity_in_bytes("sm_120")
         if smem_usage > smem_capacity:
             return False
         return True

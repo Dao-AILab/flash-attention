@@ -18,6 +18,7 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 
 from quack import copy_utils
 
+from flash_attn.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from flash_attn.cute.pack_gqa import (
     pack_gqa_layout,
     make_packgqa_tiled_tma_atom,
@@ -497,10 +498,10 @@ class FlashAttentionMLAForwardSm100:
 
         topk_length_dynamic = mIndexTopk.shape[0] if mIndexTopk is not None else None
 
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
-        self.p_layout = cutlass.utils.LayoutEnum.ROW_MAJOR
+        self.o_layout = LayoutEnum.from_tensor(mO)
+        self.p_layout = LayoutEnum.ROW_MAJOR
         if const_expr(self.store_P):
-            assert cutlass.utils.LayoutEnum.from_tensor(mP) == self.p_layout
+            assert LayoutEnum.from_tensor(mP) == self.p_layout
 
         mO_og = mO
         mP_og = mP
@@ -883,7 +884,7 @@ class FlashAttentionMLAForwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
 
         # ==== Allocate SMEM ====
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # ==== TMEM stuff ====
@@ -891,7 +892,7 @@ class FlashAttentionMLAForwardSm100:
             barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.TmemPtr),
             num_threads=self.num_mma_threads + self.num_softmax_threads + self.num_epilogue_threads,
         )
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
@@ -977,7 +978,7 @@ class FlashAttentionMLAForwardSm100:
 
         sO_empty_mbar_ptr = None
         if const_expr(self.use_tma_O and self.overlap_sO_sV):
-            sO_empty_mbar_ptr = storage.sO_empty_mbar_ptr
+            sO_empty_mbar_ptr = storage.sO_empty_mbar_ptr.ptr
             if warp_idx == 0:
                 cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
 
