@@ -161,7 +161,10 @@ class VisionTransformer(nn.Module):
         # pre_norm seems redundant, as there's a LayerNorm right at the start of each block, idk
         assert not pre_norm
         use_fc_norm = global_pool == "avg" if fc_norm is None else fc_norm
-        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        if norm_layer is None:
+            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+        elif not callable(norm_layer):
+            raise TypeError(f"norm_layer must be a callable or None, got {type(norm_layer)}")
         act_layer = act_layer or nn.GELU
 
         self.num_classes = num_classes
