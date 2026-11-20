@@ -165,6 +165,48 @@ struct Softmax {
         }
     };
 
+    // Update cumulative accum scale factors (for deferred scaling)
+    template<typename TensorScale>
+    __forceinline__ __device__ void update_accum_scale(TensorScale &accum_scale, TensorT const &scores_scale) {
+        #pragma unroll
+        for (int mi = 0; mi < kNRows; ++mi) {
+            accum_scale(mi) *= scores_scale(mi);
+        }
+    }
+
+    // Apply deferred scale to accum and merge with current accumulator
+    template<typename Tensor1, typename Tensor2, typename TensorScale>
+    __forceinline__ __device__ void merge_accum_with_scale(Tensor1 &acc_o, Tensor2 &acc_o_accum, TensorScale &accum_scale) {
+        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        Tensor accum_rowcol = make_tensor(acc_o_accum.data(), flash::convert_layout_acc_rowcol(acc_o_accum.layout()));
+        static_assert(CUTE_STATIC_V(size<0>(acc_o_rowcol)) == kNRows);
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
+            float const scale = accum_scale(mi);
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+                accum_rowcol(mi, ni) = scale * accum_rowcol(mi, ni) + acc_o_rowcol(mi, ni);
+            }
+            accum_scale(mi) = 1.0f;
+        }
+    }
+
+    // Apply scale to accum, add to accumulator, result in accumulator
+    template<typename Tensor1, typename Tensor2, typename TensorScale>
+    __forceinline__ __device__ void final_merge_accum(Tensor1 &acc_o, Tensor2 const &acc_o_accum, TensorScale const &accum_scale) {
+        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        Tensor accum_rowcol = make_tensor(acc_o_accum.data(), flash::convert_layout_acc_rowcol(acc_o_accum.layout()));
+        static_assert(CUTE_STATIC_V(size<0>(acc_o_rowcol)) == kNRows);
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
+            float const scale = accum_scale(mi);
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+                acc_o_rowcol(mi, ni) = scale * accum_rowcol(mi, ni) + acc_o_rowcol(mi, ni);
+            }
+        }
+    };
+
 };
 
 }  // namespace flash
