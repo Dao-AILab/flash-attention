@@ -147,6 +147,9 @@ def _flash_attn_forward(
     if softmax_lse_accum is None:
         softmax_lse_accum = torch.tensor([], device=out.device)
 
+    if out_ is not None:
+        out = None
+
     return out, softmax_lse, out_accum, softmax_lse_accum
 
 
