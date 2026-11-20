@@ -161,6 +161,9 @@ class AttentionMask:
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
+    # R2P assumes the canonical row ownership of the QK accumulator. Kernels
+    # with a different accumulator mapping must use the direct predicate path.
+    enable_r2p_optimization: cutlass.Constexpr[bool] = True
 
     @property
     def seqlen_q(self) -> Int32:
@@ -185,7 +188,10 @@ class AttentionMask:
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
+        local_sides: cutlass.Constexpr[str] = "both",
     ) -> None:
+        """local_sides ("both", "right", "left"): the local window edges that can cut this
+        block, for callers that know the other edge lies outside it."""
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.swap_AB)
         acc_shape = (self.tile_m, self.tile_n)
@@ -298,7 +304,9 @@ class AttentionMask:
                     1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
                 )
                 if const_expr(mask_causal):
-                    r2p = const_expr(not self.swap_AB)  # R2P trick, see apply_mask_sm100
+                    r2p = const_expr(
+                        not self.swap_AB and self.enable_r2p_optimization
+                    )  # R2P trick, see apply_mask_sm100
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                         # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
                         if const_expr(self.qhead_per_kvhead_packgqa == 1):
@@ -336,7 +344,7 @@ class AttentionMask:
                         if const_expr(self.window_size_left is not None)
                         else None
                     )
-                    r2p_local = const_expr(not self.swap_AB)
+                    r2p_local = const_expr(not self.swap_AB and self.enable_r2p_optimization)
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                         if const_expr(self.qhead_per_kvhead_packgqa == 1):
                             row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
@@ -344,17 +352,20 @@ class AttentionMask:
                             row_idx = utils.shuffle_sync(
                                 mma_m_idx, r % threads_per_row, width=threads_per_row
                             )
-                        if const_expr(self.window_size_right is not None):
-                            col_limit_right = row_idx + local_row_offset_right
-                        else:
+                        mask_right = const_expr(
+                            local_sides != "left"
+                            and (self.window_size_right is not None or mask_seqlen)
+                        )
+                        mask_left = const_expr(
+                            local_sides != "right" and self.window_size_left is not None
+                        )
+                        if const_expr(local_sides == "left" or self.window_size_right is None):
                             col_limit_right = self.tile_n
+                        else:
+                            col_limit_right = row_idx + local_row_offset_right
                         if const_expr(mask_seqlen):
                             col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
-                        col_limit_left = (
-                            row_idx + local_row_offset_left
-                            if const_expr(self.window_size_left is not None)
-                            else 0
-                        )
+                        col_limit_left = row_idx + local_row_offset_left if mask_left else 0
                         if const_expr(not r2p_local):
                             # traverse column index.
                             for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
@@ -366,11 +377,16 @@ class AttentionMask:
                             col_limit_left_r2p = sm90_col_to_r2p_idx(col_limit_left)
 
                             def mask_gen_fn(s: int) -> Uint32:
+                                if const_expr(not mask_left):
+                                    return r2p_bitmask_below(col_limit_right_r2p, s)
+                                if const_expr(not mask_right):
+                                    return r2p_bitmask_above(col_limit_left_r2p, s)
                                 return r2p_bitmask_below(
                                     col_limit_right_r2p, s
                                 ) & r2p_bitmask_above(col_limit_left_r2p, s)
 
-                            mask_r2p_lambda(acc_S_mn[r, None], mask_gen_fn, rank1=True)
+                            if const_expr(mask_left or mask_right):
+                                mask_r2p_lambda(acc_S_mn[r, None], mask_gen_fn, rank1=True)
             else:  # swap_AB
                 assert self.qhead_per_kvhead_packgqa == 1
                 thr_row_offset = tScS_mn[0][ROW]
