@@ -77,7 +77,7 @@ make_tiled_copy_C_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_first, bool Is_last, bool Seq_parallel=false, bool Compute_alibi_grad=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -453,6 +453,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     FLASH_NAMESPACE::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
+    [[maybe_unused]] float dalibi_slope = 0.0f;
 
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
@@ -589,6 +590,21 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             #pragma unroll
             for (int ni = 0; ni < size<1>(dS); ++ni) {
                 float scaled_ds = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi));
+                if constexpr (Compute_alibi_grad) {
+                    const int row = m_block * kBlockM + get<0>(taccScS_row(mi));
+                    // B/P copies make columns contiguous within each warp;
+                    // use the same column mapping as apply_alibi and masking.
+                    const int col = n_block * kBlockN
+                        + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16
+                        + (tidx % 4) * 2 + (ni / 2) * 8 + ni % 2;
+                    // ALiBi is added after softcapping. Differentiate its bias
+                    // before multiplying by dtanh or the QK softmax scale.
+                    // For causal attention, the forward column-only bias differs
+                    // by a row constant; use the canonical distance here.
+                    if (row < binfo.actual_seqlen_q && col < binfo.actual_seqlen_k) {
+                        dalibi_slope -= scaled_ds * abs(row + binfo.actual_seqlen_k - binfo.actual_seqlen_q - col);
+                    }
+                }
                 if constexpr (Is_softcap) { scaled_ds *= dtanh(mi, ni); }
                 dS(mi, ni) = scaled_ds;
             }
@@ -725,6 +741,24 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     // Epilogue
 
+    if constexpr (Compute_alibi_grad) {
+        static_assert(kBlockN >= Params::kAlibiGradMinBlockN);
+        static_assert(Kernel_traits::kNThreads <= Params::kAlibiGradMaxWarps * 32);
+        FLASH_NAMESPACE::SumOp<float> sum_op;
+        dalibi_slope = FLASH_NAMESPACE::Allreduce<32>::run(dalibi_slope, sum_op);
+        if (tidx % 32 == 0) {
+            const index_t head_offset = params.cu_seqlens_k == nullptr
+                ? (bidb * params.h + bidh) * params.dalibi_slopes_accum_head_stride
+                : bidh * params.dalibi_slopes_accum_head_stride;
+            const index_t first_slot = params.cu_seqlens_k == nullptr
+                ? 0 : binfo.sum_s_k / Params::kAlibiGradMinBlockN + bidb;
+            const index_t offset = head_offset
+                + (first_slot + n_block) * Params::kAlibiGradMaxWarps + tidx / 32;
+            // The existing dS calculation defers the reciprocal keep probability.
+            params.dalibi_slopes_accum_ptr[offset] = dalibi_slope * params.rp_dropout;
+        }
+    }
+
     if (Is_dropout) {
         #pragma unroll
         for (int i = 0; i < size(acc_dv); ++i) { acc_dv(i) *= params.rp_dropout; }
@@ -823,7 +857,7 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Compute_alibi_grad=false, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // The block index for the batch.
@@ -833,7 +867,7 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
     for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true, Compute_alibi_grad>(params, bidb, bidh, n_block);
     }
 }
 
