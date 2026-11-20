@@ -35,7 +35,8 @@ def select_amd_backend(
     FLASH_ATTENTION_AITER_AMD_ENABLE selects aiter's general implementation.
 
     The runtime passes torch.version and its FlashAttention version. aiter then requires ROCm. On
-    ROCm, FA3 uses aiter's Triton implementation, and FA2 without its extension falls back to it.
+    ROCm, FA3 uses aiter's Triton implementation and refuses the general one, and FA2 without its
+    extension falls back to the Triton one.
     FA2's setup.py passes only env, since its extension does not exist yet during the build; FA3
     has no CK extension to look for, so hopper/setup.py selects as its runtime does.
     """
@@ -54,6 +55,11 @@ def select_amd_backend(
     is_rocm = getattr(torch_version, "hip", None) is not None
     if isinstance(backend, Aiter) and not is_rocm:
         raise RuntimeError("the aiter backend requires ROCm")
+    if backend == Aiter("general") and fa_version == 3:
+        raise ValueError(
+            "FA3 does not support aiter's general implementation "
+            "(FLASH_ATTENTION_AITER_AMD_ENABLE). Use FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE."
+        )
     if isinstance(backend, Ck) and is_rocm and CK_MODULES[fa_version] is None:
         return Aiter("triton")
     if isinstance(backend, Ck) and is_rocm:

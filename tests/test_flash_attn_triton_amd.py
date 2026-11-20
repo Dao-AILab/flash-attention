@@ -1,4 +1,5 @@
 import math
+import subprocess
 import sys
 import types
 import warnings
@@ -2651,7 +2652,6 @@ def test_flash_attn_custom_ops_compile(dropout_p, return_softmax):
         pytest.param({"FLASH_ATTENTION_AITER_AMD_ENABLE": "TRUE"}, "rocm", 2, True, Aiter("general"), False, id="fa2-rocm-general"),
         pytest.param({}, "rocm", 3, False, Aiter("triton"), False, id="fa3-rocm-no-ck-extension"),
         pytest.param({"FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"}, "rocm", 3, False, Aiter("triton"), False, id="fa3-rocm-triton"),
-        pytest.param({"FLASH_ATTENTION_AITER_AMD_ENABLE": "TRUE"}, "rocm", 3, False, Aiter("general"), False, id="fa3-rocm-general"),
     ],
 )
 def test_amd_backend_routing(monkeypatch, env, platform, fa_version, has_ck, expected, warns):
@@ -2666,6 +2666,19 @@ def test_amd_backend_routing(monkeypatch, env, platform, fa_version, has_ck, exp
         backend = select_amd_backend(env, torch_version, fa_version)
     assert backend == expected
     assert ["falling back" in str(w.message) for w in caught] == ([True] if warns else [])
+
+
+def test_fa3_aiter_adapter_imports_alone():
+    """hopper/flash_attn_interface_aiter.py imports on its own: it does not import
+    flash_attn_interface, which imports it."""
+    hopper = Path(__file__).resolve().parents[1] / "hopper"
+    result = subprocess.run(
+        [sys.executable, "-c", "import flash_attn_interface_aiter"],
+        cwd=hopper,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_amd_backend_parity():
@@ -2683,13 +2696,14 @@ def test_amd_backend_parity():
         ({"FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE", "FLASH_ATTENTION_AITER_AMD_ENABLE": "TRUE"}, "rocm", 2, ValueError, "Select only one"),
         ({"FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"}, "cuda", 2, RuntimeError, "requires ROCm"),
         ({"FLASH_ATTENTION_AITER_AMD_ENABLE": "TRUE"}, "cuda", 3, RuntimeError, "requires ROCm"),
+        ({"FLASH_ATTENTION_AITER_AMD_ENABLE": "TRUE"}, "rocm", 3, ValueError, "FA3 does not support"),
         ({}, "rocm", None, TypeError, "together"),
         ({}, None, 2, TypeError, "together"),
     ],
 )
 def test_amd_backend_refusal(env, platform, fa_version, error, message):
-    """Contradictory flags, aiter without ROCm, or a runtime call missing half its arguments fail
-    with a named error."""
+    """Contradictory flags, aiter without ROCm, FA3 on aiter's general implementation, or a runtime
+    call missing half its arguments fail with a named error."""
     torch_version = None if platform is None else types.SimpleNamespace(hip="7.0" if platform == "rocm" else None)
     with pytest.raises(error, match=message):
         select_amd_backend(env, torch_version, fa_version)

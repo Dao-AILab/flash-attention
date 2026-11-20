@@ -1,8 +1,7 @@
-"""FA3 low-level ABI backed by aiter's Triton MHA v3."""
+"""FA3 low-level ABI backed by aiter's Triton MHA v3. select_amd_backend refuses aiter's general
+implementation for FA3, so this module is only reached on the Triton one."""
 
 from types import SimpleNamespace
-
-from flash_attn_interface import AMD_BACKEND
 
 
 def fwd(
@@ -41,11 +40,6 @@ def fwd(
     pack_gqa,
     sm_margin,
 ):
-    if AMD_BACKEND.impl != "triton":
-        raise NotImplementedError(
-            "FA3 is not supported by the aiter general implementation. "
-            "Use FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE."
-        )
     if scheduler_metadata is not None:
         raise NotImplementedError("scheduler_metadata is not supported by the FA3 aiter adapter")
     from aiter.ops.triton.attention import mha_v3 as triton_mha_v3
@@ -113,11 +107,6 @@ def bwd(
     deterministic,
     sm_margin,
 ):
-    if AMD_BACKEND.impl != "triton":
-        raise NotImplementedError(
-            "FA3 is not supported by the aiter general implementation. "
-            "Use FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE."
-        )
     from aiter.ops.triton.attention import mha_v3 as triton_mha_v3
 
     softmax_d = triton_mha_v3._flash_attn_backward(
@@ -148,11 +137,6 @@ def bwd(
 
 
 def fwd_combine(out_partial, lse_partial, out=None, out_dtype=None):
-    if AMD_BACKEND.impl != "triton":
-        raise NotImplementedError(
-            "FA3 is not supported by the aiter general implementation. "
-            "Use FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE."
-        )
     from aiter.ops.triton.attention import mha_v3 as triton_mha_v3
 
     return triton_mha_v3._flash_attn_combine(out_partial, lse_partial, out, out_dtype)

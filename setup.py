@@ -814,13 +814,20 @@ class NinjaBuildExtension(BuildExtension):
                 self.compiler.spawn = original_spawn
 
 
+def aiter_install_requires():
+    """The pip requirements of the aiter backend. torch is left out: pip resolves it to CUDA
+    PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch, so users must have torch
+    installed. AITER_USE_SYSTEM_TRITON=1 (read as aiter's setup.py reads it) keeps the installed
+    Triton: pip does not count a ROCm image's triton-rocm as triton, so requiring it would replace it.
+    """
+    if int(os.environ.get("AITER_USE_SYSTEM_TRITON", "0")):
+        return ["einops"]
+    return ["einops", "triton>=3.6.0" if sys.platform != "win32" else "triton-windows>=3.6.0"]
+
+
 # Build install_requires based on platform
 if USE_AITER:
-    # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
-    install_requires = [
-        "einops",
-        "triton>=3.6.0" if sys.platform != "win32" else "triton-windows>=3.6.0",
-    ]
+    install_requires = aiter_install_requires()
 else:
     install_requires = [
         "torch",

@@ -191,6 +191,12 @@ cd third_party/aiter && git fetch origin && git checkout <commit-sha> && cd ../.
 FLASH_ATTENTION_AITER_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
 
+Not supported (raises `NotImplementedError`, or `ValueError` for FA3, instead of a wrong result):
+- FA3, and KV-cache attention (`flash_attn_with_kvcache`); use the Triton backend for both.
+- `softcap` and an explicit dropout generator.
+- In varlen calls: `seqused_k`, `leftpad_k`, and `num_splits` above 1.
+- `return_attn_probs` without dropout. With dropout, it returns the dropout pattern (kept values are `>= 0`), not the attention probabilities.
+
 #### Triton Backend
 The Triton implementation of [Flash Attention](https://tridao.me/publications/flash2/flash2.pdf) supports AMD's CDNA (MI200, MI300) and RDNA GPUs using fp16, bf16, and fp32 datatypes. It provides forward and backward passes with causal masking, variable sequence lengths, arbitrary Q/KV sequence lengths and head sizes, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via the Flash Attention v3 interface). Sliding window attention is currently a work in progress.
 
@@ -211,6 +217,11 @@ Alternativly, if _not_ autotuning, `FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON` 
 ```sh
 FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON='{"BLOCK_M":128,"BLOCK_N":64,"waves_per_eu":1,"PRE_LOAD_V":false,"num_stages":1,"num_warps":8}'
 ```
+
+Not supported (raises `NotImplementedError` instead of a wrong result):
+- `softcap` and an explicit dropout generator.
+- In varlen calls: `seqused_k`, `leftpad_k`, `num_splits` above 1, and `block_table` (paged KV-cache goes through `flash_attn_with_kvcache`).
+- A preallocated `out` in `flash_attn_with_kvcache`.
 
 For a quick start with Docker:
 ```dockerfile
