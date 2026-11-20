@@ -31,6 +31,7 @@ from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
@@ -712,7 +713,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
-        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors)
+        fastdiv_mods = utils.compute_fastdiv_mods(
+            mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors, mPageTable
+        )
 
         self.kernel(
             mQ,
@@ -724,6 +727,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mPageTable,
             softmax_scale_log2,
             softmax_scale,
             window_size_left,
@@ -763,6 +767,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mPageTable: Optional[cute.Tensor],
         softmax_scale_log2: Float32,
         softmax_scale: Optional[Float32],
         window_size_left: Optional[Int32],
@@ -806,7 +811,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             seqlen = SeqlenInfoQK.create(
                 batch_idx=batch_size,
                 seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
-                seqlen_k_static=mK.shape[0],
+                seqlen_k_static=mK.shape[0] * (mPageTable.shape[1] if const_expr(mPageTable is not None) else 1),
                 mCuSeqlensQ=mCuSeqlensQ,
                 mCuSeqlensK=mCuSeqlensK,
                 mSeqUsedQ=mSeqUsedQ,
@@ -827,7 +832,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             blkV_shape = (self.tile_n, self.tile_hdimv)
             num_head_kv = num_head if const_expr(self.pack_gqa) else num_head // self.qhead_per_kvhead
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_size, dim=3)[None, None, num_head]
-            if const_expr(not seqlen.has_cu_seqlens_k):
+            if const_expr(mPageTable is not None):
+                paged_kv_manager = PagedKVManager.create(
+                    mPageTable, mK, mV, cute.FastDivmodDivisorV2(mK.shape[0]),
+                    batch_size, num_head_kv, tidx, seqlen.seqlen_k, 0,
+                    self.tile_n, self.tile_hdim, self.tile_hdimv,
+                    self.num_threads, self.dtype, arch=80,
+                    same_hdim_kv=self.same_hdim_kv,
+                )
+            elif const_expr(not seqlen.has_cu_seqlens_k):
                 mK_cur = mK[None, None, num_head_kv, batch_size]
                 mV_cur = mV[None, None, num_head_kv, batch_size]
             else:
@@ -835,8 +848,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
             if const_expr(not self.pack_gqa):
                 gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
-            gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
-            gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
+            if const_expr(mPageTable is None):
+                gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
+                gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Get shared memory buffer
@@ -855,9 +869,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
             gmem_thr_copy_V = gmem_tiled_copy_V.get_slice(tidx)
             # (CPY_Atom, CPY_N, CPY_K, n_block)
-            tKsK, tKgK = gmem_thr_copy_K.partition_D(sK), gmem_thr_copy_K.partition_S(gK)
+            tKsK = gmem_thr_copy_K.partition_D(sK)
             # (CPY_Atom, CPY_N, CPY_K, n_block)
-            tVsV, tVgV = gmem_thr_copy_V.partition_D(sV), gmem_thr_copy_V.partition_S(gV)
+            tVsV = gmem_thr_copy_V.partition_D(sV)
+            if const_expr(mPageTable is None):
+                tKgK = gmem_thr_copy_K.partition_S(gK)
+                tVgV = gmem_thr_copy_V.partition_S(gV)
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Tile MMA compute thread partitions and allocate accumulators
@@ -939,12 +956,16 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 tSsK=tSsK,
                 tOsVt=tOsVt,
             )
-            load_K = partial(
-                self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK, seqlen=seqlen.seqlen_k
-            )
-            load_V = partial(
-                self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV, seqlen=seqlen.seqlen_k
-            )
+            if const_expr(mPageTable is not None):
+                load_K = partial(self.load_paged_KV, paged_kv_manager, sK, K_or_V="K")
+                load_V = partial(self.load_paged_KV, paged_kv_manager, sV, K_or_V="V")
+            else:
+                load_K = partial(
+                    self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK, seqlen=seqlen.seqlen_k
+                )
+                load_V = partial(
+                    self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV, seqlen=seqlen.seqlen_k
+                )
 
             compute_one_n_block = partial(
                 self.compute_one_n_block,
@@ -1093,6 +1114,21 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 num_head,
                 batch_size,
             )
+
+    @cute.jit
+    def load_paged_KV(
+        self,
+        manager: PagedKVManager,
+        sX: cute.Tensor,
+        block: Int32,
+        smem_pipe_write: Int32,
+        need_predicates: cutlass.Constexpr,
+        K_or_V: cutlass.Constexpr[str],
+    ):
+        # K and V can be prefetched from different blocks, so refresh the page
+        # entries for each load. The manager predicates both sequence and page tails.
+        manager.load_page_table(block)
+        manager.load_KV(block, sX[None, None, smem_pipe_write], K_or_V)
 
     @cute.jit
     def compute_one_n_block(
