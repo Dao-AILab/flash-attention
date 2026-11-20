@@ -10,12 +10,18 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute import FastDivmodDivisorV2
 from cutlass import Float32, Int32, Int64, const_expr
-from cutlass.utils import LayoutEnum, TensorMapManager, TensorMapUpdateMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
 
 from quack import layout_utils
+from flash_attn.cute.compat import (
+    LayoutEnum,
+    SmemAllocator,
+    TensorMapManager,
+    TensorMapUpdateMode,
+    TmemAllocator,
+)
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
@@ -1611,16 +1617,16 @@ class FlashAttentionBackwardSm100:
         )
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         dQ_cluster_full_mbar_ptr = storage.dQ_cluster_full_mbar_ptr.data_ptr()
         dQ_cluster_empty_mbar_ptr = storage.dQ_cluster_empty_mbar_ptr.data_ptr()
 
         if const_expr(self.use_2cta_instrs):
-            dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr
-            dS_cluster_empty_mbar_ptr = storage.dS_cluster_empty_mbar_ptr
-            dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr
+            dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr.ptr
+            dS_cluster_empty_mbar_ptr = storage.dS_cluster_empty_mbar_ptr.ptr
+            dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr.ptr
         else:
             dS_cluster_full_mbar_ptr = None
             dS_cluster_empty_mbar_ptr = None
@@ -1628,7 +1634,7 @@ class FlashAttentionBackwardSm100:
         # The dQaccum_empty handshake exists only where sdS_xchg aliases sdQaccum; the roles
         # specialize on this handle (and on sdS_xchg) rather than on the configuration.
         if const_expr(self.xchg_aliases_dQaccum):
-            dQaccum_empty_mbar_ptr = storage.dQaccum_empty_mbar_ptr
+            dQaccum_empty_mbar_ptr = storage.dQaccum_empty_mbar_ptr.ptr
         else:
             dQaccum_empty_mbar_ptr = None
 
@@ -1656,7 +1662,7 @@ class FlashAttentionBackwardSm100:
             num_threads=cute.arch.WARP_SIZE
             * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
         )
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,

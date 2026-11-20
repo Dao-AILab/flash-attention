@@ -16,13 +16,12 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
-import cutlass.utils as utils_basic
-from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils
 from quack import layout_utils
 
+from flash_attn.cute.compat import Arch, SmemAllocator, get_smem_capacity_in_bytes
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
@@ -166,7 +165,7 @@ class FlashAttentionForwardBase:
         )
         smem_usage = smem_usage_QV + smem_usage_K
         # TODO: sm86 and sm89
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
+        smem_capacity = get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
             return False
         # Check if twice the block size is divisible by the number of threads
@@ -247,7 +246,7 @@ class FlashAttentionForwardBase:
         async_copy_elems = universal_copy_bits // self.dtype.width
         # atom_async_copy: async copy atom for QKV load
         atom_async_copy = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
             self.dtype,
             num_bits_per_copy=universal_copy_bits,
         )
@@ -846,7 +845,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             # Get shared memory buffer
             # ///////////////////////////////////////////////////////////////////////////////
-            smem = cutlass.utils.SmemAllocator()
+            smem = SmemAllocator()
             storage = smem.allocate(SharedStorage)
             sQ = storage.sQ.get_tensor(sQ_layout)
             sK = storage.sK.get_tensor(sK_layout)
