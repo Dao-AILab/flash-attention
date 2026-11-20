@@ -12,7 +12,7 @@ from pytorch_lightning import (
     Trainer,
     seed_everything,
 )
-from pytorch_lightning.loggers import LightningLoggerBase
+from pytorch_lightning.loggers import Logger
 
 from src.utils import utils
 
@@ -97,7 +97,7 @@ def evaluate(config: DictConfig) -> None:
                 callbacks.append(hydra.utils.instantiate(cb_conf))
 
     # Init Lightning loggers
-    logger: List[LightningLoggerBase] = []
+    logger: List[Logger] = []
     if "logger" in config:
         for _, lg_conf in config["logger"].items():
             if lg_conf is not None and "_target_" in lg_conf:
