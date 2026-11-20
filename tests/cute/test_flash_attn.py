@@ -41,6 +41,7 @@ from flash_attn.cute.testing import (
     maybe_fake_tensor_mode,
     is_fake_mode,
 )
+from flash_attn.cute import interface as flash_attn_interface
 from flash_attn.cute.interface import (
     TensorwiseScales,
     flash_attn_func,
@@ -2230,6 +2231,93 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
         assert (x - x_ref).abs().max().item() <= 2 * (
             x_pt - x_ref
         ).abs().max().item() + atol, name
+
+
+@pytest.mark.parametrize(
+    "seq_lens, max_seqlen, qhead_per_kvhead",
+    [
+        # 320 tokens over 1000 sequences, most of them empty.
+        ([40] * 8 + [0] * 992, 4096, 1),
+        ([40] * 8 + [0] * 992, 4096, 4),
+        ([1] * 600 + [0] * 900, 512, 1),
+        ([0] * 2000 + [200], 512, 1),
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="q_stage=2 varlen is SM100/SM110 only")
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_varlen_blocks_to_batch_covers_grid(
+    seq_lens, max_seqlen, qhead_per_kvhead, causal, monkeypatch
+):
+    """The block -> batch table must have an entry for every tile the varlen grid launches.
+
+    With max_seqlen > tile_m, SM100 uses q_stage=2, so the scheduler grid counts tiles of
+    tile_m * q_stage rows. Many short or empty sequences then give the grid more tiles than a
+    table sized for tile_m-row tiles has entries, and the last tiles read past its end.
+    disable_scheduler_metadata keeps these calls on SingleTileVarlenScheduler, which reads the
+    table, rather than the dynamic varlen scheduler.
+    """
+    device = "cuda"
+    torch.manual_seed(0)
+    nheads_kv = 4
+    nheads = nheads_kv * qhead_per_kvhead
+    d = 64
+    dtype = torch.bfloat16
+    batch_size = len(seq_lens)
+    total_q = sum(seq_lens)
+    cu_seqlens = torch.tensor(
+        [0, *itertools.accumulate(seq_lens)], device=device, dtype=torch.int32
+    )
+    q = torch.randn(total_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(total_q, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(total_q, nheads_kv, d, device=device, dtype=dtype)
+
+    table_sizes = []
+    compute_blocks_to_batch = flash_attn_interface._compute_blocks_to_batch
+
+    def recording_compute_blocks_to_batch(cu_total_blocks, num_blocks, device):
+        table_sizes.append(num_blocks)
+        return compute_blocks_to_batch(cu_total_blocks, num_blocks, device)
+
+    recording_compute_blocks_to_batch.compile_cache = compute_blocks_to_batch.compile_cache
+    monkeypatch.setattr(
+        flash_attn_interface, "_compute_blocks_to_batch", recording_compute_blocks_to_batch
+    )
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        causal=causal,
+        disable_scheduler_metadata=True,
+    )
+    if is_fake_mode():
+        return
+
+    # SingleTileVarlenScheduler.get_grid_shape with tile_m=128, q_stage=2, cluster_shape_m=1.
+    rows = total_q * qhead_per_kvhead
+    tile = 128 * 2
+    grid_tiles = (rows + batch_size * (tile - 1)) // tile
+    assert len(table_sizes) == 1
+    assert table_sizes[0] >= grid_tiles
+
+    bounds = cu_seqlens.tolist()
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        if end == start:
+            continue
+        q_seq, k_seq, v_seq = (x[start:end].unsqueeze(0) for x in (q, k, v))
+        out_ref, _ = attention_ref(q_seq, k_seq, v_seq, causal=causal)
+        out_pt, _ = attention_ref(
+            q_seq, k_seq, v_seq, causal=causal, upcast=False, reorder_ops=True
+        )
+        fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+        assert (out[start:end] - out_ref[0]).abs().max().item() <= 2 * (
+            out_pt - out_ref
+        ).abs().max().item() + fwd_atol
 
 
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="hd256 2CTA is SM100/SM110 only")
