@@ -171,6 +171,98 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
 @pytest.mark.parametrize(
     "dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16])
 )
+@pytest.mark.parametrize("gqa", [False, True])
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_rotary_emb_qkv_per_head(interleaved, gqa, dtype):
+    """Each Q/K head can use a distinct set of rotary frequencies."""
+    rtol = 1e-3
+    batch_size = 4
+    seqlen = 63
+    nheads_q = 6
+    nheads_k = 3 if gqa else nheads_q
+    headdim = 64
+    rotary_dim = 32
+    device = "cuda"
+    torch.manual_seed(42)
+
+    if not gqa:
+        qkv = torch.randn(
+            batch_size,
+            seqlen,
+            3,
+            nheads_q,
+            headdim,
+            dtype=dtype,
+            device=device,
+            requires_grad=True,
+        )
+    else:
+        qkv = torch.randn(
+            batch_size,
+            seqlen,
+            nheads_q + 2 * nheads_k,
+            headdim,
+            dtype=dtype,
+            device=device,
+            requires_grad=True,
+        )
+    qkv_pt = qkv.detach().clone().requires_grad_()
+    angles_q = torch.rand(seqlen, nheads_q, rotary_dim // 2, device=device) * 2 * math.pi
+    angles_k = torch.rand(seqlen, nheads_k, rotary_dim // 2, device=device) * 2 * math.pi
+    cos_q, sin_q = angles_q.cos().to(dtype=dtype), angles_q.sin().to(dtype=dtype)
+    cos_k, sin_k = angles_k.cos().to(dtype=dtype), angles_k.sin().to(dtype=dtype)
+
+    out = apply_rotary_emb_qkv_(
+        qkv,
+        cos_q,
+        sin_q,
+        cos_k=None if not gqa else cos_k,
+        sin_k=None if not gqa else sin_k,
+        interleaved=interleaved,
+        num_heads_q=None if not gqa else nheads_q,
+    )
+
+    def apply_rotary_per_head_torch(x, cos, sin):
+        x_rotary = x[..., :rotary_dim].float()
+        if interleaved:
+            x1, x2 = x_rotary[..., ::2], x_rotary[..., 1::2]
+            x_half = torch.stack((-x2, x1), dim=-1).flatten(-2)
+            cos = cos.repeat_interleave(2, dim=-1)
+            sin = sin.repeat_interleave(2, dim=-1)
+        else:
+            x1, x2 = x_rotary.chunk(2, dim=-1)
+            x_half = torch.cat((-x2, x1), dim=-1)
+            cos = torch.cat((cos, cos), dim=-1)
+            sin = torch.cat((sin, sin), dim=-1)
+        x_rotary = x_rotary * cos[None].float() + x_half * sin[None].float()
+        return torch.cat((x_rotary.to(dtype=dtype), x[..., rotary_dim:]), dim=-1)
+
+    if not gqa:
+        q_pt, k_pt, v_pt = qkv_pt.unbind(2)
+        cos_k, sin_k = cos_q, sin_q
+    else:
+        q_pt, k_pt, v_pt = qkv_pt.split([nheads_q, nheads_k, nheads_k], dim=2)
+    q_pt = apply_rotary_per_head_torch(q_pt, cos_q, sin_q)
+    k_pt = apply_rotary_per_head_torch(k_pt, cos_k, sin_k)
+    out_pt = (
+        torch.stack((q_pt, k_pt, v_pt), dim=2)
+        if not gqa
+        else torch.cat((q_pt, k_pt, v_pt), dim=2)
+    )
+
+    g = torch.randn_like(out)
+    g_pt = g.clone()  # Since inplace=True, backward modifies the gradient inplace
+    out.backward(g)
+    out_pt.backward(g_pt)
+    atol = ((out_pt + 0.3 - 0.3) - out_pt).abs().max().item()
+    assert torch.allclose(out, out_pt, rtol=rtol, atol=2 * atol)
+    atol = ((qkv_pt.grad + 0.3 - 0.3) - qkv_pt.grad).abs().max().item()
+    assert torch.allclose(qkv.grad, qkv_pt.grad, rtol=rtol, atol=2 * atol)
+
+
+@pytest.mark.parametrize(
+    "dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16])
+)
 # @pytest.mark.parametrize('dtype', ([torch.float16]))
 @pytest.mark.parametrize("seqlen_offsets_type", [0, int, torch.Tensor])
 # @pytest.mark.parametrize("seqlen_offsets_type", [0])
