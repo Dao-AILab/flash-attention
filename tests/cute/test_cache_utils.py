@@ -4,6 +4,7 @@ import os
 from types import SimpleNamespace
 
 import pytest
+import quack
 import torch
 
 import flash_attn.cute.cache_utils as cache_utils
@@ -184,3 +185,16 @@ def test_retry_on_oom_preserves_persistent_cache(tmp_path, monkeypatch):
     assert run() == "retried"
     assert calls == 2
     assert [entry.read_bytes() for entry in disk_entries] == [b"cached kernel"] * 2
+
+
+def test_source_fingerprint_tracks_quack_version(monkeypatch):
+    """FA4 kernels compile Quack device code in (e.g. the SM90 backward's bulk copies), so a
+    Quack upgrade must not load kernels compiled against the previous version."""
+    cache_utils._compute_source_fingerprint.cache_clear()
+    try:
+        before = cache_utils._compute_source_fingerprint()
+        monkeypatch.setattr(quack, "__version__", "0.0.0+test")
+        cache_utils._compute_source_fingerprint.cache_clear()
+        assert cache_utils._compute_source_fingerprint() != before
+    finally:
+        cache_utils._compute_source_fingerprint.cache_clear()
