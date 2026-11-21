@@ -2,8 +2,25 @@ import re
 
 import pytest
 import torch
-from flash_attn.models.vit import vit_base_patch16_224 as flash_vit_base_patch16_224
+from flash_attn.models.vit import (
+    VisionTransformer,
+    vit_base_patch16_224 as flash_vit_base_patch16_224,
+)
 from timm.models.vision_transformer import vit_base_patch16_224
+
+
+def test_vit_rejects_non_callable_norm_layer():
+    with pytest.raises(TypeError, match="norm_layer must be a callable or None"):
+        VisionTransformer(
+            img_size=32,
+            patch_size=16,
+            in_chans=3,
+            num_classes=10,
+            embed_dim=64,
+            depth=2,
+            num_heads=4,
+            norm_layer=False,
+        )
 
 
 @pytest.mark.parametrize("fused_mlp", [False, True])
