@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
 import enum
 import math
+from dataclasses import replace
 from typing import Callable, NamedTuple, Optional
 from functools import partial
 
@@ -1731,6 +1732,17 @@ class FlashAttentionBackwardSm100:
             )
         else:
             pipeline_P = None
+        if const_expr(self.cta_group_size == 2 and cute.size(cluster_layout_vmnk) == 2):
+            # The only UMMA pair in a two-CTA cluster is ranks (0, 1):
+            # arrivals target leader rank 0, and UMMA commits multicast to both.
+            # Keep these destinations constant so pipeline arrivals need no
+            # runtime rank or multicast-mask arithmetic.
+            pipeline_S_P = replace(pipeline_S_P, producer_mask=Int32(3), consumer_mask=Int32(0))
+            pipeline_dP = replace(pipeline_dP, producer_mask=Int32(3), consumer_mask=Int32(0))
+            pipeline_dKV = replace(pipeline_dKV, producer_mask=Int32(3), consumer_mask=Int32(0))
+            pipeline_dQ = replace(pipeline_dQ, producer_mask=Int32(3), consumer_mask=Int32(0))
+            pipeline_dS = replace(pipeline_dS, producer_mask=Int32(0), consumer_mask=Int32(3))
+
         # B_L / B_D ready for the extra K=16 MMA blocks (one builder thread -> MMA warp)
         pipeline_Lx = pipeline_Dx = None
         fold_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 1)
@@ -1828,6 +1840,13 @@ class FlashAttentionBackwardSm100:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=False,
         )
+
+        if const_expr(self.cta_group_size == 2 and cute.size(cluster_layout_vmnk) == 2):
+            # TMA/UMMA empty-buffer commits also multicast to the whole pair.
+            pipeline_Q = replace(pipeline_Q, producer_mask=Int32(3), consumer_mask=Int32(3))
+            pipeline_Qt = replace(pipeline_Qt, producer_mask=Int32(3), consumer_mask=Int32(3))
+            pipeline_Kt = replace(pipeline_Kt, producer_mask=Int32(3), consumer_mask=Int32(3))
+            pipeline_dO = replace(pipeline_dO, producer_mask=Int32(3), consumer_mask=Int32(3))
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
         if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
@@ -4325,13 +4344,43 @@ class FlashAttentionBackwardSm100:
 
                 #### APPLY MASK (after score_mod, matching forward pass order)
                 check_m_boundary = (m_block + 1) * self.tile_m > seqlen.seqlen_q
-                mask_fn(
-                    tSrS_t2r,
-                    m_block=m_block,
-                    is_full_block=is_full_block,
-                    check_m_boundary=check_m_boundary,
-                    head_idx=head_q,
-                )
+                if const_expr(
+                    self.is_causal
+                    and not self.is_local
+                    and self.mask_mod is None
+                    and not self.use_block_sparsity
+                    and (self.use_2cta_instrs or self.tile_hdim < 128)
+                ):
+                    # Dense causal: only the tiles that touch the diagonal or a sequence
+                    # boundary contain masked elements; skip the mask on the others. This
+                    # pays where the compute warps bound the iteration (2CTA, and the small
+                    # head dims); the 1CTA hdim 128 kernel measured 1.6% slower with it.
+                    # Tile rows are packed query rows (pack_factor per position), so compare
+                    # positions: the tile's first position vs the last KV row of the work tile.
+                    kv_end = (work_n + 1) * self.cluster_tile_n
+                    q_pos_min = (m_block * self.tile_m) // self.pack_factor
+                    q_rows_end = (m_block + 1) * self.tile_m
+                    need_mask = (
+                        (kv_end - 1 > q_pos_min + seqlen.seqlen_k - seqlen.seqlen_q)
+                        or (kv_end > seqlen.seqlen_k)
+                        or (q_rows_end > seqlen.seqlen_q * self.pack_factor)
+                    )
+                    if need_mask:
+                        mask_fn(
+                            tSrS_t2r,
+                            m_block=m_block,
+                            is_full_block=is_full_block,
+                            check_m_boundary=check_m_boundary,
+                            head_idx=head_q,
+                        )
+                else:
+                    mask_fn(
+                        tSrS_t2r,
+                        m_block=m_block,
+                        is_full_block=is_full_block,
+                        check_m_boundary=check_m_boundary,
+                        head_idx=head_q,
+                    )
                 num_stages = cute.size(tScS_t2r, mode=[1])
                 # ---------------------------------------------
                 #### P = exp(S - LSE)
