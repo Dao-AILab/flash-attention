@@ -1,6 +1,7 @@
 # Copyright (c) 2023, Tri Dao.
 
 import sys
+import copy
 import functools
 import importlib.util
 import warnings
@@ -786,41 +787,43 @@ class NinjaBuildExtension(BuildExtension):
 
         super().__init__(*args, **kwargs)
 
-    def build_extensions(self) -> None:
+    def build_extension(self, ext) -> None:
         # Match CK's per-instance scheduling options (fmha_fwd_source_flags.cmake).
         # LSE-producing pingpong instances must keep the default scheduling mode.
-        import torch.utils.cpp_extension as cpp_extension
-
-        original_write_ninja = cpp_extension._write_ninja_file
         ck_expert_sources = re.compile(
             r"^fmha_fwd_d(64|128|192)_(fp16|bf16)_.*_qr_tdm_"
             r"(sched|pingpong_.*_nlse)(_.*)?_gfx125\.(cu|hip)$"
         )
-        needs_ck_source_flags = IS_ROCM and ROCM_BACKEND == "ck" and any(
-            ck_expert_sources.match(Path(source).name)
-            for extension in self.extensions for source in extension.sources
+        expert_sources = sorted(
+            source for source in ext.sources
+            if IS_ROCM and ROCM_BACKEND == "ck"
+            and ck_expert_sources.match(Path(source).name)
         )
-        if needs_ck_source_flags:
-            if not self.use_ninja:
-                raise RuntimeError("CK gfx1250 per-source scheduling requires Ninja")
+        if expert_sources:
+            # BuildExtension has configured the HIP compiler before this hook.
+            # Keep this group's objects and Ninja cache separate from sources
+            # that use the default scheduling mode.
+            expert_args = copy.deepcopy(ext.extra_compile_args)
+            expert_args["nvcc"] += ["-mllvm", "-amdgpu-expert-scheduling-mode"]
+            expert_objects = self.compiler.compile(
+                expert_sources,
+                output_dir=os.path.join(self.build_temp, ext.name, "ck_expert"),
+                macros=ext.define_macros + [(name,) for name in ext.undef_macros],
+                include_dirs=ext.include_dirs,
+                debug=self.debug,
+                extra_postargs=expert_args,
+                depends=ext.depends,
+            )
+            # Preserve the extension's source list for packaging. Let setuptools
+            # compile the remaining sources and link both groups together.
+            ext = copy.copy(ext)
+            ext.sources = [source for source in ext.sources if source not in expert_sources]
+            ext.extra_objects = list(ext.extra_objects or []) + expert_objects
+            # Relink when an expert object changes, including non-Ninja builds.
+            ext.depends = list(ext.depends or []) + expert_objects
+        super().build_extension(ext)
 
-            def write_ninja_with_ck_source_flags(*args, **kwargs):
-                original_write_ninja(*args, **kwargs)
-                ninja_path = Path(kwargs["path"])
-                lines = ninja_path.read_text().splitlines()
-                result = []
-                for line in lines:
-                    if line.lstrip().startswith("command = $nvcc ") and "$cuda_post_cflags" in line:
-                        line += " $ck_source_flags"
-                    result.append(line)
-                    if line.startswith("build ") and ": cuda_compile " in line:
-                        source_name = Path(line.split(": cuda_compile ", 1)[1]).name
-                        if ck_expert_sources.match(source_name):
-                            result.append("  ck_source_flags = -mllvm -amdgpu-expert-scheduling-mode")
-                ninja_path.write_text("\n".join(result) + "\n")
-
-            cpp_extension._write_ninja_file = write_ninja_with_ck_source_flags
-
+    def build_extensions(self) -> None:
         original_spawn = None
         if sys.platform == "win32" and self.compiler.compiler_type == "msvc":
             original_spawn = self.compiler.spawn
@@ -846,7 +849,6 @@ class NinjaBuildExtension(BuildExtension):
         try:
             super().build_extensions()
         finally:
-            cpp_extension._write_ninja_file = original_write_ninja
             if original_spawn is not None:
                 self.compiler.spawn = original_spawn
 
