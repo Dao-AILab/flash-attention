@@ -719,6 +719,75 @@ def cvt_f16x2_f32(
     )
 
 
+@dsl_user_op
+def cvt_bf16x2_through_e4m3x2_f32(
+    a: float | Float32, b: float | Float32, *, loc=None, ip=None
+) -> cutlass.Int32:
+    """bf16x2(e4m3(a), e4m3(b)): round to E4M3 (satfinite), then widen exactly to BF16."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 q;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 q, $2, $1;\n\t"
+            "cvt.rn.bf16x2.e4m3x2 $0, q;\n\t}",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def cvt_bf16x2_maybe_through_e4m3x2_f32(
+    a: float | Float32, b: float | Float32, keep_bf16: Int32, *, loc=None, ip=None
+) -> cutlass.Int32:
+    """bf16x2(a, b) if keep_bf16 else bf16x2(e4m3(a), e4m3(b)): both conversions and a select, so
+    a run-time choice adds no branch."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                Int32(keep_bf16).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .b16 q;\n\t.reg .b32 e, h;\n\t.reg .pred p;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 q, $2, $1;\n\t"
+            "cvt.rn.bf16x2.e4m3x2 e, q;\n\t"
+            "cvt.rn.bf16x2.f32 h, $2, $1;\n\t"
+            "setp.ne.b32 p, $3, 0;\n\t"
+            "selp.b32 $0, h, e, p;\n\t}",
+            "=r,f,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def cvt_bf16_maybe_through_e4m3(src: cute.Tensor, dst: cute.Tensor, keep_bf16: Int32) -> None:
+    """dst (BFloat16) = bf16(src) if keep_bf16 else e4m3(src), chosen per call without a branch."""
+    assert cute.size(dst.shape) == cute.size(src.shape) and cute.size(src.shape) % 2 == 0
+    assert dst.element_type is cutlass.BFloat16 and src.element_type is Float32
+    dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
+    for i in cutlass.range_constexpr(cute.size(dst_i32)):
+        dst_i32[i] = cvt_bf16x2_maybe_through_e4m3x2_f32(src[2 * i], src[2 * i + 1], keep_bf16)
+
+
+@cute.jit
+def cvt_bf16_through_e4m3(src: cute.Tensor, dst: cute.Tensor) -> None:
+    """dst (BFloat16) = e4m3(src) for a Float32 src: the E4M3 rounding of an MXFP8 forward's P,
+    held exactly in BF16 (two F2FP per pair)."""
+    assert cute.size(dst.shape) == cute.size(src.shape) and cute.size(src.shape) % 2 == 0
+    assert dst.element_type is cutlass.BFloat16 and src.element_type is Float32
+    dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
+    for i in cutlass.range_constexpr(cute.size(dst_i32)):
+        dst_i32[i] = cvt_bf16x2_through_e4m3x2_f32(src[2 * i], src[2 * i + 1])
+
+
 @overload
 def cvt_f16(src: cute.Tensor, dst: cute.Tensor) -> None: ...
 

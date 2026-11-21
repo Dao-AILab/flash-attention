@@ -21,6 +21,8 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
 from flash_attn.cute.config import (
+    MXFP8_BAND_BLOCK_N,
+    MXFP8_BAND_ROWS,
     BwdConfig,
     BwdHeuristicInputs,
     FwdConfig,
@@ -503,16 +505,18 @@ class MxMirrorBwd(NamedTuple):
     """The MXFP8 forward a mirrored BF16 backward differentiates (`_flash_attn_bwd(mx_mirror=...)`;
     NOTE [MXFP8 mirrored BF16 backward] in flash_bwd_sm100.py).
 
-    The backward's q / k / v are then the forward's operands in BF16: its Q / K payloads
-    dequantized (Q-hat, K-hat; exact for E4M3 x 2^k) and its BF16 V. stats is the forward's
-    BlockScales.stats_out.
+    The backward's q / k / v are then the forward's payloads dequantized to BF16: Q-hat, K-hat, and
+    V-hat for native PV (V itself for QK-only), which is exact for E4M3 x 2^k. stats is the forward's
+    BlockScales.stats_out. v_bf16 is the original V, required exactly for causal native PV (the
+    forward's BlockScales.v_bf16), whose BF16 band the backward reproduces.
     """
 
     stats: torch.Tensor
     mode: Mxfp8Mirror
+    v_bf16: torch.Tensor | None = None
 
 
-def _validate_mx_mirror(mx: MxMirrorBwd, q, softcap, unsupported_args) -> None:
+def _validate_mx_mirror(mx: MxMirrorBwd, q, v, causal, softcap, unsupported_args) -> None:
     """Per-call checks of a mirrored backward; the config validates the problem's scope."""
     stats = mx.stats
     if stats.dtype != torch.float32 or not stats.is_contiguous() or stats.device != q.device:
@@ -521,6 +525,11 @@ def _validate_mx_mirror(mx: MxMirrorBwd, q, softcap, unsupported_args) -> None:
         raise ValueError("mx_mirror.stats must have shape (batch, nheads, seqlen_q, 2)")
     if any(t is not None for t in unsupported_args) or softcap != 0.0:
         raise ValueError("The mirrored MXFP8 backward does not support dlse, seqused, or softcap")
+    band = mx.mode is Mxfp8Mirror.PV and causal
+    if band != (mx.v_bf16 is not None):
+        raise ValueError("mx_mirror.v_bf16 is required exactly for causal native PV")
+    if band and (mx.v_bf16.dtype != v.dtype or mx.v_bf16.shape != v.shape):
+        raise ValueError("mx_mirror.v_bf16 must match V-hat's dtype and shape")
 
 
 def _check_shared_kv_scales(scales) -> None:
@@ -1157,6 +1166,17 @@ def _flash_attn_fwd(
 
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
     cluster_shape_m = 2 if qv is None and config.use_2cta_instrs else 1
+    if pv_blockscaled and causal and head_dim != 256:
+        # The causal BF16 band geometry the mirrored backward reproduces (NOTE [MXFP8 mirrored
+        # BF16 backward] in flash_bwd_sm100.py); one tile covering all rows selects the same band.
+        band_rows = config.q_stage * config.tile_m * cluster_shape_m
+        if config.tile_n != MXFP8_BAND_BLOCK_N or not (
+            band_rows == MXFP8_BAND_ROWS or seqlen_q <= min(band_rows, MXFP8_BAND_ROWS)
+        ):
+            raise ValueError(
+                f"causal native MXFP8 PV needs a {MXFP8_BAND_ROWS} x {MXFP8_BAND_BLOCK_N} band "
+                f"tile, got {band_rows} x {config.tile_n}"
+            )
     if qv is not None:
         # the MLA kernels write all num_splits partials (no per-batch dynamic split counts)
         assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
@@ -2351,7 +2371,7 @@ def _flash_attn_bwd(
     else:
         validate_bwd_config(config, inputs)
     if mx_mirror is not None:
-        _validate_mx_mirror(mx_mirror, q, softcap, (dlse, seqused_q, seqused_k))
+        _validate_mx_mirror(mx_mirror, q, v, causal, softcap, (dlse, seqused_q, seqused_k))
     tile_m, tile_n = config.tile_m, config.tile_n
     cluster_size = config.cluster_size
     q_subtile_factor = bwd_q_subtile_factor(config, inputs)
@@ -2635,8 +2655,10 @@ def _flash_attn_bwd(
         softmax_scale=softmax_scale,  # read by the mirror mode's LSE slot
         mirror=mirror_pre,
     )
+    v_band = None
     if mx_mirror is not None:
         dout = mirror_pre.dout_scaled
+        v_band = maybe_contiguous(mx_mirror.v_bf16)
     # Backward kernel: compute dk, dv, dq_accum.
     score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
     score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
@@ -2732,6 +2754,10 @@ def _flash_attn_bwd(
         n_desc = 3 if arch // 10 in [10, 11] else 2
         bwd_tensormap_workspace = torch.empty((n_ctas, n_desc, 16), dtype=torch.int64, device=device)
     compile_key = compile_key + (bwd_tensormap_workspace is not None,)
+    # QK-only mirrors run the plain kernel; native PV specializes it
+    kernel_mirror = Mxfp8Mirror.PV if inputs.mxfp8_mirror is Mxfp8Mirror.PV else None
+    if kernel_mirror is not None:
+        compile_key += (kernel_mirror, get_broadcast_dims(v_band) if v_band is not None else None)
     compiled_bwd = _flash_attn_bwd.compile_cache.get(compile_key)
     if compiled_bwd is None:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -2840,6 +2866,7 @@ def _flash_attn_bwd(
                 Q_stage=config.num_stages_Q,
                 dO_stage=config.num_stages_dO,
                 fold_LSE_dPsum=config.fold_LSE_dPsum,
+                mxfp8_mirror=kernel_mirror,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -2878,6 +2905,8 @@ def _flash_attn_bwd(
                 if bwd_tensormap_workspace is not None
                 else None
             )
+            if arch // 10 in [10, 11]:
+                compile_args.append(to_cute_tensor(v_band) if v_band is not None else None)
         compile_args.append(current_stream)
 
         # TODO: check @can_implement
@@ -2921,6 +2950,8 @@ def _flash_attn_bwd(
         ]
         if arch // 10 in [9, 10, 11]:
             call_args.append(bwd_tensormap_workspace)
+            if arch // 10 in [10, 11]:
+                call_args.append(v_band)
         compiled_bwd(*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     if arch // 10 == 9:
