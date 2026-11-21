@@ -232,7 +232,7 @@ def rename_cpp_to_cu(cpp_files, generated_rdna_bfloat16_override=None):
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"]
+    allowed_archs = ["native", "gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201", "gfx1250"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -570,6 +570,13 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
         check_if_rocm_home_none("flash_attn")
         cc_flag = [f"--offload-arch={arch}" for arch in kernel_targets]
+        # Match CK's configure-time target definition in both compiler passes.
+        ck_target_ids = ",".join(f"0x{arch[3:]}" for arch in kernel_targets)
+        ck_framework_flags = [f"-DCK_CMAKE_GPU_TARGET_IDS={ck_target_ids}"]
+        # CK's unified framework does not yet support gfx1250 (see CK CMakeLists.txt).
+        if "gfx1250" in kernel_targets:
+            ck_framework_flags += ["-DUSE_NEW_UNIFIED_FRAMEWORK=0"]
+        cc_flag += ck_framework_flags
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -650,7 +657,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
         extra_compile_args = {
-            "cxx": ["-O3", "-std=c++20"] + generator_flag + maybe_hipify_v2_flag,
+            "cxx": ["-O3", "-std=c++20"] + ck_framework_flags + generator_flag + maybe_hipify_v2_flag,
             "nvcc": cc_flag + generator_flag + maybe_hipify_v2_flag,
         }
 
@@ -780,6 +787,40 @@ class NinjaBuildExtension(BuildExtension):
         super().__init__(*args, **kwargs)
 
     def build_extensions(self) -> None:
+        # Match CK's per-instance scheduling options (fmha_fwd_source_flags.cmake).
+        # LSE-producing pingpong instances must keep the default scheduling mode.
+        import torch.utils.cpp_extension as cpp_extension
+
+        original_write_ninja = cpp_extension._write_ninja_file
+        ck_expert_sources = re.compile(
+            r"^fmha_fwd_d(64|128|192)_(fp16|bf16)_.*_qr_tdm_"
+            r"(sched|pingpong_.*_nlse)(_.*)?_gfx125\.(cu|hip)$"
+        )
+        needs_ck_source_flags = IS_ROCM and ROCM_BACKEND == "ck" and any(
+            ck_expert_sources.match(Path(source).name)
+            for extension in self.extensions for source in extension.sources
+        )
+        if needs_ck_source_flags:
+            if not self.use_ninja:
+                raise RuntimeError("CK gfx1250 per-source scheduling requires Ninja")
+
+            def write_ninja_with_ck_source_flags(*args, **kwargs):
+                original_write_ninja(*args, **kwargs)
+                ninja_path = Path(kwargs["path"])
+                lines = ninja_path.read_text().splitlines()
+                result = []
+                for line in lines:
+                    if line.lstrip().startswith("command = $nvcc ") and "$cuda_post_cflags" in line:
+                        line += " $ck_source_flags"
+                    result.append(line)
+                    if line.startswith("build ") and ": cuda_compile " in line:
+                        source_name = Path(line.split(": cuda_compile ", 1)[1]).name
+                        if ck_expert_sources.match(source_name):
+                            result.append("  ck_source_flags = -mllvm -amdgpu-expert-scheduling-mode")
+                ninja_path.write_text("\n".join(result) + "\n")
+
+            cpp_extension._write_ninja_file = write_ninja_with_ck_source_flags
+
         original_spawn = None
         if sys.platform == "win32" and self.compiler.compiler_type == "msvc":
             original_spawn = self.compiler.spawn
@@ -805,6 +846,7 @@ class NinjaBuildExtension(BuildExtension):
         try:
             super().build_extensions()
         finally:
+            cpp_extension._write_ninja_file = original_write_ninja
             if original_spawn is not None:
                 self.compiler.spawn = original_spawn
 

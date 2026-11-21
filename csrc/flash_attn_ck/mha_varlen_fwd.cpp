@@ -115,7 +115,8 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
         stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    return fmha_fwd_args{q.data_ptr(),
+    return fmha_fwd_args{nullptr, // selected_kernel_name
+                         q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
                          alibi_slopes_ptr, // bias
