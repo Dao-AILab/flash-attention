@@ -3766,7 +3766,7 @@ def test_flash_attn_local_huge_window_config_sees_given_window():
     assert (inputs.window_size_left, inputs.window_size_right) == (256, 2**31 - 1)
 
 
-@pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 FP8 paged decode")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_paged_decode_tile_boundary():
     """A second KV tile must not saturate e4m3 softmax probabilities."""
@@ -3784,7 +3784,7 @@ def test_flash_attn_fp8_paged_decode_tile_boundary():
     assert cosine > 0.99, f"FP8 paged decode lost accuracy at the tile boundary: {cosine=}"
 
 
-@pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 FP8 paged decode")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_paged_decode_preserves_tail_mass():
     """Collectively significant e4m3 softmax tails must not flush to zero."""
@@ -3804,7 +3804,7 @@ def test_flash_attn_fp8_paged_decode_preserves_tail_mass():
     torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.1)
 
 
-@pytest.mark.skipif(not IS_SM100, reason="FP8 descales are SM100-only")
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 FP8 descales")
 @pytest.mark.parametrize("present", ["q", "k", "v", "qk", "qv", "kv"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_partial_descales(present):
