@@ -147,7 +147,7 @@ FlashAttention-2 with CUDA currently supports:
 3. All head dimensions up to 256. ~~Head dim > 192 backward requires A100/A800 or H100/H800~~. Head dim 256 backward now works on consumer GPUs (if there's no dropout) as of flash-attn 2.5.5.
 
 ### AMD ROCm Support
-ROCm version has two backends. There is [composable_kernel](https://github.com/ROCm/composable_kernel) (ck) which is the default backend and a [Triton](https://github.com/triton-lang/triton) backend. They provide an implementation of FlashAttention-2.
+ROCm version has three backends. There is [composable_kernel](https://github.com/ROCm/composable_kernel) (ck) which is the default backend, an [aiter](https://github.com/ROCm/aiter) backend and a [Triton](https://github.com/triton-lang/triton) backend. They provide an implementation of FlashAttention-2.
 
 **Requirements:**
 - ROCm 6.0 and above.
@@ -162,15 +162,11 @@ FlashAttention-2 ROCm CK backend currently supports:
 2. Datatype fp16 and bf16
 3. Both forward's and backward's head dimensions up to 256.
 
-#### Triton Backend
-The Triton implementation of [Flash Attention](https://tridao.me/publications/flash2/flash2.pdf) supports AMD's CDNA (MI200, MI300) and RDNA GPUs using fp16, bf16, and fp32 datatypes. It provides forward and backward passes with causal masking, variable sequence lengths, arbitrary Q/KV sequence lengths and head sizes, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via the Flash Attention v3 interface). Sliding window attention is currently a work in progress.
-
-The Triton backend kernels are provided by the [aiter](https://github.com/ROCm/aiter) package, included as a git submodule at `third_party/aiter` and automatically installed during setup.
-
-To install, first get PyTorch for ROCm from https://pytorch.org/get-started/locally/, then install Flash Attention:
+#### aiter Backend
+To use [aiter](https://github.com/ROCm/aiter) as the backend, set `FLASH_ATTENTION_AITER_AMD_ENABLE="TRUE"`. aiter is included as a git submodule at `third_party/aiter` and installed during setup:
 ```sh
 cd flash-attention
-FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
+FLASH_ATTENTION_AITER_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
 
 Installing the bundled `third_party/aiter` replaces an existing Triton with an aiter-compatible one.
@@ -178,20 +174,35 @@ On a ROCm PyTorch image, whose Triton is matched to its PyTorch and ROCm version
 `AITER_USE_SYSTEM_TRITON=1` to keep that Triton instead:
 ```sh
 cd flash-attention
-FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" AITER_USE_SYSTEM_TRITON=1 pip install --no-build-isolation .
+FLASH_ATTENTION_AITER_AMD_ENABLE="TRUE" AITER_USE_SYSTEM_TRITON=1 pip install --no-build-isolation .
 ```
 
 To build against an `aiter` that is already installed, instead of building the bundled
 `third_party/aiter` submodule:
 ```sh
 cd flash-attention
-FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_USE_SYSTEM_AITER="TRUE" pip install --no-build-isolation .
+FLASH_ATTENTION_AITER_AMD_ENABLE="TRUE" FLASH_ATTENTION_USE_SYSTEM_AITER="TRUE" pip install --no-build-isolation .
 ```
 
 To use a specific aiter commit (e.g., for testing or development):
 ```sh
 cd flash-attention
 cd third_party/aiter && git fetch origin && git checkout <commit-sha> && cd ../..
+FLASH_ATTENTION_AITER_AMD_ENABLE="TRUE" pip install --no-build-isolation .
+```
+
+Not supported (raises `NotImplementedError`, or `ValueError` for FA3, instead of a wrong result):
+- FA3, and KV-cache attention (`flash_attn_with_kvcache`); use the Triton backend for both.
+- `softcap` and an explicit dropout generator.
+- In varlen calls: `seqused_k`, `leftpad_k`, and `num_splits` above 1.
+- `return_attn_probs` without dropout. With dropout, it returns the dropout pattern (kept values are `>= 0`), not the attention probabilities.
+
+#### Triton Backend
+The Triton implementation of [Flash Attention](https://tridao.me/publications/flash2/flash2.pdf) supports AMD's CDNA (MI200, MI300) and RDNA GPUs using fp16, bf16, and fp32 datatypes. It provides forward and backward passes with causal masking, variable sequence lengths, arbitrary Q/KV sequence lengths and head sizes, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via the Flash Attention v3 interface). Sliding window attention is currently a work in progress.
+
+The Triton backend kernels are provided by aiter, and the install options of the aiter backend apply with `FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"`. To install, first get PyTorch for ROCm from https://pytorch.org/get-started/locally/, then install Flash Attention:
+```sh
+cd flash-attention
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
 
@@ -206,6 +217,11 @@ Alternativly, if _not_ autotuning, `FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON` 
 ```sh
 FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON='{"BLOCK_M":128,"BLOCK_N":64,"waves_per_eu":1,"PRE_LOAD_V":false,"num_stages":1,"num_warps":8}'
 ```
+
+Not supported (raises `NotImplementedError` instead of a wrong result):
+- `softcap` and an explicit dropout generator.
+- In varlen calls: `seqused_k`, `leftpad_k`, `num_splits` above 1, and `block_table` (paged KV-cache goes through `flash_attn_with_kvcache`).
+- A preallocated `out` in `flash_attn_with_kvcache`.
 
 For a quick start with Docker:
 ```dockerfile
