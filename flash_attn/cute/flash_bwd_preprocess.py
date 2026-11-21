@@ -11,6 +11,11 @@
 #   dS_ij = P_ij * (dP_ij - D_i) + dLSE_i * P_ij
 #         = P_ij * (dP_ij - (D_i - dLSE_i))
 # So the main backward kernel is unchanged; we just replace D with D' = D - dLSE here.
+#
+# Mirror mode (mirror_offset set, NOTE [MXFP8 mirrored BF16 backward] in flash_bwd_sm100.py):
+# the stats are an MXFP8 forward's BlockScales.stats_out (m, L) instead of LSE. The preprocess
+# writes dO' = bf16(dO * (1 / L)) to mdOScaled (dO' = 0 where L = 0), D = rowsum(dO' * O) from
+# that dO', and LSElog2 = fp32(m * scale_log2) - mirror_offset (0 where m = -inf).
 import enum
 import math
 import operator
@@ -70,6 +75,7 @@ class FlashAttentionBackwardPreprocess:
         qhead_per_kvhead: int = 1,
         nheads_kv: int = 1,
         hdim_multiple_of: int = 32,
+        mirror_offset: int | None = None,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -82,6 +88,8 @@ class FlashAttentionBackwardPreprocess:
         :param num_threads: number of threads
         :type num_threads: int
         :param hdim_multiple_of: accumulator alignment shared with the main backward kernel.
+        :param mirror_offset: the MXFP8 forward's P exponent offset in mirror mode (see the
+            module comment), None otherwise.
         """
         self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.dtype = dtype
@@ -95,6 +103,7 @@ class FlashAttentionBackwardPreprocess:
         self.pack_gqa = pack_gqa
         self.qhead_per_kvhead = qhead_per_kvhead
         self.nheads_kv = nheads_kv
+        self.mirror_offset = mirror_offset
 
     @staticmethod
     def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
@@ -170,6 +179,9 @@ class FlashAttentionBackwardPreprocess:
         softmax_scale: Float32,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mOlo: Optional[cute.Tensor] = None,  # same shape/dtype as mO: bf16 rounding residual of O
+        # mirror mode: (batch, nheads, seqlen, 2) FP32 (m, L) in, dO' (same shape as mdO) out
+        mStats: Optional[cute.Tensor] = None,
+        mdOScaled: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -208,17 +220,31 @@ class FlashAttentionBackwardPreprocess:
             if const_expr(mRowMax.element_type not in [Float32]):
                 raise TypeError("RowMax tensor must be Float32")
 
+        mirror = self.mirror_offset is not None
+        assert mirror == (mStats is not None) == (mdOScaled is not None)
+        assert not mirror or (
+            mLSE is None
+            and mLSElog2 is not None
+            and mdLSE is None
+            and mOlo is None
+            and mRowMax is None
+            and mCuSeqlensQ is None
+            and not self.nheads_major
+        ), "mirror mode: dense, with LSElog2 from the stats and no LSE / dLSE / O residual"
         self._setup_attributes()
 
         # (b, s, h, d)  -> (s, d, h, b)  or
         # (total, h, d) -> (total, d, h)
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        mO, mdO, mOlo = [
+        mO, mdO, mOlo, mdOScaled = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=QO_layout_transpose))
             if mX is not None
             else None
-            for mX in (mO, mdO, mOlo)
+            for mX in (mO, mdO, mOlo, mdOScaled)
         ]
+        # (b, h, s, 2) -> (s, 2, h, b): O's mode order, so it packs and slices like O
+        if const_expr(mStats is not None):
+            mStats = layout_utils.select(mStats, [2, 3, 1, 0])
 
         if const_expr(not self.nheads_major):
             # (batch, nheads, seqlen) -> (seqlen, nheads, batch) or
@@ -243,11 +269,11 @@ class FlashAttentionBackwardPreprocess:
 
         # pack gqa
         if const_expr(self.pack_gqa != PackGQA.OFF):
-            mO, mdO, mRowMax, mScaleP, mOlo = [
+            mO, mdO, mRowMax, mScaleP, mOlo, mStats, mdOScaled = [
                 pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
                 if mX is not None
                 else None
-                for mX in (mO, mdO, mRowMax, mScaleP, mOlo)
+                for mX in (mO, mdO, mRowMax, mScaleP, mOlo, mStats, mdOScaled)
             ]
             mLSE, mdLSE = [
                 pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
@@ -318,6 +344,8 @@ class FlashAttentionBackwardPreprocess:
             self.gmem_tiled_copy_dQaccum,
             tile_sched_params,
             TileScheduler,
+            mStats,
+            mdOScaled,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -345,6 +373,8 @@ class FlashAttentionBackwardPreprocess:
         gmem_tiled_copy_dQaccum: cute.TiledCopy,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
+        mStats: Optional[cute.Tensor] = None,
+        mdOScaled: Optional[cute.Tensor] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -426,6 +456,16 @@ class FlashAttentionBackwardPreprocess:
             if const_expr(mOlo is not None):
                 gOlo = cute.local_tile(mOlo_cur, blk_shape, (m_block, 0))
                 tOgOlo = gmem_thr_copy_O.partition_S(gOlo)
+            gStats = tOgdOs = None
+            if const_expr(mStats is not None):
+                mStats_cur, mdOScaled_cur = [
+                    seqlen.offset_batch(mX, batch_idx, dim=3)[None, None, head_idx]
+                    for mX in (mStats, mdOScaled)
+                ]
+                gStats = cute.local_tile(mStats_cur, (self.tile_m, 2), (m_block, 0))
+                tOgdOs = gmem_thr_copy_O.partition_D(
+                    cute.local_tile(mdOScaled_cur, blk_shape, (m_block, 0))
+                )
             cO = cute.make_identity_tensor(blk_shape)
             tOcO = gmem_thr_copy_O.partition_S(cO)
             t0OcO = gmem_thr_copy_O.get_slice(0).partition_S(cO)
@@ -453,6 +493,21 @@ class FlashAttentionBackwardPreprocess:
                         tOpO_cur = tOpO[None, m, None] if const_expr(tOpO is not None) else None
                         copy(tOgO[None, m, None], tOrO[None, m, None], pred=tOpO_cur)
                         copy(tOgdO[None, m, None], tOrdO[None, m, None], pred=tOpO_cur)
+                if const_expr(mStats is not None):
+                    # dO' = bf16(dO / L), stored for the main kernel; D below uses this dO'
+                    for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
+                        row = tOcO[0, m, 0][0]
+                        inv_L = Float32(0.0)
+                        if row < seqlen_limit:
+                            L = gStats[row, 1]
+                            if L > 0.0:
+                                inv_L = Float32(1.0) / L
+                        tOrdO[None, m, None].store(
+                            (tOrdO[None, m, None].load().to(Float32) * inv_L).to(tOrdO.element_type)
+                        )
+                        if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
+                            tOpO_cur = tOpO[None, m, None] if const_expr(tOpO is not None) else None
+                            copy(tOrdO[None, m, None], tOgdOs[None, m, None], pred=tOpO_cur)
                 # O and dO loads are done; signal that the next kernel can start.
                 # Correctness is ensured by griddepcontrol_wait() in bwd_sm90 before it reads our outputs.
                 if const_expr(self.use_pdl):
@@ -532,7 +587,16 @@ class FlashAttentionBackwardPreprocess:
                 cute.copy(gmem_tiled_copy_dQaccum, zero, tdQgdQaccum)
 
             LOG2_E = math.log2(math.e)
-            lse_log2 = lse * LOG2_E if lse != -Float32.inf else 0.0
+            if const_expr(mStats is None):
+                lse_log2 = lse * LOG2_E if lse != -Float32.inf else 0.0
+            else:
+                # the slot fp32(m * scale_log2) - offset; rows past seqlen keep +inf
+                lse_log2 = Float32.inf
+                if tidx < seqlen_limit:
+                    row_max = gStats[tidx, 0]
+                    lse_log2 = Float32(0.0)
+                    if row_max != -Float32.inf:
+                        lse_log2 = row_max * softmax_scale_log2 - Float32(self.mirror_offset)
             if const_expr(mLSElog2 is not None):
                 mLSElog2_cur = (
                     mLSElog2[None, head_idx, batch_idx]
