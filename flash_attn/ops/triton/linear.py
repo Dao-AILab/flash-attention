@@ -269,7 +269,7 @@ def triton_linear_act(
     :param weight: weight matrix
     :param bias: an optional bias tensor
     :param activation: Activation name. Needs to be a Triton kernel.
-    :param act_input: an optional tensor to save the activation inputs (for backward)
+    :param save_act_input: whether to save the activation input for the backward pass
     :return: result tensor
     """
     # if torch.is_autocast_enabled():
