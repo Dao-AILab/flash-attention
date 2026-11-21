@@ -149,7 +149,12 @@ for causal in causal_vals:
 
             qkv = qkv.detach().requires_grad_(True)
             f, b = time_fwd_bwd(
-                fav2_qkvpacked_func, qkv, dropout_p, causal=causal, repeats=repeats, verbose=False
+                flash_attn_qkvpacked_func,
+                qkv,
+                dropout_p,
+                causal=causal,
+                repeats=repeats,
+                verbose=False,
             )
             time_f[(causal, headdim, batch_size, seqlen), "Flash2"] = f
             time_b[(causal, headdim, batch_size, seqlen), "Flash2"] = b
