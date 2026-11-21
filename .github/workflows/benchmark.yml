@@ -1,0 +1,247 @@
+name: Benchmark (PR)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'csrc/flash_attn/**'
+      - 'benchmarks/**'
+      - 'flash_attn/cute/**'
+      - '.github/workflows/benchmark.yml'
+      - 'tools/ci/run_fa4_ci.py'
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  CI_WORK_DIR: ${{ vars.CI_WORK_DIR || format('/scratch/user/{0}', github.actor) }}
+  # Benchmark configuration for PR validation (subset of full CI)
+  # seqlens: 1K, 4K, 16K — covers short/medium/long
+  # hdim: 128 — standard head dimension
+  # causal: both — tests both causal and non-causal
+  BENCH_SEQLENS: "1024,4096,16384"
+  BENCH_HEADDIM: "128"
+  BENCH_CAUSAL: "both"
+
+jobs:
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu: [b200]
+    runs-on: [self-hosted, '${{ matrix.gpu }}']
+    name: benchmark (${{ matrix.gpu }})
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need history for comparison
+
+      - name: Log in to Docker Hub
+        if: ${{ vars.FA4_LOCAL_SIF == '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Run benchmark (FA4 fwd + bwd)
+        uses: ./.github/actions/gpu-test
+        id: benchmark
+        with:
+          test-filter: ""  # No test filter for benchmark
+          compile-workers: "20"
+          fa4_local_sif: ${{ vars.FA4_LOCAL_SIF }}
+          fa4_image_cu129: "togethercomputer/training-performance:flash-attn-cu12.9-26.03.25@sha256:304a5c3d2b3a75b151cd2a964cd26d444e0d8b5686d63943df13378c9705f943"
+          fa4_image_cu130: "togethercomputer/training-performance:flash-attn-cu13.0-26.06.27@sha256:2c31843c7137cbe909611eb70a9b6940581a2e3018d2c8b629f84dfd04b9bfd7"
+
+      - name: Extract benchmark results
+        if: success()
+        shell: bash
+        run: |
+          # The gpu-test action runs the benchmark as part of its step plan
+          # We need to capture the output. Let's run it again to get clean output for parsing.
+          python3 "$GITHUB_WORKSPACE/tools/ci/run_fa4_ci.py" \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --test-filter "" \
+            --compile-workers 1 \
+            --skip-benchmark \
+            --test-target "tests/cute/test_flash_attn.py::test_flash_attn_output" \
+            --min-free-memory-mb 40000 2>&1 | tail -20
+          echo "BENCHMARK_DONE=1" >> "$GITHUB_ENV"
+
+      - name: Run benchmark and capture output
+        if: success()
+        shell: bash
+        env:
+          FA4_SIF: ${{ env.FA4_SIF }}
+        run: |
+          # Run benchmark directly to capture clean output for PR comment
+          # We use the same SIF and overlay approach
+          REPO_ROOT="$GITHUB_WORKSPACE"
+          SIF="$FA4_SIF"
+          WORK_DIR="$CI_WORK_DIR"
+          OVERLAY="$WORK_DIR/fa4_bench_overlay.img"
+
+          # Reuse the existing overlay from the gpu-test action if possible
+          # For now, create a fresh minimal one just for benchmark
+          python3 -c "
+import os, subprocess, sys
+repo_root = '$REPO_ROOT'
+sif = os.environ.get('FA4_SIF')
+work_dir = os.environ.get('CI_WORK_DIR', '/scratch/user/runner')
+overlay = os.path.join(work_dir, 'fa4_bench_overlay.img')
+
+# Quick benchmark run - use existing provisioned overlay approach
+# For simplicity, run the benchmark command directly
+cmd = [
+    'apptainer', 'exec', '--nv',
+    '--overlay', overlay,
+    '--bind', work_dir,
+    sif, 'bash', '-c',
+    f'cd /tmp && python3 {repo_root}/benchmarks/benchmark_attn.py '
+    f'--backend fa4 --fwd --bwd '
+    f'--headdim {os.environ.get("BENCH_HEADDIM", "128")} '
+    f'--seqlen {os.environ.get("BENCH_SEQLENS", "1024,4096,16384")} '
+    f'--causal {os.environ.get("BENCH_CAUSAL", "both")} '
+    f'--warmup 1 --rep 3'
+]
+result = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, timeout=300)
+print(result.stdout)
+if result.stderr:
+    print('STDERR:', result.stderr, file=sys.stderr)
+sys.exit(result.returncode)
+" 2>&1 | tee /tmp/bench_output.txt
+
+      - name: Parse benchmark and post PR comment
+        if: success()
+        shell: bash
+        run: |
+          # Parse the benchmark output and create a comparison table
+          python3 << 'PYEOF'
+import re
+import os
+import subprocess
+
+# Read the benchmark output
+with open('/tmp/bench_output.txt', 'r') as f:
+    output = f.read()
+
+# Parse TFLOPS results from benchmark output
+# Expected format from benchmark_attn.py:
+# | SeqLen | Causal |   Fwd TFLOPS |   Bwd TFLOPS |   Fwd MFU% |   Bwd MFU% |   Fwd TB/s |   Bwd TB/s |
+pattern = re.compile(
+    r'\|\s*(\d+)\s*\|\s*(True|False)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)%?\s*\|\s*([\d.]+)%?\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|'
+)
+
+results = []
+for match in pattern.finditer(output):
+    seqlen = int(match.group(1))
+    causal = match.group(2) == 'True'
+    fwd_tflops = float(match.group(3))
+    bwd_tflops = float(match.group(4))
+    fwd_mfu = float(match.group(5))
+    bwd_mfu = float(match.group(6))
+    fwd_tbs = float(match.group(7))
+    bwd_tbs = float(match.group(8))
+    results.append({
+        'seqlen': seqlen,
+        'causal': causal,
+        'fwd_tflops': fwd_tflops,
+        'bwd_tflops': bwd_tflops,
+        'fwd_mfu': fwd_mfu,
+        'bwd_mfu': bwd_mfu,
+        'fwd_tbs': fwd_tbs,
+        'bwd_tbs': bwd_tbs,
+    })
+
+if not results:
+    print("No benchmark results found in output")
+    print("Output preview:", output[:2000])
+    exit(1)
+
+# Build markdown table
+table = "| SeqLen | Causal | Fwd TFLOPS | Bwd TFLOPS | Fwd MFU% | Bwd MFU% | Fwd TB/s | Bwd TB/s |\n"
+table += "|--------|--------|------------|------------|----------|----------|----------|----------|\n"
+for r in results:
+    table += f"| {r['seqlen']} | {r['causal']} | {r['fwd_tflops']:.2f} | {r['bwd_tflops']:.2f} | {r['fwd_mfu']:.1f}% | {r['bwd_mfu']:.1f}% | {r['fwd_tbs']:.2f} | {r['bwd_tbs']:.2f} |\n"
+
+# Get commit info
+commit_sha = os.environ.get('GITHUB_SHA', 'unknown')[:7]
+pr_number = os.environ.get('GITHUB_EVENT_NUMBER', 'unknown')
+
+# Create PR comment
+comment = f"""## 🚀 FlashAttention Benchmark Results (PR #{pr_number})
+
+**Commit:** `{commit_sha}`
+**Backend:** FA4 | **HeadDim:** 128 | **SeqLens:** 1K, 4K, 16K | **Causal:** Both
+
+### Performance Table
+{table}
+
+### Summary
+- **Forward (avg MFU):** {sum(r['fwd_mfu'] for r in results) / len(results):.1f}%
+- **Backward (avg MFU):** {sum(r['bwd_mfu'] for r in results) / len(results):.1f}%
+- **Forward (avg TFLOPS):** {sum(r['fwd_tflops'] for r in results) / len(results):.2f}
+- **Backward (avg TFLOPS):** {sum(r['bwd_tflops'] for r in results) / len(results):.2f}
+
+---
+*Generated by GitHub Actions benchmark workflow. [View workflow run]({os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')})*
+"""
+
+# Write comment to file for next step
+with open('/tmp/pr_comment.md', 'w') as f:
+    f.write(comment)
+
+print("Comment prepared:")
+print(comment[:500])
+PYEOF
+
+      - name: Post benchmark comment to PR
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('/tmp/pr_comment.md', 'utf8');
+
+            // Find existing benchmark comment to update
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existingComment = comments.data.find(c =>
+              c.body.includes('FlashAttention Benchmark Results') && c.user.type === 'Bot'
+            );
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment
+              });
+              console.log('Updated existing benchmark comment');
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+              console.log('Created new benchmark comment');
+            }
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ matrix.gpu }}
+          path: |
+            /tmp/bench_output.txt
+            /tmp/pr_comment.md
+          retention-days: 7
