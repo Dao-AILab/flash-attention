@@ -13,6 +13,7 @@ from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.utils import LayoutEnum, TensorMapManager, TensorMapUpdateMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+import cutlass.utils.blockscaled_layout as blockscaled_layout
 from cutlass.pipeline import PipelineAsync
 
 from quack import layout_utils
@@ -24,9 +25,11 @@ from flash_attn.cute.bwd_accum_tile import AccumTileOrder, accum_tile_layout
 from flash_attn.cute.config import (
     MXFP8_BAND_BLOCK_N,
     MXFP8_BAND_ROWS,
+    Mxfp8Bwd,
     Mxfp8Mirror,
     Sm100BwdRegisters,
 )
+from flash_attn.cute import mxfp8_bwd_utils as mxu
 from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.pack_gqa import pack_gqa_layout
@@ -134,6 +137,134 @@ from flash_attn.cute.block_sparse_utils import (
 # rounded at that max and rescaled (native PV updates the max at every block), so their P-hat is
 # reproduced only up to that rounding (BlockScales.stats_out). That is the mirror's inherent
 # error, and it dominates native PV's dV error against the FP64 derivative of the online forward.
+
+
+# NOTE [MXFP8 hd256 backward]
+# BwdConfig.mxfp8 runs the hdim-256 tile (2CTA, 64 keys per CTA, NOTE [M=64 accumulator layout])
+# as the backward of the hdim-256 native PV MXFP8 forward (BlockScales with stats_out), with
+# either pv_normalizer. Like NOTE [MXFP8 mirrored BF16 backward] it differentiates the function
+# that forward computed, with P recomputed from the final statistics: the quantizers are
+# straight-through, and the saved row max and normalizer replace recomputing them (the derivative
+# flows through L as the D term and vanishes through the max). With c = softmax_scale log2(e),
+# off = Mxfp8Mirror.PV.p_offset = 8, the forward's row max M = fp32(m c) (log2 units) and
+# normalizer L, P~ = 2^(S c - (M - off)) and Phat = e4m3(P~):
+#     dV = (Phat / L)^T dO,   dS = (P~ / L) (dO Vhat^T - D),   D = rowsum(dO * O),
+#     dQ = softmax_scale dS Khat,   dK = softmax_scale dS^T Qhat.
+# S^T, dP^T, dV and dK are SS block-scaled MMAs (kind::mxf8f6f4, one UE8M0 scale per 32, K = 32 per
+# instruction on every arch: the pair MMA is M = 128); dQ = dS K-hat stays the BF16 MMA on the
+# exact BF16 K-hat. The operands (Mxfp8BwdTensors, built by mxfp8_hd256_prep):
+#   * S: the forward's Q / K payloads and scales, unchanged;
+#   * dP's V: V-hat requantized along head_dim; dK's Q^T: Q-hat requantized along queries.
+#     Requantizing an E4M3 payload with power-of-two scales along another axis is exact down to
+#     2^-14.8 of the new group's maximum (E4M3's normal range);
+#   * dO'' = 2^8 dO / L along head_dim (dP) and along queries (dV), and the dPsum slot
+#     D'' = rowsum(dequant(dO''_d) O): the 1 / L of dS and dV folded into dO, times 2^8;
+#   * the LSE slot M - off: P~ <= 2^off fits E4M3 under the constant P^T scale 2^-8 and is
+#     bitwise the forward's P wherever the forward used the final row max.
+# So dS'' = 2^8 dS: dK drops the 2^8 in its dS^T scale bytes (- 8), dV in the P^T scale, and dQ
+# in the postprocess scale (softmax_scale / 256).
+# Causal: the forward ran each 256-row work tile's band (keys [256 floor(i / 256), i]) on BF16 P
+# and the original V. Work tile w (keys [128 w, 128 w + 128)) meets the band exactly on the steps
+# with floor(m_block / 2) == floor(w / 2) (two steps for even w, one for odd), and no other step
+# holds band elements. There dP^T += R dO''^T with R = MX(V - Vhat_d) along head_dim (keys [s, 2s)
+# of the V copy, V's second SMEM stage), so dP reads V to about BF16 precision, and dV runs as
+# the BF16 MMA on BF16 P~ and dO / L (the BF16 dO slot), as the forward's PV read BF16 P.
+# Schedule: the TWO_CTA_SERIAL tile with its own MMA order (NOTE [MXFP8 hd256 schedule]). Each
+# operand's scales ride its payload's ring slot and reach TMEM by tcgen05.cp from SMEM, issued by
+# the MMA warp right before the MMA that reads them, into the free columns between S^T and dQ
+# (tmem_sf_offsets). The compute warps write the dS^T scales (one per key and 32 queries,
+# thread-local: a thread owns one key and 32 adjacent queries) and the BF16 dS of dQ, whose
+# exchange half they stage in sdS_dK (no longer the dK operand).
+# Scope (config.mxfp8_mirror_rejection): MHA, dense, seqlen_q = seqlen_k.
+#
+# Known gap: P~ is recomputed at the final max, so blocks the forward visited under an earlier
+# running max are reproduced only up to that max's rounding of P (BlockScales.stats_out); it
+# dominates dV's error against the FP64 derivative of the online forward.
+
+
+# NOTE [MXFP8 hd256 schedule]
+# Q8 and Q^T8 (dK's B operand) hold different payloads, as do dO''_d (dP's B) and dO''_q (dV's
+# B), so each pair streams through a 2-slot ring (Q_stage = dO_stage = 2) instead of aliasing one
+# stage like BF16 Q / Qt, and the MMA warp overlaps steps:
+#     S(0), dP(0), then per step j: S(j+1), dV(j), dP(j+1), dK(j), dQ(j)
+# S^T(j + 1) only needs the compute warps to have loaded S^T(j), dP(j + 1) to have loaded dP^T(j)
+# (released right after its TMEM load) and dQ(j - 1) to have drained (dP^T aliases dQ's tail).
+# The load warp issues per step Q(j+1), dO''_q(j), dO''_d(j+1), Q^T(j): Q^T(j)'s slot frees only
+# once dK(j - 1) completed, so issuing it earlier would hold dV(j)'s dO''_q(j) behind it.
+
+
+class Mxfp8BwdTensors(NamedTuple):
+    """Operands of NOTE [MXFP8 hd256 backward]. E4M3 payloads are (b, s, h, 256); pair-tile
+    scales are flat UE8M0 tiles of 1024 B per 64 keys (sfk, sfv) or 128 queries (sfq, sfdo);
+    sfqt / sfdot are interleave_sf buffers with MN = channels. Causal: v / sfv hold V-hat (keys
+    [0, s)) followed by the band residual R (keys [s, 2s))."""
+
+    q: cute.Tensor  # the forward's Q payload (scales along head_dim)
+    sfq: cute.Tensor
+    k: cute.Tensor  # the forward's K payload
+    sfk: cute.Tensor
+    v: cute.Tensor  # V-hat along head_dim [+ R]
+    sfv: cute.Tensor
+    do: cute.Tensor  # dO'' along head_dim
+    sfdo: cute.Tensor
+    qt: cute.Tensor  # Q-hat requantized along queries
+    sfqt: cute.Tensor
+    dot: cute.Tensor  # dO'' along queries
+    sfdot: cute.Tensor
+
+
+class MxLoads(NamedTuple):
+    """NOTE [MXFP8 hd256 backward]: the load warp's MXFP8 loaders of one work tile
+    (FlashAttentionBackwardSm100._mx_loaders)."""
+
+    load_V_tiles: Callable
+    load_SFK: Callable
+    load_SFV: Callable
+    load_SFQ: Callable
+    load_SFdO_dP: Callable
+    load_SFQt: Callable
+    load_SFdO_dV: Callable
+    load_dO_band: Optional[Callable]
+
+
+class MxMma(NamedTuple):
+    """NOTE [MXFP8 hd256 backward]: the MMA warp's block-scaled operand fragments, the
+    (tmem scales, s2t copy, src, dst) tuples of each GEMM's A / B scales, and the band's BF16 dV
+    MMA (FlashAttentionBackwardSm100._mx_mma_operands)."""
+
+    tSrK: cute.Tensor
+    tSrQ: cute.Tensor
+    tdPrV: cute.Tensor
+    tdPrdOt: cute.Tensor
+    tdKrdS: cute.Tensor
+    tdKrQ: cute.Tensor
+    tdVrP: cute.Tensor
+    tdVrdO: cute.Tensor
+    sf_S: tuple
+    sf_dP: tuple
+    sf_dP_band: Optional[tuple]
+    sf_dV: tuple
+    sf_dK: tuple
+    tdVrP_band: Optional[cute.Tensor]  # the band's BF16 P^T and dO / L (two K-half ring slots)
+    tdVrdO_band: Optional[cute.Tensor]
+
+
+class MxSmem(NamedTuple):
+    """NOTE [MXFP8 hd256 backward]: the MXFP8-only SMEM views of one CTA: the E4M3 P^T / dS^T
+    A operands of dV / dK, the band's BF16 dO / L (sdO's storage), and the UE8M0 scale buffers
+    (sSFQ / sSFQt and sSFdOt / sSFdO alias, like the payloads that share a stage)."""
+
+    sP: cute.Tensor
+    sdSt: cute.Tensor
+    sdO_band: Optional[cute.Tensor]
+    sSFK: cute.Tensor
+    sSFV: cute.Tensor
+    sSFQ: cute.Tensor  # S's B (Q)
+    sSFQt: cute.Tensor  # dK's B (Q^T)
+    sSFdO_dP: cute.Tensor  # dP's B (dO'' along head_dim)
+    sSFdO_dV: cute.Tensor  # dV's B (dO'' along queries)
+    sSFP: cute.Tensor
+    sSFdS: cute.Tensor
 
 
 # NOTE [SM100 backward coordinate spaces]
@@ -273,6 +404,7 @@ class FlashAttentionBackwardSm100:
         dO_stage: int,
         fold_LSE_dPsum: bool,
         mxfp8_mirror: Mxfp8Mirror | None = None,
+        mxfp8: Mxfp8Bwd | None = None,
     ):
         # Pad head_dim to a multiple of 32 (k_block_size). Must stay a multiple of 32 so
         # that the dQ accumulator reduce (dQ_reduce_ncol up to 32) tiles evenly and matches
@@ -406,6 +538,14 @@ class FlashAttentionBackwardSm100:
             and MXFP8_BAND_BLOCK_N % tile_n == 0
             and (MXFP8_BAND_ROWS * pack_factor) % tile_m == 0
         ), "the MXFP8 band's V swap needs a pipelined schedule, one dO stage, and aligned tiles"
+        # See NOTE [MXFP8 hd256 backward]; mx_band: the causal band's dP residual and BF16 dV
+        self.mxfp8 = mxfp8 is not None
+        self.mx_band = self.mxfp8 and is_causal
+        if self.mxfp8:
+            assert is_hdim256 and self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL
+            assert qhead_per_kvhead == 1 and pack_factor == 1 and not head_loop
+            assert not is_local and score_mod is None and mask_mod is None
+            assert Q_stage == 2 and dO_stage == 2  # the Q / Q^T and dO''_d / dO''_q rings
 
         # Score mod and mask mod support
         self.score_mod = score_mod
@@ -513,6 +653,20 @@ class FlashAttentionBackwardSm100:
             else:
                 self.tmem_P_offset = self.tmem_S_offset  # overlap with S
                 self.tmem_dS_offset = self.tmem_dP_offset  # overlap with dP
+        if self.mxfp8:
+            # NOTE [MXFP8 hd256 backward]: the scales take the columns between S^T and dQ, 8 per
+            # operand (the A scales of K = 128 MMAs, P^T and dS^T, use 4). Every slot has one
+            # writer (the MMA warp's tcgen05.cp right before its MMA) and is rewritten only after
+            # that MMA completed.
+            widths = dict(sfk=8, sfq=8, sfv=8, sfdo=8, sfdot=8, sfqt=8, sfp=4, sfds=4)
+            if self.mx_band:
+                widths["sfvr"] = 8
+            self.tmem_sf_offsets = {}
+            col = self.tmem_S_offset + self.tmem_cols_S
+            for name, width in widths.items():
+                self.tmem_sf_offsets[name] = col
+                col += width
+            assert col <= self.tmem_dQ_offset, f"MXFP8 scales need TMEM columns up to {col}"
         tmem_end = max(
             self.tmem_S_offset + self.tmem_cols_S,
             self.tmem_dP_offset + self.tmem_cols_dP,
@@ -864,6 +1018,236 @@ class FlashAttentionBackwardSm100:
             # self.dK_reduce_ncol same for dV
             self.sdK_layout = self.sdV_layout = self.sdKV_accum_layout
 
+    def _setup_mx_layouts(self):
+        """NOTE [MXFP8 hd256 backward]: the block-scaled tiled MMAs of S^T, dP^T, dV and dK, their
+        E4M3 SMEM operand layouts (staged like the BF16 ones), and the scale layouts. A scales of
+        64 keys use the 128-row chunk of an M = 256 proxy MMA (key k in rows k and k + 64, lane
+        quadrants 0/2 and 1/3), B scales CUTLASS's TMEM SFB layout of the pair MMA."""
+        K, MN = cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.MN
+        self.tiled_mma_S_mx = mxu.make_mx_tiled_mma(K, K, self.mma_tiler_kq[:2])
+        self.tiled_mma_dP_mx = mxu.make_mx_tiled_mma(K, K, self.mma_tiler_vdo[:2])
+        self.tiled_mma_dV_mx = mxu.make_mx_tiled_mma(K, MN, self.mma_tiler_pdo[:2])
+        self.tiled_mma_dK_mx = mxu.make_mx_tiled_mma(K, MN, self.mma_tiler_dsq[:2])
+        MX = mxu.MX_DTYPE
+        layout_a = sm100_utils_basic.make_smem_layout_a
+        layout_b = sm100_utils_basic.make_smem_layout_b
+        no_stage = (None, None, None, 0)
+        self.mx_V_stage = 2 if self.mx_band else 1  # stage 1: the band residual R
+        self.mx_sK_layout = cute.slice_(
+            layout_a(self.tiled_mma_S_mx, self.mma_tiler_kq, MX, 1), no_stage
+        )
+        self.mx_sQ_layout = layout_b(self.tiled_mma_S_mx, self.mma_tiler_kq, MX, self.Q_stage)
+        self.mx_sV_layout = layout_a(self.tiled_mma_dP_mx, self.mma_tiler_vdo, MX, self.mx_V_stage)
+        self.mx_sdOt_layout = layout_b(
+            self.tiled_mma_dP_mx, self.mma_tiler_vdo, MX, self.dO_stage
+        )  # dP's B: dO'' along head_dim
+        self.mx_sP_layout = cute.slice_(
+            layout_a(self.tiled_mma_dV_mx, self.mma_tiler_pdo, MX, 1), no_stage
+        )
+        self.mx_sdO_layout = layout_b(
+            self.tiled_mma_dV_mx, self.mma_tiler_pdo, MX, self.dO_stage
+        )  # dV's B: dO'' along queries
+        self.mx_sdSt_layout = cute.slice_(
+            layout_a(self.tiled_mma_dK_mx, self.mma_tiler_dsq, MX, 1), no_stage
+        )
+        self.mx_sQt_layout = layout_b(self.tiled_mma_dK_mx, self.mma_tiler_dsq, MX, self.Q_stage)
+        # dV / dK: A (P^T, dS^T; K = 128 queries) and B (dO''_q, Q^T; N = 256) scales
+        sfa_tiler = (256, self.mma_tiler_pdo[1], self.mma_tiler_pdo[2])
+        sfa_proxy = mxu.make_mx_tiled_mma(K, MN, sfa_tiler[:2])
+        self.mx_sSFA_layout = blockscaled_layout.make_smem_layout_sfa(
+            sfa_proxy, sfa_tiler, mxu.SF_VEC, 1
+        )
+        self.mx_tSFA_layout = blockscaled_layout.make_tmem_layout_sfa(
+            sfa_proxy, sfa_tiler, mxu.SF_VEC, cute.slice_(self.mx_sSFA_layout, no_stage)
+        )
+        assert self.Q_stage == self.dO_stage  # one scale-ring depth for both rings
+        self.mx_sSFB_layout = blockscaled_layout.make_smem_layout_sfb(
+            self.tiled_mma_dV_mx, self.mma_tiler_pdo, mxu.SF_VEC, self.Q_stage
+        )
+        self.mx_tSFB_layout = blockscaled_layout.make_tmem_layout_sfb(
+            self.tiled_mma_dV_mx,
+            self.mma_tiler_pdo,
+            mxu.SF_VEC,
+            cute.slice_(self.mx_sSFB_layout, no_stage),
+        )
+        # S^T / dP^T: A (K, V; K = 256) and B (Q, dO''_d; N = 128) scales
+        sdp_tiler = (256, self.mma_tiler_kq[1], self.mma_tiler_kq[2])
+        sdp_proxy = mxu.make_mx_tiled_mma(K, K, sdp_tiler[:2])
+        self.mx_sSFK_layout = blockscaled_layout.make_smem_layout_sfa(
+            sdp_proxy, sdp_tiler, mxu.SF_VEC, 1
+        )
+        self.mx_sSFV_layout = blockscaled_layout.make_smem_layout_sfa(
+            sdp_proxy, sdp_tiler, mxu.SF_VEC, self.mx_V_stage
+        )
+        self.mx_tSFA_sdp_layout = blockscaled_layout.make_tmem_layout_sfa(
+            sdp_proxy, sdp_tiler, mxu.SF_VEC, cute.slice_(self.mx_sSFK_layout, no_stage)
+        )
+        self.mx_tSFB_sdp_layout = blockscaled_layout.make_tmem_layout_sfb(
+            self.tiled_mma_S_mx,
+            self.mma_tiler_kq,
+            mxu.SF_VEC,
+            cute.slice_(
+                blockscaled_layout.make_smem_layout_sfb(
+                    self.tiled_mma_S_mx, self.mma_tiler_kq, mxu.SF_VEC, 1
+                ),
+                no_stage,
+            ),
+        )
+        self.mx_sSFQ_layout = mxu.lane_halves_smem_layout_sfb(self.mx_tSFB_sdp_layout, self.Q_stage)
+        assert cute.cosize(self.mx_sSFA_layout) == mxu.SF_TILE_BYTES // 2
+        assert cute.cosize(self.mx_sSFB_layout) == mxu.SF_TILE_BYTES * self.Q_stage
+        assert cute.cosize(self.mx_sSFK_layout) == mxu.SF_TILE_BYTES
+        assert cute.cosize(self.mx_sSFQ_layout) == mxu.SF_TILE_BYTES * self.Q_stage
+        # the causal band's dV B operand: BF16 dO / L as two 64-query halves, one dO-ring slot each
+        self.mx_band_tiler = (*self.mma_tiler_pdo[:2], self.mma_tiler_pdo[2] // 2)
+        tiled_mma_band = sm100_utils_basic.make_trivial_tiled_mma(
+            cutlass.BFloat16,
+            cutlass.BFloat16,
+            K,
+            MN,
+            Float32,
+            tcgen05.CtaGroup.TWO,
+            self.mma_tiler_pdo[:2],
+            a_source=tcgen05.OperandSource.SMEM,
+        )
+        self.mx_sdO_band_layout = layout_b(
+            tiled_mma_band, self.mx_band_tiler, cutlass.BFloat16, self.dO_stage
+        )
+
+    def _mx_tma_atoms(self, mx: Mxfp8BwdTensors, tma_load_op, transpose_sh_q):
+        """NOTE [MXFP8 hd256 backward]: TMA atoms of the E4M3 payloads, in the roles of the BF16
+        Q / K / V / dO (dV's B) / dOt (dP's B) / Qt loads, and of their scale tiles."""
+        QO_t, KV_t = [1, 3, 2, 0], [1, 3, 2, 0]  # dense only: (b, s, h, d) -> (s, d, h, b)
+        mQ, mdO_d = [layout_utils.select(t, mode=QO_t) for t in (mx.q, mx.do)]
+        mK, mV = [layout_utils.select(t, mode=KV_t) for t in (mx.k, mx.v)]
+        # the K = queries B operands: (s, d, h, b) -> (d, s, h, b)
+        mQt, mdO_q = [
+            layout_utils.select(layout_utils.select(t, mode=QO_t), mode=transpose_sh_q)
+            for t in (mx.qt, mx.dot)
+        ]
+        vmnk = self.cluster_layout_vmnk.shape
+        atom_K = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_load_op,
+            mK,
+            cute.select(self.mx_sK_layout, mode=[0, 1, 2]),
+            self.mma_tiler_kq,
+            self.tiled_mma_S_mx,
+            vmnk,
+        )
+        Q_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
+            self.cluster_shape_mnk, self.tiled_mma_S_mx.thr_id
+        )
+        atom_Q = cute.nvgpu.make_tiled_tma_atom_B(
+            Q_tma_op,
+            mQ,
+            cute.select(self.mx_sQ_layout, mode=[0, 1, 2]),
+            self.mma_tiler_kq,
+            self.tiled_mma_S_mx,
+            vmnk,
+        )
+        atom_V = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_load_op,
+            mV,
+            cute.select(self.mx_sV_layout, mode=[0, 1, 2]),
+            self.mma_tiler_vdo,
+            self.tiled_mma_dP_mx,
+            vmnk,
+        )
+        dO_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
+            self.cluster_shape_mnk, self.tiled_mma_dV_mx.thr_id
+        )
+        atom_dO = cute.nvgpu.make_tiled_tma_atom_B(
+            dO_tma_op,
+            mdO_q,
+            cute.select(self.mx_sdO_layout, mode=[0, 1, 2]),
+            self.mma_tiler_pdo,
+            self.tiled_mma_dV_mx,
+            vmnk,
+        )
+        atom_dOt = cute.nvgpu.make_tiled_tma_atom_B(
+            dO_tma_op,
+            mdO_d,
+            cute.select(self.mx_sdOt_layout, mode=[0, 1, 2]),
+            self.mma_tiler_vdo,
+            self.tiled_mma_dP_mx,
+            vmnk,
+        )
+        atom_Qt = cute.nvgpu.make_tiled_tma_atom_B(
+            Q_tma_op,
+            mQt,
+            cute.select(self.mx_sQt_layout, mode=[0, 1, 2]),
+            self.mma_tiler_dsq,
+            self.tiled_mma_dK_mx,
+            vmnk,
+        )
+        # Pair scale tiles (1024 B per 64 keys / 128 queries): one plain TMA per CTA and tile,
+        # each CTA needs all of them.
+        seqlen_q, seqlen_k = cute.size(mQ.shape[0]), cute.size(mK.shape[0])
+        heads, batch = mQ.shape[2], mQ.shape[3]
+        n64 = cute.ceil_div(seqlen_k, 64)
+        n64_v = cute.ceil_div(cute.size(mV.shape[0]), 64)  # causal: V-hat, then R
+        n128 = cute.ceil_div(seqlen_q, 128)
+        sf_box = cute.make_layout((16, 64), stride=(1, 16))
+        atoms_sf = [
+            cpasync.make_tiled_tma_atom(
+                tma_load_op, mxu.sf_tile_tensor(sf, n, heads, batch), sf_box, (16, 64)
+            )
+            for sf, n in ((mx.sfk, n64), (mx.sfv, n64_v), (mx.sfq, n128), (mx.sfdo, n128))
+        ]
+        # The B scales of the N = 256 dV / dK MMAs: each CTA receives all 256 channels' scales
+        # (multicast halves), as in CUTLASS's 2CTA block-scaled GEMM.
+        self.mx_mma_tiler_sfb = (128, self.mma_tiler_pdo[1], self.mma_tiler_pdo[2])
+        tiled_mma_sfb = mxu.make_mx_tiled_mma(
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
+            self.mx_mma_tiler_sfb[:2],
+            cta_group=tcgen05.CtaGroup.ONE,
+        )
+        self.mx_cluster_layout_sfb_vmnk = cute.tiled_divide(
+            cute.make_layout(self.cluster_shape_mnk), (tiled_mma_sfb.thr_id.shape,)
+        )
+        self.mx_tiled_mma_sfb = tiled_mma_sfb
+        sfb_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFB(
+            self.cluster_shape_mnk, self.tiled_mma_dV_mx.thr_id
+        )
+        sSFB_one = cute.select(self.mx_sSFB_layout, mode=[0, 1, 2])
+        atoms_sfb = [
+            cute.nvgpu.make_tiled_tma_atom_B(
+                sfb_op,
+                mxu.sf_gmem_tensor(sf, self.tile_hdim, seqlen_q, heads, batch),
+                sSFB_one,
+                self.mx_mma_tiler_sfb,
+                tiled_mma_sfb,
+                self.mx_cluster_layout_sfb_vmnk.shape,
+                internal_type=cutlass.Int16,
+            )
+            for sf in (mx.sfqt, mx.sfdot)
+        ]
+        C = self.cta_group_size
+
+        def payload(layout):
+            return C * cute.size_in_bytes(mxu.MX_DTYPE, cute.select(layout, mode=[0, 1, 2]))
+
+        sf_tile = C * mxu.SF_TILE_BYTES
+        sfb = C * cute.size_in_bytes(mxu.SF_DTYPE, sSFB_one)
+        band_half = C * cute.size_in_bytes(
+            cutlass.BFloat16, cute.select(self.mx_sdO_band_layout, mode=[0, 1, 2])
+        )
+        mx_bytes = dict(
+            Q=payload(self.mx_sQ_layout) + sf_tile,
+            K=payload(self.mx_sK_layout) + sf_tile,
+            V=self.mx_V_stage * (payload(self.mx_sV_layout) + sf_tile),
+            # the dO ring's slots: dO''_q (dV) or dO''_d (dP) with scales, or a band half of
+            # BF16 dO / L, which takes no scales
+            dO=band_half,
+            dO_sf=sf_tile,
+        )
+        # Q / Q^T share the Q ring's transaction count, dO''_q / dO''_d / band halves the dO ring's
+        assert mx_bytes["Q"] == payload(self.mx_sQt_layout) + sfb
+        assert payload(self.mx_sdO_layout) == payload(self.mx_sdOt_layout) == band_half
+        assert sfb == sf_tile
+        return (atom_K, atom_Q, atom_V, atom_dO, atom_dOt, atom_Qt), atoms_sf, atoms_sfb, mx_bytes
+
     @cute.jit
     def __call__(
         self,
@@ -896,6 +1280,9 @@ class FlashAttentionBackwardSm100:
         # the original V of the MXFP8 causal band, mV holding V-hat (NOTE [MXFP8 mirrored BF16
         # backward]); same shape and layout as mV
         mV_band: Optional[cute.Tensor] = None,
+        # NOTE [MXFP8 hd256 backward]; mK then holds the BF16 K-hat (dQ's Kt) and, causal, mdO
+        # dO / L in BF16 (the band's dV); mQ / mV only give shapes
+        mx: Optional[Mxfp8BwdTensors] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -1005,6 +1392,9 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_dQ,
         ) = self._get_tiled_mma()
         self._setup_smem_layout()
+        assert (mx is not None) == self.mxfp8, "mx operands exactly with BwdConfig.mxfp8"
+        if const_expr(self.mxfp8):
+            self._setup_mx_layouts()
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -1080,35 +1470,97 @@ class FlashAttentionBackwardSm100:
         mK_tma, mV_tma = mK, mV
         mK_gmem, mV_gmem = (mK, mV) if const_expr(self.ragged_kv_tma) else (None, None)
         mKt_gmem = None
-        # S.T = K @ Q.T
-        tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mK_tma,
-            cute.select(self.sK_layout, mode=[0, 1, 2]),
-            self.mma_tiler_kq,
-            self.tiled_mma_S,
-            self.cluster_layout_vmnk.shape,
-        )
-        Q_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mnk, self.tiled_mma_S.thr_id
-        )
-        tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_B(
-            Q_tma_op,
-            mQ,
-            cute.select(self.sQ_layout, mode=[0, 1, 2]),
-            self.mma_tiler_kq,
-            self.tiled_mma_S,
-            self.cluster_layout_vmnk.shape,
-        )
-        # dP.T = V @ dO.T
-        tma_atom_V, tma_tensor_V = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mV_tma,
-            cute.select(self.sV_layout, mode=[0, 1, 2]),
-            self.mma_tiler_vdo,
-            self.tiled_mma_dP,
-            self.cluster_layout_vmnk.shape,
-        )
+        tma_atom_dO_band = tma_tensor_dO_band = None
+        mx_sf_atoms = mx_sfb_atoms = None
+        if const_expr(not self.mxfp8):
+            # S.T = K @ Q.T
+            tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                mK_tma,
+                cute.select(self.sK_layout, mode=[0, 1, 2]),
+                self.mma_tiler_kq,
+                self.tiled_mma_S,
+                self.cluster_layout_vmnk.shape,
+            )
+            Q_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
+                self.cluster_shape_mnk, self.tiled_mma_S.thr_id
+            )
+            tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_B(
+                Q_tma_op,
+                mQ,
+                cute.select(self.sQ_layout, mode=[0, 1, 2]),
+                self.mma_tiler_kq,
+                self.tiled_mma_S,
+                self.cluster_layout_vmnk.shape,
+            )
+            # dP.T = V @ dO.T
+            tma_atom_V, tma_tensor_V = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                mV_tma,
+                cute.select(self.sV_layout, mode=[0, 1, 2]),
+                self.mma_tiler_vdo,
+                self.tiled_mma_dP,
+                self.cluster_layout_vmnk.shape,
+            )
+            # dV = P.T @ dO
+            dO_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
+                self.cluster_shape_mnk, self.tiled_mma_dV.thr_id
+            )
+            tma_atom_dO, tma_tensor_dO = cute.nvgpu.make_tiled_tma_atom_B(
+                dO_tma_op,
+                mdO,
+                cute.select(self.sdO_layout, mode=[0, 1, 2]),
+                self.mma_tiler_pdo,
+                self.tiled_mma_dV,
+                self.cluster_layout_vmnk.shape,
+            )
+            # ------------------------------------------------------------
+            # 2-CTA
+            # ------------------------------------------------------------
+            tma_atom_dOt = tma_tensor_dOt = None
+            if const_expr(self.use_2cta_instrs):
+                tma_atom_dOt, tma_tensor_dOt = cute.nvgpu.make_tiled_tma_atom_B(
+                    dO_tma_op,
+                    layout_utils.select(mdO, mode=transpose_sh_q),
+                    cute.select(self.sdOt_layout, mode=[0, 1, 2]),
+                    self.mma_tiler_vdo,
+                    self.tiled_mma_dP,
+                    self.cluster_layout_vmnk.shape,
+                )
+            tma_atom_Qt = tma_tensor_Qt = None
+            if const_expr(self.use_2cta_instrs):
+                tma_atom_Qt, tma_tensor_Qt = cute.nvgpu.make_tiled_tma_atom_B(
+                    Q_tma_op,
+                    layout_utils.select(mQ, mode=transpose_sh_q),
+                    cute.select(self.sQt_layout, mode=[0, 1, 2]),
+                    self.mma_tiler_dsq,
+                    self.tiled_mma_dK,
+                    self.cluster_layout_vmnk.shape,
+                )
+        else:
+            mx_atoms, mx_sf_atoms, mx_sfb_atoms, mx_bytes = self._mx_tma_atoms(
+                mx, tma_load_op, transpose_sh_q
+            )
+            (
+                (tma_atom_K, tma_tensor_K),
+                (tma_atom_Q, tma_tensor_Q),
+                (tma_atom_V, tma_tensor_V),
+                (tma_atom_dO, tma_tensor_dO),
+                (tma_atom_dOt, tma_tensor_dOt),
+                (tma_atom_Qt, tma_tensor_Qt),
+            ) = mx_atoms
+            if const_expr(self.mx_band):
+                # the band's dV B operand: dO / L in BF16 (the BF16 dO slot)
+                tma_atom_dO_band, tma_tensor_dO_band = cute.nvgpu.make_tiled_tma_atom_B(
+                    sm100_utils_basic.cluster_shape_to_tma_atom_B(
+                        self.cluster_shape_mnk, self.tiled_mma_dV.thr_id
+                    ),
+                    mdO,
+                    cute.select(self.mx_sdO_band_layout, mode=[0, 1, 2]),
+                    self.mx_band_tiler,
+                    self.tiled_mma_dV,
+                    self.cluster_layout_vmnk.shape,
+                )
         tma_atom_V_band = tma_tensor_V_band = None
         if const_expr(mV_band is not None):
             assert not self.ragged_kv_tma and blocksparse_tensors is None
@@ -1118,41 +1570,6 @@ class FlashAttentionBackwardSm100:
                 cute.select(self.sV_layout, mode=[0, 1, 2]),
                 self.mma_tiler_vdo,
                 self.tiled_mma_dP,
-                self.cluster_layout_vmnk.shape,
-            )
-        # dV = P.T @ dO
-        dO_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mnk, self.tiled_mma_dV.thr_id
-        )
-        tma_atom_dO, tma_tensor_dO = cute.nvgpu.make_tiled_tma_atom_B(
-            dO_tma_op,
-            mdO,
-            cute.select(self.sdO_layout, mode=[0, 1, 2]),
-            self.mma_tiler_pdo,
-            self.tiled_mma_dV,
-            self.cluster_layout_vmnk.shape,
-        )
-        # ------------------------------------------------------------
-        # 2-CTA
-        # ------------------------------------------------------------
-        tma_atom_dOt = tma_tensor_dOt = None
-        if const_expr(self.use_2cta_instrs):
-            tma_atom_dOt, tma_tensor_dOt = cute.nvgpu.make_tiled_tma_atom_B(
-                dO_tma_op,
-                layout_utils.select(mdO, mode=transpose_sh_q),
-                cute.select(self.sdOt_layout, mode=[0, 1, 2]),
-                self.mma_tiler_vdo,
-                self.tiled_mma_dP,
-                self.cluster_layout_vmnk.shape,
-            )
-        tma_atom_Qt = tma_tensor_Qt = None
-        if const_expr(self.use_2cta_instrs):
-            tma_atom_Qt, tma_tensor_Qt = cute.nvgpu.make_tiled_tma_atom_B(
-                Q_tma_op,
-                layout_utils.select(mQ, mode=transpose_sh_q),
-                cute.select(self.sQt_layout, mode=[0, 1, 2]),
-                self.mma_tiler_dsq,
-                self.tiled_mma_dK,
                 self.cluster_layout_vmnk.shape,
             )
         tma_atom_Kt = tma_tensor_Kt = None
@@ -1188,6 +1605,10 @@ class FlashAttentionBackwardSm100:
         self.tma_copy_bytes["dKacc"] = self.tile_n * self.dK_reduce_ncol * Float32.width // 8
         self.tma_copy_bytes["dS"] = cute.size_in_bytes(self.ds_dtype, self.sdS_layout)
         self.tma_copy_bytes["sdS_xchg"] = self.tma_copy_bytes["dS"] // 2  # Half of dS for exchange
+        # Kt rides on the first Qt stage (BF16: the K bytes; MXFP8: the BF16 K-hat)
+        self.tma_copy_bytes["Kt"] = self.tma_copy_bytes["K"]
+        if const_expr(self.mxfp8):
+            self.tma_copy_bytes.update(mx_bytes)
 
         # TileScheduler = SingleTileScheduler
         if const_expr(self.is_varlen_k):
@@ -1268,7 +1689,116 @@ class FlashAttentionBackwardSm100:
             assert sdV_bytes <= sV_bytes, "sdV doesn't fit in sV storage allocation (2-CTA)"
             assert sdK_bytes <= sK_bytes, "sdK doesn't fit in sK storage allocation (2-CTA)"
 
-        if const_expr(self.use_2cta_instrs):
+        if const_expr(self.mxfp8):
+            # NOTE [MXFP8 hd256 backward]: sQ is the Q / Q^T ring and sdO the dO''_d / dO''_q
+            # (causal: and band halves of BF16 dO / L) ring; sP holds E4M3 P^T or the band's BF16
+            # P~; sdS_dK is only the BF16 dS exchange staging (the peer's half), sdS_mx the dK
+            # operand; sKt also stages the dK / dV epilogue, which starts after the last MMA (dQ)
+            # has completed.
+            MX = mxu.MX_DTYPE
+            nbytes = cute.size_in_bytes
+            sQ_mx_bytes = max(nbytes(MX, self.mx_sQ_layout), nbytes(MX, self.mx_sQt_layout))
+            sdO_mx_bytes = max(
+                nbytes(MX, self.mx_sdO_layout),
+                nbytes(MX, self.mx_sdOt_layout),
+                nbytes(cutlass.BFloat16, self.mx_sdO_band_layout) if self.mx_band else 0,
+            )
+            sP_mx_bytes = max(
+                nbytes(MX, self.mx_sP_layout),
+                nbytes(self.do_dtype, self.tP_layout) if self.mx_band else 0,
+            )
+            sKt_mx_bytes = max(
+                nbytes(self.k_dtype, self.sKt_layout),
+                nbytes(self.dk_dtype, self.sdK_layout),
+                nbytes(self.dv_dtype, self.sdV_layout),
+            )
+            sf_tile = mxu.SF_TILE_BYTES
+
+            @cute.struct
+            class SharedStorage:
+                Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
+                dO_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dO_stage]
+                LSE_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
+                dPsum_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dPsum_stage]
+                S_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
+                dP_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
+                dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
+                dKV_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.sdKVaccum_stage]
+                dQ_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+                dQ_cluster_full_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.dQaccum_reduce_stage // 2
+                ]
+                dQ_cluster_empty_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.dQaccum_reduce_stage // 2
+                ]
+                tmem_holding_buf: Int32
+                tmem_dealloc_mbar: cutlass.Int64
+                Qt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
+                Kt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
+                dS_cluster_empty_mbar_ptr: cutlass.Int64
+                dS_cluster_full_mbar_ptr: cutlass.Int64
+                dS_cluster_leader_mbar_ptr: cutlass.Int64
+                dQaccum_empty_mbar_ptr: cutlass.Int64
+                P_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+
+                sQ: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint8, sQ_mx_bytes], self.buffer_align_bytes
+                ]
+                sK: cute.struct.Align[
+                    cute.struct.MemRange[MX, cute.cosize(self.mx_sK_layout)],
+                    self.buffer_align_bytes,
+                ]
+                sV: cute.struct.Align[
+                    cute.struct.MemRange[MX, cute.cosize(self.mx_sV_layout)],
+                    self.buffer_align_bytes,
+                ]
+                sdO: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint8, sdO_mx_bytes], self.buffer_align_bytes
+                ]
+                sP: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint8, sP_mx_bytes], self.buffer_align_bytes
+                ]
+                sdS_mx: cute.struct.Align[
+                    cute.struct.MemRange[MX, cute.cosize(self.mx_sdSt_layout)],
+                    self.buffer_align_bytes,
+                ]
+                sdS_dK: cute.struct.Align[  # the peer's half only
+                    cute.struct.MemRange[self.ds_dtype, cute.cosize(self.sdSt_layout) // 2],
+                    self.buffer_align_bytes,
+                ]
+                sKt: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint8, sKt_mx_bytes], self.buffer_align_bytes
+                ]
+                sdS: cute.struct.Align[
+                    cute.struct.MemRange[self.ds_dtype, cute.cosize(self.sdSt_layout)],
+                    self.buffer_align_bytes,
+                ]
+                sLSE: cute.struct.Align[
+                    cute.struct.MemRange[self.lse_dtype, cute.cosize(self.sLSE_layout)],
+                    128,
+                ]
+                sdPsum: cute.struct.Align[
+                    cute.struct.MemRange[self.dpsum_dtype, cute.cosize(self.sdPsum_layout)],
+                    128,
+                ]
+                sdQaccum: cute.struct.Align[
+                    cute.struct.MemRange[self.dqaccum_dtype, cute.cosize(self.sdQaccum_layout)],
+                    self.buffer_align_bytes,
+                ]
+                sSFK: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sf_tile], 128]
+                sSFV: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint8, sf_tile * self.mx_V_stage], 128
+                ]
+                sSFQ: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint8, sf_tile * self.Q_stage], 128
+                ]
+                sSFdO: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint8, sf_tile * self.dO_stage], 128
+                ]
+                sSFP: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sf_tile // 2], 128]
+                sSFdS: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, sf_tile // 2], 128]
+
+        elif const_expr(self.use_2cta_instrs):
             # The serial schedule aliases Qt / dOt into Q / dO and sdS_xchg into sdQaccum; the
             # M=64 layout has no exchange staging buffer at all (see xchg_aliases_dQaccum).
             own_xchg = const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED)
@@ -1450,6 +1980,12 @@ class FlashAttentionBackwardSm100:
                 ]
 
         self.shared_storage = SharedStorage
+        if const_expr(self.mxfp8):
+            # an SMEM layout past the per-block limit does not always fail the launch
+            smem_limit = 327 * 1024 if mxu.is_sm107() else 232448
+            assert self.shared_storage.size_in_bytes() <= smem_limit, (
+                f"MXFP8 backward SMEM {self.shared_storage.size_in_bytes()} > {smem_limit}"
+            )
 
         LOG2_E = math.log2(math.e)
         if const_expr(self.score_mod is None):
@@ -1556,6 +2092,19 @@ class FlashAttentionBackwardSm100:
             blocksparse_tensors,
             tma_tensor_V_band,
             tma_atom_V_band,
+            *(
+                (
+                    self.tiled_mma_S_mx,
+                    self.tiled_mma_dP_mx,
+                    self.tiled_mma_dV_mx,
+                    self.tiled_mma_dK_mx,
+                    *(x for atom_tensor in (*mx_sf_atoms, *mx_sfb_atoms) for x in atom_tensor),
+                    tma_atom_dO_band,
+                    tma_tensor_dO_band,
+                )
+                if const_expr(self.mxfp8)
+                else ()
+            ),
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1649,9 +2198,32 @@ class FlashAttentionBackwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mV_band: Optional[cute.Tensor] = None,
         tma_atom_V_band: Optional[cute.CopyAtom] = None,
+        # NOTE [MXFP8 hd256 backward]: block-scaled tiled MMAs, the scale-tile TMA atoms and
+        # tensors, and the band's BF16 dO / L load
+        tiled_mma_S_mx: Optional[cute.TiledMma] = None,
+        tiled_mma_dP_mx: Optional[cute.TiledMma] = None,
+        tiled_mma_dV_mx: Optional[cute.TiledMma] = None,
+        tiled_mma_dK_mx: Optional[cute.TiledMma] = None,
+        tma_atom_SFK: Optional[cute.CopyAtom] = None,
+        mSFK: Optional[cute.Tensor] = None,
+        tma_atom_SFV: Optional[cute.CopyAtom] = None,
+        mSFV: Optional[cute.Tensor] = None,
+        tma_atom_SFQ: Optional[cute.CopyAtom] = None,
+        mSFQ: Optional[cute.Tensor] = None,
+        tma_atom_SFdO_dP: Optional[cute.CopyAtom] = None,
+        mSFdO_dP: Optional[cute.Tensor] = None,
+        tma_atom_SFQt: Optional[cute.CopyAtom] = None,
+        mSFQt: Optional[cute.Tensor] = None,
+        tma_atom_SFdO_dV: Optional[cute.CopyAtom] = None,
+        mSFdO_dV: Optional[cute.Tensor] = None,
+        tma_atom_dO_band: Optional[cute.CopyAtom] = None,
+        mdO_band: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
+        if const_expr(self.mxfp8):
+            # rebuild the MXFP8 layouts in the kernel region (the host's are not visible here)
+            self._setup_mx_layouts()
         # The CTA rank of a 2CTA pair; NOTE [SM100 backward coordinate spaces].
         mma_tile_coord_v = bidx % self.cta_group_size
         is_leader_cta = mma_tile_coord_v == 0
@@ -1675,6 +2247,18 @@ class FlashAttentionBackwardSm100:
                     cpasync.prefetch_descriptor(tma_atom_dV)
                 if const_expr(tma_atom_dK is not None):
                     cpasync.prefetch_descriptor(tma_atom_dK)
+                if const_expr(self.mxfp8):
+                    for atom in (
+                        tma_atom_SFK,
+                        tma_atom_SFV,
+                        tma_atom_SFQ,
+                        tma_atom_SFdO_dP,
+                        tma_atom_SFQt,
+                        tma_atom_SFdO_dV,
+                    ):
+                        cpasync.prefetch_descriptor(atom)
+                    if const_expr(self.mx_band):
+                        cpasync.prefetch_descriptor(tma_atom_dO_band)
 
         cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk),
@@ -1684,6 +2268,20 @@ class FlashAttentionBackwardSm100:
         # Alloc
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        if const_expr(self.mxfp8):
+            if warp_idx == self.mma_warp_id:
+                # the constant P^T scale 2^-8 for every (key, 32-query) group; the leader's
+                # tcgen05.cp reads it after the pipeline-init cluster sync below
+                sSFP_u32 = cute.make_tensor(
+                    cute.recast_ptr(storage.sSFP.data_ptr(), dtype=cutlass.Uint32),
+                    cute.make_layout(mxu.SF_TILE_BYTES // 8),
+                )
+                lane = cute.arch.lane_idx()
+                for i in cutlass.range_constexpr(mxu.SF_TILE_BYTES // 8 // 32):
+                    sSFP_u32[lane * (mxu.SF_TILE_BYTES // 8 // 32) + i] = cutlass.Uint32(
+                        mxu.SF_P_BYTE * 0x01010101
+                    )
+                cute.arch.fence_view_async_shared()
 
         dQ_cluster_full_mbar_ptr = storage.dQ_cluster_full_mbar_ptr.data_ptr()
         dQ_cluster_empty_mbar_ptr = storage.dQ_cluster_empty_mbar_ptr.data_ptr()
@@ -1792,7 +2390,8 @@ class FlashAttentionBackwardSm100:
             barrier_storage=storage.dS_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
-        if const_expr(self.split_P_dS):
+        if const_expr(self.split_P_dS or self.mxfp8):
+            # MXFP8: P^T in SMEM ready for dV, which its schedule issues before dK
             pipeline_P = cutlass.pipeline.PipelineAsyncUmma.create(
                 num_stages=1,
                 producer_group=pipeline_PdS_producer_group,
@@ -1900,81 +2499,161 @@ class FlashAttentionBackwardSm100:
             defer_sync=False,
         )
 
-        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
-        if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
-            sQt = storage.sQt.get_tensor(
-                sQt_layout.outer, swizzle=sQt_layout.inner, dtype=self.q_dtype
+        mx_smem = None
+        if const_expr(self.mxfp8):
+            # NOTE [MXFP8 hd256 backward]: E4M3 views in the BF16 operands' roles (sdO = dV's B,
+            # dO'' along queries; sdOt = dP's B, dO'' along head_dim), and the MXFP8-only buffers
+            MX = mxu.MX_DTYPE
+            sQ = storage.sQ.get_tensor(
+                self.mx_sQ_layout.outer, swizzle=self.mx_sQ_layout.inner, dtype=MX
             )
-        else:
             sQt = cute.make_tensor(
-                cute.recast_ptr(sQ.iterator, sQt_layout.inner, dtype=self.q_dtype), sQt_layout.outer
+                cute.recast_ptr(sQ.iterator, self.mx_sQt_layout.inner, dtype=MX),
+                self.mx_sQt_layout.outer,
             )
-        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        if const_expr(self.use_2cta_instrs):
-            sKt = storage.sKt.get_tensor(sKt_layout.outer, swizzle=sKt_layout.inner)
-        else:
-            sKt = cute.make_tensor(cute.recast_ptr(sK.iterator, sKt_layout.inner), sKt_layout.outer)
-        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
-        sdSt = storage.sdS.get_tensor(sdSt_layout.outer, swizzle=sdSt_layout.inner)
-        sdS = cute.make_tensor(cute.recast_ptr(sdSt.iterator, sdS_layout.inner), sdS_layout.outer)
-        if const_expr(self.has_sdS_xchg):
-            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
-                sdS_xchg = storage.sdS_xchg.get_tensor(sdS_xchg_layout)
-            else:
-                sdS_xchg = storage.sdQaccum.get_tensor(sdS_xchg_layout, dtype=self.ds_dtype)
-        else:
+            sK = storage.sK.get_tensor(self.mx_sK_layout.outer, swizzle=self.mx_sK_layout.inner)
+            sKt = storage.sKt.get_tensor(
+                sKt_layout.outer, swizzle=sKt_layout.inner, dtype=self.k_dtype
+            )
+            sV = storage.sV.get_tensor(self.mx_sV_layout.outer, swizzle=self.mx_sV_layout.inner)
+            sdSt = storage.sdS.get_tensor(sdSt_layout.outer, swizzle=sdSt_layout.inner)
+            sdS = cute.make_tensor(
+                cute.recast_ptr(sdSt.iterator, sdS_layout.inner), sdS_layout.outer
+            )
             sdS_xchg = None
-        if const_expr(self.acc_m64):
-            # P^T and this CTA's dS^T: the SMEM A operands of the dV / dK MMAs.
-            sP = storage.sP.get_tensor(
+            sP = storage.sP.get_tensor(  # BF16: the band's P~
                 tP_layout.outer, swizzle=tP_layout.inner, dtype=self.do_dtype
             )
+            # the BF16 dS exchange staging: storage for one Q-column half of the BF16 dS^T tile,
+            # the peer's, which is the exchange source (_dS_exchange_source); the compute warps
+            # store into it through per-half views (compute_loop)
             sdS_dK = storage.sdS_dK.get_tensor(sdSt_layout.outer, swizzle=sdSt_layout.inner)
-        else:
-            sP = None
-            sdS_dK = None
-
-        sdO = storage.sdO.get_tensor(
-            sdO_layout.outer, swizzle=sdO_layout.inner, dtype=self.do_dtype
-        )
-        if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
-            sdOt = storage.sdOt.get_tensor(
-                sdOt_layout.outer, swizzle=sdOt_layout.inner, dtype=self.do_dtype
+            sdO = storage.sdO.get_tensor(
+                self.mx_sdO_layout.outer, swizzle=self.mx_sdO_layout.inner, dtype=MX
             )
-        else:
             sdOt = cute.make_tensor(
-                cute.recast_ptr(sdO.iterator, sdOt_layout.inner, dtype=self.do_dtype),
-                sdOt_layout.outer,
+                cute.recast_ptr(sdO.iterator, self.mx_sdOt_layout.inner, dtype=MX),
+                self.mx_sdOt_layout.outer,
             )
+            sdV = storage.sKt.get_tensor(
+                sdV_layout.outer, swizzle=sdV_layout.inner, dtype=self.dv_dtype
+            )
+            sdK = storage.sKt.get_tensor(
+                sdK_layout.outer, swizzle=sdK_layout.inner, dtype=self.dk_dtype
+            )
+            sLSE = storage.sLSE.get_tensor(sLSE_layout)
+            sdPsum = storage.sdPsum.get_tensor(sdPsum_layout)
+            sAx = sDx = sLx = None
 
-        sLSE = storage.sLSE.get_tensor(sLSE_layout)
-        sdPsum = storage.sdPsum.get_tensor(sdPsum_layout)
-        sAx = sDx = sLx = None
-        if const_expr(self.fold_LSE_dPsum):
-            sAx = storage.sAx.get_tensor(sAx_layout.outer, swizzle=sAx_layout.inner)
-            sDx = storage.sDx.get_tensor(sDx_layout.outer, swizzle=sDx_layout.inner)
-            sLx = storage.sLx.get_tensor(sLx_layout.outer, swizzle=sLx_layout.inner)
-        if const_expr(self.use_2cta_instrs):
-            if const_expr(not self.dKV_postprocess):
-                sdV = storage.sV.get_tensor(
+            def sf_view(t, layout):
+                return cute.make_tensor(cute.recast_ptr(t.data_ptr(), dtype=mxu.SF_DTYPE), layout)
+
+            mx_smem = MxSmem(
+                sP=cute.make_tensor(
+                    cute.recast_ptr(sP.iterator, self.mx_sP_layout.inner, dtype=MX),
+                    self.mx_sP_layout.outer,
+                ),
+                sdSt=storage.sdS_mx.get_tensor(
+                    self.mx_sdSt_layout.outer, swizzle=self.mx_sdSt_layout.inner
+                ),
+                sdO_band=cute.make_tensor(
+                    cute.recast_ptr(
+                        sdO.iterator, self.mx_sdO_band_layout.inner, dtype=cutlass.BFloat16
+                    ),
+                    self.mx_sdO_band_layout.outer,
+                )
+                if const_expr(self.mx_band)
+                else None,
+                sSFK=sf_view(storage.sSFK, self.mx_sSFK_layout),
+                sSFV=sf_view(storage.sSFV, self.mx_sSFV_layout),
+                sSFQ=sf_view(storage.sSFQ, self.mx_sSFQ_layout),
+                sSFQt=sf_view(storage.sSFQ, self.mx_sSFB_layout),
+                sSFdO_dP=sf_view(storage.sSFdO, self.mx_sSFQ_layout),
+                sSFdO_dV=sf_view(storage.sSFdO, self.mx_sSFB_layout),
+                sSFP=sf_view(storage.sSFP, self.mx_sSFA_layout),
+                sSFdS=sf_view(storage.sSFdS, self.mx_sSFA_layout),
+            )
+        else:
+            sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
+            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
+                sQt = storage.sQt.get_tensor(
+                    sQt_layout.outer, swizzle=sQt_layout.inner, dtype=self.q_dtype
+                )
+            else:
+                sQt = cute.make_tensor(
+                    cute.recast_ptr(sQ.iterator, sQt_layout.inner, dtype=self.q_dtype),
+                    sQt_layout.outer,
+                )
+            sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+            if const_expr(self.use_2cta_instrs):
+                sKt = storage.sKt.get_tensor(sKt_layout.outer, swizzle=sKt_layout.inner)
+            else:
+                sKt = cute.make_tensor(
+                    cute.recast_ptr(sK.iterator, sKt_layout.inner), sKt_layout.outer
+                )
+            sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+            sdSt = storage.sdS.get_tensor(sdSt_layout.outer, swizzle=sdSt_layout.inner)
+            sdS = cute.make_tensor(
+                cute.recast_ptr(sdSt.iterator, sdS_layout.inner), sdS_layout.outer
+            )
+            if const_expr(self.has_sdS_xchg):
+                if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
+                    sdS_xchg = storage.sdS_xchg.get_tensor(sdS_xchg_layout)
+                else:
+                    sdS_xchg = storage.sdQaccum.get_tensor(sdS_xchg_layout, dtype=self.ds_dtype)
+            else:
+                sdS_xchg = None
+            if const_expr(self.acc_m64):
+                # P^T and this CTA's dS^T: the SMEM A operands of the dV / dK MMAs.
+                sP = storage.sP.get_tensor(
+                    tP_layout.outer, swizzle=tP_layout.inner, dtype=self.do_dtype
+                )
+                sdS_dK = storage.sdS_dK.get_tensor(sdSt_layout.outer, swizzle=sdSt_layout.inner)
+            else:
+                sP = None
+                sdS_dK = None
+
+            sdO = storage.sdO.get_tensor(
+                sdO_layout.outer, swizzle=sdO_layout.inner, dtype=self.do_dtype
+            )
+            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
+                sdOt = storage.sdOt.get_tensor(
+                    sdOt_layout.outer, swizzle=sdOt_layout.inner, dtype=self.do_dtype
+                )
+            else:
+                sdOt = cute.make_tensor(
+                    cute.recast_ptr(sdO.iterator, sdOt_layout.inner, dtype=self.do_dtype),
+                    sdOt_layout.outer,
+                )
+
+            sLSE = storage.sLSE.get_tensor(sLSE_layout)
+            sdPsum = storage.sdPsum.get_tensor(sdPsum_layout)
+            sAx = sDx = sLx = None
+            if const_expr(self.fold_LSE_dPsum):
+                sAx = storage.sAx.get_tensor(sAx_layout.outer, swizzle=sAx_layout.inner)
+                sDx = storage.sDx.get_tensor(sDx_layout.outer, swizzle=sDx_layout.inner)
+                sLx = storage.sLx.get_tensor(sLx_layout.outer, swizzle=sLx_layout.inner)
+            if const_expr(self.use_2cta_instrs):
+                if const_expr(not self.dKV_postprocess):
+                    sdV = storage.sV.get_tensor(
+                        sdV_layout.outer, swizzle=sdV_layout.inner, dtype=self.dv_dtype
+                    )
+                    sdK = storage.sK.get_tensor(
+                        sdK_layout.outer, swizzle=sdK_layout.inner, dtype=self.dk_dtype
+                    )
+                else:
+                    sdV = storage.sV.get_tensor(sdV_layout, dtype=self.dv_dtype)
+                    sdK = storage.sK.get_tensor(sdK_layout, dtype=self.dk_dtype)
+            elif const_expr(not self.dKV_postprocess):
+                sdV = storage.sdO.get_tensor(
                     sdV_layout.outer, swizzle=sdV_layout.inner, dtype=self.dv_dtype
                 )
-                sdK = storage.sK.get_tensor(
+                sdK = storage.sQ.get_tensor(
                     sdK_layout.outer, swizzle=sdK_layout.inner, dtype=self.dk_dtype
                 )
             else:
-                sdV = storage.sV.get_tensor(sdV_layout, dtype=self.dv_dtype)
-                sdK = storage.sK.get_tensor(sdK_layout, dtype=self.dk_dtype)
-        elif const_expr(not self.dKV_postprocess):
-            sdV = storage.sdO.get_tensor(
-                sdV_layout.outer, swizzle=sdV_layout.inner, dtype=self.dv_dtype
-            )
-            sdK = storage.sQ.get_tensor(
-                sdK_layout.outer, swizzle=sdK_layout.inner, dtype=self.dk_dtype
-            )
-        else:
-            sdV = storage.sdO.get_tensor(sdV_layout, dtype=self.dv_dtype)
-            sdK = storage.sQ.get_tensor(sdK_layout, dtype=self.dk_dtype)
+                sdV = storage.sdO.get_tensor(sdV_layout, dtype=self.dv_dtype)
+                sdK = storage.sQ.get_tensor(sdK_layout, dtype=self.dk_dtype)
 
         # Buffer sizing is guaranteed by max(...) in SharedStorage declarations
         # for both sQ (reused as sdK) and sdO (reused as sdV)
@@ -2156,6 +2835,17 @@ class FlashAttentionBackwardSm100:
                 should_load_dO=True,
                 mV_band=mV_band,
                 tma_atom_V_band=tma_atom_V_band,
+                mx_smem=mx_smem,
+                mx_tiled_mmas=(tiled_mma_S_mx, tiled_mma_dP_mx, tiled_mma_dV_mx, tiled_mma_dK_mx),
+                mx_sf_loads=(
+                    (tma_atom_SFK, mSFK),
+                    (tma_atom_SFV, mSFV),
+                    (tma_atom_SFQ, mSFQ),
+                    (tma_atom_SFdO_dP, mSFdO_dP),
+                    (tma_atom_SFQt, mSFQt),
+                    (tma_atom_SFdO_dV, mSFdO_dV),
+                ),
+                dO_band_load=(tma_atom_dO_band, mdO_band),
             )
 
         #  MMA
@@ -2215,6 +2905,8 @@ class FlashAttentionBackwardSm100:
                 sLx=sLx,
                 pipeline_Lx=pipeline_Lx,
                 pipeline_Dx=pipeline_Dx,
+                mx_smem=mx_smem,
+                mx_tiled_mmas=(tiled_mma_S_mx, tiled_mma_dP_mx, tiled_mma_dV_mx, tiled_mma_dK_mx),
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -2272,6 +2964,7 @@ class FlashAttentionBackwardSm100:
                 aux_data,
                 fastdiv_mods,
                 blocksparse_tensors,
+                mx_smem=mx_smem,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2348,6 +3041,141 @@ class FlashAttentionBackwardSm100:
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+    def _mx_loaders(
+        self,
+        mV_cur,
+        head_idx,
+        kv_head,
+        batch_idx,
+        thr_mma_dP,
+        thr_mma_dV_bf16,
+        tma_atom_V,
+        sV,
+        mx_smem,
+        mx_sf_loads,
+        dO_band_load,
+        pipeline_Q,
+        pipeline_dO,
+        cta_rank_in_cluster,
+        b_cta_layout,
+        block_in_cluster_coord_vmnk,
+        q_do_mcast_mask,
+    ) -> "MxLoads":
+        """NOTE [MXFP8 hd256 backward]: the V tile loader (V-hat, causal also R, by tile index),
+        the scale-tile loaders (Q / dO''_d / Q^T / dO''_q ones ride their payload's stage), and
+        the band's BF16 dO / L loader. Plain Python: returns callables."""
+        (
+            (atom_SFK, mSFK),
+            (atom_SFV, mSFV),
+            (atom_SFQ, mSFQ),
+            (atom_SFdO_dP, mSFdO_dP),
+            (atom_SFQt, mSFQt),
+            (atom_SFdO_dV, mSFdO_dV),
+        ) = mx_sf_loads
+        gV_tiles = cute.local_tile(mV_cur, cute.select(self.mma_tiler_vdo, mode=[0, 2]), (None, 0))
+        load_V_tiles, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_V, 0, cute.make_layout(1), thr_mma_dP.partition_A(gV_tiles), sV
+        )
+
+        def pair_tile_loader(atom, mSF, sSF, head, stages):
+            # (16 B, 64 rows, stage) bytes of the scale buffer: one 1024 B tile per stage
+            sSF_bytes = cute.make_tensor(
+                cute.recast_ptr(sSF.iterator, dtype=cutlass.Uint8),
+                cute.make_layout((16, 64, stages), stride=(1, 16, mxu.SF_TILE_BYTES)),
+            )
+            load, _, _ = copy_utils.tma_get_copy_fn(
+                atom, 0, cute.make_layout(1), mSF[None, None, None, head, batch_idx], sSF_bytes
+            )
+            return load
+
+        # The B scales of the N = 256 dV / dK MMAs: each CTA loads half and multicasts it.
+        tiled_mma_sfb = mxu.make_mx_tiled_mma(
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
+            self.mx_mma_tiler_sfb[:2],
+            cta_group=tcgen05.CtaGroup.ONE,
+        )
+        layout_sfb_vmnk = cute.tiled_divide(
+            cute.make_layout(self.cluster_shape_mnk), (tiled_mma_sfb.thr_id.shape,)
+        )
+        coord_sfb = layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
+        thr_mma_sfb = tiled_mma_sfb.get_slice(0)
+
+        def sfb_loader(atom, mSF, sSF, pipe):
+            gSF = cute.local_tile(
+                mSF[None, None, head_idx, batch_idx],
+                cute.select(self.mx_mma_tiler_sfb, mode=[1, 2]),
+                (0, None),
+            )
+            load, _, _ = copy_utils.tma_get_copy_fn(
+                atom,
+                cta_coord=coord_sfb[1],
+                cta_layout=cute.make_layout(cute.slice_(layout_sfb_vmnk, (0, None, 0, 0)).shape),
+                src_tensor=thr_mma_sfb.partition_B(gSF),
+                dst_tensor=sSF,
+                filter_zeros=True,
+                mcast_mask=cpasync.create_tma_multicast_mask(
+                    layout_sfb_vmnk, coord_sfb, mcast_mode=1
+                ),
+            )
+            return copy_utils.tma_producer_copy_fn(load, pipe)
+
+        load_dO_band = None
+        if const_expr(self.mx_band):
+            atom_band, mdO_band = dO_band_load
+            gdO_band = cute.local_tile(
+                mdO_band[None, None, head_idx, batch_idx],
+                cute.select(self.mx_band_tiler, mode=[1, 2]),
+                (0, None),
+            )
+            load_band, _, _ = copy_utils.tma_get_copy_fn(
+                atom_band,
+                cta_coord=block_in_cluster_coord_vmnk[1],
+                cta_layout=b_cta_layout,
+                src_tensor=thr_mma_dV_bf16.partition_B(gdO_band),
+                dst_tensor=mx_smem.sdO_band,
+                mcast_mask=q_do_mcast_mask,
+            )
+            load_dO_band = copy_utils.tma_producer_copy_fn(load_band, pipeline_dO)
+        return MxLoads(
+            load_V_tiles=load_V_tiles,
+            load_SFK=pair_tile_loader(atom_SFK, mSFK, mx_smem.sSFK, kv_head, 1),
+            load_SFV=pair_tile_loader(atom_SFV, mSFV, mx_smem.sSFV, kv_head, self.mx_V_stage),
+            load_SFQ=copy_utils.tma_producer_copy_fn(
+                pair_tile_loader(atom_SFQ, mSFQ, mx_smem.sSFQ, head_idx, 1), pipeline_Q
+            ),
+            load_SFdO_dP=copy_utils.tma_producer_copy_fn(
+                pair_tile_loader(atom_SFdO_dP, mSFdO_dP, mx_smem.sSFdO_dP, head_idx, 1),
+                pipeline_dO,
+            ),
+            load_SFQt=sfb_loader(atom_SFQt, mSFQt, mx_smem.sSFQt, pipeline_Q),
+            load_SFdO_dV=sfb_loader(atom_SFdO_dV, mSFdO_dV, mx_smem.sSFdO_dV, pipeline_dO),
+            load_dO_band=load_dO_band,
+        )
+
+    def _mx_load_V(self, load_V_tiles, load_SFV, work_n, kv_block, seqlen, tma_bar_ptr):
+        """NOTE [MXFP8 hd256 backward]: V-hat and its scales into V's stage 0 and, causal, the band
+        residual R (keys [s, 2s) of the V copy) into stage 1, on one barrier."""
+        load_V_tiles(src_idx=work_n, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
+        load_SFV(src_idx=kv_block, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
+        if const_expr(self.mx_band):
+            load_V_tiles(
+                src_idx=work_n + seqlen.seqlen_k // self.cluster_tile_n,
+                dst_idx=1,
+                tma_bar_ptr=tma_bar_ptr,
+            )
+            load_SFV(
+                src_idx=kv_block + seqlen.seqlen_k // self.tile_n,
+                dst_idx=1,
+                tma_bar_ptr=tma_bar_ptr,
+            )
+
+    @cute.jit
+    def _is_mx_band(self, m_block, work_n):
+        """NOTE [MXFP8 hd256 backward]: whether step m_block of work tile work_n lies on the
+        forward's BF16 band (keys [256 floor(i / 256), i] of query i)."""
+        return m_block * self.tile_m // 256 == work_n * self.cluster_tile_n // 256
 
     # Q-side loaders of one query head (or packed group). With head_loop the tile's
     # head_idx is the KV head and these are rebuilt per sub-group.
@@ -2523,7 +3351,18 @@ class FlashAttentionBackwardSm100:
         should_load_dO: bool = True,
         mV_band: Optional[cute.Tensor] = None,
         tma_atom_V_band: Optional[cute.CopyAtom] = None,
+        mx_smem: Optional[MxSmem] = None,
+        mx_tiled_mmas: tuple = (None,) * 4,
+        mx_sf_loads: tuple = ((None, None),) * 6,
+        dO_band_load: tuple = (None, None),
     ):
+        thr_mma_dV_bf16 = thr_mma_dV  # the band's BF16 dO / L
+        if const_expr(self.mxfp8):
+            # NOTE [MXFP8 hd256 backward]: the payload loads partition the block-scaled MMAs
+            mma_tile_coord_v = cute.arch.block_idx()[0] % self.cta_group_size
+            thr_mma_S, thr_mma_dP, thr_mma_dV, thr_mma_dK = [
+                t.get_slice(mma_tile_coord_v) for t in mx_tiled_mmas
+            ]
         producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
         )
@@ -2659,18 +3498,22 @@ class FlashAttentionBackwardSm100:
                 **({"tma_desc_ptr": desc_ptrs[0]} if const_expr(self.ragged_kv_tma) else {}),
             )
 
-            # (2) dP = V @ dO.T: V side
-            gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_vdo, mode=[0, 2]), (work_n, 0))
-            tdPgV = thr_mma_dP.partition_A(gV)
-            load_V, _, _ = copy_utils.tma_get_copy_fn(
-                tma_atom_V,
-                0,
-                cute.make_layout(1),
-                tdPgV,
-                sV,
-                single_stage=True,
-                **({"tma_desc_ptr": desc_ptrs[1]} if const_expr(self.ragged_kv_tma) else {}),
-            )
+            # (2) dP = V @ dO.T: V side (MXFP8: _mx_load_V)
+            load_V = None
+            if const_expr(not self.mxfp8):
+                gV = cute.local_tile(
+                    mV_cur, cute.select(self.mma_tiler_vdo, mode=[0, 2]), (work_n, 0)
+                )
+                tdPgV = thr_mma_dP.partition_A(gV)
+                load_V, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_V,
+                    0,
+                    cute.make_layout(1),
+                    tdPgV,
+                    sV,
+                    single_stage=True,
+                    **({"tma_desc_ptr": desc_ptrs[1]} if const_expr(self.ragged_kv_tma) else {}),
+                )
             # The MXFP8 causal band: the original V for the steps before m_band_end, V-hat
             # (load_V) from there on (NOTE [MXFP8 mirrored BF16 backward])
             m_band_end = m_block_min
@@ -2707,6 +3550,39 @@ class FlashAttentionBackwardSm100:
                     sKt,
                     single_stage=True,
                     **({"tma_desc_ptr": desc_ptrs[2]} if const_expr(self.ragged_kv_tma) else {}),
+                )
+
+            # (plain names: a staged region treats a method-style call on a tuple as a write)
+            load_V_tiles = load_SFK = load_SFV = load_SFQ = load_SFdO_dP = None
+            load_SFQt = load_SFdO_dV = load_dO_band = None
+            if const_expr(self.mxfp8):
+                (
+                    load_V_tiles,
+                    load_SFK,
+                    load_SFV,
+                    load_SFQ,
+                    load_SFdO_dP,
+                    load_SFQt,
+                    load_SFdO_dV,
+                    load_dO_band,
+                ) = self._mx_loaders(
+                    mV_cur,
+                    head_idx,
+                    kv_head,
+                    batch_idx,
+                    thr_mma_dP,
+                    thr_mma_dV_bf16,
+                    tma_atom_V,
+                    sV,
+                    mx_smem,
+                    mx_sf_loads,
+                    dO_band_load,
+                    pipeline_Q,
+                    pipeline_dO,
+                    cta_rank_in_cluster,
+                    b_cta_layout,
+                    block_in_cluster_coord_vmnk,
+                    q_do_mcast_mask,
                 )
 
             # One loader set per query-head (sub-)group of the tile (a single set without
@@ -2762,7 +3638,140 @@ class FlashAttentionBackwardSm100:
             if const_expr(not self.use_block_sparsity):
                 if process_tile:
                     first_m_block = m_block_min
-                    if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
+                    if const_expr(self.mxfp8):
+                        # NOTE [MXFP8 hd256 schedule]: the Q ring carries Q(0), then per step
+                        # Q(j+1), Q^T(j); the dO ring dO''_d(0), then per step dO''_q(j) (causal
+                        # band: two halves of BF16 dO / L), dO''_d(j+1). K, V (and R) ride the first
+                        # Q / dO''_d slots, Kt the first Q^T slot. Per step the loads issue as
+                        # Q(j+1), dO''_q(j), dO''_d(j+1), Q^T(j).
+                        pipeline_Q.producer_acquire(
+                            producer_state_Q_LSE, extra_tx_count=self.tma_copy_bytes["K"]
+                        )
+                        load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE))
+                        load_SFK(
+                            src_idx=kv_block,
+                            dst_idx=0,
+                            tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE),
+                        )
+                        load_Q(first_m_block, producer_state=producer_state_Q_LSE)
+                        load_SFQ(first_m_block, producer_state=producer_state_Q_LSE)
+                        pipeline_Q.producer_commit(producer_state_Q_LSE)
+                        producer_state_Q_LSE.advance()
+                        pipeline_LSE.producer_acquire(producer_state_LSE)
+                        with cute.arch.elect_one():
+                            copy_stats(
+                                gLSE[None, first_m_block],
+                                sLSE[None, producer_state_LSE.index],
+                                mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
+                            )
+                        producer_state_LSE.advance()
+                        pipeline_dO.producer_acquire(
+                            producer_state_dO_dPsum,
+                            extra_tx_count=self.tma_copy_bytes["V"] + self.tma_copy_bytes["dO_sf"],
+                        )
+                        self._mx_load_V(
+                            load_V_tiles,
+                            load_SFV,
+                            work_n,
+                            kv_block,
+                            seqlen,
+                            pipeline_dO.producer_get_barrier(producer_state_dO_dPsum),
+                        )
+                        load_dOt(first_m_block, producer_state=producer_state_dO_dPsum)
+                        load_SFdO_dP(first_m_block, producer_state=producer_state_dO_dPsum)
+                        pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                        producer_state_dO_dPsum.advance()
+                        pipeline_dPsum.producer_acquire(producer_state_dPsum)
+                        with cute.arch.elect_one():
+                            copy_stats(
+                                gdPsum[None, first_m_block],
+                                sdPsum[None, producer_state_dPsum.index],
+                                mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dPsum),
+                            )
+                        producer_state_dPsum.advance()
+                        for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
+                            has_next = m_block + 1 < m_block_max
+                            if has_next:
+                                # Q(j+1), for S(j+1)
+                                pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                                load_Q(m_block + 1, producer_state=producer_state_Q_LSE)
+                                load_SFQ(m_block + 1, producer_state=producer_state_Q_LSE)
+                                pipeline_Q.producer_commit(producer_state_Q_LSE)
+                                producer_state_Q_LSE.advance()
+                                pipeline_LSE.producer_acquire(producer_state_LSE)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gLSE[None, m_block + 1],
+                                        sLSE[None, producer_state_LSE.index],
+                                        mbar_ptr=pipeline_LSE.producer_get_barrier(
+                                            producer_state_LSE
+                                        ),
+                                    )
+                                producer_state_LSE.advance()
+                            # dO''_q(j), for dV(j)
+                            is_band = False
+                            if const_expr(self.mx_band):
+                                is_band = self._is_mx_band(m_block, work_n)
+                                if is_band:
+                                    for h in cutlass.range_constexpr(2):
+                                        pipeline_dO.producer_acquire(producer_state_dO_dPsum)
+                                        load_dO_band(
+                                            2 * m_block + h, producer_state=producer_state_dO_dPsum
+                                        )
+                                        pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                                        producer_state_dO_dPsum.advance()
+                            if not is_band:
+                                pipeline_dO.producer_acquire(
+                                    producer_state_dO_dPsum,
+                                    extra_tx_count=self.tma_copy_bytes["dO_sf"],
+                                )
+                                load_dO(m_block, producer_state=producer_state_dO_dPsum)
+                                load_SFdO_dV(m_block, producer_state=producer_state_dO_dPsum)
+                                pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                                producer_state_dO_dPsum.advance()
+                            if has_next:
+                                # dO''_d(j+1), for dP(j+1)
+                                pipeline_dO.producer_acquire(
+                                    producer_state_dO_dPsum,
+                                    extra_tx_count=self.tma_copy_bytes["dO_sf"],
+                                )
+                                load_dOt(m_block + 1, producer_state=producer_state_dO_dPsum)
+                                load_SFdO_dP(m_block + 1, producer_state=producer_state_dO_dPsum)
+                                pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                                producer_state_dO_dPsum.advance()
+                                pipeline_dPsum.producer_acquire(producer_state_dPsum)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gdPsum[None, m_block + 1],
+                                        sdPsum[None, producer_state_dPsum.index],
+                                        mbar_ptr=pipeline_dPsum.producer_get_barrier(
+                                            producer_state_dPsum
+                                        ),
+                                    )
+                                producer_state_dPsum.advance()
+                            # Q^T(j), for dK(j), last: its slot frees only once dK(j - 1) has
+                            # completed, and the dO'' loads must not queue behind it. Kt rides
+                            # the first one
+                            if m_block == m_block_min:
+                                pipeline_Q.producer_acquire(
+                                    producer_state_Q_LSE, extra_tx_count=self.tma_copy_bytes["Kt"]
+                                )
+                                load_Kt(
+                                    tma_bar_ptr=pipeline_Q.producer_get_barrier(
+                                        producer_state_Q_LSE
+                                    )
+                                )
+                            else:
+                                pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                            load_Qt(m_block, producer_state=producer_state_Q_LSE)
+                            load_SFQt(m_block, producer_state=producer_state_Q_LSE)
+                            pipeline_Q.producer_commit(producer_state_Q_LSE)
+                            producer_state_Q_LSE.advance()
+                        pipeline_Q.producer_tail(producer_state_Q_LSE)
+                        pipeline_LSE.producer_tail(producer_state_LSE)
+                        pipeline_dO.producer_tail(producer_state_dO_dPsum)
+                        pipeline_dPsum.producer_tail(producer_state_dPsum)
+                    elif const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                         #### Prologue ####
                         assert should_load_Q and should_load_dO
                         assert load_dOt is not None and load_Qt is not None
@@ -3172,98 +4181,110 @@ class FlashAttentionBackwardSm100:
         sLx: Optional[cute.Tensor] = None,
         pipeline_Lx: Optional[PipelineAsync] = None,
         pipeline_Dx: Optional[PipelineAsync] = None,
+        mx_smem: Optional[MxSmem] = None,
+        mx_tiled_mmas: tuple = (None,) * 4,
     ):
         # [2025-10-21] For reasons I don't understand, putting these partitioning in the main
         # kernel (before warp specialization) is a lot slower tha putting them here.
         # Partition smem / tmem tensors
-        # S = K @ Q.T
-        tSrK = tiled_mma_S.make_fragment_A(sK)
-        tSrQ = tiled_mma_S.make_fragment_B(sQ)
-        # dP = V @ dOt.T
-        tdPrV = tiled_mma_dP.make_fragment_A(sV)
-        tdPrdOt = tiled_mma_dP.make_fragment_B(sdOt)
-        # dK = dS.T @ Q
-        # For 2-CTA, dS (dK mma) MUST come from TMEM (cannot use SMEM)
-        if const_expr(self.acc_m64):
-            tdKrdS = tiled_mma_dK.make_fragment_A(sdS_dK)  # this CTA's dS^T rows, from SMEM
-        elif const_expr(self.use_smem_dS_for_mma_dK and not self.use_2cta_instrs):
-            tdKrdS = tiled_mma_dK.make_fragment_A(sdSt)  # From SMEM
-        else:
-            tdKrdS = tiled_mma_dK.make_fragment_A(tdS)  # From TMEM
+        mx = None
+        tiled_mma_S_mx, tiled_mma_dP_mx, tiled_mma_dV_mx, tiled_mma_dK_mx = mx_tiled_mmas
+        if const_expr(not self.mxfp8):
+            # S = K @ Q.T
+            tSrK = tiled_mma_S.make_fragment_A(sK)
+            tSrQ = tiled_mma_S.make_fragment_B(sQ)
+            # dP = V @ dOt.T
+            tdPrV = tiled_mma_dP.make_fragment_A(sV)
+            tdPrdOt = tiled_mma_dP.make_fragment_B(sdOt)
+            # dK = dS.T @ Q
+            # For 2-CTA, dS (dK mma) MUST come from TMEM (cannot use SMEM)
+            if const_expr(self.acc_m64):
+                tdKrdS = tiled_mma_dK.make_fragment_A(sdS_dK)  # this CTA's dS^T rows, from SMEM
+            elif const_expr(self.use_smem_dS_for_mma_dK and not self.use_2cta_instrs):
+                tdKrdS = tiled_mma_dK.make_fragment_A(sdSt)  # From SMEM
+            else:
+                tdKrdS = tiled_mma_dK.make_fragment_A(tdS)  # From TMEM
 
-        tdKrQ = tiled_mma_dK.make_fragment_B(sQt)
-        # dQ = dS @ K
-        tdQrdS = tiled_mma_dQ.make_fragment_A(sdS)
-        tdQrK = tiled_mma_dQ.make_fragment_B(sKt)
-        # dV = P @ dO.T
-        tdVrdO = tiled_mma_dV.make_fragment_B(sdO)
-        tdVrP = tiled_mma_dV.make_fragment_A(sP if const_expr(self.acc_m64) else tP)
+            tdKrQ = tiled_mma_dK.make_fragment_B(sQt)
+            # dQ = dS @ K
+            tdQrdS = tiled_mma_dQ.make_fragment_A(sdS)
+            tdQrK = tiled_mma_dQ.make_fragment_B(sKt)
+            # dV = P @ dO.T
+            tdVrdO = tiled_mma_dV.make_fragment_B(sdO)
+            tdVrP = tiled_mma_dV.make_fragment_A(sP if const_expr(self.acc_m64) else tP)
 
-        # mma_qk_fn = partial(gemm_w_idx, tiled_mma_S, tStS, tSrK, tSrQ, zero_init=True)
-        mma_qk_fn = partial(
-            gemm_ptx_w_idx,
-            tiled_mma_S,
-            tStS,
-            tSrK,
-            tSrQ,
-            sA=sK,
-            sB=sQ,
-            zero_init=True,
-            cta_group=self.cta_group_size,
-        )
-        # mma_dov_fn = partial(gemm_w_idx, tiled_mma_dP, tdPtdP, tdPrV, tdPrdOt, zero_init=True)
-        mma_dov_fn = partial(
-            gemm_ptx_w_idx,
-            tiled_mma_dP,
-            tdPtdP,
-            tdPrV,
-            tdPrdOt,
-            sA=sV,
-            sB=sdOt,
-            zero_init=True,
-            cta_group=self.cta_group_size,
-        )
-        # mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO)
-        mma_pdo_fn = partial(
-            gemm_ptx_w_idx,
-            tiled_mma_dV,
-            tdVtdV,
-            tdVrP,
-            tdVrdO,
-            sA=sP if const_expr(self.acc_m64) else None,
-            sB=sdO,
-            tA_addr=None if const_expr(self.acc_m64) else self.tmem_P_offset,
-            cta_group=self.cta_group_size,
-        )
-        # The extra K=16 blocks, see NOTE [hdim64 LSE / dPsum fold into the S / dP MMA]
-        if const_expr(self.fold_LSE_dPsum):
-            mma_qkx_fn = partial(
+            # mma_qk_fn = partial(gemm_w_idx, tiled_mma_S, tStS, tSrK, tSrQ, zero_init=True)
+            mma_qk_fn = partial(
                 gemm_ptx_w_idx,
                 tiled_mma_S,
                 tStS,
-                tiled_mma_S.make_fragment_A(sAx),
-                tiled_mma_S.make_fragment_B(sLx),
-                sA=sAx,
-                sB=sLx,
-                zero_init=False,
+                tSrK,
+                tSrQ,
+                sA=sK,
+                sB=sQ,
+                zero_init=True,
                 cta_group=self.cta_group_size,
             )
-            consumer_state_Lx = cutlass.pipeline.make_pipeline_state(
-                cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
-            )
-            mma_dovx_fn = partial(
+            # mma_dov_fn = partial(gemm_w_idx, tiled_mma_dP, tdPtdP, tdPrV, tdPrdOt, zero_init=True)
+            mma_dov_fn = partial(
                 gemm_ptx_w_idx,
                 tiled_mma_dP,
                 tdPtdP,
-                tiled_mma_dP.make_fragment_A(sAx),
-                tiled_mma_dP.make_fragment_B(sDx),
-                sA=sAx,
-                sB=sDx,
-                zero_init=False,
+                tdPrV,
+                tdPrdOt,
+                sA=sV,
+                sB=sdOt,
+                zero_init=True,
                 cta_group=self.cta_group_size,
             )
-            consumer_state_Dx = cutlass.pipeline.make_pipeline_state(
-                cutlass.pipeline.PipelineUserType.Consumer, self.dPsum_stage
+            # mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO)
+            mma_pdo_fn = partial(
+                gemm_ptx_w_idx,
+                tiled_mma_dV,
+                tdVtdV,
+                tdVrP,
+                tdVrdO,
+                sA=sP if const_expr(self.acc_m64) else None,
+                sB=sdO,
+                tA_addr=None if const_expr(self.acc_m64) else self.tmem_P_offset,
+                cta_group=self.cta_group_size,
+            )
+            # The extra K=16 blocks, see NOTE [hdim64 LSE / dPsum fold into the S / dP MMA]
+            if const_expr(self.fold_LSE_dPsum):
+                mma_qkx_fn = partial(
+                    gemm_ptx_w_idx,
+                    tiled_mma_S,
+                    tStS,
+                    tiled_mma_S.make_fragment_A(sAx),
+                    tiled_mma_S.make_fragment_B(sLx),
+                    sA=sAx,
+                    sB=sLx,
+                    zero_init=False,
+                    cta_group=self.cta_group_size,
+                )
+                consumer_state_Lx = cutlass.pipeline.make_pipeline_state(
+                    cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
+                )
+                mma_dovx_fn = partial(
+                    gemm_ptx_w_idx,
+                    tiled_mma_dP,
+                    tdPtdP,
+                    tiled_mma_dP.make_fragment_A(sAx),
+                    tiled_mma_dP.make_fragment_B(sDx),
+                    sA=sAx,
+                    sB=sDx,
+                    zero_init=False,
+                    cta_group=self.cta_group_size,
+                )
+                consumer_state_Dx = cutlass.pipeline.make_pipeline_state(
+                    cutlass.pipeline.PipelineUserType.Consumer, self.dPsum_stage
+                )
+        else:
+            # dQ = dS @ K (BF16)
+            tdQrdS = tiled_mma_dQ.make_fragment_A(sdS)
+            tdQrK = tiled_mma_dQ.make_fragment_B(sKt)
+            mx = self._mx_mma_operands(
+                mx_tiled_mmas, sK, sQ, sV, sdOt, sQt, sdO, sP, mx_smem, tiled_mma_dV, tdVtdV
             )
         num_unroll_groups = 2 if const_expr(self.use_2cta_instrs) else 1
         mma_dsk_fn = partial(
@@ -3278,7 +4299,9 @@ class FlashAttentionBackwardSm100:
         # mma_dsk_fn = partial(
         #     gemm_ptx_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, sA=sdS, sB=sKt, zero_init=True
         # )
-        if const_expr(self.acc_m64):
+        if const_expr(self.mxfp8):
+            mma_dsq_fn = None  # the block-scaled dK, see _mx_gemm
+        elif const_expr(self.acc_m64):
             mma_dsq_fn = partial(
                 gemm_ptx_w_idx,
                 tiled_mma_dK,
@@ -3329,6 +4352,11 @@ class FlashAttentionBackwardSm100:
             cutlass.pipeline.PipelineUserType.Consumer, 1
         )
         producer_phase_dKV = Int32(1)
+        if const_expr(self.mxfp8):
+            # NOTE [MXFP8 hd256 schedule]: the S^T-empty, dS-stored and dQ-empty waits
+            phase_S_empty = Int32(1)
+            phase_dP_loaded = Int32(0)
+            phase_dQ_empty = Int32(1)
         cta_group = pipeline_S_P.cta_group
 
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -3337,7 +4365,7 @@ class FlashAttentionBackwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            _, kv_block, head_idx, _, batch_idx, _, m_block_min, m_block_max, process_tile = (
+            work_n, kv_block, head_idx, _, batch_idx, _, m_block_min, m_block_max, process_tile = (
                 self._work_tile(work_tile, cta_rank_in_cluster, SeqlenInfoCls, block_info)
             )
 
@@ -3356,7 +4384,159 @@ class FlashAttentionBackwardSm100:
                 if const_expr(self.head_loop):
                     block_iter_count = block_iter_count * self.kv_group
 
-            if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
+            if const_expr(self.mxfp8):
+                if is_leader_cta and process_tile:
+                    # NOTE [MXFP8 hd256 schedule]: S(0), dP(0), then per step j: S(j+1), dV(j),
+                    # dP(j+1), dK(j), dQ(j)
+                    accumulate_dK = False
+                    accumulate_dV = False
+                    n_iters = block_iter_count
+                    # S(0)
+                    pipeline_Q.consumer_wait(consumer_state_Q)
+                    pipeline_S_P.sync_object_empty.wait(0, phase_S_empty)
+                    phase_S_empty ^= 1
+                    tiled_mma_S_mx = self._mx_gemm(
+                        tiled_mma_S_mx,
+                        tStS,
+                        mx.tSrK,
+                        mx.tSrQ,
+                        mx.sf_S,
+                        0,
+                        consumer_state_Q.index,
+                        False,
+                    )
+                    pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
+                    pipeline_Q.consumer_release(consumer_state_Q)
+                    consumer_state_Q.advance()
+                    # dP(0) (TMEM and dQ are untouched yet)
+                    pipeline_dO.consumer_wait(consumer_state_dO)
+                    tiled_mma_dP_mx = self._mx_dP(
+                        tiled_mma_dP_mx, tdPtdP, mx, consumer_state_dO.index, m_block_min, work_n
+                    )
+                    pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
+                    pipeline_dO.consumer_release(consumer_state_dO)
+                    consumer_state_dO.advance()
+
+                    for it in cutlass.range(n_iters, unroll=1):
+                        m_block = m_block_min + it
+                        has_next = it + 1 < n_iters
+                        # S(j+1): the compute warps released S^T(j) right after loading it
+                        if has_next:
+                            pipeline_Q.consumer_wait(consumer_state_Q)
+                            pipeline_S_P.sync_object_empty.wait(0, phase_S_empty)
+                            tiled_mma_S_mx = self._mx_gemm(
+                                tiled_mma_S_mx,
+                                tStS,
+                                mx.tSrK,
+                                mx.tSrQ,
+                                mx.sf_S,
+                                0,
+                                consumer_state_Q.index,
+                                False,
+                            )
+                            pipeline_S_P.sync_object_full.arrive(
+                                0, pipeline_S_P.producer_mask, cta_group
+                            )
+                            pipeline_Q.consumer_release(consumer_state_Q)
+                            consumer_state_Q.advance()
+                            phase_S_empty ^= 1
+
+                        # dV(j) += P^T dO''_q (causal band: BF16 P~ and dO / L, two K halves)
+                        pipeline_P.consumer_wait(consumer_state_P)
+                        is_band = False
+                        if const_expr(self.mx_band):
+                            is_band = self._is_mx_band(m_block, work_n)
+                            if is_band:
+                                for h in cutlass.range_constexpr(2):
+                                    pipeline_dO.consumer_wait(consumer_state_dO)
+                                    tiled_mma_dV = self._mx_band_dV(
+                                        tiled_mma_dV,
+                                        tdVtdV,
+                                        mx,
+                                        h,
+                                        consumer_state_dO.index,
+                                        accumulate_dV,
+                                    )
+                                    pipeline_dO.consumer_release(consumer_state_dO)
+                                    consumer_state_dO.advance()
+                        if not is_band:
+                            pipeline_dO.consumer_wait(consumer_state_dO)
+                            tiled_mma_dV_mx = self._mx_gemm(
+                                tiled_mma_dV_mx,
+                                tdVtdV,
+                                mx.tdVrP,
+                                mx.tdVrdO,
+                                mx.sf_dV,
+                                0,
+                                consumer_state_dO.index,
+                                accumulate_dV,
+                            )
+                            pipeline_dO.consumer_release(consumer_state_dO)
+                            consumer_state_dO.advance()
+                        pipeline_P.consumer_release(consumer_state_P)
+                        consumer_state_P.advance()
+                        accumulate_dV = True
+
+                        # dP(j+1): dP^T(j) has been loaded, and dQ(j-1), whose tail dP^T
+                        # overlaps, emptied by the reduce warps
+                        if has_next:
+                            pipeline_dO.consumer_wait(consumer_state_dO)
+                            pipeline_dP.sync_object_empty.wait(0, phase_dP_loaded)
+                            pipeline_dQ.sync_object_empty.wait(0, phase_dQ_empty)
+                            tiled_mma_dP_mx = self._mx_dP(
+                                tiled_mma_dP_mx,
+                                tdPtdP,
+                                mx,
+                                consumer_state_dO.index,
+                                m_block + 1,
+                                work_n,
+                            )
+                            pipeline_dP.sync_object_full.arrive(
+                                0, pipeline_dP.producer_mask, cta_group
+                            )
+                            pipeline_dO.consumer_release(consumer_state_dO)
+                            consumer_state_dO.advance()
+                        phase_dQ_empty ^= 1
+
+                        # dK(j) += dS^T Q^T: after the compute warps stored dS^T(j) and its scales
+                        pipeline_Q.consumer_wait(consumer_state_Q)
+                        pipeline_dS.consumer_wait(consumer_state_dS)
+                        tiled_mma_dK_mx = self._mx_gemm(
+                            tiled_mma_dK_mx,
+                            tdKtdK,
+                            mx.tdKrdS,
+                            mx.tdKrQ,
+                            mx.sf_dK,
+                            0,
+                            consumer_state_Q.index,
+                            accumulate_dK,
+                        )
+                        pipeline_Q.consumer_release(consumer_state_Q)
+                        consumer_state_Q.advance()
+                        accumulate_dK = True
+
+                        # dQ(j) = dS K-hat (BF16), after the peer's dS half arrived. dQ(j-1) has
+                        # been emptied: dP(j+1) waited for it, or on the last step wait here. It
+                        # overwrites dP^T(j+1), so it also waits until the compute warps loaded that
+                        cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
+                        if has_next:
+                            pipeline_dP.sync_object_empty.wait(0, phase_dP_loaded ^ 1)
+                        else:
+                            pipeline_dQ.sync_object_empty.wait(0, phase_dQ_empty ^ 1)
+                        mma_dsk_fn()
+                        pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                        pipeline_dS.consumer_release(consumer_state_dS)
+                        consumer_state_dS.advance()
+                        dS_cluster_phase ^= 1
+                        phase_dP_loaded ^= 1
+
+                    # signal to the epilogue that dV, then dK, is ready
+                    pipeline_dKV.sync_object_empty.wait(0, producer_phase_dKV)
+                    pipeline_dKV.sync_object_full.arrive(0, pipeline_dKV.producer_mask, cta_group)
+                    pipeline_dKV.sync_object_empty.wait(1, producer_phase_dKV)
+                    pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
+                    producer_phase_dKV ^= 1
+            elif const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                 if is_leader_cta and process_tile:
                     accumulate_dK = False
                     accumulate_dV = False
@@ -3737,6 +4917,124 @@ class FlashAttentionBackwardSm100:
         # pipeline_dKV.producer_tail(producer_state_dKV)
         # pipeline_dQ.producer_tail(producer_state_dQ)
 
+    def _mx_mma_operands(
+        self, mx_tiled_mmas, sK, sQ, sV, sdOt, sQt, sdO, sP, mx_smem, tiled_mma_dV, tdVtdV
+    ) -> "MxMma":
+        """NOTE [MXFP8 hd256 backward]: the MMA warp's E4M3 operand fragments, the scales'
+        SMEM -> TMEM copies (make_sf_s2t), and the band's BF16 dV MMA. Plain Python."""
+        tiled_mma_S, tiled_mma_dP, tiled_mma_dV_mx, tiled_mma_dK = mx_tiled_mmas
+        cols = self.tmem_sf_offsets
+        sm = mx_smem
+        sf_dP = (
+            mxu.make_sf_s2t(sm.sSFV, self.mx_tSFA_sdp_layout, cols["sfv"]),
+            mxu.make_sf_s2t(sm.sSFdO_dP, self.mx_tSFB_sdp_layout, cols["sfdo"], lane_halves=True),
+        )
+        sf_dP_band = tdVrP_band = tdVrdO_band = None
+        if const_expr(self.mx_band):
+            sf_dP_band = (
+                mxu.make_sf_s2t(sm.sSFV, self.mx_tSFA_sdp_layout, cols["sfvr"]),
+                sf_dP[1],
+            )
+            tdVrP_band = tiled_mma_dV.make_fragment_A(sP)
+            tdVrdO_band = tiled_mma_dV.make_fragment_B(sm.sdO_band)
+        return MxMma(
+            tSrK=tiled_mma_S.make_fragment_A(sK),
+            tSrQ=tiled_mma_S.make_fragment_B(sQ),
+            tdPrV=tiled_mma_dP.make_fragment_A(sV),
+            tdPrdOt=tiled_mma_dP.make_fragment_B(sdOt),
+            tdKrdS=tiled_mma_dK.make_fragment_A(sm.sdSt),
+            tdKrQ=tiled_mma_dK.make_fragment_B(sQt),
+            tdVrP=tiled_mma_dV_mx.make_fragment_A(sm.sP),
+            tdVrdO=tiled_mma_dV_mx.make_fragment_B(sdO),
+            sf_S=(
+                mxu.make_sf_s2t(sm.sSFK, self.mx_tSFA_sdp_layout, cols["sfk"]),
+                mxu.make_sf_s2t(sm.sSFQ, self.mx_tSFB_sdp_layout, cols["sfq"], lane_halves=True),
+            ),
+            sf_dP=sf_dP,
+            sf_dP_band=sf_dP_band,
+            sf_dV=(
+                mxu.make_sf_s2t(sm.sSFP, self.mx_tSFA_layout, cols["sfp"]),
+                mxu.make_sf_s2t(sm.sSFdO_dV, self.mx_tSFB_layout, cols["sfdot"], lane_halves=True),
+            ),
+            sf_dK=(
+                mxu.make_sf_s2t(sm.sSFdS, self.mx_tSFA_layout, cols["sfds"]),
+                mxu.make_sf_s2t(sm.sSFQt, self.mx_tSFB_layout, cols["sfqt"], lane_halves=True),
+            ),
+            tdVrP_band=tdVrP_band,
+            tdVrdO_band=tdVrdO_band,
+        )
+
+    @cute.jit
+    def _mx_dP(self, tiled_mma, tdPtdP, mx, b_idx, m_block, work_n) -> cute.TiledMma:
+        """NOTE [MXFP8 hd256 backward]: dP^T = V-hat dO''^T, and on the causal band also += R dO''^T
+        (dO''s scales are in TMEM already)."""
+        tiled_mma = self._mx_gemm(
+            tiled_mma, tdPtdP, mx.tdPrV, mx.tdPrdOt, mx.sf_dP, 0, b_idx, False
+        )
+        if const_expr(self.mx_band):
+            if self._is_mx_band(m_block, work_n):
+                tiled_mma = self._mx_gemm(
+                    tiled_mma,
+                    tdPtdP,
+                    mx.tdPrV,
+                    mx.tdPrdOt,
+                    mx.sf_dP_band,
+                    1,
+                    b_idx,
+                    True,
+                    copy_b=False,
+                )
+        return tiled_mma
+
+    @cute.jit
+    def _mx_band_dV(self, tiled_mma, tdVtdV, mx, half: cutlass.Constexpr[int], b_idx, accumulate):
+        """NOTE [MXFP8 hd256 backward]: the causal band's dV += P~^T (dO / L) in BF16, K half `half`
+        (64 queries; the BF16 dO / L tile arrives as two dO-ring slots)."""
+        n_kb = cute.size(mx.tdVrdO_band, mode=[2])
+        for k in cutlass.range_constexpr(n_kb):
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, accumulate if half == 0 and k == 0 else True)
+            cute.gemm(
+                tiled_mma,
+                tdVtdV,
+                mx.tdVrP_band[None, None, half * n_kb + k],
+                mx.tdVrdO_band[None, None, k, b_idx],
+                tdVtdV,
+            )
+        return tiled_mma
+
+    @cute.jit
+    def _mx_gemm(
+        self,
+        tiled_mma: cute.TiledMma,
+        acc: cute.Tensor,
+        tCrA: cute.Tensor,
+        tCrB: cute.Tensor,
+        sf,
+        a_idx: Int32,
+        b_idx: Int32,
+        accumulate,
+        copy_b: cutlass.Constexpr[bool] = True,
+    ) -> cute.TiledMma:
+        """NOTE [MXFP8 hd256 backward]: one SS block-scaled GEMM: copy the A (stage a_idx) and B
+        (stage b_idx) scales SMEM -> TMEM, then one MMA per K = 32 block reading them. Returns
+        the tiled MMA, whose fields it set: callers assign it back, which threads it through
+        their staged regions."""
+        (tSFA, cp_a, src_a, dst_a), (tSFB, cp_b, src_b, dst_b) = sf
+        cute.copy(cp_a, src_a[None, None, None, None, a_idx], dst_a)
+        if const_expr(copy_b):
+            cute.copy(cp_b, src_b[None, None, None, None, b_idx], dst_b)
+        for k in cutlass.range_constexpr(cute.size(tCrA, mode=[2])):
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, accumulate if k == 0 else True)
+            tiled_mma.set(tcgen05.Field.SFA, tSFA[None, None, k].iterator)
+            tiled_mma.set(tcgen05.Field.SFB, tSFB[None, None, k].iterator)
+            tCrA_k = (
+                tCrA[None, None, k]
+                if const_expr(cute.rank(tCrA) == 3)
+                else tCrA[None, None, k, a_idx]
+            )
+            cute.gemm(tiled_mma, acc, tCrA_k, tCrB[None, None, k, b_idx], acc)
+        return tiled_mma
+
     def _check_dS_exchange_layouts(self):
         """The dS exchange of the M=64 layout copies the peer's Q-column half of this CTA's
         dS^T from sdS_dK (K-major (kv, q), q = tile_m // 2 per K block) into the peer's sdS
@@ -3767,11 +5065,14 @@ class FlashAttentionBackwardSm100:
 
         With the M=128 layout the compute warps stage that half in sdS_xchg. With P / dS^T in
         SMEM (M=64 layout) it already sits in sdS_dK, the dK A operand, as the peer's K block
-        (the layout contract is checked at setup, _check_dS_exchange_layouts).
+        (the layout contract is checked at setup, _check_dS_exchange_layouts). MXFP8's sdS_dK
+        is the exchange staging and holds only that block.
         """
         if const_expr(sdS_xchg is not None):
             return sdS_xchg
         assert sdS_dK is not None
+        if const_expr(self.mxfp8):
+            return sdS_dK
         return sdS_dK[None, None, (None, peer_cta_rank_in_cluster)]
 
     @cute.jit
@@ -4118,6 +5419,7 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mx_smem: Optional[MxSmem] = None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -4266,10 +5568,38 @@ class FlashAttentionBackwardSm100:
             tRS_sP = self.split_wg(thr_copy_r2s.partition_D(sP_epi), wg_idx, num_wg)
             sdS_dK_epi = cute.make_tensor(sdS_dK.iterator, sdS_layout)
             tRS_sdS_dK = self.split_wg(thr_copy_r2s.partition_D(sdS_dK_epi), wg_idx, num_wg)
+            if const_expr(self.mxfp8):
+                # NOTE [MXFP8 hd256 backward]: sdS_dK backs only the exchanged Q-column half, so
+                # the tile is viewed with that half h at the storage: one view per h, each at a
+                # static offset (whole swizzle atoms), which keeps the r2s copy vectorized
+                half = cute.cosize(sdS_layout) // 2
+                tRS_sdS_xchg = [
+                    self.split_wg(
+                        thr_copy_r2s.partition_D(
+                            cute.make_tensor(sdS_dK.iterator - h * half, sdS_layout)
+                        ),
+                        wg_idx,
+                        num_wg,
+                    )
+                    for h in range(2)
+                ]
             # Q-column half this thread's chunk belongs to (from its partition coordinates); the
             # CTA keeps the half it owns for dQ (the peer's half reaches it from sdS_dK, see the
             # exchange copy below).
             q_half = tScS_t2r[0][1] // (self.tile_m // 2)
+            if const_expr(self.mxfp8):
+                # NOTE [MXFP8 hd256 backward]: this thread's key and 32-query group, (key, query)
+                # views of the E4M3 P^T / dS^T operands, and its dS^T scale bytes (rows key and
+                # key + 64 of the A-scale chunk)
+                mx_key = tScS_t2r[0][0] % self.tile_n
+                mx_group = tScS_t2r[0][1] // 32
+                sP_kq = self._mx_kq_view(mx_smem.sP)
+                sdSt_kq = self._mx_kq_view(mx_smem.sdSt)
+                sSFdS_u8 = cute.make_tensor(
+                    cute.recast_ptr(mx_smem.sSFdS.iterator, dtype=cutlass.Uint8),
+                    cute.make_layout(mxu.SF_TILE_BYTES // 2),
+                )
+                mx_sf_idx = 16 * (mx_key % 32) + 4 * (mx_key // 32) + mx_group
 
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         dS_cluster_empty_phase = Int32(1)
@@ -4486,6 +5816,9 @@ class FlashAttentionBackwardSm100:
                 if const_expr(not self.acc_m64):
                     tSrP_r2t_f32 = cute.make_rmem_tensor(tScP_r2t.shape, Float32)  # 64
                     tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
+                if const_expr(self.mxfp8):
+                    # the P^T stage is free once dV(j-1) has completed
+                    pipeline_P.producer_acquire(producer_state_P)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     if const_expr(not self.fold_LSE_dPsum):
@@ -4517,7 +5850,11 @@ class FlashAttentionBackwardSm100:
                             )
                         tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
                         tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
-                    if const_expr(self.acc_m64):
+                    if const_expr(self.mxfp8):
+                        # NOTE [MXFP8 hd256 backward]: P~ (<= 2^off) in E4M3 under the constant
+                        # P^T scale 2^-8, or in BF16 on the causal band
+                        self._mx_store_P(tSrS_cur, tRS_sP, sP_kq, mx_key, mx_group, m_block, work_n)
+                    elif const_expr(self.acc_m64):
                         # P^T goes to SMEM; S stays untouched in TMEM until the dS pipeline
                         # releases it, so no cross-warp barrier is needed before the store.
                         tSrP_cvt = cute.make_fragment_like(tSrS_cur, self.q_dtype)
@@ -4558,7 +5895,7 @@ class FlashAttentionBackwardSm100:
                     cute.arch.sync_warp()
                 else:
                     self.compute_sync_barrier.arrive_and_wait()
-                if const_expr(self.split_P_dS):
+                if const_expr(self.split_P_dS or self.mxfp8):
                     with cute.arch.elect_one():
                         pipeline_P.producer_commit(producer_state_P)
                     producer_state_P.advance()
@@ -4588,6 +5925,11 @@ class FlashAttentionBackwardSm100:
                     tdPrdP_t2r = cute.make_rmem_tensor(tScS_t2r[None, 0, None, None].shape, Float32)
                     cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
                     cute.arch.fence_view_async_tmem_load()
+                    if const_expr(self.mxfp8):
+                        # NOTE [MXFP8 hd256 schedule]: dP^T is in registers; its columns are free
+                        # for dQ(j-1) / dP(j+1) (dS^T readiness goes through pipeline_dS)
+                        with cute.arch.elect_one():
+                            pipeline_dP.consumer_release(consumer_state_S_P_dP)
                     if const_expr(not self.split_P_dS):
                         # dS overwrites dP with the same cross-warp lane sharing as P over S
                         self.compute_sync_barrier.arrive_and_wait()
@@ -4647,7 +5989,21 @@ class FlashAttentionBackwardSm100:
                         if const_expr(self.use_2cta_instrs and not self.acc_m64):
                             tdPrdS_xchg = cute.make_fragment_like(tdPrdS_cvt, self.ds_dtype)
 
-                    if const_expr(self.acc_m64):
+                    if const_expr(self.mxfp8):
+                        # NOTE [MXFP8 hd256 backward]: BF16 dS for dQ, this CTA's own Q-column half
+                        # into sdS, the peer's into the exchange staging; then the E4M3 dS^T
+                        if q_half == cta_rank_in_cluster:
+                            cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, 0, 0, 0])
+                        elif q_half == 0:
+                            cute.autovec_copy(tdPrdS_cvt, tRS_sdS_xchg[0][None, 0, 0, 0])
+                        else:
+                            cute.autovec_copy(tdPrdS_cvt, tRS_sdS_xchg[1][None, 0, 0, 0])
+                        # dS'' = 2^8 dS in E4M3 with this thread's scale for its 32 queries (the
+                        # dK operand); the scale byte drops the 2^8
+                        self._mx_store_dSt(
+                            tdPrdP_cur, sdSt_kq, sSFdS_u8, mx_key, mx_group, mx_sf_idx
+                        )
+                    elif const_expr(self.acc_m64):
                         # dS^T for the dK MMA: this CTA's rows, both Q-column halves; the half
                         # the peer needs for its dQ MMA is exchanged straight from here.
                         cute.autovec_copy(tdPrdS_cvt, tRS_sdS_dK[None, 0, 0, 0])
@@ -4677,7 +6033,7 @@ class FlashAttentionBackwardSm100:
                 elif const_expr(not self.use_smem_dS_for_mma_dK):
                     cute.arch.fence_view_async_tmem_store()
 
-                if const_expr(self.use_2cta_instrs):
+                if const_expr(self.use_2cta_instrs and not self.mxfp8):
                     # use pipeline_dP to signal the dS store (TMEM, or SMEM with acc_m64)
                     with cute.arch.elect_one():
                         pipeline_dP.consumer_release(consumer_state_S_P_dP)
@@ -4860,6 +6216,67 @@ class FlashAttentionBackwardSm100:
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+    @cute.jit
+    def _mx_kq_view(self, s: cute.Tensor) -> cute.Tensor:
+        """NOTE [MXFP8 hd256 backward]: (key, (32, query // 32)) view of an E4M3 K-major A tile
+        ((tile_n keys, 32 queries), 1, queries // 32): the 32 queries of a group of one key."""
+        n_kb = cute.size(s, mode=[2])
+        return cute.composition(
+            s,
+            cute.make_layout(
+                (self.tile_n, (32, n_kb)), stride=(1, (self.tile_n, self.tile_n * 32))
+            ),
+        )
+
+    @cute.jit
+    def _mx_store_P(
+        self,
+        tSrP: cute.Tensor,
+        tRS_sP: cute.Tensor,
+        sP_kq: cute.Tensor,
+        key: Int32,
+        group: Int32,
+        m_block: Int32,
+        work_n: Int32,
+    ):
+        """NOTE [MXFP8 hd256 backward]: this thread's 32 P~ values into the E4M3 P^T operand
+        (constant scale 2^-8), or as BF16 into the BF16 P^T tile on the causal band."""
+        is_band = False
+        if const_expr(self.mx_band):
+            is_band = self._is_mx_band(m_block, work_n)
+        if is_band:
+            tSrP_cvt = cute.make_fragment_like(tSrP, self.q_dtype)
+            utils.cvt_f16(tSrP, tSrP_cvt)
+            cute.autovec_copy(tSrP_cvt, tRS_sP[None, 0, 0, 0])
+        else:
+            tSrP8 = cute.make_rmem_tensor((32,), mxu.MX_DTYPE)
+            tSrP8.store(
+                cute.make_tensor(tSrP.iterator, cute.make_layout(32)).load().to(mxu.MX_DTYPE)
+            )
+            cute.autovec_copy(tSrP8, sP_kq[key, (None, group)])
+
+    @cute.jit
+    def _mx_store_dSt(
+        self,
+        tdS: cute.Tensor,
+        sdSt_kq: cute.Tensor,
+        sSFdS_u8: cute.Tensor,
+        key: Int32,
+        group: Int32,
+        sf_idx: Int32,
+    ):
+        """NOTE [MXFP8 hd256 backward]: this thread's 32 dS'' values (one key, 32 queries: one
+        1x32 group of the dK MMA) in E4M3 with their own UE8M0 scale, minus the 2^8; scales tdS
+        in place off sm_107."""
+        x = cute.make_tensor(tdS.iterator, cute.make_layout(32))
+        tdS8 = cute.make_rmem_tensor((32,), mxu.MX_DTYPE)
+        sf, inv_scale = mxu.mx_scale(x)
+        mxu.quantize_e4m3x32(x, sf, inv_scale, tdS8)
+        cute.autovec_copy(tdS8, sdSt_kq[key, (None, group)])
+        sf_byte = cutlass.Uint8(cutlass.max(sf - 8, 0))
+        sSFdS_u8[sf_idx] = sf_byte
+        sSFdS_u8[sf_idx + 8] = sf_byte
 
     @cute.jit
     def _dq_semaphore_lock_value(

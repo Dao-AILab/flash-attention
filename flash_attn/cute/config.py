@@ -2735,6 +2735,14 @@ MXFP8_BAND_ROWS = 256
 MXFP8_BAND_BLOCK_N = 128
 
 
+class Mxfp8Bwd(enum.Enum):
+    """The block-scaled kernel of a mirrored MXFP8 backward (BwdConfig.mxfp8): hdim 256 native PV
+    (NOTE [MXFP8 hd256 backward] in flash_bwd_sm100.py). EXACT runs S^T / dP^T / dV / dK as
+    block-scaled MMAs on the forward's payloads and dQ = dS K-hat in BF16."""
+
+    EXACT = "exact"
+
+
 @dataclass(frozen=True)
 class BwdConfig:
     """Fully resolved backward launch configuration.
@@ -2750,7 +2758,8 @@ class BwdConfig:
     dK / dV go through the fp32 accumulate + postprocess, or, with head_loop (hdim 256), the
     passes of one tile per KV head that keeps K / V resident and dK / dV in TMEM.
     fold_LSE_dPsum folds the LSE / dPsum subtractions into the S / dP MMAs (NOTE [hdim64 LSE /
-    dPsum fold into the S / dP MMA] in flash_bwd_sm100.py).
+    dPsum fold into the S / dP MMA] in flash_bwd_sm100.py). mxfp8 (SM100 hdim 256) runs the
+    MXFP8 backward on the operands of _flash_attn_bwd(mx_hd256=...).
     """
 
     device_capacity: int
@@ -2775,6 +2784,7 @@ class BwdConfig:
     head_loop: bool
     fold_LSE_dPsum: bool
     registers: BwdRegisters
+    mxfp8: Mxfp8Bwd | None = None
 
     @property
     def pack_gqa(self) -> bool:
@@ -3299,22 +3309,30 @@ def can_fold_LSE_dPsum(
     )
 
 
-def mxfp8_mirror_rejection(config: BwdConfig, inputs: BwdHeuristicInputs) -> str | None:
-    """Why the mirrored BF16 backward of an MXFP8 forward cannot run this problem, or None.
+def mxfp8_bwd_kernel(inputs: BwdHeuristicInputs) -> Mxfp8Bwd | None:
+    """The block-scaled backward a mirrored MXFP8 problem runs, or None for the BF16 mirror (NOTE
+    [MXFP8 mirrored BF16 backward] in flash_bwd_sm100.py) and the plain backward."""
+    if inputs.mxfp8_mirror is Mxfp8Mirror.PV and inputs.is_hdim256:
+        return Mxfp8Bwd.EXACT
+    return None
 
-    Scope (NOTE [MXFP8 mirrored BF16 backward] in flash_bwd_sm100.py): the SM100 family's general
-    kernel on BF16 operands, dense (the MXFP8 forward is dense only), causal or not, MHA or GQA,
-    deterministic or not; QK-only at head dims 64, 128, and 256, native PV at 64 and 128 (the 1CTA
-    or the pipelined 2CTA schedule).
+
+def mxfp8_mirror_rejection(inputs: BwdHeuristicInputs) -> str | None:
+    """Why the mirrored backward of an MXFP8 forward cannot run this problem, or None.
+
+    Scope: the SM100 family, BF16, dense (the MXFP8 forward is dense only), causal or not,
+    deterministic or not, without local attention, score / mask mods, softcap, or sinks.
+    - The BF16 mirror (NOTE [MXFP8 mirrored BF16 backward] in flash_bwd_sm100.py) runs QK-only at
+      head dims 64, 128, and 256 and native PV at 64 and 128, MHA or GQA; the 2CTA pair constraint
+      of the causal band is a config property (mxfp8_band_splits_pair).
+    - hdim 256 native PV runs the block-scaled kernel (mxfp8_bwd_kernel; NOTE [MXFP8 hd256
+      backward]): MHA with seqlen_q = seqlen_k. GQA would need per-KV-head scale tiles (and
+      packed-row ones for the query-head fold), and unequal lengths a band offset; neither is built.
     """
     if inputs.device_capacity not in (10, 11):
         return f"needs SM100 / SM110, got SM{inputs.device_capacity}"
-    head_dims = {bwd_tile_hdim(d) for d in (inputs.head_dim, inputs.head_dim_v)}
-    supported = (64, 128, 256) if inputs.mxfp8_mirror is Mxfp8Mirror.QK else (64, 128)
-    if not head_dims <= set(supported):
-        return f"in {inputs.mxfp8_mirror.name} mode needs head dims padded to {supported}"
     if inputs.dtype != "torch.bfloat16":
-        return "needs BF16 Q-hat / K-hat / V-hat"
+        return "needs BF16 gradients"
     unsupported = {
         "local attention": inputs.local,
         "varlen": inputs.has_cu_seqlens,
@@ -3327,11 +3345,26 @@ def mxfp8_mirror_rejection(config: BwdConfig, inputs: BwdHeuristicInputs) -> str
     }
     if names := [name for name, present in unsupported.items() if present]:
         return "does not support " + ", ".join(names)
-    if config.use_2cta_instrs and mxfp8_band_splits_pair(inputs, tile_n=config.tile_n):
-        return (
-            "with 2CTA needs (seqlen_k - seqlen_q) mod 256 < 128 so both KV tiles of a pair "
-            "share the causal band; use the 1CTA config"
-        )
+    if mxfp8_bwd_kernel(inputs) is not None:
+        if inputs.qhead_per_kvhead != 1:
+            return (
+                "at hdim 256 with native PV supports MHA only (num_heads == num_heads_kv), got "
+                f"qhead_per_kvhead={inputs.qhead_per_kvhead}"
+            )
+        if inputs.max_seqlen_q != inputs.max_seqlen_k:
+            return (
+                "at hdim 256 with native PV needs seqlen_q == seqlen_k, got "
+                f"{inputs.max_seqlen_q} and {inputs.max_seqlen_k}"
+            )
+        # the prep's 32-token tiles; causal: whole 256-row band tiles
+        multiple = 256 if inputs.causal else 32
+        if inputs.max_seqlen_q % multiple:
+            return f"at hdim 256 with native PV needs seqlen a multiple of {multiple}"
+        return None
+    head_dims = {bwd_tile_hdim(d) for d in (inputs.head_dim, inputs.head_dim_v)}
+    supported = (64, 128, 256) if inputs.mxfp8_mirror is Mxfp8Mirror.QK else (64, 128)
+    if not head_dims <= set(supported) or (256 in head_dims and len(head_dims) > 1):
+        return f"in {inputs.mxfp8_mirror.name} mode needs head dims padded to {supported}"
     return None
 
 
@@ -3421,6 +3454,7 @@ _SM100_ONLY_NEUTRAL_FIELDS = dict(
     pack_factor=1,
     head_loop=False,
     fold_LSE_dPsum=False,
+    mxfp8=None,
 )
 # The SM100 kernel launches 16 warps: dQ reduce, 2x compute, MMA, load, relay, and empty.
 SM100_BWD_THREADS_PER_CTA = 512
@@ -3448,6 +3482,8 @@ def sm120_bwd_fields(inputs: BwdHeuristicInputs) -> dict:
 @lru_cache(maxsize=1024)
 def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
     """Select one fully resolved backward config from host-visible metadata."""
+    if inputs.mxfp8_mirror is not None and (reason := mxfp8_mirror_rejection(inputs)):
+        raise ValueError(f"The mirrored MXFP8 backward {reason}")
     fields = {**_SM90_ONLY_NEUTRAL_FIELDS, **_SM100_ONLY_NEUTRAL_FIELDS}
     match inputs.device_capacity:
         case 9:
@@ -3473,7 +3509,11 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
             # hdim 256 runs a 64-row KV tile per CTA (NOTE [M=64 accumulator layout] in
             # flash_bwd_sm100.py); the 2CTA decision sees that tile.
             tile_n = 64 if inputs.is_hdim256 else 128
-            use_2cta_instrs = not inputs.disable_2cta and can_use_bwd_2cta(inputs, tile_n=tile_n)
+            # the MXFP8 backward has only the 2CTA tile
+            mxfp8 = mxfp8_bwd_kernel(inputs)
+            use_2cta_instrs = (mxfp8 is not None or not inputs.disable_2cta) and can_use_bwd_2cta(
+                inputs, tile_n=tile_n
+            )
             if (
                 inputs.requested_tile_n == 64
                 and not inputs.is_hdim256
@@ -3487,8 +3527,9 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
             fields.update(
                 tile_m=SM100_BWD_TILE_M,
                 tile_n=tile_n,
-                num_stages_Q=1 if use_2cta_instrs else 2,
-                num_stages_dO=1,
+                # MXFP8: two-slot Q (Q / Q^T) and dO rings, NOTE [MXFP8 hd256 backward]
+                num_stages_Q=2 if mxfp8 is not None or not use_2cta_instrs else 1,
+                num_stages_dO=2 if mxfp8 is not None else 1,
                 num_threads=SM100_BWD_THREADS_PER_CTA,
                 use_2cta_instrs=use_2cta_instrs,
                 cluster_size=cluster_size,
@@ -3498,6 +3539,7 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 fold_LSE_dPsum=can_fold_LSE_dPsum(
                     inputs, tile_m=SM100_BWD_TILE_M, tile_n=tile_n, cluster_size=cluster_size
                 ),
+                mxfp8=mxfp8,
             )
             registers = select_sm100_bwd_registers(inputs, use_2cta_instrs=use_2cta_instrs)
         case 12:
@@ -3654,8 +3696,13 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
         raise ValueError(
             f"Config targets SM{config.device_capacity}, but the problem targets SM{capacity}"
         )
-    if inputs.mxfp8_mirror is not None and (reason := mxfp8_mirror_rejection(config, inputs)):
+    if inputs.mxfp8_mirror is not None and (reason := mxfp8_mirror_rejection(inputs)):
         raise ValueError(f"The mirrored MXFP8 backward {reason}")
+    if config.use_2cta_instrs and mxfp8_band_splits_pair(inputs, tile_n=config.tile_n):
+        raise ValueError(
+            "The mirrored MXFP8 backward with 2CTA needs (seqlen_k - seqlen_q) mod 256 < 128 so "
+            "both KV tiles of a pair share the causal band; use the 1CTA config"
+        )
     if config.tile_m <= 0 or config.tile_n <= 0:
         raise ValueError(f"Tile dimensions must be positive, got {(config.tile_m, config.tile_n)}")
     if config.tile_m % 16 != 0 or config.tile_n % 16 != 0:
@@ -3664,6 +3711,8 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
         )
     if config.num_stages_Q < 1 or config.num_stages_dO < 1 or config.num_stages_PdS < 1:
         raise ValueError("Pipeline stage counts must be positive")
+    if config.mxfp8 != (expected := mxfp8_bwd_kernel(inputs)):
+        raise ValueError(f"Config mxfp8={config.mxfp8} does not match the problem's {expected}")
     sm100_only = [
         name for name, value in _SM100_ONLY_NEUTRAL_FIELDS.items() if getattr(config, name) != value
     ]
@@ -3692,7 +3741,14 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
             )
         if config.num_threads != SM100_BWD_THREADS_PER_CTA:
             raise ValueError(f"SM100 backward launches {SM100_BWD_THREADS_PER_CTA} threads")
-        if config.num_stages_Q != (1 if config.use_2cta_instrs else 2) or config.num_stages_dO != 1:
+        if config.mxfp8 is not None:
+            if (config.num_stages_Q, config.num_stages_dO) != (2, 2):
+                raise ValueError("The SM100 MXFP8 backward uses 2 Q and 2 dO stages")
+            if not config.use_2cta_instrs:
+                raise ValueError("The SM100 MXFP8 backward runs the 2CTA hdim-256 tile")
+        elif (
+            config.num_stages_Q != (1 if config.use_2cta_instrs else 2) or config.num_stages_dO != 1
+        ):
             raise ValueError("SM100 backward uses 2 Q stages (1 with 2CTA) and 1 dO stage")
         if (config.pack_factor > 1 or config.head_loop) and not can_use_bwd_fold(inputs):
             raise ValueError(

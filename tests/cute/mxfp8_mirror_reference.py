@@ -12,6 +12,9 @@ one (batch, head) at a time in FP64 / FP32 on (seqlen, dim) tensors; `per_head` 
   including its online max (blocks visited under an earlier running max were rounded there).
 - `autograd_backward`: torch.autograd through an FP64 forward at the final max with
   straight-through roundings (checks the recipe's formula).
+- `emulate_mx_backward`: the hdim-256 block-scaled backward's recipe (NOTE [MXFP8 hd256
+  backward]): the same derivative with MXFP8 dP / dV / dK operands, BF16 dS for dQ, and the
+  causal band's dP residual and BF16 dV.
 """
 
 import math
@@ -29,6 +32,20 @@ def bf16(x):
 
 def e4m3(x):
     return x.to(torch.float8_e4m3fn).to(x.dtype)
+
+
+def mx(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """x rounded to MXFP8 and dequantized: E4M3 with one power-of-two scale per 32 elements along
+    dim, 2^ceil(log2(amax / 448)) (the forward's and the kernels' scale rule)."""
+    x = x.movedim(dim, -1)
+    n = x.shape[-1]
+    groups = torch.nn.functional.pad(x, (0, -n % 32)).unflatten(-1, (-1, 32)).double()
+    amax = groups.abs().amax(-1, keepdim=True)
+    mantissa, exponent = torch.frexp(amax)
+    exponent = torch.where(amax == 0, 0, (exponent - 9 + (mantissa > 0.875)).clamp(-127, 127))
+    scale = torch.exp2(exponent.double())
+    q = (groups / scale).clamp(-448, 448).float().to(torch.float8_e4m3fn).double() * scale
+    return q.flatten(-2)[..., :n].to(x.dtype).movedim(-1, dim)
 
 
 def scale_log2(softmax_scale: float) -> torch.Tensor:
@@ -87,6 +104,35 @@ def emulate_backward(qh, kh, vh, v, out, dout, m, L, *, softmax_scale, causal, n
     dv = p_hat.double().T @ do.double()
     dk = softmax_scale * ds.double().T @ qh.double()
     dq = softmax_scale * ds.double() @ kh.double()
+    return dq, dk, dv
+
+
+def emulate_mx_backward(qh, kh, vh, v, out, dout, m, L, *, softmax_scale, causal, native_pv=True):
+    """(dq, dk, dv) of the hdim-256 block-scaled backward for one head, in FP32 with its roundings:
+    dO'' = 2^8 dO / L in MXFP8 along head_dim (dP, D'') and along queries (dV), V-hat requantized
+    along head_dim with the causal band's residual R = MX(V - V-hat_d), dS'' rounded to MXFP8
+    along queries for dK and to BF16 for dQ, the band's dV on BF16 P~ and dO / L."""
+    assert native_pv, "the block-scaled backward mirrors native PV"
+    sq, sk = qh.shape[0], kh.shape[0]
+    c = scale_log2(softmax_scale).to(qh.device)
+    visible, band = masks(sq, sk, causal, True, qh.device)
+    s = (qh.double() @ kh.double().T).float()
+    x = (s.double() * c.double() - slot(m.float(), c, 8).double()[:, None]).float()
+    p = torch.exp2(x).masked_fill(~visible, 0.0)
+    do2 = dout.float() * (torch.tensor(256.0, device=qh.device) / L.float())[:, None]
+    do_d, do_q = mx(do2, 1), mx(do2, 0)
+    v_d = mx(vh.float(), 1)
+    dp = do_d.double() @ v_d.double().T
+    if causal:
+        v_band = v_d.double() + mx(v.float() - v_d, 1).double()
+        dp = torch.where(band, do_d.double() @ v_band.T, dp)
+    d = (do_d.double() * out.double()).sum(-1).float()
+    ds = (p * (dp.float() - d[:, None])).float()
+    dv = e4m3(p).masked_fill(band, 0.0).double().T @ do_q.double() / 256
+    if causal:
+        dv += bf16(p).masked_fill(~band, 0.0).double().T @ bf16(do2 / 256).double()
+    dk = softmax_scale / 256 * mx(ds, 0).double().T @ mx(qh.float(), 0).double()
+    dq = softmax_scale / 256 * bf16(ds).double() @ kh.double()
     return dq, dk, dv
 
 

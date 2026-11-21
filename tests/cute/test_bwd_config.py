@@ -5,6 +5,8 @@ import pytest
 
 from flash_attn.cute.config import (
     BwdHeuristicInputs,
+    Mxfp8Bwd,
+    Mxfp8Mirror,
     Sm90BwdRegisters,
     Sm100BwdRegisters,
     bwd_pack_gqa_heuristic,
@@ -853,3 +855,69 @@ def test_cross_compiled_gqa_backward_needs_num_sms_only_to_pack(
                 q, k, v, out, torch.empty_like(out), lse, score_mod=score_mod,
                 score_mod_bwd=score_mod,
             )
+
+
+@pytest.mark.parametrize("device_arch", [100, 103, 107])
+@pytest.mark.parametrize("causal", [False, True])
+def test_mxfp8_backward_config(device_arch, causal):
+    inputs = make_inputs(
+        device_arch=device_arch, head_dim=256, head_dim_v=256, causal=causal,
+        max_seqlen_q=4096, max_seqlen_k=4096, mxfp8_mirror=Mxfp8Mirror.PV,
+    )
+    config = select_bwd_config(inputs)
+    assert config.mxfp8 == Mxfp8Bwd.EXACT
+    assert (config.use_2cta_instrs, config.tile_n, config.pack_factor) == (True, 64, 1)
+    assert (config.num_stages_Q, config.num_stages_dO) == (2, 2)
+    # the BF16 configuration is the same but for the mode and its Q / dO rings
+    bf16 = select_bwd_config(inputs._replace(mxfp8_mirror=None))
+    assert replace(config, mxfp8=None, num_stages_Q=1, num_stages_dO=1) == bf16
+    with pytest.raises(ValueError, match="does not match"):
+        validate_bwd_config(replace(bf16, mxfp8=None), inputs)
+    with pytest.raises(ValueError, match="2 Q and 2 dO"):
+        validate_bwd_config(replace(config, num_stages_Q=1), inputs)
+    # the MXFP8 backward has only the 2CTA tile, whatever FLASH_ATTENTION_DISABLE_2CTA asks
+    assert select_bwd_config(inputs._replace(disable_2cta=True)) == config
+    with pytest.raises(ValueError, match="2CTA hdim-256 tile"):
+        validate_bwd_config(replace(config, use_2cta_instrs=False, cluster_size=1), inputs)
+
+
+@pytest.mark.parametrize(
+    "changes, error",
+    [
+        (dict(num_heads_kv=4), "MHA only"),
+        (dict(max_seqlen_k=2048), "seqlen_q == seqlen_k"),
+        (dict(max_seqlen_q=4016, max_seqlen_k=4016), "multiple of 32"),
+        (dict(max_seqlen_q=4128, max_seqlen_k=4128, causal=True), "multiple of 256"),
+        (dict(has_cu_seqlens=True), "varlen"),
+        (dict(head_dim=192, head_dim_v=192), "head dims padded to"),
+        (dict(dtype="torch.float16"), "BF16"),
+        (dict(local=True), "local"),
+        (dict(has_softcap=True), "softcap"),
+        (dict(device_arch=90), "SM100 / SM110"),
+    ],
+)
+def test_mxfp8_mirror_scope_is_rejected(changes, error):
+    inputs = make_inputs(
+        head_dim=256, head_dim_v=256, max_seqlen_q=4096, max_seqlen_k=4096,
+        mxfp8_mirror=Mxfp8Mirror.PV,
+    )._replace(**changes)
+    with pytest.raises(ValueError, match=error):
+        select_bwd_config(inputs)
+
+
+@pytest.mark.parametrize("mode", [Mxfp8Mirror.QK, Mxfp8Mirror.PV])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_mxfp8_mirror_selects_its_kernel(mode, head_dim):
+    """hdim 256 native PV runs the block-scaled kernel; every other mirror runs the BF16 kernel's
+    own configuration (MHA, the forward's head dims)."""
+    inputs = make_inputs(
+        head_dim=head_dim, head_dim_v=head_dim, max_seqlen_q=4096, max_seqlen_k=4096,
+        mxfp8_mirror=mode,
+    )
+    config = select_bwd_config(inputs)
+    block_scaled = mode is Mxfp8Mirror.PV and head_dim == 256
+    assert config.mxfp8 == (Mxfp8Bwd.EXACT if block_scaled else None)
+    if not block_scaled:
+        assert config == select_bwd_config(inputs._replace(mxfp8_mirror=None))
+    with pytest.raises(ValueError, match="does not match"):
+        validate_bwd_config(replace(config, mxfp8=None if block_scaled else Mxfp8Bwd.EXACT), inputs)

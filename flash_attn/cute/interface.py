@@ -71,7 +71,7 @@ from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess, PackGQA
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
-from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100, Mxfp8BwdTensors
 from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import (
     FlashAttentionBackwardPostprocess,
@@ -530,6 +530,85 @@ def _validate_mx_mirror(mx: MxMirrorBwd, q, v, causal, softcap, unsupported_args
         raise ValueError("mx_mirror.v_bf16 is required exactly for causal native PV")
     if band and (mx.v_bf16.dtype != v.dtype or mx.v_bf16.shape != v.shape):
         raise ValueError("mx_mirror.v_bf16 must match V-hat's dtype and shape")
+
+
+class MxHd256BwdOperands(NamedTuple):
+    """Operands of the MXFP8 hdim-256 backward (`_flash_attn_bwd(mx_hd256=...)`), built from an
+    MXFP8 forward's payloads and stats_out (NOTE [MXFP8 hd256 backward] in flash_bwd_sm100.py;
+    mxfp8_hd256_prep builds them).
+
+    E4M3 payloads are (batch, seqlen, nheads, 256). Scale buffers are flat UE8M0: sfq / sfdo pair
+    tiles of 1024 B per 128 queries, sfk / sfv per 64 keys, sfqt / sfdot interleave_sf buffers with
+    MN = channels. Causal: v / sfv hold V-hat (keys [0, s)) followed by the band residual R (keys
+    [s, 2s)), and do_band holds dO / L in BF16 (the band's dV operand); non-causal leaves do_band
+    None. k_hat is the forward's K payload dequantized to BF16 (dQ = dS K-hat). The (batch, nheads,
+    seqlen) FP32 rows: lse_log2 = M - offset (the LSE slot) and dpsum = D'' (the dPsum slot).
+    """
+
+    q: torch.Tensor  # the forward's Q payload, scales along head_dim
+    sfq: torch.Tensor
+    k: torch.Tensor  # the forward's K payload, scales along head_dim
+    sfk: torch.Tensor
+    v: torch.Tensor  # V-hat requantized along head_dim [+ R]
+    sfv: torch.Tensor
+    do: torch.Tensor  # dO'' along head_dim
+    sfdo: torch.Tensor
+    qt: torch.Tensor  # Q-hat requantized along queries
+    sfqt: torch.Tensor
+    dot: torch.Tensor  # dO'' along queries
+    sfdot: torch.Tensor
+    k_hat: torch.Tensor
+    lse_log2: torch.Tensor
+    dpsum: torch.Tensor
+    do_band: torch.Tensor | None = None
+
+
+# the MxHd256BwdOperands fields the kernel reads as Mxfp8BwdTensors, in its order
+_MX_KERNEL_FIELDS = ("q", "sfq", "k", "sfk", "v", "sfv", "do", "sfdo", "qt", "sfqt", "dot", "sfdot")
+
+
+def _validate_mx_hd256_operands(mx: MxHd256BwdOperands, q: torch.Tensor, causal: bool) -> None:
+    """Check MxHd256BwdOperands against Q's (batch, seqlen, nheads, 256) shape: dtypes, shapes,
+    scale-buffer sizes, contiguity, and device. The kernel sizes its TMA loads from the payloads,
+    so a short scale buffer would be read out of bounds."""
+    b, s, h, d = q.shape
+
+    def interleaved(mn, k_extent):  # interleave_sf: 512 scales per 128 MN x 128 K tile
+        return b * h * math.ceil(mn / 128) * math.ceil(k_extent / 128) * 512
+
+    def pair_tiles(n, rows):  # 1024 B per tile of `rows` tokens
+        return b * h * math.ceil(n / rows) * 1024
+
+    payload = (b, s, h, d)
+    s_v = 2 * s if causal else s  # causal: V-hat, then the band residual R
+    expected = {
+        "q": (payload, torch.float8_e4m3fn), "k": (payload, torch.float8_e4m3fn),
+        "v": ((b, s_v, h, d), torch.float8_e4m3fn), "do": (payload, torch.float8_e4m3fn),
+        "qt": (payload, torch.float8_e4m3fn), "dot": (payload, torch.float8_e4m3fn),
+        "sfq": (pair_tiles(s, 128), torch.float8_e8m0fnu),
+        "sfdo": (pair_tiles(s, 128), torch.float8_e8m0fnu),
+        "sfk": (pair_tiles(s, 64), torch.float8_e8m0fnu),
+        "sfv": (pair_tiles(s_v, 64), torch.float8_e8m0fnu),
+        "sfqt": (interleaved(d, s), torch.float8_e8m0fnu),
+        "sfdot": (interleaved(d, s), torch.float8_e8m0fnu),
+        "k_hat": (payload, torch.bfloat16),
+        "lse_log2": ((b, h, s), torch.float32), "dpsum": ((b, h, s), torch.float32),
+    }
+    if causal:
+        expected["do_band"] = (payload, torch.bfloat16)
+    elif mx.do_band is not None:
+        raise ValueError("mx_hd256.do_band must be None when not causal")
+    for name, (want, dtype) in expected.items():
+        t = getattr(mx, name)
+        if t is None:
+            raise ValueError(f"mx_hd256.{name} must be set")
+        ok = t.numel() == want if isinstance(want, int) else tuple(t.shape) == want
+        if t.dtype != dtype or not ok or not t.is_contiguous() or t.device != q.device:
+            raise ValueError(
+                f"mx_hd256.{name} must be a contiguous {dtype} tensor of "
+                f"{'numel' if isinstance(want, int) else 'shape'} {want} on {q.device}; got "
+                f"{t.dtype} {tuple(t.shape)}"
+            )
 
 
 def _check_shared_kv_scales(scales) -> None:
@@ -2267,6 +2346,7 @@ def _flash_attn_bwd(
     *,
     config: BwdConfig | None = None,
     mx_mirror: MxMirrorBwd | None = None,
+    mx_hd256: Optional[MxHd256BwdOperands] = None,
 ) -> Tuple[torch.Tensor, ...]:
     """Attention backward. ``config`` replaces the selected BwdConfig and is validated.
 
@@ -2274,6 +2354,10 @@ def _flash_attn_bwd(
     BwdConfig owns them. V_in_regs is the only one still read, as the SM90 request.
     mx_mirror differentiates an MXFP8 forward in BF16 (MxMirrorBwd): q / k / v are its operands in
     BF16 and lse is unused (the stats replace it).
+
+    mx_hd256: run the SM100 hdim-256 backward in MXFP8 on these operands (NOTE [MXFP8 hd256
+    backward] in flash_bwd_sm100.py), which also replace the preprocess's LSE / dPsum; q, k, v,
+    out, and dout then only provide shapes and dtypes.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
@@ -2364,14 +2448,34 @@ def _flash_attn_bwd(
         has_softcap=softcap != 0.0, zero_softmax_scale=softmax_scale == 0.0,
         has_mask_mod=mask_mod is not None,
         has_learnable_sink=learnable_sink is not None,
-        mxfp8_mirror=mx_mirror.mode if mx_mirror is not None else None,
+        mxfp8_mirror=(
+            mx_mirror.mode if mx_mirror is not None
+            else Mxfp8Mirror.PV if mx_hd256 is not None else None
+        ),
     )
     if config is None:
         config = select_bwd_config(inputs)
     else:
         validate_bwd_config(config, inputs)
+    if mx_mirror is not None and mx_hd256 is not None:
+        raise ValueError("Pass mx_mirror or mx_hd256, not both")
+    if (config.mxfp8 is not None) != (mx_hd256 is not None):
+        raise ValueError(
+            "hdim 256 native MXFP8 PV runs the MXFP8 backward on mx_hd256 operands"
+            if mx_hd256 is None
+            else "mx_hd256 operands need head_dim = head_dim_v = 256"
+        )
     if mx_mirror is not None:
         _validate_mx_mirror(mx_mirror, q, v, causal, softcap, (dlse, seqused_q, seqused_k))
+    if mx_hd256 is not None:
+        # The config validated the problem (config.mxfp8_mirror_rejection); the rest is per call.
+        if dlse is not None or seqused_q is not None or seqused_k is not None or softcap != 0.0:
+            raise ValueError("The MXFP8 backward does not support dlse, seqused, or softcap")
+        _validate_mx_hd256_operands(mx_hd256, q, causal)
+        # the kernel's K slot is dQ's BF16 K-hat; causal dout is the band's dO / L
+        k = mx_hd256.k_hat
+        if causal:
+            dout = mx_hd256.do_band
     tile_m, tile_n = config.tile_m, config.tile_n
     cluster_size = config.cluster_size
     q_subtile_factor = bwd_q_subtile_factor(config, inputs)
@@ -2437,6 +2541,8 @@ def _flash_attn_bwd(
             "cu_seqlens_k must have shape (batch_size + 1,)"
         )
 
+    # the mirrored MXFP8 backwards read the forward's statistics from their operands
+    lse_unused = mx_mirror is not None or mx_hd256 is not None
     if cu_seqlens_q is not None:
         assert cu_seqlens_q.shape == (batch_size + 1,), (
             "cu_seqlens_q must have shape (batch_size + 1,)"
@@ -2448,7 +2554,7 @@ def _flash_attn_bwd(
     else:
         assert out.shape == (batch_size, seqlen_q, num_head, head_dim_v)
         assert dout.shape == (batch_size, seqlen_q, num_head, head_dim_v)
-        assert mx_mirror is not None or lse.shape == (batch_size, num_head, seqlen_q), (
+        assert lse_unused or lse.shape == (batch_size, num_head, seqlen_q), (
             "lse must have shape (batch_size, num_head, seqlen_q)"
         )
 
@@ -2459,7 +2565,7 @@ def _flash_attn_bwd(
     for t in [cu_seqlens_q, cu_seqlens_k]:
         if t is not None:
             assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k must be int32"
-    assert mx_mirror is not None or lse.dtype == torch.float32, "lse must be float32"
+    assert lse_unused or lse.dtype == torch.float32, "lse must be float32"
     if dlse is not None:
         dlse = maybe_contiguous(dlse)
     if learnable_sink is not None:
@@ -2631,34 +2737,46 @@ def _flash_attn_bwd(
 
     dsink = torch.empty_like(learnable_sink) if learnable_sink is not None else None
 
-    # NOTE [MXFP8 mirrored BF16 backward]: the preprocess turns the stats into the LSE slot and
-    # dO' = bf16(dO / L), which the main kernel reads in place of dO.
-    mirror_pre = None
-    if mx_mirror is not None:
-        mirror_pre = MirrorPreprocess(
-            mx_mirror.stats, torch.empty_like(dout), mx_mirror.mode.p_offset
-        )
-        lse = None
-    # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
-    _bwd_preprocess(
-        out, dout, dpsum, lse, lse_log2, dq_accum,
-        cu_seqlens_q, seqused_q, dlse,
-        dtype, head_dim, head_dim_v, tile_m,
-        # NOTE [bwd pack_gqa]: packed views of the per-head O / dO / LSE; dPsum / LSElog2 /
-        # dQaccum are per KV head in packed row order
-        pack_gqa=PackGQA.PACKED_ROW_OUTPUTS if bwd_pack_gqa else PackGQA.OFF,
-        qhead_per_kvhead=bwd_pack_factor,
-        nheads_kv=num_head // bwd_pack_factor if bwd_pack_gqa else 1,
-        cu_total_m_blocks=cu_total_m_blocks_q,
-        fake_mode=fake_mode,
-        hdim_multiple_of=hdim_multiple_of,
-        softmax_scale=softmax_scale,  # read by the mirror mode's LSE slot
-        mirror=mirror_pre,
-    )
     v_band = None
-    if mx_mirror is not None:
-        dout = mirror_pre.dout_scaled
-        v_band = maybe_contiguous(mx_mirror.v_bf16)
+    if mx_hd256 is not None:
+        # The operands carry the LSE / dPsum slots (NOTE [MXFP8 hd256 backward]); only the dQ
+        # accumulator is left to zero.
+        # rows past seqlen: the preprocess's +inf LSE slot (P = 0) and zero dPsum
+        for scratch, rows, pad in (
+            (lse_log2, mx_hd256.lse_log2, float("inf")), (dpsum, mx_hd256.dpsum, 0.0)
+        ):
+            scratch[..., :seqlen_q].copy_(rows)
+            scratch[..., seqlen_q:].fill_(pad)
+        dq_accum.zero_()
+    else:
+        # NOTE [MXFP8 mirrored BF16 backward]: the preprocess turns the stats into the LSE slot and
+        # dO' = bf16(dO / L), which the main kernel reads in place of dO.
+        mirror_pre = None
+        if mx_mirror is not None:
+            mirror_pre = MirrorPreprocess(
+                mx_mirror.stats, torch.empty_like(dout), mx_mirror.mode.p_offset
+            )
+            lse = None
+        # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out
+        # dq_accum.
+        _bwd_preprocess(
+            out, dout, dpsum, lse, lse_log2, dq_accum,
+            cu_seqlens_q, seqused_q, dlse,
+            dtype, head_dim, head_dim_v, tile_m,
+            # NOTE [bwd pack_gqa]: packed views of the per-head O / dO / LSE; dPsum / LSElog2 /
+            # dQaccum are per KV head in packed row order
+            pack_gqa=PackGQA.PACKED_ROW_OUTPUTS if bwd_pack_gqa else PackGQA.OFF,
+            qhead_per_kvhead=bwd_pack_factor,
+            nheads_kv=num_head // bwd_pack_factor if bwd_pack_gqa else 1,
+            cu_total_m_blocks=cu_total_m_blocks_q,
+            fake_mode=fake_mode,
+            hdim_multiple_of=hdim_multiple_of,
+            softmax_scale=softmax_scale,  # read by the mirror mode's LSE slot
+            mirror=mirror_pre,
+        )
+        if mx_mirror is not None:
+            dout = mirror_pre.dout_scaled
+            v_band = maybe_contiguous(mx_mirror.v_bf16)
     # Backward kernel: compute dk, dv, dq_accum.
     score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
     score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
@@ -2755,7 +2873,11 @@ def _flash_attn_bwd(
         bwd_tensormap_workspace = torch.empty((n_ctas, n_desc, 16), dtype=torch.int64, device=device)
     compile_key = compile_key + (bwd_tensormap_workspace is not None,)
     # QK-only mirrors run the plain kernel; native PV specializes it
-    kernel_mirror = Mxfp8Mirror.PV if inputs.mxfp8_mirror is Mxfp8Mirror.PV else None
+    kernel_mirror = (
+        Mxfp8Mirror.PV
+        if inputs.mxfp8_mirror is Mxfp8Mirror.PV and config.mxfp8 is None
+        else None
+    )
     if kernel_mirror is not None:
         compile_key += (kernel_mirror, get_broadcast_dims(v_band) if v_band is not None else None)
     compiled_bwd = _flash_attn_bwd.compile_cache.get(compile_key)
@@ -2867,6 +2989,7 @@ def _flash_attn_bwd(
                 dO_stage=config.num_stages_dO,
                 fold_LSE_dPsum=config.fold_LSE_dPsum,
                 mxfp8_mirror=kernel_mirror,
+                mxfp8=config.mxfp8,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -2907,6 +3030,12 @@ def _flash_attn_bwd(
             )
             if arch // 10 in [10, 11]:
                 compile_args.append(to_cute_tensor(v_band) if v_band is not None else None)
+        if arch // 10 in [10, 11]:
+            compile_args.append(
+                Mxfp8BwdTensors(*(_mx_cute_tensor(getattr(mx_hd256, f)) for f in _MX_KERNEL_FIELDS))
+                if mx_hd256 is not None
+                else None
+            )
         compile_args.append(current_stream)
 
         # TODO: check @can_implement
@@ -2952,6 +3081,12 @@ def _flash_attn_bwd(
             call_args.append(bwd_tensormap_workspace)
             if arch // 10 in [10, 11]:
                 call_args.append(v_band)
+        if arch // 10 in [10, 11]:
+            call_args.append(
+                tuple(_mx_torch_tensor(getattr(mx_hd256, f)) for f in _MX_KERNEL_FIELDS)
+                if mx_hd256 is not None
+                else None
+            )
         compiled_bwd(*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     if arch // 10 == 9:
@@ -2963,7 +3098,8 @@ def _flash_attn_bwd(
         num_threads_post_dKV = 128
 
     _bwd_postprocess_convert(
-        dq_accum, dq, softmax_scale,
+        # MXFP8: the kernel's dS carries 2^8 (NOTE [MXFP8 hd256 backward])
+        dq_accum, dq, softmax_scale / 256 if mx_hd256 is not None else softmax_scale,
         cu_seqlens_q, seqused_q,
         arch, dtype, head_dim, tile_m, num_threads_post_dQ,
         config.AtomLayoutMdQ, config.dQ_swapAB,
@@ -3010,6 +3146,18 @@ def _flash_attn_bwd(
 
 
 _flash_attn_bwd.compile_cache = get_jit_cache("bwd")
+
+
+def _mx_torch_tensor(t: torch.Tensor) -> torch.Tensor:
+    """An MXFP8 backward operand as the kernel receives it: bytes (E4M3 payloads keep their
+    shape, to_cute_tensor restores their element type; scale buffers are flat)."""
+    if t.dtype == torch.float8_e8m0fnu:
+        return t.view(torch.uint8).reshape(-1)
+    return t.view(torch.uint8) if t.dtype == torch.float8_e4m3fn else t
+
+
+def _mx_cute_tensor(t: torch.Tensor):
+    return to_cute_tensor(t.view(torch.uint8).reshape(-1) if t.dtype == torch.float8_e8m0fnu else t)
 
 
 def _bwd_dsink_reduce(
