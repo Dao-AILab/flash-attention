@@ -67,10 +67,11 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
     k = k_ref.detach().to(dtype).requires_grad_()
     v = v_ref.detach().to(dtype).requires_grad_()
 
-    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, causal=causal)
-    out_pt, _ = attention_ref(
-        q_ref, k_ref, v_ref, None, None, causal=causal, upcast=False, reorder_ops=True,
-    )
+    if not is_fake_mode():
+        out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, causal=causal)
+        out_pt, _ = attention_ref(
+            q_ref, k_ref, v_ref, None, None, causal=causal, upcast=False, reorder_ops=True,
+        )
 
     out, lse = flash_attn_func(q, k, v, causal=causal, num_splits=num_splits)
 
