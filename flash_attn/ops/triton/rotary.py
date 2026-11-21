@@ -4,6 +4,7 @@
 from typing import Optional, Union
 
 import torch
+from torch.fx.experimental.proxy_tensor import get_proxy_mode
 
 import triton
 import triton.language as tl
@@ -156,7 +157,11 @@ def apply_rotary(
     # Need this, otherwise Triton tries to launch from cuda:0 and we get
     # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
     with torch.cuda.device(x.device.index):
-        torch.library.wrap_triton(rotary_kernel)[grid](
+        # Eager execution does not need the traceable higher-order operator. Avoiding it
+        # removes its per-launch dispatch overhead while preserving compile and proxy capture.
+        tracing = torch.compiler.is_compiling() or get_proxy_mode() is not None
+        kernel = torch.library.wrap_triton(rotary_kernel) if tracing else rotary_kernel
+        kernel[grid](
             output,  # data ptrs
             x,
             cos,
