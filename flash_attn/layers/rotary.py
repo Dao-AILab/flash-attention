@@ -65,8 +65,9 @@ class ApplyRotaryEmb(torch.autograd.Function):
             ctx.save_for_backward(cos, sin, cu_seqlens, seqlen_offsets)
             ctx.seqlen_offsets = None
         ctx.interleaved = interleaved
-        ctx.inplace = inplace
         ctx.max_seqlen = max_seqlen
+        if inplace and not torch.compiler.is_compiling():
+            ctx.mark_dirty(x)
         return out if not inplace else x
 
     @staticmethod
@@ -84,7 +85,7 @@ class ApplyRotaryEmb(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             max_seqlen=ctx.max_seqlen,
             interleaved=ctx.interleaved,
-            inplace=ctx.inplace,
+            inplace=False,
             conjugate=True,
         )
         return dx, None, None, None, None, None, None, None
@@ -217,6 +218,8 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
             ctx.seqlen_offsets = None
         ctx.interleaved = interleaved
         ctx.num_heads_q = num_heads_q
+        if not torch.compiler.is_compiling():
+            ctx.mark_dirty(qkv)
         return qkv
 
     @staticmethod
@@ -227,7 +230,7 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
         else:
             cos, sin, cos_k, sin_k = ctx.saved_tensors
         dqkv = _apply_rotary_emb_qkv(
-            dqkv, cos, sin, cos_k, sin_k, interleaved=ctx.interleaved, inplace=True,
+            dqkv.clone(), cos, sin, cos_k, sin_k, interleaved=ctx.interleaved, inplace=True,
             seqlen_offsets=seqlen_offsets, num_heads_q=ctx.num_heads_q, conjugate=True,
         )
         return dqkv, None, None, None, None, None, None, None
@@ -281,6 +284,8 @@ class ApplyRotaryEmbKV_(torch.autograd.Function):
             ctx.save_for_backward(cos, sin, seqlen_offsets)
             ctx.seqlen_offsets = None
         ctx.interleaved = interleaved
+        if not torch.compiler.is_compiling():
+            ctx.mark_dirty(kv)
         return kv
 
     @staticmethod
@@ -290,6 +295,7 @@ class ApplyRotaryEmbKV_(torch.autograd.Function):
             cos, sin, seqlen_offsets = ctx.saved_tensors
         else:
             cos, sin = ctx.saved_tensors
+        dkv = dkv.clone()
         apply_rotary(
             dkv[:, :, 0],
             cos,

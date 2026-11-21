@@ -52,7 +52,7 @@ def test_rotary(rotary_emb_fraction, seqlen_offset):
         .requires_grad_(True)
     )
     q_neox, k_neox = apply_rotary_pos_emb_neox(q_pt, k_pt, cos_neox, sin_neox, offset=seqlen_offset)
-    out = rotary(qkv, seqlen_offset=seqlen_offset)
+    out = rotary(qkv.clone(), seqlen_offset=seqlen_offset)
     assert torch.allclose(
         rotary._cos_cached, cos_neox[..., : rotary_dim // 2].to(dtype=dtype), rtol=rtol, atol=atol
     )
@@ -69,8 +69,9 @@ def test_rotary(rotary_emb_fraction, seqlen_offset):
     assert torch.equal(out[:, :, 2], qkv_og[:, :, 2])
 
     g = torch.randn_like(out)
-    g_og = g.clone().detach()  # Our implementation modifies g inplace
+    g_og = g.clone().detach()
     out.backward(g)
+    assert torch.equal(g, g_og)
     q_neox.backward(rearrange(g_og[:, :, 0, :, :rotary_dim], "b s h d -> b h s d"))
     k_neox.backward(rearrange(g_og[:, :, 1, :, :rotary_dim], "b s h d -> b h s d"))
     assert torch.allclose(
@@ -115,7 +116,7 @@ def test_rotary_interleaved(rotary_emb_fraction, seqlen_offset):
     k_pt = qkv[:, :, 1, :, :rotary_dim].detach().clone().requires_grad_(True)
     q_gptj = apply_rotary_pos_emb_gptj(q_pt, sincos_gptj, offset=seqlen_offset)
     k_gptj = apply_rotary_pos_emb_gptj(k_pt, sincos_gptj, offset=seqlen_offset)
-    out = rotary(qkv, seqlen_offset=seqlen_offset)
+    out = rotary(qkv.clone(), seqlen_offset=seqlen_offset)
     assert torch.allclose(rotary._cos_cached, sincos_gptj[1], rtol=rtol, atol=atol)
     assert torch.allclose(rotary._sin_cached, sincos_gptj[0], rtol=rtol, atol=atol)
     assert torch.allclose(q_gptj, out[:, :, 0, :, :rotary_dim], rtol=rtol, atol=atol)
@@ -124,8 +125,9 @@ def test_rotary_interleaved(rotary_emb_fraction, seqlen_offset):
     assert torch.equal(out[:, :, 2], qkv_og[:, :, 2])
 
     g = torch.randn_like(out)
-    g_og = g.clone().detach()  # Our implementation modifies g inplace
+    g_og = g.clone().detach()
     out.backward(g)
+    assert torch.equal(g, g_og)
     q_gptj.backward(g_og[:, :, 0, :, :rotary_dim])
     k_gptj.backward(g_og[:, :, 1, :, :rotary_dim])
     assert torch.allclose(q_pt.grad, qkv.grad[:, :, 0, :, :rotary_dim], rtol=rtol, atol=atol)
