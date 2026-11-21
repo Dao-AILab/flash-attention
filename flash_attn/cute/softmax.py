@@ -65,15 +65,29 @@ def apply_learnable_sink(
 
     `max_offset` is the fp8 exponent offset and `empty_row_sum == 2**max_offset` (0 and 1 for
     bf16/fp16). `Softmax.finalize` (SM80/SM90) applies the same fold in the scaled domain.
+
+    Returns the new stats and `o_rescale`, the factor the caller multiplies into the O scale.
+    The sink term is exp2(sink*LOG2_E - row_max*scale_log2), which overflows fp32 once the sink
+    is about 88 above the row's largest logit (inf row_sum, inf LSE, dsink 0 in the backward).
+    So the row is rebased to max(row_max, sink): the O accumulator, taken relative to the old
+    row max, then needs the factor exp2(old - new). A sink at or below the row max gives the
+    same row_max, the same row_sum term as before and o_rescale == 1 exactly.
     """
+    o_rescale = Float32(1.0)
     if row_max == -Float32.inf:
         row_max = sink_val * (utils.LOG2_E / scale_log2)
         row_sum = empty_row_sum
     else:
-        row_sum += cute.math.exp2(
-            sink_val * utils.LOG2_E - row_max * scale_log2 + max_offset, fastmath=True
+        sink_scaled = sink_val * utils.LOG2_E
+        row_max_scaled = row_max * scale_log2
+        new_max_scaled = cute.arch.fmax(row_max_scaled, sink_scaled)
+        o_rescale = cute.math.exp2(row_max_scaled - new_max_scaled, fastmath=True)
+        row_sum = row_sum * o_rescale + cute.math.exp2(
+            sink_scaled - new_max_scaled + max_offset, fastmath=True
         )
-    return row_max, row_sum
+        if sink_scaled > row_max_scaled:
+            row_max = sink_val * (utils.LOG2_E / scale_log2)
+    return row_max, row_sum, o_rescale
 
 
 @cute.jit

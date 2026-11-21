@@ -2174,6 +2174,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                 self.sm_stats_barrier_full.arrive_and_wait()
                 row_sum = sRowSum[tidx % self.cta_tile_m, 0] + sRowSum[tidx % self.cta_tile_m, 1]
                 row_max = sRowMax[tidx % self.cta_tile_m, 0]
+                o_rescale = Float32(1.0)
                 if const_expr(learnable_sink is not None):
                     # split-KV: only the first split owns the sink column (as in flash_fwd_sm100)
                     if const_expr(not self.is_split_kv) or split_idx == 0:
@@ -2185,7 +2186,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                             self.pack_gqa,
                             qhead_per_kvhead_valid=self.qhead_per_kvhead_valid,
                         )
-                        row_max, row_sum = apply_learnable_sink(
+                        row_max, row_sum, o_rescale = apply_learnable_sink(
                             row_max,
                             row_sum,
                             sink_val,
@@ -2196,6 +2197,8 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                 self.sm_stats_barrier_empty.arrive()
                 acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                 scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                if const_expr(learnable_sink is not None):
+                    scale = scale * o_rescale
                 # seqlen_k == 0 with TMA KV: the fully masked dummy block still loaded a KV tile, and
                 # P = 0 times a NaN V row is NaN (scaling by 0 would keep it): write zeros instead.
                 zero_O = seqlen.seqlen_k == 0 if const_expr(not self.use_cpasync_kv) else False
