@@ -44,6 +44,15 @@ def test_block_scales_are_dense_only():
         flash_attn_varlen_func(q, k, v.to(torch.bfloat16), scales=BlockScales(sf, sf))
 
 
+@pytest.mark.parametrize("softmax_scale", [0.0, -0.125, float("nan")])
+def test_block_scales_require_positive_softmax_scale(softmax_scale):
+    q, k, v = fp8_inputs()
+    sf = torch.ones(512).to(torch.float8_e8m0fnu)
+    with pytest.raises(ValueError, match="softmax_scale > 0"):
+        flash_attn_func(
+            q, k, v.to(torch.bfloat16), softmax_scale=softmax_scale, scales=BlockScales(sf, sf)
+        )
+
 def test_block_scales_require_both_qk_scales():
     q, k, v = fp8_inputs()
     sf = torch.ones(512).to(torch.float8_e8m0fnu)
