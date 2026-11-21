@@ -437,8 +437,13 @@ class Sm107PvTuning(NamedTuple):
 
 
 # Keyed by (pv_normalizer, head_dim_padded, is_causal); missing keys use the defaults.
+# "rounded_p" has no softmax-side quantized row sum (pv_ones_acc_sum), hence its own spill-free
+# register splits.
 SM107_MXFP8_PV_TUNING = {
-    (PvNormalizer.ROUNDED_P, 64, False): Sm107PvTuning(Sm100Registers(160, 96, 96)),
+    (PvNormalizer.ROUNDED_P, 128, False): Sm107PvTuning(Sm100Registers(192, 80, 48)),
+    (PvNormalizer.ROUNDED_P, 128, True): Sm107PvTuning(Sm100Registers(184, 80, 64)),
+    (PvNormalizer.ROUNDED_P, 64, False): Sm107PvTuning(Sm100Registers(176, 96, 64)),
+    (PvNormalizer.ROUNDED_P, 64, True): Sm107PvTuning(Sm100Registers(184, 72, 72)),
     (PvNormalizer.FP32, 128, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
     (PvNormalizer.FP32, 64, False): Sm107PvTuning(Sm100Registers(168, 96, 80)),
     (PvNormalizer.FP32, 64, True): Sm107PvTuning(Sm100Registers(192, 64, 64)),
@@ -546,7 +551,7 @@ def mxfp8_pv_fp32_tuning(inputs: FwdHeuristicInputs) -> PvFp32Tuning:
     return MXFP8_PV_FP32_TUNING.get(family, {}).get(key, PvFp32Tuning())
 
 
-def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs) -> Sm100Registers | None:
+def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs, *, q_stage: int) -> Sm100Registers | None:
     """Native MXFP8 PV register split; None keeps the FP8 split."""
     family = sm100_arch_family(inputs.device_arch)
     key = (inputs.head_dim_padded, inputs.causal)
@@ -554,6 +559,11 @@ def select_mxfp8_pv_registers(inputs: FwdHeuristicInputs) -> Sm100Registers | No
         return SM107_MXFP8_PV_TUNING.get((inputs.pv_normalizer, *key), Sm107PvTuning()).registers
     if fp32_registers := mxfp8_pv_fp32_tuning(inputs).registers:
         return fp32_registers
+    rounded_p = inputs.pv_normalizer is PvNormalizer.ROUNDED_P
+    if rounded_p and q_stage == 2 and inputs.head_dim_padded >= 96:
+        # The ones MMA (pv_ones_step_sum) adds register pressure outside the softmax warps: hd128
+        # splits with the fewest spills under the extra MMA-warp pressure.
+        return Sm100Registers(176, 80, 80) if inputs.causal else Sm100Registers(176, 64, 96)
     # The MMA warp also issues the PV scale copies and the split-P wait. It spills with the
     # 48 registers of the hd128 default, and on sm_103 the persistent non-causal loop
     # needs 80 (causal uses a single-tile scheduler, or CLC with its own split).
@@ -578,7 +588,9 @@ def select_sm100_registers(
         sm100_is_sm103_family(inputs.device_arch),
     )
     is_fp8 = has_fp8_pv(inputs)
-    if sm100_native_pv(inputs) and (pv_registers := select_mxfp8_pv_registers(inputs)):
+    if sm100_native_pv(inputs) and (
+        pv_registers := select_mxfp8_pv_registers(inputs, q_stage=q_stage)
+    ):
         return pv_registers
     if head_dim_padded < 96:
         small = SM100_FP8_SMALL_HDIM_REGISTERS if is_fp8 else SM100_SMALL_HDIM_REGISTERS
@@ -1151,18 +1163,38 @@ def sm100_num_softmax_stats(
     return 3 if separate_lse_sum else 2
 
 
+# "rounded_p" native PV's all-ones B tiles for the P @ ones row-sum MMAs: N=16 x K=128 elements
+# (pv_ones_n x tile_n), E4M3 and, for causal diagonal blocks on sm_107, BF16. Each ones SMEM
+# field is 1024-byte aligned.
+SM100_PV_ONES_TILE_ELEMS = 16 * 128
+SM100_PV_ONES_ALIGN_BYTES = 1024
+
+
 def sm100_fwd_scale_bytes(inputs: FwdHeuristicInputs, *, q_stage: int) -> tuple[int, int, int]:
-    """Per-CTA (sSFQ, sSFK per K/V stage, fixed) bytes of the MXFP8 forward's UE8M0 block scales.
+    """Per-CTA (sSFQ, sSFK per K/V stage, sSFP) bytes of the MXFP8 forward's UE8M0 block scales.
 
     tcgen05.cp copies whole 128-row x 4-scale chunks, one per 128 channels of head_dim
-    (padding hd64 to a full chunk). Native PV adds one constant chunk for P's scales (fixed);
-    V's scales share the K scale ring. Other forwards have no scale buffers.
+    (padding hd64 to a full chunk). Native PV adds one constant chunk for P's scales (V's
+    scales share the K scale ring). Other forwards have no scale buffers.
     """
     if inputs.mxfp8_path is None:
         return 0, 0, 0
     chunk_bytes = 128 * 4 * ceil_div(inputs.head_dim, 128)
-    fixed = 512 if sm100_native_pv(inputs) else 0
-    return q_stage * chunk_bytes, chunk_bytes, fixed
+    return q_stage * chunk_bytes, chunk_bytes, 512 if sm100_native_pv(inputs) else 0
+
+
+def sm100_pv_ones_bytes(inputs: FwdHeuristicInputs, *, q_stage: int) -> tuple[int, ...]:
+    """Bytes of each all-ones SMEM field of "rounded_p" native PV, in declaration order.
+
+    sm_107 (pv_ones_acc_sum): the E4M3 tile, then the BF16 one, empty without causal.
+    sm_100/sm_103: the E4M3 tile with two Q stages (pv_ones_step_sum), otherwise none.
+    """
+    if not sm100_native_pv(inputs) or inputs.pv_normalizer is PvNormalizer.FP32:
+        return ()
+    tile = SM100_PV_ONES_TILE_ELEMS
+    if sm100_arch_family(inputs.device_arch) == "sm_107":
+        return tile, 2 * tile if inputs.causal else 0
+    return (tile,) if q_stage == 2 else ()
 
 
 def select_sm100_smem_layout(
@@ -1200,9 +1232,11 @@ def select_sm100_smem_layout(
         num_splits=num_splits,
         use_2cta_instrs=use_2cta_instrs,
     )
-    # MXFP8 Q scales count with sQ, and each K/V stage holds its scales.
-    sfq, sfkv, sf_fixed = sm100_fwd_scale_bytes(inputs, q_stage=q_stage)
-    q_o = (max(q + sfq, o) if overlap_sO_sQ else q + sfq + o) + sf_fixed
+    # MXFP8 Q scales count with sQ, and each K/V stage holds its scales. The budget charges each
+    # all-ones field a full alignment pad.
+    sfq, sfkv, sfp = sm100_fwd_scale_bytes(inputs, q_stage=q_stage)
+    ones = sum(b + SM100_PV_ONES_ALIGN_BYTES for b in sm100_pv_ones_bytes(inputs, q_stage=q_stage))
+    q_o = (max(q + sfq, o) if overlap_sO_sQ else q + sfq + o) + sfp + ones
     kv_stage = min((_SM100_KV_STAGE_BUDGET_BYTES - q_o) // (max(k, v) + sfkv), SM100_MAX_KV_STAGE)
     # 1CTA hd192/128 fits a third stage with the uneven [K, V, K] layout.
     if sm100_uneven_kv_smem(head_dim_padded, head_dim_v_padded, kv_stage + 1, use_2cta_instrs):
@@ -1262,11 +1296,14 @@ def sm100_fwd_smem_bytes(config: FwdConfig, inputs: FwdHeuristicInputs) -> int:
     total = round_up(header, align)
     for buffer in (o, q, kv_bytes):
         total = round_up(total + buffer, align)
-    # MXFP8 scale buffers follow sK, 128-byte aligned.
-    sfq, sfkv, sf_fixed = sm100_fwd_scale_bytes(inputs, q_stage=q_stage)
+    # MXFP8 scale buffers follow sK, 128-byte aligned, then the all-ones fields, each aligned
+    # in declaration order.
+    sfq, sfkv, sfp = sm100_fwd_scale_bytes(inputs, q_stage=q_stage)
     if sfq:
-        total = round_up(round_up(total + sfq, 128) + kv_stage * sfkv, 128)
-        total = round_up(total + sf_fixed, align)
+        total = round_up(round_up(total + sfq, 128) + kv_stage * sfkv, 128) + sfp
+        for ones in sm100_pv_ones_bytes(inputs, q_stage=q_stage):
+            total = round_up(total, SM100_PV_ONES_ALIGN_BYTES) + ones
+        total = round_up(total, align)
     return total
 
 
