@@ -12,11 +12,10 @@ from transformers.utils import (
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
 
-def state_dict_from_pretrained(model_name, device=None, dtype=None):
+def state_dict_from_pretrained(model_name, device=None, dtype=None, load_safe=False):
     # If not fp32, then we don't want to load directly to the GPU
     mapped_device = "cpu" if dtype not in [torch.float32, None] else device
     is_sharded = False
-    load_safe = False
     resolved_archive_file = None
 
     weights_path = os.path.join(model_name, WEIGHTS_NAME)
@@ -45,11 +44,13 @@ def state_dict_from_pretrained(model_name, device=None, dtype=None):
         is_sharded = True
         load_safe = True
     else:  # Try loading from HF hub instead of from local files
-        resolved_archive_file = cached_file(model_name, WEIGHTS_NAME,
-                                            _raise_exceptions_for_missing_entries=False)
+        resolved_archive_file = cached_file(
+            model_name, SAFE_WEIGHTS_NAME if load_safe else WEIGHTS_NAME,
+            _raise_exceptions_for_missing_entries=False)
         if resolved_archive_file is None:
-            resolved_archive_file = cached_file(model_name, WEIGHTS_INDEX_NAME,
-                                                _raise_exceptions_for_missing_entries=False)
+            resolved_archive_file = cached_file(
+                model_name, SAFE_WEIGHTS_INDEX_NAME if load_safe else WEIGHTS_INDEX_NAME,
+                _raise_exceptions_for_missing_entries=False)
             if resolved_archive_file is not None:
                 is_sharded = True
 
