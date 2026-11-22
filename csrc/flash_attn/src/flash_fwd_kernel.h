@@ -1209,13 +1209,13 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
     // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
     if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
-        if (params.unpadded_lse) {
-            const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
-            if (lse_offset < lse_size) {
+        const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
+        if (lse_offset < lse_size) {
+            if (params.unpadded_lse) {
                 gLSE_unpadded(lse_offset) = lse_logsum;
+            } else {
+                gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
             }
-        } else {
-            gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
         }
     }
     // Store the scales exp(lse - lse_logsum) in shared memory.
