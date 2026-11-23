@@ -322,7 +322,11 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
-    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+    int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+    if (params.q_heads_as_rows && params.window_size_left >= 0) {
+        // The split kernel only splits the blocks inside the left window, see compute_attn_1rowblock_splitkv.
+        num_n_blocks = std::min(num_n_blocks, (params.window_size_left + block_n) / block_n + 1);
+    }
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
     const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
@@ -423,13 +427,14 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     if (window_size_left >= seqlen_k) { window_size_left = -1; }
     if (window_size_right >= seqlen_k) { window_size_right = -1; }
 
-    // causal=true is the same as causal=false in this case
-    if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
+    // causal=true is the same as causal=false in this case, and so is a right window (the query is at the last key)
+    if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; window_size_right = -1; }
     if (is_causal) { window_size_right = 0; }
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
+    // With a left window, the kernel masks every row as the last query (params.q_heads_as_rows).
+    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2);
@@ -492,6 +497,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
                      window_size_right,
                      softcap
                      );
+    params.q_heads_as_rows = seqlenq_ngroups_swapped;
 
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
@@ -613,14 +619,16 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int page_block_size = !paged_KV ? 1 : k.size(1);
     TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
 
-    if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
+    if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; window_size_right = -1; }  // causal=true is the same as causal=false in this case, and so is a right window (the query is at the last key)
     if (is_causal) { window_size_right = 0; }
 
     void *cu_seqlens_q_d = cu_seqlens_q.data_ptr();
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
+    // With a left window, the kernel masks every row as the last query (params.q_heads_as_rows).
+    // The reshape below needs exactly one query per sequence (total_q == batch_size).
+    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && q.size(0) == batch_size && num_heads > num_heads_k && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size});
@@ -717,6 +725,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      softcap,
                      seqlenq_ngroups_swapped,
                      /*unpadded_lse*/true);
+    params.q_heads_as_rows = seqlenq_ngroups_swapped;
     params.total_q = total_q;
 
     if (paged_KV) {
@@ -1311,13 +1320,14 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
-    // causal=true is the same as causal=false in this case
-    if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
+    // causal=true is the same as causal=false in this case, and so is a right window (the query is at the last key)
+    if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; window_size_right = -1; }
     if (is_causal) { window_size_right = 0; }
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
+    // With a left window, the kernel masks and rotates every row as the last query (params.q_heads_as_rows).
+    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_right < 0 && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
     if (seqlenq_ngroups_swapped) {
         const int ngroups = num_heads / num_heads_k;
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
@@ -1390,6 +1400,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      window_size_right,
                      softcap
                      );
+    params.q_heads_as_rows = seqlenq_ngroups_swapped;
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {

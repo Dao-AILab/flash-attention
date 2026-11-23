@@ -114,15 +114,19 @@ struct Mask {
     const int max_seqlen_k, max_seqlen_q;
     const int window_size_left, window_size_right;
     const float alibi_slope;
+    // The rows are the query heads of one query at the last key position (Flash_fwd_params::q_heads_as_rows),
+    // not consecutive queries.
+    const bool q_heads_as_rows;
 
     __forceinline__ __device__ Mask(const int max_seqlen_k, const int max_seqlen_q,
                                     const int window_size_left, const int window_size_right,
-                                    const float alibi_slope=0.f)
+                                    const float alibi_slope=0.f, const bool q_heads_as_rows=false)
         : max_seqlen_k(max_seqlen_k)
         , max_seqlen_q(max_seqlen_q)
         , window_size_left(window_size_left)
         , window_size_right(window_size_right)
-        , alibi_slope(!Has_alibi ? 0.0 : alibi_slope) {
+        , alibi_slope(!Has_alibi ? 0.0 : alibi_slope)
+        , q_heads_as_rows(q_heads_as_rows) {
     };
 
     // Causal_mask: whether this particular iteration needs causal masking
@@ -168,7 +172,8 @@ struct Mask {
                     const int row_idx_base = row_idx_offset + mi * warp_row_stride;
                     #pragma unroll
                     for (int i = 0; i < size<0, 0>(tensor); ++i) {
-                        const int row_idx = row_idx_base + i * 8;
+                        // Is_local first: causal and ALiBi kernels compile exactly as before.
+                        const int row_idx = Is_local && q_heads_as_rows ? max_seqlen_q - 1 : row_idx_base + i * 8;
                         const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
                         const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
                         #pragma unroll
