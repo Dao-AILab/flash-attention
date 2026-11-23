@@ -521,7 +521,10 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
-        run_mha_fwd(params, stream);
+        // Decode with packed query heads (seqlenq_ngroups_swapped) has only ngroups query rows per KV head. For head
+        // dims <= 128 the standard kernel tiles them with kBlockM = 128, the split-KV kernel with kBlockM = 64, which
+        // is faster. With one split the split-KV kernel uses the standard kernel's kBlockN (except hdim 128 on sm86/89).
+        run_mha_fwd(params, stream, /*force_split_kernel=*/seqlenq_ngroups_swapped && head_size <= 128);
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
@@ -1507,8 +1510,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,
-    // or paged KV cache
-    run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
+    // or paged KV cache. Decode with packed query heads also uses it when the split count is left to the
+    // heuristic and head dim <= 128 (see mha_fwd).
+    run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV
+                                                      || (seqlenq_ngroups_swapped && num_splits < 1 && head_size <= 128));
 
     if (head_size_og % 8 != 0) {
         out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
