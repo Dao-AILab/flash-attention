@@ -1091,6 +1091,7 @@ class dKGemmKernel:
             #
             tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
             cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+            cute.arch.fence_view_async_tmem_load()
 
             #
             # Convert to C type
