@@ -1,6 +1,8 @@
 import os
+import sys
 import math
 import itertools
+import subprocess
 
 import pytest
 import torch
@@ -1368,6 +1370,38 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     # # pytorch_profiler(torch.sum, lse_partial)
     # pytorch_profiler(flash_attn_combine, out_partial, lse_partial)
     # pytorch_profiler(torch.sum, out_partial)
+
+
+def test_flash_attn_combine_launch_failure():
+    if DISABLE_SPLIT:
+        pytest.skip()
+    # gridDim.z is batch_size (max 65535): B=65535 must succeed, B=65536 must not fail silently.
+    b_max = 65535
+    out = torch.zeros(b_max, 1, 1, 4, device="cuda")
+    out, lse = flash_attn_combine(
+        torch.ones(2, b_max, 1, 1, 4, device="cuda"),
+        torch.zeros(2, b_max, 1, 1, device="cuda"),
+        out=out,
+    )
+    torch.testing.assert_close(out, torch.ones_like(out))
+    torch.testing.assert_close(lse, torch.full_like(lse, math.log(2.0)))
+
+    hopper_dir = os.path.dirname(os.path.abspath(__file__))
+    code = (
+        f"import sys; sys.path.insert(0, {hopper_dir!r}); "
+        "import torch; from flash_attn_interface import flash_attn_combine; "
+        "B = 65536; "
+        "out = torch.zeros(B, 1, 1, 4, device='cuda'); "
+        "flash_attn_combine(torch.ones(2, B, 1, 1, 4, device='cuda'), "
+        "torch.zeros(2, B, 1, 1, device='cuda'), out=out)"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0, "Expected combine kernel launch failure to terminate with an error"
+    assert "CUTLASS error" in proc.stderr, f"Unexpected stderr: {proc.stderr}"
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
