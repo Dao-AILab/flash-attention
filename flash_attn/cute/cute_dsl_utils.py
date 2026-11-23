@@ -49,8 +49,37 @@ def _get_device_arch_and_num_sms(device_index: int) -> tuple[int, int]:
     return properties.major * 10 + properties.minor, properties.multi_processor_count
 
 
+@lru_cache
+def _get_context_num_sms(ctx: int, green_ctx: int) -> int | None:
+    from cuda.bindings import driver
+
+    sm = driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+    if green_ctx:
+        err, resource = driver.cuGreenCtxGetDevResource(driver.CUgreenCtx(green_ctx), sm)
+    else:
+        err, resource = driver.cuCtxGetDevResource(driver.CUcontext(ctx), sm)
+    return resource.sm.smCount if err == driver.CUresult.CUDA_SUCCESS else None
+
+
+def _get_stream_num_sms(device_index: int, device_num_sms: int) -> int:
+    """SMs available to the current stream's context: a green context or partition can own
+    fewer than the device has. Falls back to the device total."""
+    try:
+        from cuda.bindings import driver
+
+        stream = torch.cuda.current_stream(device_index).cuda_stream
+        err, ctx, green_ctx = driver.cuStreamGetCtx_v2(driver.CUstream(stream))
+        if err != driver.CUresult.CUDA_SUCCESS:
+            return device_num_sms
+        num_sms = _get_context_num_sms(int(ctx), int(green_ctx))
+    except (ImportError, AttributeError):
+        return device_num_sms
+    return min(num_sms, device_num_sms) if num_sms else device_num_sms
+
+
 def get_num_sms_for_selection(device_index: int, arch: int) -> int:
-    """Return the SM count of the matching local GPU or cross-compilation target."""
+    """Return the SM count available to the current stream on the matching local GPU (its
+    green context's partition, if any), or of the cross-compilation target."""
     override = os.getenv("FLASH_ATTENTION_NUM_SMS")
     if override is not None:
         num_sms = int(override)
@@ -60,7 +89,7 @@ def get_num_sms_for_selection(device_index: int, arch: int) -> int:
     if torch.cuda.is_available():
         device_arch, num_sms = _get_device_arch_and_num_sms(device_index)
         if device_arch == arch:
-            return num_sms
+            return _get_stream_num_sms(device_index, num_sms)
     raise RuntimeError(
         "Cannot determine the target GPU's SM count; set FLASH_ATTENTION_NUM_SMS "
         "when cross-compiling without a matching local GPU"

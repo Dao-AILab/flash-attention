@@ -37,6 +37,7 @@ class FlashAttentionForwardCombine:
         log_max_splits: int = 4,
         num_threads: int = 256,
         stages: int = 4,
+        skip_single_split: bool = False,
     ):
         """
         Forward combine kernel for split attention computation.
@@ -51,7 +52,10 @@ class FlashAttentionForwardCombine:
         :param num_threads: number of threads
         :param varlen: whether using variable length sequences
         :param stages: number of pipeline stages
+        :param skip_single_split: batches whose dynamic split count is 1 already hold their
+            output (the attention kernel wrote it directly) and are skipped
         """
+        self.skip_single_split = skip_single_split
         self.dtype = dtype
         self.dtype_partial = dtype_partial
         self.head_dim = head_dim
@@ -430,9 +434,8 @@ class FlashAttentionForwardCombine:
             num_head = mO_partial.shape[3]
             max_idx = seqlen * num_head
 
-            # TODO: early exit for single split if dynamic — for now always merge so the
-            # num_splits_dynamic == 1 case still writes mO from mO_partial[0].
-            if (const_expr(num_splits_dynamic_ptr is None) or num_splits > 0) and (
+            min_splits = 1 if const_expr(self.skip_single_split) else 0
+            if (const_expr(num_splits_dynamic_ptr is None) or num_splits > min_splits) and (
                 const_expr(not varlen) or m_block * self.tile_m < max_idx
             ):
                 # Wait for dependent grids (e.g., the main attention kernel that produces O_partial/LSE_partial)

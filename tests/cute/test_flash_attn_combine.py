@@ -60,6 +60,8 @@ def test_splitkv_forwards_explicit_arch(monkeypatch):
     monkeypatch.setattr(_flash_attn_fwd, "compile_cache", HitCache())
     monkeypatch.setattr(_flash_attn_fwd_combine, "compile_cache", HitCache())
     monkeypatch.setattr(interface, "_get_device_arch", unexpected_arch_query)
+    # The target's SM count, for hosts whose GPU is not the explicit architecture.
+    monkeypatch.setenv("FLASH_ATTENTION_NUM_SMS", "148")
     with FakeTensorMode():
         q = torch.empty(1, 1, 8, 64, device="cuda", dtype=torch.bfloat16)
         k = torch.empty(1, 1024, 8, 64, device="cuda", dtype=torch.bfloat16)
@@ -128,6 +130,38 @@ def test_flash_attn_combine_dynamic_splits_and_semaphore(monkeypatch):
         assert len(cache.cache) == expected_cache_size
         if semaphore_ptr is not None:
             assert semaphore_ptr.item() == 0
+
+
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="Runtime combine optional-input test")
+def test_flash_attn_combine_skip_single_split():
+    """skip_single_split leaves batches with one dynamic split as they are (the attention
+    kernel wrote them) and combines the others."""
+    torch.manual_seed(0)
+    num_splits, batch, seqlen, heads, head_dim = 3, 3, 17, 4, 64
+    out_partial = torch.randn(
+        num_splits, batch, seqlen, heads, head_dim, device="cuda", dtype=torch.float32
+    )
+    lse_partial = torch.randn(
+        num_splits, batch, heads, seqlen, device="cuda", dtype=torch.float32
+    ).transpose(-1, -2)
+    out = torch.full((batch, seqlen, heads, head_dim), 7.0, device="cuda", dtype=torch.bfloat16)
+    lse = torch.full((batch, heads, seqlen), 7.0, device="cuda").transpose(-1, -2)
+    counts = (1, 3, 2)
+    _flash_attn_fwd_combine(
+        out_partial,
+        lse_partial,
+        out,
+        lse,
+        num_splits_dynamic_ptr=torch.tensor(counts, device="cuda", dtype=torch.int32),
+        skip_single_split=True,
+    )
+    assert (out[0] == 7.0).all() and (lse[0] == 7.0).all()
+    for b, count in enumerate(counts):
+        if count > 1:
+            reference = attention_combine_ref(
+                out_partial[:count, b : b + 1], lse_partial[:count, b : b + 1]
+            )
+            check_combine_results(out[b : b + 1], lse[b : b + 1], *reference, torch.bfloat16)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
