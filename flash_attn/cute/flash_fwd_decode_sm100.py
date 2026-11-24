@@ -1276,7 +1276,7 @@ class _SwapABCore:
                 # TODO: with query_len_in_heads = 4 this kernel is still 3-5% slower than without
                 # it (96 heads, GB300); the cause is not found.
                 if cutlass.const_expr(self.query_len_in_heads > 1):
-                    if valid_rows < tile_n + self.query_len_in_heads:
+                    if valid_rows < tile_n + self.query_len_in_heads - 1:
                         # This row's key is hidden from tokens j < hidden_tokens, i.e. from heads
                         # gi < hidden_tokens * heads_per_token.
                         heads_per_token = qhead_per_kvhead // self.query_len_in_heads
