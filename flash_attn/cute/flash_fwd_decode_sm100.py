@@ -234,6 +234,7 @@ class _SwapABCore:
         is_local=False,
         *,
         head_dim_v,
+        query_len_in_heads=1,
     ):
         self.tile_hq = tile_hq
         self.tile_n = tile_n
@@ -250,7 +251,12 @@ class _SwapABCore:
             "mask_mod __vec_size__ must divide 32 or be a multiple of 32"
         )
         self.is_local = is_local
-        self.check_empty_rows = score_mod is not None or mask_mod is not None or is_local
+        self.apply_score_mods = score_mod is not None or mask_mod is not None or is_local
+        # Each KV head's query heads hold query_len_in_heads tokens, token-major (MTP verify rows).
+        # Token j sees keys up to seqlen_k - query_len_in_heads + j, so a split may hide all of a
+        # head's keys, as masking can.
+        self.query_len_in_heads = query_len_in_heads
+        self.check_empty_rows = self.apply_score_mods or query_len_in_heads > 1
 
         assert head_dim > 0 and head_dim % 16 == 0
         assert self.head_dim_v > 0 and self.head_dim_v % 16 == 0
@@ -1268,7 +1274,20 @@ class _SwapABCore:
                     if thr_in_wg + sm * tile_m >= valid_rows:
                         scores_r[None, sm].fill(-Float32.inf)
 
-                if cutlass.const_expr(self.check_empty_rows):
+                if cutlass.const_expr(self.query_len_in_heads > 1):
+                    # This row's key is hidden from tokens j < hidden_tokens, i.e. from heads
+                    # gi < hidden_tokens * heads_per_token. Only the last keys hide from anyone.
+                    heads_per_token = qhead_per_kvhead // self.query_len_in_heads
+                    for sm in cutlass.range_constexpr(num_s_subtiles):
+                        hidden_tokens = (
+                            thr_in_wg + sm * tile_m - valid_rows + self.query_len_in_heads
+                        )
+                        if hidden_tokens > 0:
+                            for gi in cutlass.range_constexpr(tile_hq):
+                                if gi < hidden_tokens * heads_per_token:
+                                    scores_r[gi, sm] = -Float32.inf
+
+                if cutlass.const_expr(self.apply_score_mods):
                     batch_idx = bh_idx // num_heads_kv
                     # score_mod runs on one score per call: a register column holds one KV token
                     # across tile_hq heads, not the consecutive tokens of one head that the
@@ -1680,6 +1699,7 @@ class FlashAttentionForwardSm100SwapAB:
         is_varlen_q: bool = False,
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
+        query_len_in_heads: int = 1,
         *,
         config: FwdConfig,
     ):
@@ -1699,6 +1719,7 @@ class FlashAttentionForwardSm100SwapAB:
         self.mask_mod = mask_mod
         self.tile_hq = config.tile_m
         self.tile_n = config.tile_n
+        self.query_len_in_heads = query_len_in_heads
 
     @cute.jit
     def __call__(
@@ -1798,6 +1819,7 @@ class FlashAttentionForwardSm100SwapAB:
             mask_mod=self.mask_mod,
             is_local=self.is_local,
             head_dim_v=self.head_dim_v,
+            query_len_in_heads=self.query_len_in_heads,
         )
         problem_size = (batch, num_heads, num_heads_kv, seqlen_k)
         # Stock conventions carried through: window sizes as resolved by

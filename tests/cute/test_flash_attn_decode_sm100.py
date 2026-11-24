@@ -4,6 +4,7 @@ Two-pass capable: under FLASH_ATTENTION_FAKE_TENSOR=1 every test issues all of i
 variants and returns before the first data-dependent check.
 """
 
+import math
 import os
 from functools import partial
 
@@ -24,7 +25,7 @@ from decode_test_utils import (
 )
 from flash_attn.cute import interface
 from flash_attn.cute.config import select_fwd_config
-from flash_attn.cute.interface import _flash_attn_fwd, flash_attn_func
+from flash_attn.cute.interface import _flash_attn_fwd, flash_attn_func, TensorwiseScales
 from flash_attn.cute.testing import is_fake_mode, maybe_fake_tensor_mode
 
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
@@ -166,6 +167,70 @@ DENSE_CASES = (
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_dense(dims, dtype, ns):
     check(*decode_inputs(*dims, dtype=dtype), ns=ns)
+
+
+# (dims, GQA ratio, ns): hd256 decode and a 4-token MTP verify group (24 heads per KV head, the
+# 32-head tile), and the other head-dim kernels.
+FP8_CASES = [
+    ((256, 256), 6, 1),
+    ((256, 256), 6, 3),
+    ((256, 256), 24, 3),
+    ((128, 128), 8, 3),
+    ((64, 64), 3, 1),
+]
+
+
+@pytest.mark.parametrize(
+    "dims,ratio,ns",
+    [pytest.param(d, r, n, id=f"hd{d[0]}-gqa{r}-ns{n}") for d, r, n in FP8_CASES],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_fp8(dims, ratio, ns):
+    """E4M3 Q/K/V with per-(batch, KV head) descales vs the fp32 oracle on the dequantized inputs.
+
+    The error baseline rounds P to e4m3 as the kernel does: exp(S - max) * 2^8, so P <= 256.
+    """
+    q, k, v = decode_inputs(*dims, ratio=ratio, length=1537)
+    descales = [torch.rand(2, 2, device="cuda") + 0.5 for _ in range(3)]  # (batch, KV heads)
+    per_head = [descales[0].repeat_interleave(ratio, dim=1)[:, None, :, None]] + [
+        d[:, None, :, None] for d in descales[1:]
+    ]
+    q8, k8, v8 = ((x / d).to(torch.float8_e4m3fn) for x, d in zip((q, k, v), per_head))
+    o, lse, *_ = _flash_attn_fwd(
+        q8, k8, v8, num_splits=ns, return_lse=True, scales=TensorwiseScales(*descales)
+    )
+    if is_fake_mode():
+        return
+    q_ref, k_ref, v_ref = (x.float() * d for x, d in zip((q8, k8, v8), per_head))
+    ref = decode_reference(q_ref, k_ref, v_ref)
+    scores = torch.einsum(
+        "bqhd,bkhd->bhqk", q_ref, k_ref.repeat_interleave(ratio, dim=2)
+    ) / math.sqrt(dims[0])
+    p = torch.exp(scores - scores.amax(-1, keepdim=True))
+    p_e4m3 = (p * 256).to(torch.float8_e4m3fn).float() / 256
+    out_pt = torch.einsum(
+        "bhqk,bkhd->bqhd", p_e4m3, v_ref.repeat_interleave(ratio, dim=2)
+    ) / p.sum(-1).transpose(1, 2)[..., None]
+    assert_decode_close(o, lse, ref._replace(out_pt=out_pt))
+
+
+@pytest.mark.parametrize("ns", [1, 3])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_query_len_in_heads(ns):
+    """4 query tokens of a 6-head GQA group as 24 heads per KV head: token j sees keys
+    < length - 3 + j. With 3 splits the last split holds only the last 3 keys, all hidden from
+    token 0 (its heads get an empty split)."""
+    query_len, group, length = 4, 6, 4 * 256 + 3
+    q, k, v = decode_inputs(256, 256, ratio=query_len * group, length=length)
+    o, lse, *_ = _flash_attn_fwd(
+        q, k, v, num_splits=ns, return_lse=True, query_len_in_heads=query_len
+    )
+    if is_fake_mode():
+        return
+    token = torch.arange(q.shape[2], device="cuda") % (query_len * group) // group
+    keep = torch.arange(length, device="cuda")[None, :] < length - query_len + 1 + token[:, None]
+    ref = decode_reference(q, k, v, keep=keep.expand(q.shape[0], -1, -1))
+    assert_decode_close(o, lse, ref)
 
 
 @pytest.mark.parametrize(
