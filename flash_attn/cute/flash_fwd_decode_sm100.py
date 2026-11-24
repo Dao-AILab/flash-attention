@@ -1274,18 +1274,21 @@ class _SwapABCore:
                     if thr_in_wg + sm * tile_m >= valid_rows:
                         scores_r[None, sm].fill(-Float32.inf)
 
+                # Only the last query_len_in_heads - 1 keys hide from some tokens: a CTA-uniform
+                # branch skips the other blocks.
                 if cutlass.const_expr(self.query_len_in_heads > 1):
-                    # This row's key is hidden from tokens j < hidden_tokens, i.e. from heads
-                    # gi < hidden_tokens * heads_per_token. Only the last keys hide from anyone.
-                    heads_per_token = qhead_per_kvhead // self.query_len_in_heads
-                    for sm in cutlass.range_constexpr(num_s_subtiles):
-                        hidden_tokens = (
-                            thr_in_wg + sm * tile_m - valid_rows + self.query_len_in_heads
-                        )
-                        if hidden_tokens > 0:
-                            for gi in cutlass.range_constexpr(tile_hq):
-                                if gi < hidden_tokens * heads_per_token:
-                                    scores_r[gi, sm] = -Float32.inf
+                    if valid_rows < tile_n + self.query_len_in_heads:
+                        # This row's key is hidden from tokens j < hidden_tokens, i.e. from heads
+                        # gi < hidden_tokens * heads_per_token.
+                        heads_per_token = qhead_per_kvhead // self.query_len_in_heads
+                        for sm in cutlass.range_constexpr(num_s_subtiles):
+                            hidden_tokens = (
+                                thr_in_wg + sm * tile_m - valid_rows + self.query_len_in_heads
+                            )
+                            if hidden_tokens > 0:
+                                for gi in cutlass.range_constexpr(tile_hq):
+                                    if gi < hidden_tokens * heads_per_token:
+                                        scores_r[gi, sm] = -Float32.inf
 
                 if cutlass.const_expr(self.apply_score_mods):
                     batch_idx = bh_idx // num_heads_kv
@@ -1375,11 +1378,18 @@ class _SwapABCore:
                 # the PV MMA.
                 pipeline_p.producer_acquire(p_state, p_token)
 
-                if cutlass.const_expr(self.check_empty_rows):
+                if cutlass.const_expr(self.apply_score_mods):
                     # Only the local exponent bias is zeroed; shared final maxima stay -inf.
                     for gi in cutlass.range_constexpr(tile_hq):
                         if row_max_valid[gi] == -Float32.inf:
                             row_max_valid[gi] = Float32(0.0)
+                elif cutlass.const_expr(self.check_empty_rows):
+                    # Hidden keys alone leave a head no key only in a split whose first block
+                    # holds fewer than query_len_in_heads keys.
+                    if (s == 0) & (valid_rows < self.query_len_in_heads):
+                        for gi in cutlass.range_constexpr(tile_hq):
+                            if row_max_valid[gi] == -Float32.inf:
+                                row_max_valid[gi] = Float32(0.0)
                 row_max_tile = row_max_valid.load().reshape((tile_hq, 1))
                 if cutlass.const_expr(self.max_offset != 0):
                     row_max_tile = row_max_tile - Float32(self.max_offset)
