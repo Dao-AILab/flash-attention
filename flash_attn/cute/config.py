@@ -1296,7 +1296,8 @@ class SwapABPolicy:
             "varlen Q needs max_seqlen_q == 1": not is_dense_q
             and not (inputs.has_max_seqlen_q_hint and inputs.max_seqlen_q == 1),
             "single query token per sequence": is_dense_q and inputs.total_q != inputs.batch_size,
-            # TODO: e5m2 needs only a test; the kernel's FP8 path is not e4m3-specific.
+            # TODO: e5m2: admit it here and in the SwapAB adapter's dtype assert, with a test; the
+            # kernel's FP8 math is not e4m3-specific.
             "dtype": inputs.dtype not in ("torch.float16", "torch.bfloat16", "torch.float8_e4m3fn"),
             "MXFP8 block scales": inputs.mxfp8_path is not None,
             "head dimensions": not self.supports_head_dims(inputs.head_dim, inputs.head_dim_v),

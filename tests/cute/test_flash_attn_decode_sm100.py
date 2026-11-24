@@ -216,7 +216,9 @@ def test_fp8(dims, ratio, ns):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "e4m3"])
 @pytest.mark.parametrize(
-    "length", [4 * 256 + 3, 4 * 256 + 1], ids=["hidden-in-last-block", "hidden-across-blocks"]
+    "length",
+    [4 * 256 + 3, 4 * 256 + 2, 4 * 256 + 1],
+    ids=["hidden-in-last-block", "one-hidden-key-in-earlier-block", "hidden-across-blocks"],
 )
 @pytest.mark.parametrize("ns", [1, 3])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
@@ -226,6 +228,7 @@ def test_query_len_in_heads(ns, length, dtype):
     get an empty split).
 
         length 4 * 256 + 3: hidden keys 1024-1026, all in the last 256-key block
+        length 4 * 256 + 2: hidden keys 1023-1025, only key 1023 in block 3
         length 4 * 256 + 1: hidden keys 1022-1024, across blocks 3 and 4
     """
     query_len, group = 4, 6
@@ -750,6 +753,30 @@ def test_varlen_paged_decode(ns):
     if is_fake_mode():
         return
     ref = decode_reference(q, k, v, page_table=table, seqused=used)
+    ref = ref._replace(out=ref.out[rows], lse=ref.lse[rows], out_pt=ref.out_pt[rows])
+    assert_decode_close(out[:3, None], lse[:, :3].T[:, :, None], ref)
+    assert torch.all(out[3] == 7.0)
+
+
+@pytest.mark.parametrize("ns", [1, 3])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_query_len_in_heads_varlen_paged(ns):
+    """query_len_in_heads in a serving layout (varlen Q, 128-token pages, seqused_k): 4 tokens of
+    a 2-head GQA group as 8 heads per KV head, token j sees keys < seqused_k - 3 + j."""
+    query_len, group = 4, 2
+    q, q_var, k, v, table, used, cu, rows = varlen_paged_inputs()
+    out = torch.full_like(q_var, 7.0)
+    _, lse, *_ = _flash_attn_fwd(
+        q_var, k, v, cu_seqlens_q=cu, max_seqlen_q=1, page_table=table, seqused_k=used,
+        num_splits=ns, out=out, return_lse=True, query_len_in_heads=query_len,
+    )
+    if is_fake_mode():
+        return
+    token = torch.arange(q.shape[2], device="cuda") % (query_len * group) // group
+    capacity = table.shape[1] * k.shape[1]
+    last_seen_key = used[:, None, None] - query_len + token[None, :, None]
+    keep = torch.arange(capacity, device="cuda")[None, None, :] <= last_seen_key
+    ref = decode_reference(q, k, v, page_table=table, seqused=used, keep=keep)
     ref = ref._replace(out=ref.out[rows], lse=ref.lse[rows], out_pt=ref.out_pt[rows])
     assert_decode_close(out[:3, None], lse[:, :3].T[:, :, None], ref)
     assert torch.all(out[3] == 7.0)
