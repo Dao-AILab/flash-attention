@@ -8,6 +8,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cmath>
+#include <limits>
 #ifndef FLASHATTENTION_DISABLE_DROPOUT
 #include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::PhiloxCudaState / at::CUDAGeneratorImpl (default-generator dropout path)
 #include "philox_unpack.cuh"  // For at::cuda::philox::unpack
@@ -138,6 +140,13 @@ void set_params_fprop(Flash_fwd_params &params,
         params.scale_softmax = softmax_scale;
         params.scale_softmax_log2 = softmax_scale * M_LOG2E;
     }
+    // Masked scores are -inf, and --use_fast_math flushes a subnormal scale to zero.
+    TORCH_CHECK(
+        std::isfinite(params.scale_softmax_log2)
+            && params.scale_softmax_log2 >= std::numeric_limits<float>::min(),
+        "softmax_scale (or softcap when softcap > 0) must produce a finite positive normal "
+        "scale_softmax_log2; softmax_scale (or softcap) must be >= 2^-126 * ln(2) "
+        "(about 8.15e-39) because the kernels use --use_fast_math and masked scores use -inf");
 
     // Set this to probability of keeping an element to simplify things.
     params.p_dropout = 1.f - p_dropout;

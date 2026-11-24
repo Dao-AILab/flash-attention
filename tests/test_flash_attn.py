@@ -2887,6 +2887,18 @@ def test_flash_attn_generator_arg_must_be_none():
                                   seqlen, seqlen, 0.0, scale, False, True, -1, -1, 0.0, False, bad, None)
 
 
+@pytest.mark.skipif(USE_TRITON_ROCM, reason="scale validation is only in the CUDA extension")
+@pytest.mark.parametrize("softmax_scale", [0.0, -1.0, 1e-39, float("inf"), float("nan")])
+def test_flash_attn_rejects_invalid_softmax_scale(softmax_scale):
+    q, k, v = (
+        torch.randn(1, 100, 1, 64, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+
+    with pytest.raises(RuntimeError, match="must produce a finite positive normal"):
+        flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=True)
+
+
 def _skip_if_free_memory_below(gib):
     free, _ = torch.cuda.mem_get_info()
     if free < gib * 2**30:
