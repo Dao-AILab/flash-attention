@@ -32,7 +32,7 @@ from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.config import FwdConfig
 from flash_attn.cute.compat import SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
+from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, FlashAttentionForwardSm100
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100SwapAB
 from flash_attn.cute.pipeline import NamedBarrier
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, TileSchedulerArguments
@@ -727,17 +727,12 @@ class _SwapABCore:
             num_n_blocks = num_n_blocks if has_q else Int32(0)
         q_bh_idx = q_row * num_heads_kv + bh_idx % num_heads_kv
 
-        # FP8 descales of this sequence and KV head: q and k fold into the softmax scale, v into 1 / L.
-        v_descale = Float32(1.0)
+        # FP8 descales of this sequence and KV head: q and k fold into the softmax scale, v scales
+        # the final O.
+        qk_descale, v_descale = FlashAttentionForwardSm100._load_effective_descales(
+            descale_tensors, bh_idx // num_heads_kv, bh_idx % num_heads_kv
+        )
         if const_expr(descale_tensors is not None):
-            descale_idx = (bh_idx // num_heads_kv, bh_idx % num_heads_kv)
-            qk_descale = Float32(1.0)
-            if const_expr(descale_tensors.q_descale is not None):
-                qk_descale *= Float32(descale_tensors.q_descale[descale_idx])
-            if const_expr(descale_tensors.k_descale is not None):
-                qk_descale *= Float32(descale_tensors.k_descale[descale_idx])
-            if const_expr(descale_tensors.v_descale is not None):
-                v_descale = Float32(descale_tensors.v_descale[descale_idx])
             if const_expr(self.score_mod is None):
                 softmax_scale_log2 = softmax_scale_log2 * qk_descale
             else:
