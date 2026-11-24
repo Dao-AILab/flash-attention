@@ -268,6 +268,25 @@ def test_query_len_in_heads(ns, length, dtype):
 
 
 @pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        pytest.param(dict(query_len_in_heads=4), "must divide", id="heads-not-divisible"),
+        pytest.param(dict(window_size_left=31), "takes no local window", id="local"),
+        pytest.param(dict(mask_mod=keep_every_third), "takes no local window", id="mask_mod"),
+        pytest.param(dict(score_mod=batch_bias), "takes no local window", id="score_mod"),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_query_len_in_heads_rejects(kwargs, match):
+    """query_len_in_heads raises when it does not divide the query heads per KV head (6 heads,
+    n = 4), or with a local window or modifier, which would see the last token's position."""
+    q, k, v = decode_inputs(ratio=6)
+    kwargs = {"query_len_in_heads": 3, **kwargs}
+    with pytest.raises(ValueError, match=match):
+        _flash_attn_fwd(q, k, v, **kwargs)
+
+
+@pytest.mark.parametrize(
     "ratio,length,ns",
     [
         (1, 1, 1),

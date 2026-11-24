@@ -675,8 +675,10 @@ def _flash_attn_fwd(
             BlockScales). BlockScales give BF16 output and support only dense, unsplit,
             forward-only attention. BlockScales.v selects native MXFP8 PV with e4m3 V, which
             is also nonlocal and unmodified; causal native PV also needs BlockScales.v_bf16.
-        query_len_in_heads: SwapAB decode only: each KV head's query heads hold this many query
-            tokens of the sequence, token-major, and token j sees keys up to seqused_k - n + j.
+        query_len_in_heads: SwapAB decode only: each KV head's query heads hold n =
+            query_len_in_heads query tokens of the sequence, token-major, and token j sees keys
+            up to seqused_k - n + j. n must divide the query heads per KV head, and takes no
+            local window, score_mod or mask_mod.
             Example, n = 4 tokens of a 6-head GQA group: q holds 24 heads per KV head,
             heads 0-5 token 0 (keys < seqused_k - 3), ..., heads 18-23 token 3 (every key).
         config: Fully resolved forward config, or None for the default: an MlaFwdConfig with qv,
@@ -963,11 +965,28 @@ def _flash_attn_fwd(
     mla_1cta = mla_kernel in ("1cta", "1cta_kb64")
     mla_1cta_kb64 = mla_kernel == "1cta_kb64"
     use_swapab = mla_kernel is None and config.use_swapab
-    if query_len_in_heads > 1 and not use_swapab:
-        raise ValueError(
-            f"query_len_in_heads={query_len_in_heads} needs the SwapAB decode kernel, but the "
-            f"config selects another: {config}"
-        )
+    if query_len_in_heads > 1:
+        if qhead_per_kvhead % query_len_in_heads != 0:
+            raise ValueError(
+                f"query_len_in_heads={query_len_in_heads} must divide the query heads per KV "
+                f"head: {num_head} // {num_head_kv} = {qhead_per_kvhead}"
+            )
+
+        # The window and the modifiers see the decode query's position (q_idx 0) for every
+        # packed token, so each token would get the last token's window or mask.
+        if local or score_mod is not None or mask_mod is not None:
+            raise ValueError(
+                f"query_len_in_heads={query_len_in_heads} takes no local window, score_mod or "
+                f"mask_mod, got window ({window_size_left}, {window_size_right}), "
+                f"score_mod={score_mod}, mask_mod={mask_mod}"
+            )
+
+        if not use_swapab:
+            raise ValueError(
+                f"query_len_in_heads={query_len_in_heads} needs the SwapAB decode kernel, but "
+                f"the config selects another: {config}"
+            )
+
     prepare_split_metadata = mla_kernel is None and needs_split_metadata(config, inputs)
     use_dynamic_varlen = (
         mla_kernel is None and config.use_dynamic_varlen and scheduler_metadata is None
