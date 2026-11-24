@@ -751,8 +751,13 @@ class ParallelMHA(nn.Module):
             self.num_heads % self.num_heads_kv == 0
         ), "num_heads must be divisible by num_heads_kv"
 
+        # Partition complete KV groups, including all Q heads that share each KV head.
+        # Leave the existing layout for TP > num_heads_kv unchanged.
+        q_head_multiple = (
+            self.num_heads // self.num_heads_kv if self.num_heads_kv >= self.world_size else 1
+        )
         self.num_heads_per_rank = get_dim_for_local_rank(
-            self.num_heads, self.world_size, self.local_rank
+            self.num_heads, self.world_size, self.local_rank, multiple_of=q_head_multiple
         )
         self.num_heads_kv_per_rank = get_dim_for_local_rank(
             self.num_heads_kv, self.world_size, self.local_rank
@@ -762,11 +767,14 @@ class ParallelMHA(nn.Module):
 
         if use_alibi:
             assert use_flash_attn, "ALiBi code path requires flash_attn"
-            num_heads_local = math.ceil(self.num_heads / self.world_size)
+            head_start = sum(
+                get_dim_for_local_rank(
+                    self.num_heads, self.world_size, rank, multiple_of=q_head_multiple
+                )
+                for rank in range(self.local_rank)
+            )
             alibi_slopes = torch.tensor(
-                get_alibi_slopes(num_heads)[
-                    self.local_rank * num_heads_local : (self.local_rank + 1) * num_heads_local
-                ],
+                get_alibi_slopes(num_heads)[head_start : head_start + self.num_heads_per_rank],
                 device=device,
             )
         else:
@@ -817,7 +825,7 @@ class ParallelMHA(nn.Module):
             process_group,
             bias=out_proj_bias,
             sequence_parallel=sequence_parallel,
-            multiple_of=self.head_dim,
+            multiple_of=self.head_dim * q_head_multiple,
             **factory_kwargs,
         )
 

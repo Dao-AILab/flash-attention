@@ -710,6 +710,8 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
 
     n_head = config.n_head
     n_head_kv = getattr(config, "n_head_kv", n_head)
+    # Keep each KV head's Q heads together; preserve the layout for TP > n_head_kv.
+    q_head_multiple = n_head // n_head_kv if n_head_kv >= world_size else 1
 
     embed_dim = config.hidden_size
     head_dim = embed_dim // n_head
@@ -742,7 +744,9 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
     def shard_qkv_headdim(state_dict, key):
         if key in state_dict:
             n_head_each_rank = [
-                get_dim_for_local_rank(n_head, world_size, local_rank)
+                get_dim_for_local_rank(
+                    n_head, world_size, local_rank, multiple_of=q_head_multiple
+                )
                 for local_rank in range(world_size)
             ]
             n_head_kv_each_rank = [
@@ -795,7 +799,9 @@ def shard_state_dict_tp(state_dict, config, world_size, rank):
         shard_qkv_headdim(state_dict, f"transformer.layers.{i}.mixer.Wqkv.weight")
         shard_qkv_headdim(state_dict, f"transformer.layers.{i}.mixer.Wqkv.bias")
         shard_last_dim(
-            state_dict, f"transformer.layers.{i}.mixer.out_proj.weight", multiple_of=head_dim
+            state_dict,
+            f"transformer.layers.{i}.mixer.out_proj.weight",
+            multiple_of=head_dim * q_head_multiple,
         )
         if rank != 0:
             state_dict.pop(f"transformer.layers.{i}.mixer.out_proj.bias", None)
@@ -851,14 +857,17 @@ def combine_state_dicts_tp(state_dicts: List[Dict[str, torch.Tensor]], config: G
                 ]
                 state_dict[key] = rearrange(torch.cat(xs, dim=1), "three d ... -> (three d) ...")
             else:
-                n_head_each_rank = [
-                    get_dim_for_local_rank(n_head, world_size, local_rank)
-                    for local_rank in range(world_size)
-                ]
                 n_head_kv_each_rank = [
                     get_dim_for_local_rank(n_head_kv, world_size, local_rank)
                     for local_rank in range(world_size)
                 ]
+                # Infer Q counts from each tensor to support both legacy and KV-group shards.
+                n_head_each_rank = [
+                    s[key].shape[0] // headdim - 2 * rank_n_head_kv
+                    for s, rank_n_head_kv in zip(state_dicts, n_head_kv_each_rank)
+                ]
+                if sum(n_head_each_rank) != n_head:
+                    raise ValueError(f"Expected {n_head} query heads across shards of {key}")
                 xs = [
                     rearrange(
                         s[key],
