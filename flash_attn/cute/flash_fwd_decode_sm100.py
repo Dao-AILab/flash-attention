@@ -9,6 +9,8 @@
 # prepare-scheduler kernel), split CTAs past their sequence's count exit without writing.
 # One CTA = 16 warps: 0 QK MMA, 1 PV MMA, 2 K/V load + final statistics,
 # 3 Q load + O store, WGs 1/2 alternating softmax, WG3 O correction.
+# FP8 (e4m3) Q/K/V run both MMAs in e4m3 with the standard kernel's tensorwise descales, and P is
+# cast to e4m3 scaled by 2^max_offset (Note [Low Precision Scaling] in flash_fwd_sm100.py).
 
 import math
 from functools import partial
@@ -239,6 +241,8 @@ class _SwapABCore:
         self.head_dim_v = head_dim_v
         self.dtype = dtype
         self.qk_acc_dtype = cutlass.Float32
+        # FP8 P = exp2(S - M + max_offset) <= 2^8, below e4m3's max of 448 (the running max is exact).
+        self.max_offset = 8 if dtype.width == 8 else 0
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.mask_vec_size = getattr(mask_mod, "__vec_size__", 1)
@@ -321,6 +325,7 @@ class _SwapABCore:
         mCuSeqlensQ: cute.Tensor | None = None,
         mNumSplitsDynamic: cute.Tensor | None = None,  # (batch,) int32: splits per sequence
         tensormap_workspace: cute.Tensor | None = None,  # (num_ctas, 16) Int64 (ragged V only)
+        descale_tensors: DescaleTensors | None = None,  # FP8: (batch, num_heads_kv) fp32 each
     ):
         hdim = self.head_dim
         hdim_v = self.head_dim_v
@@ -352,7 +357,8 @@ class _SwapABCore:
         # accumulator layout. The K-step is 64 for both GEMMs so that a K tile (128 tokens x 64 dims)
         # and a V^T tile (128 dims x 64 tokens) have the same size and can share one SMEM ring.
         tile_m = 128
-        tile_hq_mma = max(MMA_N_MIN, tile_hq)
+        # tcgen05 takes an MN-major 8-bit B operand (P^T in the PV MMA) only with N % 16 == 0.
+        tile_hq_mma = max(2 * MMA_N_MIN if self.dtype.width == 8 else MMA_N_MIN, tile_hq)
         tile_k = 64
         assert tile_hq_mma % tile_hq == 0
         num_s_subtiles = cute.ceil_div(tile_n, tile_m)
@@ -521,6 +527,7 @@ class _SwapABCore:
             tile_sched_params,
             mVt_pv if const_expr(self.ragged_tma_V) else None,
             tensormap_workspace if const_expr(self.ragged_tma_V) else None,
+            descale_tensors,
         ).launch(
             grid=grid,
             block=(NUM_WG * WG_SIZE, 1, 1),
@@ -564,6 +571,7 @@ class _SwapABCore:
         tile_sched_params: SingleTileScheduler.Params,
         mV_gmem: cute.Tensor | None,
         tensormap_workspace: cute.Tensor | None,
+        descale_tensors: DescaleTensors | None,
     ):
         if const_expr(self.num_splits_dynamic):
             cute.arch.griddepcontrol_wait()  # the split counts
@@ -620,6 +628,7 @@ class _SwapABCore:
                 tile_sched_params.num_splits,
                 mV_gmem,
                 tensormap_workspace,
+                descale_tensors,
             )
 
     @cute.jit
@@ -655,6 +664,7 @@ class _SwapABCore:
         num_splits: Int32,
         mV_gmem: cute.Tensor | None,
         tensormap_workspace: cute.Tensor | None,
+        descale_tensors: DescaleTensors | None,
     ):
         """One split CTA: its contiguous KV block range (BlockInfo) of sequence bh_idx."""
         # Warp roles (see header): WG0 = MMA + TMA warps, WG1 / WG2 = softmax for even / odd KV blocks,
@@ -708,6 +718,22 @@ class _SwapABCore:
             q_row = seqlen_info.offset_q if has_q else num_q_rows
             num_n_blocks = num_n_blocks if has_q else Int32(0)
         q_bh_idx = q_row * num_heads_kv + bh_idx % num_heads_kv
+
+        # FP8 descales of this sequence and KV head: q and k fold into the softmax scale, v into 1 / L.
+        v_descale = Float32(1.0)
+        if const_expr(descale_tensors is not None):
+            descale_idx = (bh_idx // num_heads_kv, bh_idx % num_heads_kv)
+            qk_descale = Float32(1.0)
+            if const_expr(descale_tensors.q_descale is not None):
+                qk_descale *= Float32(descale_tensors.q_descale[descale_idx])
+            if const_expr(descale_tensors.k_descale is not None):
+                qk_descale *= Float32(descale_tensors.k_descale[descale_idx])
+            if const_expr(descale_tensors.v_descale is not None):
+                v_descale = Float32(descale_tensors.v_descale[descale_idx])
+            if const_expr(self.score_mod is None):
+                softmax_scale_log2 = softmax_scale_log2 * qk_descale
+            else:
+                softmax_scale = softmax_scale * qk_descale
 
         mma_tiler = self.mma_tiler
         tile_m, tile_hq_mma, tile_k = self.mma_tiler
@@ -1326,7 +1352,8 @@ class _SwapABCore:
                 cute.autovec_copy(sRowMax, row_max_r)
                 bar_max_turn.arrive_w_index(phase ^ 1)
 
-                # P = exp2(S * scale * log2(e) - M(j)) in bf16 / fp16 into SMEM for the PV MMA.
+                # P = exp2(S * scale * log2(e) - M(j) + max_offset) in the input dtype into SMEM for
+                # the PV MMA.
                 pipeline_p.producer_acquire(p_state, p_token)
 
                 if cutlass.const_expr(self.check_empty_rows):
@@ -1335,6 +1362,8 @@ class _SwapABCore:
                         if row_max_valid[gi] == -Float32.inf:
                             row_max_valid[gi] = Float32(0.0)
                 row_max_tile = row_max_valid.load().reshape((tile_hq, 1))
+                if cutlass.const_expr(self.max_offset != 0):
+                    row_max_tile = row_max_tile - Float32(self.max_offset)
                 probs = exp2_fast(softmax_scale_log2 * scores - row_max_tile)
 
                 if cutlass.const_expr(tile_hq < tile_hq_mma):
@@ -1533,6 +1562,8 @@ class _SwapABCore:
             tOrO_tail1 = tOrO_tail1.reshape((vec_size, num_d_tiles))
             tOrO_final = tOrO_tail1 + acc_scale.load().reshape((vec_size, 1)) * tOrO_tail0
             tOrO_final *= tLrL.load().reshape((vec_size, 1))
+            if cutlass.const_expr(descale_tensors is not None):
+                tOrO_final *= v_descale
             if cutlass.const_expr(self.check_empty_rows):
                 # Select real zeros for fully masked heads, never rely on 0 * NaN.
                 normalized = cute.make_rmem_tensor(
@@ -1563,6 +1594,7 @@ class _SwapABCore:
                 sRowMax,
                 sRowSumWarp,
                 mLSE_partial,
+                max_offset=self.max_offset,
             )
 
         # Free TMEM once every role is done with it.
@@ -1582,6 +1614,7 @@ class _SwapABCore:
         sRowMax: cute.Tensor,
         sRowSumWarp: cute.Tensor,
         mLSE_partial: cute.Tensor | None,
+        max_offset: cutlass.Constexpr[int] = 0,
     ):
         split_id, bh_idx = block_idx
         lane_owns_head = lane_idx < tile_hq
@@ -1605,9 +1638,10 @@ class _SwapABCore:
                 if lane_idx < mLSE_partial.shape[1]:
                     lse = -Float32.inf
                     if row_sum > Float32(0.0):
-                        lse = (row_max_lane + cute.math.log2(row_sum, fastmath=True)) * math.log(
-                            2.0
-                        )
+                        log2_sum = cute.math.log2(row_sum, fastmath=True)
+                        if cutlass.const_expr(max_offset != 0):
+                            log2_sum -= Float32(max_offset)
+                        lse = (row_max_lane + log2_sum) * math.log(2.0)
                     num_heads_kv = mLSE_partial.shape[2][0]
                     bh_coord = (bh_idx % num_heads_kv, bh_idx // num_heads_kv)
                     if bh_coord[1] < mLSE_partial.shape[2][1]:
@@ -1704,7 +1738,6 @@ class FlashAttentionForwardSm100SwapAB:
             mCuSeqlensK,
             mSeqUsedQ,
             learnable_sink,
-            descale_tensors,
             blocksparse_tensors,
             tile_count_semaphore,
             virtual_batch_idx_ptr,
@@ -1716,10 +1749,12 @@ class FlashAttentionForwardSm100SwapAB:
             assert value is None, "swap-AB adapter: unsupported argument"
         assert len(mQ.shape) == (3 if self.is_varlen_q else 4)
         assert len(mK.shape) == 4 and len(mV.shape) == 4
-        assert mQ.element_type in (cutlass.Float16, cutlass.BFloat16)
+        assert mQ.element_type in (cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN)
         assert mQ.element_type == mK.element_type == mV.element_type
+        is_fp8 = mQ.element_type.width == 8
+        assert descale_tensors is None or is_fp8
         if const_expr(not self.is_split_kv):
-            assert mO.element_type == mQ.element_type
+            assert mO.element_type == (cutlass.BFloat16 if is_fp8 else mQ.element_type)
             assert num_splits_dynamic_ptr is None
         if const_expr(mLSE is not None):
             assert mLSE.element_type == Float32
@@ -1785,4 +1820,5 @@ class FlashAttentionForwardSm100SwapAB:
             mCuSeqlensQ,
             num_splits_dynamic_ptr,
             tensormap_workspace,
+            descale_tensors,
         )

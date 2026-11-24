@@ -1296,7 +1296,8 @@ class SwapABPolicy:
             "varlen Q needs max_seqlen_q == 1": not is_dense_q
             and not (inputs.has_max_seqlen_q_hint and inputs.max_seqlen_q == 1),
             "single query token per sequence": is_dense_q and inputs.total_q != inputs.batch_size,
-            "dtype": inputs.dtype not in ("torch.float16", "torch.bfloat16"),
+            # TODO: e5m2 needs only a test; the kernel's FP8 path is not e4m3-specific.
+            "dtype": inputs.dtype not in ("torch.float16", "torch.bfloat16", "torch.float8_e4m3fn"),
             "MXFP8 block scales": inputs.mxfp8_path is not None,
             "head dimensions": not self.supports_head_dims(inputs.head_dim, inputs.head_dim_v),
             "GQA ratio": inputs.qhead_per_kvhead > self.max_qhead_per_kvhead,
