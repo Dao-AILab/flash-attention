@@ -214,23 +214,57 @@ def test_fp8(dims, ratio, ns):
     assert_decode_close(o, lse, ref._replace(out_pt=out_pt))
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "e4m3"])
+@pytest.mark.parametrize(
+    "length", [4 * 256 + 3, 4 * 256 + 1], ids=["hidden-in-last-block", "hidden-across-blocks"]
+)
 @pytest.mark.parametrize("ns", [1, 3])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_query_len_in_heads(ns):
+def test_query_len_in_heads(ns, length, dtype):
     """4 query tokens of a 6-head GQA group as 24 heads per KV head: token j sees keys
-    < length - 3 + j. With 3 splits the last split holds only the last 3 keys, all hidden from
-    token 0 (its heads get an empty split)."""
-    query_len, group, length = 4, 6, 4 * 256 + 3
-    q, k, v = decode_inputs(256, 256, ratio=query_len * group, length=length)
+    < length - 3 + j. With 3 splits the last split holds only keys hidden from token 0 (its heads
+    get an empty split).
+
+        length 4 * 256 + 3: hidden keys 1024-1026, all in the last 256-key block
+        length 4 * 256 + 1: hidden keys 1022-1024, across blocks 3 and 4
+    """
+    query_len, group = 4, 6
+    ratio = query_len * group
+    q, k, v = decode_inputs(256, 256, ratio=ratio, length=length)
+    scales = None
+    if dtype == torch.float8_e4m3fn:
+        descales = [torch.rand(2, 2, device="cuda") + 0.5 for _ in range(3)]  # (batch, KV heads)
+        per_head = [descales[0].repeat_interleave(ratio, dim=1)[:, None, :, None]] + [
+            d[:, None, :, None] for d in descales[1:]
+        ]
+        q, k, v = ((x / d).to(dtype) for x, d in zip((q, k, v), per_head))
+        scales = TensorwiseScales(*descales)
     o, lse, *_ = _flash_attn_fwd(
-        q, k, v, num_splits=ns, return_lse=True, query_len_in_heads=query_len
+        q, k, v, num_splits=ns, return_lse=True, query_len_in_heads=query_len, scales=scales
     )
     if is_fake_mode():
         return
-    token = torch.arange(q.shape[2], device="cuda") % (query_len * group) // group
+    token = torch.arange(q.shape[2], device="cuda") % ratio // group
     keep = torch.arange(length, device="cuda")[None, :] < length - query_len + 1 + token[:, None]
-    ref = decode_reference(q, k, v, keep=keep.expand(q.shape[0], -1, -1))
-    assert_decode_close(o, lse, ref)
+    keep = keep.expand(q.shape[0], -1, -1)
+    if scales is None:
+        assert_decode_close(o, lse, decode_reference(q, k, v, keep=keep))
+        return
+
+    # e4m3: the oracle runs on the dequantized inputs; the error baseline rounds P to e4m3 as the
+    # kernel does (test_fp8).
+    q_ref, k_ref, v_ref = (x.float() * d for x, d in zip((q, k, v), per_head))
+    ref = decode_reference(q_ref, k_ref, v_ref, keep=keep)
+    scores = torch.einsum(
+        "bqhd,bkhd->bhqk", q_ref, k_ref.repeat_interleave(ratio, dim=2)
+    ) / math.sqrt(256)
+    scores = scores.masked_fill(~keep[:, :, None, :], -math.inf)
+    p = torch.exp(scores - scores.amax(-1, keepdim=True))
+    p_e4m3 = (p * 256).to(torch.float8_e4m3fn).float() / 256
+    out_pt = torch.einsum(
+        "bhqk,bkhd->bqhd", p_e4m3, v_ref.repeat_interleave(ratio, dim=2)
+    ) / p.sum(-1).transpose(1, 2)[..., None]
+    assert_decode_close(o, lse, ref._replace(out_pt=out_pt))
 
 
 @pytest.mark.parametrize(
