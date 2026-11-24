@@ -364,6 +364,8 @@ class _SwapABCore:
         # and a V^T tile (128 dims x 64 tokens) have the same size and can share one SMEM ring.
         tile_m = 128
         # tcgen05 takes an MN-major 8-bit B operand (P^T in the PV MMA) only with N % 16 == 0.
+        # TODO: a K-major P^T store would keep N = 8 for 8-head FP8 tiles; the P store view needs
+        # rework.
         tile_hq_mma = max(2 * MMA_N_MIN if self.dtype.width == 8 else MMA_N_MIN, tile_hq)
         tile_k = 64
         assert tile_hq_mma % tile_hq == 0
@@ -1276,6 +1278,8 @@ class _SwapABCore:
 
                 # Only the last query_len_in_heads - 1 keys hide from some tokens: a CTA-uniform
                 # branch skips the other blocks.
+                # TODO: with query_len_in_heads = 4 this kernel is still 3-5% slower than without
+                # it (96 heads, GB300); the cause is not found.
                 if cutlass.const_expr(self.query_len_in_heads > 1):
                     if valid_rows < tile_n + self.query_len_in_heads:
                         # This row's key is hidden from tokens j < hidden_tokens, i.e. from heads
