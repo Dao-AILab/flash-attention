@@ -424,6 +424,19 @@ class FlashAttentionForwardSm100:
         # claims); dynamic scheduling claims from the first load warp after it issues the current
         # tile's loads.
         self.scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
+        # PTX requires all warps of a warpgroup to execute the same setmaxnreg instruction. The
+        # scheduler/empty, load, MMA and epilogue warps all run with num_regs_other and share
+        # warpgroups, so the kernel lowers their registers once per warpgroup, not once per role.
+        other_warp_ids = {
+            self.mma_warp_id,
+            *self.load_warp_ids,
+            *self.empty_warp_ids,
+            *(() if self.use_correction_warps_for_epi else self.epilogue_warp_ids),
+        }
+        self.other_warpgroup_ids = tuple(sorted({w // 4 for w in other_warp_ids}))
+        assert other_warp_ids == {
+            w for wg in self.other_warpgroup_ids for w in range(4 * wg, 4 * wg + 4)
+        }, "warps sharing a warpgroup must use the same register count"
         # NOTE [global LPT] (config.py); validate_fwd_config admits it only on this scheduler path.
         self.lpt_global = config.lpt_global
         assert not self.lpt_global or (
@@ -1515,29 +1528,33 @@ class FlashAttentionForwardSm100:
         assert isinstance(tile_scheduler, TileSchedulerProtocol), f"tile_scheduler is not a TileSchedulerProtocol: {type(tile_scheduler)}"
 
         # ///////////////////////////////////////////////////////////////////////////////
+        #  Lower registers for the scheduler/empty, load, MMA and epilogue warpgroups
+        # ///////////////////////////////////////////////////////////////////////////////
+        for i in cutlass.range_constexpr(len(self.other_warpgroup_ids)):
+            wg = self.other_warpgroup_ids[i]
+            if warp_idx >= 4 * wg and warp_idx < 4 * wg + 4:
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
+
+        # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY / SCHEDULER WARP
         # ///////////////////////////////////////////////////////////////////////////////
         if const_expr(self.use_clc_scheduler):
             if warp_idx == self.scheduler_warp_id:
-                cute.arch.setmaxregister_decrease(self.num_regs_other)
                 # CLC: only the leader produces; late claims belong to the load warp.
                 if is_leader_cta and not self.clc_late_claim:
                     self.scheduler_warp(tile_scheduler)
                 else:
                     self.empty_warp(tile_scheduler)
         for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
-            if const_expr(self.empty_warp_ids[i] != self.scheduler_warp_id):
+            # Dynamic schedulers need every warp to consume each published tile.
+            if const_expr(self.dynamic_persistent and self.empty_warp_ids[i] != self.scheduler_warp_id):
                 if warp_idx == self.empty_warp_ids[i]:
-                    cute.arch.setmaxregister_decrease(self.num_regs_other)
-                    # Dynamic schedulers need every warp to consume each published tile.
-                    if const_expr(self.dynamic_persistent):
-                        self.empty_warp(tile_scheduler)
+                    self.empty_warp(tile_scheduler)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.load_warp_ids[0] and warp_idx <= self.load_warp_ids[-1]:
-            cute.arch.setmaxregister_decrease(self.num_regs_other)
             self.load(
                 thr_mma_qk,
                 thr_mma_pv,
@@ -1573,7 +1590,6 @@ class FlashAttentionForwardSm100:
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tensor memory buffer
             tmem.allocate(self.tmem_alloc_cols)
             tmem_alloc_barrier.arrive_and_wait_unaligned()
@@ -1613,7 +1629,6 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if const_expr(not self.use_correction_warps_for_epi):
             if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
-                cute.arch.setmaxregister_decrease(self.num_regs_other)
                 self.epilogue_s2g(
                     mO,
                     sO,
