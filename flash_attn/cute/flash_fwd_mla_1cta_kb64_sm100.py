@@ -2263,11 +2263,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                     consumer_states_O[split] = consumer_state_Oi
                 consumer_state_O0, consumer_state_O1 = consumer_states_O
             else:
-                # empty split: no O to reduce, but the combine kernel keys off LSE, so this split
-                # must be marked dead (O_partial is left unwritten)
-                if const_expr(mLSE is not None):
-                    self.store_lse(
-                        mLSE, seqlen, head_idx, batch_idx, split_idx, m_block, tidx, -Float32.inf
-                    )
+                if const_expr(self.is_split_kv and mLSE is not None):
+                    self.store_empty_split(mO, mLSE, learnable_sink, seqlen, head_idx, batch_idx, split_idx, m_block, tidx)
 
             work_tile = tile_scheduler.advance_to_next_work()

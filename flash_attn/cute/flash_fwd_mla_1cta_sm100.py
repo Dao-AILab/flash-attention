@@ -55,6 +55,7 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 from quack import copy_utils
 
 from flash_attn.cute import utils as fa_utils
+from flash_attn.cute.copy_utils import store_zero_fp32_row
 from flash_attn.cute.utils import get_batch_from_cu_tensor
 from flash_attn.cute.pack_gqa import (
     PackGQA,
@@ -3210,11 +3211,8 @@ class FlashAttentionMLAForward1CtaSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = self._n_block_range(block_info, seqlen, m_block, split_idx)
             num_n_blocks = n_block_max - n_block_min
-            # Split-kv: this split's slice of the n_block range can be empty (the
-            # per-split count is rounded up, so empties are the trailing splits).
-            # Every warp role skips the whole tile body together, which keeps all
-            # pipeline phases and raw-mbar phase counters consistent; the epilogue
-            # still writes LSE = -inf so the combine kernel can ignore this split.
+            # Every role skips KV work and pipeline handoffs for an empty split.
+            # Only the epilogue publishes its partial results.
             has_work = block_info.has_kv_work(n_block_min, n_block_max)
             if has_work:
 
@@ -3406,17 +3404,43 @@ class FlashAttentionMLAForward1CtaSm100:
                 consumer_state_O0.advance()
                 consumer_state_O1.advance()
             else:
-                # Empty split: no O to reduce, but the combine kernel keys off LSE, so
-                # this split must be marked dead. O_partial is left unwritten (combine
-                # never reads a split whose LSE is -inf).
-                if const_expr(mLSE is not None):
-                    self.store_lse(
-                        mLSE, seqlen, head_idx, batch_idx, split_idx, m_block, tidx,
-                        -Float32.inf,
+                if const_expr(self.is_split_kv and mLSE is not None):
+                    self.store_empty_split(
+                        mO, mLSE, learnable_sink, seqlen, head_idx, batch_idx, split_idx, m_block, tidx
                     )
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
+
+    @cute.jit
+    def store_empty_split(
+        self,
+        mO: cute.Tensor,
+        mLSE: cute.Tensor,
+        learnable_sink: Optional[cute.Tensor],
+        seqlen: SeqlenInfoQK,
+        head_idx: Int32,
+        batch_idx: Int32,
+        split_idx: Int32,
+        m_block: Int32,
+        tidx: Int32,
+    ) -> None:
+        # The sink belongs to split 0 even if the tile has no KV work. Only one
+        # epilogue thread per valid row stores O here; the normal O path is skipped.
+        lse = -Float32.inf
+        if const_expr(learnable_sink is not None):
+            if split_idx == 0 and tidx < self.cta_tile_m:
+                packed_row = m_block * self.cta_tile_m + tidx
+                q_pos = packed_row // self.qhead_per_kvhead if const_expr(self.pack_gqa) else packed_row
+                if q_pos < seqlen.seqlen_q and self.is_valid_qhead_row(packed_row):
+                    lse = load_learnable_sink(
+                        learnable_sink, head_idx, packed_row, self.qhead_per_kvhead, self.pack_gqa,
+                        qhead_per_kvhead_valid=self.qhead_per_kvhead_valid,
+                    )
+                    mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
+                    row = (packed_row % self.qhead_per_kvhead, q_pos) if const_expr(self.pack_gqa) else q_pos
+                    store_zero_fp32_row(mO_cur[row, None])
+        self.store_lse(mLSE, seqlen, head_idx, batch_idx, split_idx, m_block, tidx, lse)
 
     @cute.jit
     def store_lse(

@@ -34,6 +34,7 @@ from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils, layout_utils
 
+from flash_attn.cute.copy_utils import store_zero_fp32_row
 from flash_attn.cute.paged_kv import PagedKVManager, resolve_paged_token
 from flash_attn.cute.tensormap_utils import acquire_tensormap, bound_rows, cta_tensormap_slot
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
@@ -854,6 +855,10 @@ class FlashAttentionForwardSm100:
             )
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
+        # Empty sink-only splits store directly from the correction warpgroup, not via TMA.
+        mO_gmem = mO if const_expr(
+            self.use_tma_O and self.is_split_kv and blocksparse_tensors is None and learnable_sink is not None
+        ) else None
         if const_expr(self.use_tma_O):
             tma_atom_O, mO = cpasync.make_tiled_tma_atom(
                 tma_store_op, mO, cute.select(sO_layout, mode=[0, 1]), self.epi_tile
@@ -1063,6 +1068,7 @@ class FlashAttentionForwardSm100:
             mSFQ, mSFK, tma_atom_SFQ, tma_atom_SFK, sSFQ_layout, sSFK_layout,
             mSFV, tma_atom_SFV, sSFP_layout, sSFV_layout,
             mV_bf16, tma_atom_V_bf16, sV_bf16_layout, tP_bf16_layout, tiled_mma_pv_bf16,
+            mO_gmem=mO_gmem,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1143,6 +1149,7 @@ class FlashAttentionForwardSm100:
         sV_bf16_layout: cute.ComposedLayout | None = None,
         tP_bf16_layout: cute.ComposedLayout | None = None,
         tiled_mma_pv_bf16: cute.TiledMma | None = None,
+        mO_gmem: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1716,6 +1723,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                mO_gmem=mO_gmem,
             )
             tmem_alloc_barrier.arrive_unaligned()
 
@@ -3199,6 +3207,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        mO_gmem: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -3521,16 +3530,30 @@ class FlashAttentionForwardSm100:
                         if const_expr(not self.pack_gqa)
                         else seqlen.seqlen_q * self.qhead_per_kvhead
                     )
-                    if const_expr(not self.pack_gqa or self.m_block_size % self.qhead_per_kvhead == 0):
-                        gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (q_block,))
-                        if tidx < seqlen_q - q_block * self.m_block_size:
+                    packed_row = q_block * self.m_block_size + tidx
+                    if packed_row < seqlen_q:
+                        if const_expr(self.is_split_kv and not self.use_block_sparsity and learnable_sink is not None):
+                            if not has_work and split_idx == 0:
+                                # A finite LSE makes combine consume this row's O partial.
+                                # No other warp writes O for a dense split with no KV work.
+                                lse = load_learnable_sink(
+                                    learnable_sink, head_idx, packed_row, self.qhead_per_kvhead, self.pack_gqa
+                                )
+                                mO_empty = mO_cur
+                                if const_expr(mO_gmem is not None):
+                                    mO_empty = seqlen.offset_batch_Q(mO_gmem, batch_idx, dim=3)[None, None, head_idx, split_idx]
+                                row = (
+                                    (packed_row % self.qhead_per_kvhead, packed_row // self.qhead_per_kvhead)
+                                    if const_expr(self.pack_gqa) else packed_row
+                                )
+                                store_zero_fp32_row(mO_empty[row, None])
+                        if const_expr(not self.pack_gqa or self.m_block_size % self.qhead_per_kvhead == 0):
+                            gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (q_block,))
                             # This actually just works with PackGQA too
                             gLSE[tidx] = lse
-                    else:
-                        idx = q_block * self.m_block_size + tidx
-                        if idx < seqlen_q:
-                            m_idx = idx // self.qhead_per_kvhead
-                            h_idx = idx - m_idx * self.qhead_per_kvhead
+                        else:
+                            m_idx = packed_row // self.qhead_per_kvhead
+                            h_idx = packed_row - m_idx * self.qhead_per_kvhead
                             lse_ptr_i64 = utils.elem_pointer(mLSE_cur, ((h_idx, m_idx),)).toint()
                             lse_gmem_ptr = cute.make_ptr(
                                 mLSE_cur.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4

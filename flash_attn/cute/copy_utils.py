@@ -78,6 +78,18 @@ def copy(
     cute.copy(copy_atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
 
 
+@cute.jit
+def store_zero_fp32_row(mO_row: cute.Tensor) -> None:
+    """Write a contiguous, 16-byte-aligned SplitKV output row without reading it."""
+    assert mO_row.element_type == Float32
+    gO = cute.tiled_divide(mO_row, (4,))
+    zero = cute.make_rmem_tensor((4,), Float32)
+    zero.fill(0.0)
+    atom = get_copy_atom(Float32, 4)
+    for col in cutlass.range(cute.size(gO, mode=[1]), unroll=4):
+        cute.copy(atom, zero, gO[None, col])
+
+
 def tiled_copy_1d(
     dtype: Type[cutlass.Numeric], num_threads: int, num_copy_elems: int = 1, is_async: bool = False
 ) -> cute.TiledCopy:
