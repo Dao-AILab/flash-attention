@@ -385,9 +385,9 @@ class _SwapABCore:
         # accumulator layout. The K-step is 64 for both GEMMs so that a K tile (128 tokens x 64 dims)
         # and a V^T tile (128 dims x 64 tokens) have the same size and can share one SMEM ring.
         tile_m = 128
-        # tcgen05 takes an MN-major 8-bit B operand (P^T in the PV MMA) only with N % 16 == 0.
-        # TODO: a K-major P^T store would keep N = 8 for 8-head FP8 tiles; the P store view needs
-        # rework.
+        # tcgen05 takes an MN-major 8-bit B operand (P^T in the PV MMA) only with N % 16 == 0, so
+        # FP8 tiles of up to 8 columns pad N to 16. A K-major P^T store keeps N = 8 but measured no
+        # faster: +0.2% median, -2.6% .. +1.8% over 270 FP8 decode shapes (GB300).
         tile_cols_mma = max(2 * MMA_N_MIN if self.dtype.width == 8 else MMA_N_MIN, tile_cols)
         tile_k = 64
         assert tile_cols_mma % tile_cols == 0
