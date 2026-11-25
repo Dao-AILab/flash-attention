@@ -21,6 +21,7 @@ from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 from flash_attn.cute.config import Sm90BwdRegisters
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
+from flash_attn.cute import copy_utils as fa_copy_utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -505,12 +506,12 @@ class FlashAttentionBackwardSm90:
         )
         if const_expr(self.qhead_per_kvhead == 1):
             mdK_tma = (
-                copy_utils.create_ragged_tensor_for_tma(mdK, ragged_dim=0, ptr_shift=True)
+                fa_copy_utils.create_ragged_tensor_for_tma_store(mdK, ragged_dim=0)
                 if self.varlen_k
                 else mdK
             )
             mdV_tma = (
-                copy_utils.create_ragged_tensor_for_tma(mdV, ragged_dim=0, ptr_shift=True)
+                fa_copy_utils.create_ragged_tensor_for_tma_store(mdV, ragged_dim=0)
                 if self.varlen_k
                 else mdV
             )

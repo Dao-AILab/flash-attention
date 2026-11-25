@@ -692,15 +692,71 @@ def test_flash_attn_mla_1cta_dense_kb64_varlen_paged(nheads, causal, mode, num_s
     _assert_mla_fwd_close(out, out_2cta, lse, lse_2cta, "kb64 vs 2CTA")
 
 
+@pytest.mark.parametrize("layout", ["packed", "dense"])
+@pytest.mark.parametrize("h", [16, 64])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_ragged_tma_store_base_stays_near_tensor(h, layout):
+    """Ragged TMA stores (MLA 2CTA varlen O, SM90 varlen O and dK / dV) use a descriptor based
+    one ragged extent before the tensor: 6 rows of h x 512, all of a packed (6, h, 512) tensor
+    or one batch slice of a dense (3, 6, h, 512) one. The base cannot wrap below address 0.
+    quack's 2**30-row form put it 64 TiB before a 64-head MLA O: below 0 for O near 43 TiB
+    (x86 B200), where stores faulted ("Out Of Range Address", Xid 13) when another context's
+    exception preempted them. This checks the view's base directly; the fault itself needs
+    that address layout and a concurrent exception."""
+    import hashlib
+    import inspect
+
+    import cutlass
+    from cutlass import cute
+    from quack.compile_utils import make_fake_tensor
+
+    from flash_attn.cute.cache_utils import get_jit_cache
+    from flash_attn.cute.copy_utils import create_ragged_tensor_for_tma_store
+
+    @cute.kernel
+    def store_base(view: cute.Tensor, base: cute.Tensor):
+        base[0] = view.iterator.toint()
+
+    @cute.jit
+    def ragged_base(o: cute.Tensor, base: cute.Tensor, stream):
+        view = create_ragged_tensor_for_tma_store(o, ragged_dim=0 if layout == "packed" else 1)
+        store_base(view, base).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+
+    shape = (6, h, 512) if layout == "packed" else (3, 6, h, 512)
+    # The FA4 cache fingerprints flash_attn/cute only: key the probe on its own source too.
+    probe = hashlib.sha256(
+        (inspect.getsource(store_base) + inspect.getsource(ragged_base)).encode()
+    ).hexdigest()[:16]
+    key = (probe, torch.cuda.get_device_capability(), h, layout)
+    cache = get_jit_cache("ragged_tma_store_base_probe")
+    if key not in cache:
+        cache[key] = cute.compile(
+            ragged_base,
+            make_fake_tensor(cutlass.BFloat16, (cute.sym_int(), *shape[1:]), divisibility=8),
+            make_fake_tensor(cutlass.Int64, (1,)),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    if is_fake_mode():
+        return
+    o = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+    base = torch.zeros(1, device="cuda", dtype=torch.int64)
+    cache[key](o, base)
+    assert o.data_ptr() - base.item() == 6 * h * 512 * o.element_size()
+
+
 @pytest.mark.parametrize("mode", ["cu_seqlens", "seqused_q", "paged128", "paged16"])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("h", [96, 48, 12])
+@pytest.mark.parametrize("h", [96, 64, 48, 16, 12])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_2cta_dense_padded_heads_varlen(h, causal, mode, monkeypatch):
-    """Dense 2CTA MQA pads each token's heads in-kernel (96 -> 128, 48 and 12 -> 64). Varlen Q
+def test_flash_attn_mla_2cta_dense_varlen(h, causal, mode, monkeypatch):
+    """Dense 2CTA MQA with varlen Q: 64 and 16 heads pack several tokens into a cluster tile
+    unpadded, and 96, 48 and 12 pad each token's heads in-kernel (to 128, 64 and 64). Varlen Q
     (ragged lengths incl. 0 and multi-token rows, cu_seqlens / seqused_q) and paged KV (TMA page
-    128, cp.async page 16) match the reference in O and LSE: padded rows land in neither the next
-    token's rows nor the next sequence's (cu_seqlens stores O per row)."""
+    128, cp.async page 16) match the reference in O and LSE: no row lands in the next token's
+    rows or the next sequence's, and nothing outside a sequence is written (48 and 12 heads store
+    O per row; 96 heads, padded to one token per tile, keep the plain TMA store; 64 and 16 heads
+    store through the ragged TMA descriptor, which clips each box at its sequence end)."""
     if not IS_SM100:
         pytest.skip()
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
@@ -738,9 +794,26 @@ def test_flash_attn_mla_2cta_dense_padded_heads_varlen(h, causal, mode, monkeypa
         k_cache[page_table.view(-1).long()] = pad(ks, npg * ps).view(b * npg, ps, 1, 64)
         v_cache[page_table.view(-1).long()] = pad(vs, npg * ps).view(b * npg, ps, 1, 512)
         call.update(k=k_cache, v=v_cache, page_table=page_table)
-    out, lse, *_ = _flash_attn_fwd(**call, causal=causal, num_splits=1, return_lse=True)
+    # O is a view into a canary-filled buffer: rows outside every sequence (guard rows around
+    # O, and seqused_q padding including the empty sequence) must keep the canary.
+    canary, guard = 7.0, 9
+    if mode == "cu_seqlens":
+        big = torch.full((sum(seqlens_q) + 2 * guard, h, 512), canary, device=device, dtype=dtype)
+        out = big[guard:-guard]
+    else:
+        big = torch.full((b + 2, s_q_max, h, 512), canary, device=device, dtype=dtype)
+        out = big[1:-1]
+    _, lse, *_ = _flash_attn_fwd(
+        **call, causal=causal, num_splits=1, return_lse=True, out=out
+    )
     if is_fake_mode():
         return
+    if mode == "cu_seqlens":
+        assert (big[:guard] == canary).all() and (big[-guard:] == canary).all()
+    else:
+        assert (big[0] == canary).all() and (big[-1] == canary).all()
+        for i, sq in enumerate(seqlens_q):
+            assert (out[i, sq:] == canary).all(), f"sequence {i} wrote rows past seqused_q"
     starts_q = list(itertools.accumulate([0] + seqlens_q))
     for i, sq in enumerate(seqlens_q):
         if sq == 0:

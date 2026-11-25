@@ -27,6 +27,7 @@ from flash_attn.cute.pack_gqa import (
 from flash_attn.cute.config import mla_2cta_pads_dense_qheads, sparse_mla_qhead_tile
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute import utils as fa_utils
+from flash_attn.cute import copy_utils as fa_copy_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.mask import AttentionMask
@@ -645,9 +646,7 @@ class FlashAttentionMLAForwardSm100:
             # TODO: add asserts
             mP_tma = mP_og if const_expr(self.ragged_tma_O) else mP_valid
             if const_expr(self.ragged_tma_O):
-                mP_tma = copy_utils.create_ragged_tensor_for_tma(
-                    mP_tma, ragged_dim=0, ptr_shift=True
-                )
+                mP_tma = fa_copy_utils.create_ragged_tensor_for_tma_store(mP_tma, ragged_dim=0)
             tma_atom_P, tma_tensor_P = make_tiled_tma_atom_fn(
                 tma_store_op, mP_tma, cute.select(sP_layout_out, mode=[0, 1]), self.tile_P
             )
@@ -669,9 +668,7 @@ class FlashAttentionMLAForwardSm100:
         if const_expr(self.use_tma_O):
             mO_tma = mO_og if const_expr(self.ragged_tma_O) else mO_valid
             if const_expr(self.ragged_tma_O):
-                mO_tma = copy_utils.create_ragged_tensor_for_tma(
-                    mO_tma, ragged_dim=0, ptr_shift=True
-                )
+                mO_tma = fa_copy_utils.create_ragged_tensor_for_tma_store(mO_tma, ragged_dim=0)
 
             tma_atom_O, tma_tensor_O = make_tiled_tma_atom_fn(
                 tma_store_op, mO_tma, cute.select(sO_layout, mode=[0, 1]), self.epi_tile

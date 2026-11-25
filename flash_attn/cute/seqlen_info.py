@@ -219,8 +219,8 @@ class SeqlenInfoQK:
     ) -> cute.Tensor:
         """Seqlen must be the first dimension of mK.
 
-        ragged: mK was built with copy_utils.create_ragged_tensor_for_tma; ptr_shift must match the
-        form used there (ptr_shift=True is store-only, loads need the wraparound form).
+        ragged: mK was built with a ragged TMA view; ptr_shift must match its form (stores use
+        flash_attn.cute.copy_utils.create_ragged_tensor_for_tma_store, a ptr_shift view).
         """
         if const_expr(not ragged):
             if const_expr(not self.has_cu_seqlens_k):
