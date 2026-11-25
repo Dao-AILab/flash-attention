@@ -1192,6 +1192,8 @@ class SwapABPolicy:
     # Kernel shapes. Each 256-token KV block is two 128-row MMA subtiles, and pages are resolved
     # per subtile, so a page holds a whole number of subtiles. One lane owns one column (a query
     # head of one query token) in the softmax and correction warpgroups.
+    # TODO: tile_n 128 took 6% (decode) and 8% (token mode) less time on a 26-row fp8 24/4 hd256
+    # call at 27k-107k (GB300, 12 splits); re-sweep tile_n on SM103 before changing it.
     tile_n: int = 256
     page_multiple: int = 128
     max_columns: int = 32
@@ -1232,6 +1234,17 @@ class SwapABPolicy:
     # lengths, so large (vLLM-style) page tables never take this rule.
     short_kv_max_tokens: int = 512
     short_kv_min_heads: int = 512
+    # Token mode (rows of 2+ query tokens) keeps the standard kernel at short KV capacity: at most
+    # token_short_kv_max_tokens, or token_mid_kv_max_tokens with at least token_mid_kv_min_heads
+    # (batch * KV heads). Source: GB300 CUDA-graph sweep at 4 tokens per row (fp8 and bf16, causal,
+    # num_splits=0, 128-token pages, the head configs above, batch 1-256, KV 512-128K): SwapAB was
+    # 1.13x (fp8) and 1.11x (bf16) slower at the median on the 77 such shapes. Elsewhere it was
+    # 1.00x / 1.03x at the median, up to 1.41x slower, on that sweep's equal-length rows. Mixed
+    # lengths reverse it (26 MTP-3 rows, 24/4 hd256, 27k-107k: 0.81x, 0.70x with shared prompt
+    # pages), and selection sees only the capacity, so the rule stops at 2K.
+    token_short_kv_max_tokens: int = 512
+    token_mid_kv_max_tokens: int = 2048
+    token_mid_kv_min_heads: int = 128
 
     def supports_head_dims(self, head_dim: int, head_dim_v: int) -> bool:
         """Tested and benchmarked head dims. Adding a shape needs tests and a decode benchmark."""
@@ -1344,12 +1357,20 @@ class SwapABPolicy:
         return inputs.max_seqlen_k if inputs.seqlen_k_capacity is None else inputs.seqlen_k_capacity
 
     def slower_than_standard(self, inputs: FwdHeuristicInputs) -> bool:
-        """Measured SwapAB losses that automatic selection avoids; see short_kv_max_tokens."""
-        return (
+        """Measured SwapAB losses that automatic selection avoids; see short_kv_max_tokens and
+        token_short_kv_max_tokens."""
+        capacity = self.seqlen_k_capacity(inputs)
+        bh = inputs.batch_size * inputs.num_heads_kv
+        short_decode = (
             max(inputs.head_dim, inputs.head_dim_v) <= 128
-            and self.seqlen_k_capacity(inputs) <= self.short_kv_max_tokens
-            and inputs.batch_size * inputs.num_heads_kv >= self.short_kv_min_heads
+            and capacity <= self.short_kv_max_tokens
+            and bh >= self.short_kv_min_heads
         )
+        short_token_rows = self.tile_tokens(inputs) > 1 and (
+            capacity <= self.token_short_kv_max_tokens
+            or (capacity <= self.token_mid_kv_max_tokens and bh >= self.token_mid_kv_min_heads)
+        )
+        return short_decode or short_token_rows
 
     def per_sequence_splits(self, inputs: FwdHeuristicInputs) -> bool:
         """Whether SwapAB takes per-sequence split counts from the prepare-scheduler kernel.
@@ -1367,6 +1388,9 @@ class SwapABPolicy:
 
     def select_num_splits(self, inputs: FwdHeuristicInputs) -> int:
         """Automatic split count; with per-sequence splits, the cap of the per-sequence counts."""
+        # TODO: token mode uses this decode-fitted policy, but at 4 tokens per row the best count
+        # differs: 1 split is 6-11% faster at 32-64 rows x 32K-128K KV, 4 splits 25% faster at 8
+        # rows x 8K (GB300, fp8 24/4 hd256). A token-mode split rule needs its own sweep.
         seqlen_k = self.seqlen_k_capacity(inputs)
         bh = inputs.batch_size * inputs.num_heads_kv
         # An empty batch has no tiles to split, as in num_splits_heuristic.

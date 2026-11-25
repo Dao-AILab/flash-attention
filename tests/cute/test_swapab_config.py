@@ -169,6 +169,12 @@ def test_explicit_swapab_config_for_unsupported_problem_raises(changes, match):
         # A large page table hides the real lengths: its capacity keeps SwapAB.
         ({"batch_size": 256, "total_q": 256, "max_seqlen_k": 512, "seqlen_k_capacity": 262144,
           "has_seqused_k": True, "page_size": 128}, True),
+        # Token mode (4 tokens per row) at short KV: any batch at 512, 128+ (batch * KV heads) at 2K.
+        ({"batch_size": 1, "total_q": 4, "max_seqlen_q": 4, "max_seqlen_k": 512}, False),
+        ({"batch_size": 64, "total_q": 256, "max_seqlen_q": 4, "max_seqlen_k": 2048}, False),
+        # Fewer CTAs or longer KV keep token mode.
+        ({"batch_size": 63, "total_q": 252, "max_seqlen_q": 4, "max_seqlen_k": 2048}, True),
+        ({"batch_size": 64, "total_q": 256, "max_seqlen_q": 4, "max_seqlen_k": 2049}, True),
     ],
 )
 def test_automatic_selection_skips_measured_swapab_losses(changes, use_swapab):
