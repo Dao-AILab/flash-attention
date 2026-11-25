@@ -521,7 +521,8 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
     if (seqlens_k_.has_value())
         append_seqlens_k = seqlens_k_.value() + seqlen_knew;
     else
-        append_seqlens_k.fill_(seqlen_knew);
+        // No seqlens_k means no new k either (checked above): attend to the whole cache.
+        append_seqlens_k.fill_(seqlen_k);
 
     // we use splitkv even num_splits == 1, because fmha_fwd() does not support seqlen_k_ in batch mode
     auto splitkv_traits =
