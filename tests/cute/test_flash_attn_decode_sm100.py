@@ -963,6 +963,46 @@ def test_verify_rows_graph_replay():
     torch.cuda.synchronize()
 
 
+@cute.jit
+def keep_by_token(b, h, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Drops a different third of the keys for each query token."""
+    return (kv_idx + q_idx) % 3 != 0
+
+
+@pytest.mark.parametrize("kind", ["mask_mod", "score_mod", "local"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_verify_rows_modifiers(kind, monkeypatch):
+    """Token mode hands each column's token to modifiers as q_idx (score_mod reads aux data at
+    offset_q + q_idx) and centers a local window on the token's position, as the standard kernel
+    does."""
+    q, k, v, table, used, cu, _, _ = verify_inputs(4, 3, 128, torch.bfloat16)
+    kw = dict(
+        cu_seqlens_q=cu, max_seqlen_q=3, page_table=table, seqused_k=used, num_splits=3,
+        return_lse=True, causal=kind != "mask_mod",
+    )
+    if kind == "mask_mod":
+        kw["mask_mod"] = keep_by_token
+    elif kind == "score_mod":
+        token_bias = torch.randn(q.shape[0], device="cuda")
+        kw.update(score_mod=global_q_bias, aux_tensors=[token_bias])
+    else:
+        kw["window_size_left"] = 100
+    out, lse, *_ = _flash_attn_fwd(q, k, v, **kw)
+    monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "standard")
+    std_out, std_lse, *_ = _flash_attn_fwd(q, k, v, **kw)
+    if is_fake_mode():
+        return
+    tokens = int(cu[-1])
+    seen = ~torch.isneginf(std_lse[:, :tokens])
+    assert torch.equal(torch.isneginf(lse[:, :tokens]), ~seen)
+    torch.testing.assert_close(
+        out[:tokens].transpose(0, 1)[seen], std_out[:tokens].transpose(0, 1)[seen],
+        atol=2e-3, rtol=0,
+    )
+    torch.testing.assert_close(lse[:, :tokens][seen], std_lse[:, :tokens][seen], atol=1e-4, rtol=0)
+    assert torch.count_nonzero(out[:tokens].transpose(0, 1)[~seen]) == 0
+
+
 @pytest.fixture
 def combine_split_counts(monkeypatch):
     """The per-sequence split-count tensors the forward hands to the combine, one per call."""

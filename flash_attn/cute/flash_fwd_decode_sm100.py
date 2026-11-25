@@ -269,8 +269,6 @@ class _SwapABCore:
         # of a column's keys, as masking can.
         self.causal_tokens = is_causal and tokens_tile > 1
         self.check_empty_rows = self.apply_score_mods or self.causal_tokens
-        # config.SWAPAB.rejection refuses token mode with a local window, score_mod or mask_mod.
-        assert tokens_tile == 1 or not self.apply_score_mods
 
         assert head_dim > 0 and head_dim % 16 == 0
         assert self.head_dim_v > 0 and self.head_dim_v % 16 == 0
@@ -731,8 +729,9 @@ class _SwapABCore:
         # This split's KV blocks are [n_block_min, n_block_max). With per-sequence split counts
         # the scheduler packed the count into split_idx's high 16 bits.
         packed_splits = self.num_splits_dynamic
+        # tile_m = the row's tokens, so a local window's right edge reaches the last token's keys.
         block_info = BlockInfo(
-            tile_m=1,
+            tile_m=self.tokens_tile,
             tile_n=tile_n,
             is_causal=False,
             is_local=self.is_local,
@@ -1344,12 +1343,19 @@ class _SwapABCore:
                     score_tiles = cute.zipped_divide(scores_r, (1, 1))
                     for sm in cutlass.range_constexpr(num_s_subtiles):
                         kv_idx = (s + n_block_min) * tile_n + thr_in_wg + sm * tile_m
-                        # (q, kv) coordinate of this thread's token; the decode query is q = 0.
+                        # (q, kv) coordinate of this thread's key; q is each column's token,
+                        # passed as constant_q_idx.
                         tScS = cute.domain_offset((0, kv_idx), cute.make_identity_tensor((1, 1)))
                         for gi in cutlass.range_constexpr(tile_cols):
+                            head, token = gi % self.heads_tile, gi // self.heads_tile
+                            # A token past the row's end scores no key: modifiers would see a
+                            # q_idx outside the row.
+                            keys_in_row = seqlen_k
+                            if cutlass.const_expr(self.tokens_tile > 1):
+                                keys_in_row = seqlen_k if token < seqlen_q else Int32(0)
                             value = -Float32.inf
-                            if gi < qhead_per_kvhead and kv_idx < seqlen_k:
-                                global_head = (bh_idx % num_heads_kv) * qhead_per_kvhead + gi
+                            if head < qhead_per_kvhead and kv_idx < keys_in_row:
+                                global_head = (bh_idx % num_heads_kv) * qhead_per_kvhead + head
                                 if cutlass.const_expr(self.score_mod is not None):
                                     apply_score_mod_inner(
                                         score_tiles[None, (gi, sm)],
@@ -1363,15 +1369,19 @@ class _SwapABCore:
                                         aux_data,
                                         None,  # the guard keeps indices in bounds: no wrapping
                                         seqlen_info,
-                                        constant_q_idx=0,
+                                        constant_q_idx=token,
                                     )
                                 value = scores_r[gi, sm]
                                 keep = cutlass.Boolean(True)
                                 if cutlass.const_expr(self.is_local):
+                                    # The window is around the token's own position.
+                                    last_key = seqlen_k - 1
+                                    if cutlass.const_expr(self.tokens_tile > 1):
+                                        last_key = seqlen_k - seqlen_q + token
                                     if cutlass.const_expr(window_size_left is not None):
-                                        keep &= kv_idx >= seqlen_k - 1 - window_size_left
+                                        keep &= kv_idx >= last_key - window_size_left
                                     if cutlass.const_expr(window_size_right is not None):
-                                        keep &= kv_idx <= seqlen_k - 1 + window_size_right
+                                        keep &= kv_idx <= last_key + window_size_right
                                 if cutlass.const_expr(self.mask_mod is not None):
                                     # Build fresh SSA values per score: a callback that indexes
                                     # (b[0]) an SSA value shared across dynamic regions fails IR
@@ -1381,7 +1391,7 @@ class _SwapABCore:
                                         self.mask_vec_size,
                                         scalar_to_ssa(batch_idx, Int32),
                                         scalar_to_ssa(global_head, Int32),
-                                        scalar_to_ssa(Int32(0), Int32),
+                                        scalar_to_ssa(Int32(token), Int32),
                                         kv_idx,
                                         seqlen_k,
                                         seqlen_info,

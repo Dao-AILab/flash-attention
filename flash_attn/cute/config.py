@@ -1313,8 +1313,6 @@ class SwapABPolicy:
             f"query heads x query tokens per KV head over {self.max_columns} columns": (
                 columns > self.max_columns
             ),
-            "token mode with a local window, score_mod or mask_mod": self.tile_tokens(inputs) > 1
-            and (inputs.local or inputs.has_score_mod or inputs.has_mask_mod),
             # TODO: e5m2: admit it here and in the SwapAB adapter's dtype assert, with a test; the
             # kernel's FP8 math is not e4m3-specific.
             "dtype": inputs.dtype not in ("torch.float16", "torch.bfloat16", "torch.float8_e4m3fn"),

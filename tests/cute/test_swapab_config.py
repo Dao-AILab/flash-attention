@@ -77,6 +77,9 @@ def test_admitted_decode_selects_swapab(changes):
         ({"num_heads": 12, "total_q": 16, "max_seqlen_q": 4}, 32),
         ({**_VARLEN_PAGED, "total_q": 9, "max_seqlen_q": 3}, 16),
         ({"num_heads": 2, **_VARLEN_PAGED, "total_q": 96, "max_seqlen_q": 32}, 32),
+        # Each column's token reaches modifiers as q_idx and centers its local window.
+        ({**_VARLEN_PAGED, "total_q": 9, "max_seqlen_q": 3, "local": True,
+          "window_size_left": 31, "has_score_mod": True, "has_mask_mod": True}, 16),
     ],
 )
 def test_admitted_verify_rows_select_swapab(changes, tile_m):
@@ -111,9 +114,6 @@ _UNSUPPORTED = [
     ({**_VARLEN_PAGED, "max_seqlen_q": 9}, "over 32 columns"),
     # A tensor (device) max_seqlen_q is no host bound.
     ({**_VARLEN_PAGED, "has_max_seqlen_q_hint": False}, "needs a host max_seqlen_q"),
-    ({**_VARLEN_PAGED, "max_seqlen_q": 4, "local": True, "window_size_left": 31},
-     "token mode with a local window"),
-    ({**_VARLEN_PAGED, "max_seqlen_q": 4, "has_score_mod": True}, "token mode with a local window"),
     ({"dtype": "torch.float8_e5m2"}, "dtype"),
     ({"mxfp8_path": "qk"}, "MXFP8 block scales"),
     ({"head_dim": 192, "head_dim_v": 128}, "head dimensions"),
