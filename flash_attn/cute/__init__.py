@@ -13,10 +13,12 @@ from .interface import (
     flash_attn_func,
     flash_attn_varlen_func,
 )
+from .mxfp8_attention import mxfp8_attn_func
 
 __all__ = [
     "BlockScales",
     "TensorwiseScales",
     "flash_attn_func",
     "flash_attn_varlen_func",
+    "mxfp8_attn_func",
 ]
