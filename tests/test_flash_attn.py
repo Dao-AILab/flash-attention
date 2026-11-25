@@ -215,6 +215,36 @@ def construct_local_mask(
         )
 
 
+@pytest.mark.parametrize("cross_attn", [False, True])
+def test_eager_mha_padding(cross_attn):
+    """An empty causal row contributes neither output nor value gradients."""
+    from flash_attn.modules.mha import MHA
+
+    layer = MHA(
+        1, 1, cross_attn=cross_attn, causal=True, qkv_proj_bias=False, out_proj_bias=False,
+    )
+    with torch.no_grad():
+        if cross_attn:
+            layer.Wq.weight.zero_()
+        projection = layer.Wkv if cross_attn else layer.Wqkv
+        projection.weight.zero_()
+        projection.weight[-1].fill_(1)
+        layer.out_proj.weight.fill_(1)
+
+    values = torch.tensor([[1., 2., 3., 6.], [4., 5., 7., 8.]]).unsqueeze(-1).requires_grad_()
+    keep = torch.tensor([[False, True, False, True], [False, False, False, False]])
+    if cross_attn:
+        output = layer(torch.zeros_like(values), x_kv=values, key_padding_mask=keep)
+        rows, gradients = [0., 0., 2., 4.], [0., 1.5, 0., 0.5]
+    else:
+        output = layer(values, key_padding_mask=keep)
+        rows, gradients = [0., 2., 2., 4.], [0., 2.5, 0., 0.5]
+    dvalues, = torch.autograd.grad(output.sum(), values)
+    for actual, expected in ((output, rows), (dvalues, gradients)):
+        if not torch.equal(actual.squeeze(-1), values.new_tensor([expected, [0.] * 4])):
+            pytest.fail(f"incorrect masked rows or gradients for cross_attn={cross_attn}: {actual}")
+
+
 def attention_ref(
     q,
     k,
