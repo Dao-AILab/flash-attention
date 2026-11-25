@@ -437,10 +437,6 @@ def test_flash_attn_mla_1cta_learnable_sink(seqlen_q, seqlen_k, nheads, causal, 
     if not return_lse:
         assert lse is None
         return
-    if num_splits > 1:
-        # A split-KV tile with no KV blocks at all never reaches split 0's epilogue, so its
-        # LSE stays -inf instead of the sink (same as flash_fwd_sm100); O is still 0.
-        lse, lse_ref = lse[:, masked_rows:], lse_ref[:, masked_rows:]
     torch.testing.assert_close(lse, lse_ref, atol=1e-2, rtol=1e-3)
 
 

@@ -691,7 +691,10 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
         case 12:
             tile_n = 64 if inputs.head_dim > 64 else 128
             # Tune equal-width heads only: O reuses Q storage in the epilogue.
-            if inputs.dtype in ("torch.float16", "torch.bfloat16") and inputs.head_dim == inputs.head_dim_v <= 256:
+            if (
+                inputs.dtype in ("torch.float16", "torch.bfloat16")
+                and inputs.head_dim == inputs.head_dim_v <= 256
+            ):
                 if inputs.head_dim > 64:
                     tile_m, tile_n = 64, 64
                 elif inputs.causal:

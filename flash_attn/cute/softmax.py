@@ -45,35 +45,32 @@ def load_learnable_sink(
 
 @cute.jit
 def apply_learnable_sink(
-    row_max: Float32,
+    row_max_log2: Float32,
     row_sum: Float32,
     sink_val: Float32,
-    scale_log2: Float32,
     max_offset: Float32 = 0.0,
     empty_row_sum: Float32 = 1.0,
-) -> tuple[Float32, Float32]:
-    """Fold a learnable sink logit into the final (unscaled row_max, row_sum) softmax stats.
+) -> tuple[Float32, Float32, Float32]:
+    """Fold one sink logit per query head into the final softmax statistics.
 
-    A learnable sink is one extra softmax column per Q head with logit `sink_val` (natural-log
-    units, not multiplied by softmax_scale) and no value vector: it enlarges the normalizer
-    and the LSE but contributes nothing to O. Kernels fold it in at the end of the KV loop.
-    The stats are an *unscaled* row max and a row sum of exp2(score*scale_log2 - max*scale_log2)
-    terms, so the sink enters as exp2(sink*LOG2_E - row_max*scale_log2 + max_offset). A fully
-    masked row (row_max == -inf) has the sink as its only column, so its stats become
-    row_max = sink/scale (i.e. row_max*scale_log2 == sink*LOG2_E) and row_sum = empty_row_sum,
-    giving O = 0 and lse = sink. Backward: dsink[h] = -sum_rows exp(sink[h] - lse[row,h]) * dpsum[row,h].
+    The sink is in natural-log units and is not multiplied by ``softmax_scale``.
+    It has no value vector: it adds weight to the denominator, not the numerator.
+    If all keys are masked, a finite sink gives zero output and LSE equal to the sink.
 
-    `max_offset` is the fp8 exponent offset and `empty_row_sum == 2**max_offset` (0 and 1 for
-    bf16/fp16). `Softmax.finalize` (SM80/SM90) applies the same fold in the scaled domain.
+    Return the updated log2 maximum, sum, and correction. When the sink raises
+    the maximum, multiply the accumulated output numerator by the correction.
+    The FP8 exponent offset scales the unit weight to ``empty_row_sum = 2**max_offset``
+    without changing the maximum.
     """
-    if row_max == -Float32.inf:
-        row_max = sink_val * (utils.LOG2_E / scale_log2)
-        row_sum = empty_row_sum
-    else:
-        row_sum += cute.math.exp2(
-            sink_val * utils.LOG2_E - row_max * scale_log2 + max_offset, fastmath=True
-        )
-    return row_max, row_sum
+    sink_log2 = sink_val * utils.LOG2_E
+    correction = Float32(1.0)
+    if sink_log2 > row_max_log2:
+        correction = cute.math.exp2(row_max_log2 - sink_log2, fastmath=True)
+        row_sum = row_sum * correction + empty_row_sum
+        row_max_log2 = sink_log2
+    elif sink_log2 != -Float32.inf:
+        row_sum += cute.math.exp2(sink_log2 - row_max_log2 + max_offset, fastmath=True)
+    return row_max_log2, row_sum, correction
 
 
 @cute.jit
@@ -266,18 +263,19 @@ class Softmax(ParamsBase):
 
         for r in cutlass.range(cute.size(row_sum), unroll_full=True):
             row_max_scaled = row_max[r] * scale_log2
+            output_scale = final_scale
             if cutlass.const_expr(sink_val is not None):
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
-                LOG2_E = math.log2(math.e)
-                if row_max[r] == -Float32.inf:
-                    row_max_scaled = sink_val_cur * LOG2_E
-                row_sum[r] += cute.math.exp2(sink_val_cur * LOG2_E - row_max_scaled, fastmath=True)
+                row_max_scaled, row_sum[r], correction = apply_learnable_sink(
+                    row_max_scaled, row_sum[r], sink_val_cur
+                )
+                output_scale = final_scale * correction
 
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
             row_scale[r] = (
                 cute.arch.rcp_approx(row_sum[r] if not acc_O_mn_row_is_zero_or_nan else 1.0)
-            ) * final_scale
+            ) * output_scale
             row_sum_cur = row_sum[r]
             LN2 = math.log(2.0)
             row_sum[r] = (
