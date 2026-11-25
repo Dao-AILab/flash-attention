@@ -498,9 +498,11 @@ def _validate_tensorwise_scales(
 ) -> TensorwiseScales:
     """Check FP8 descales against the inputs; return them in a kernel-compatible layout.
 
-    maybe_contiguous keeps ABI-valid strided tensors as they are. Broadcast (stride-0) descales
-    stay as given: the kernels read one fp32 per (batch, KV head), so a copy would only add a
-    kernel per call. All-unset scales pass through.
+    maybe_contiguous keeps ABI-valid strided tensors as they are. Broadcast views whose other
+    strides are 1 (e.g. `s[:, None].expand(b, h)`) stay as given: the kernels read one fp32 per
+    (batch, KV head), so a copy would only add a kernel per call. Other broadcast views are
+    copied: CuTe keeps unit strides static, and the compile key holds only the broadcast dims.
+    All-unset scales pass through.
     """
     if all(t is None for t in scales):
         return scales
@@ -521,8 +523,8 @@ def _validate_tensorwise_scales(
             "scales.v (scales.k, if given, must be the same tensor)"
         )
     return TensorwiseScales(
-        *(t if t is not None and 0 in t.stride() else maybe_contiguous(t, align_bytes=4)
-          for t in scales)
+        *(t if t is not None and 0 in t.stride() and set(t.stride()) <= {0, 1}
+          else maybe_contiguous(t, align_bytes=4) for t in scales)
     )
 
 
@@ -1364,7 +1366,7 @@ def _flash_attn_fwd(
         else:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
-        # A broadcast descale may have no unit stride; its zero strides stay static (and keyed).
+        # A kept broadcast descale has strides 0 and 1 only: both stay static, and the key holds them.
         descale_tensors_tensor = (
             DescaleTensors(*(
                 to_cute_tensor(
@@ -3837,7 +3839,7 @@ def _check_forward_only_buffers(out, lse, q, k, v, qv, learnable_sink, aux_tenso
     and the caller owns that buffer."""
     if (out is None and lse is None) or not torch.is_grad_enabled():
         return
-    inputs = dict(q=q, k=k, v=v, qv=qv, learnable_sink=learnable_sink)
+    inputs = dict(out=out, lse=lse, q=q, k=k, v=v, qv=qv, learnable_sink=learnable_sink)
     inputs.update((f"aux_tensors[{i}]", t) for i, t in enumerate(aux_tensors or ()))
     needs_grad = [name for name, t in inputs.items() if t is not None and t.requires_grad]
     if needs_grad:
