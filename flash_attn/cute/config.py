@@ -1748,7 +1748,7 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
     )
     if config.use_swapab:
         # registers=None: the SwapAB kernel owns its fixed per-role budgets (64/120/208 at
-        # tile_hq=32) and its SMEM stages; it keeps hardware exp2.
+        # tile_m=32) and its SMEM stages; it keeps hardware exp2.
         derived = dict(
             registers=None,
             ex2_emu_freq=0,

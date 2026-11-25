@@ -225,7 +225,7 @@ def gemm_view(mX, order, head_idx=None, qhead_per_kvhead=None, num_heads_kv=None
 class _SwapABCore:
     def __init__(
         self,
-        tile_hq,
+        tile_cols,
         tile_n,
         head_dim,
         dtype,
@@ -236,7 +236,8 @@ class _SwapABCore:
         head_dim_v,
         query_len_in_heads=1,
     ):
-        self.tile_hq = tile_hq
+        # MMA N columns per CTA: the query heads of one KV head.
+        self.tile_cols = tile_cols
         self.tile_n = tile_n
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
@@ -260,11 +261,11 @@ class _SwapABCore:
 
         assert head_dim > 0 and head_dim % 16 == 0
         assert self.head_dim_v > 0 and self.head_dim_v % 16 == 0
-        assert tile_hq in (1, 2, 4, 8, 16, 32)
+        assert tile_cols in (1, 2, 4, 8, 16, 32)
         assert tile_n > 0 and tile_n % 128 == 0 and tile_n <= 256
 
     def make_shared_storage(self, sQ_layout, sK_layout, sP_layout):
-        tile_hq_mma = self.mma_tiler[1]
+        tile_cols_mma = self.mma_tiler[1]
 
         @cute.struct
         class SharedStorage:
@@ -274,11 +275,11 @@ class _SwapABCore:
             mbar_p: cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages_p]
             mbar_o: cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages_o]
             tmem_holding_buf: Int32
-            # Per-head running max for softmax/correction; split stats later publish 1/L here.
-            sRowMax: cute.struct.Align[cute.struct.MemRange[Float32, tile_hq_mma], 128]
+            # Per-column running max for softmax/correction; split stats later publish 1/L here.
+            sRowMax: cute.struct.Align[cute.struct.MemRange[Float32, tile_cols_mma], 128]
             # Per-warp row sums from the correction WG for the split statistics.
             sRowSumWarp: cute.struct.Align[
-                cute.struct.MemRange[Float32, WARPS_PER_WG * self.tile_hq], 128
+                cute.struct.MemRange[Float32, WARPS_PER_WG * self.tile_cols], 128
             ]
             sP: cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(sP_layout)], 1024]
             sQ: cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(sQ_layout)], 1024]
@@ -340,7 +341,7 @@ class _SwapABCore:
             softmax_scale, self.score_mod
         )
         qhead_per_kvhead = num_heads // num_heads_kv
-        tile_hq = self.tile_hq
+        tile_cols = self.tile_cols
         tile_n = self.tile_n
 
         # GEMM views over the FA layouts with the real strides (so e.g. a KV cache slice works
@@ -366,14 +367,14 @@ class _SwapABCore:
         # tcgen05 takes an MN-major 8-bit B operand (P^T in the PV MMA) only with N % 16 == 0.
         # TODO: a K-major P^T store would keep N = 8 for 8-head FP8 tiles; the P store view needs
         # rework.
-        tile_hq_mma = max(2 * MMA_N_MIN if self.dtype.width == 8 else MMA_N_MIN, tile_hq)
+        tile_cols_mma = max(2 * MMA_N_MIN if self.dtype.width == 8 else MMA_N_MIN, tile_cols)
         tile_k = 64
-        assert tile_hq_mma % tile_hq == 0
+        assert tile_cols_mma % tile_cols == 0
         num_s_subtiles = cute.ceil_div(tile_n, tile_m)
         num_k_tiles = cute.ceil_div(hdim, tile_k)
         num_d_tiles = cute.ceil_div(hdim_v, tile_m)
         num_pv_k_tiles = cute.ceil_div(tile_n, tile_k)
-        self.mma_tiler = (tile_m, tile_hq_mma, tile_k)
+        self.mma_tiler = (tile_m, tile_cols_mma, tile_k)
         self.subtile_counts = (num_s_subtiles, num_k_tiles, num_d_tiles, num_pv_k_tiles)
 
         # Pipeline depths. S: 4 TMEM score buffers, P: 4 SMEM buffers, O: 2 TMEM slots (even / odd
@@ -412,16 +413,16 @@ class _SwapABCore:
             tiled_mma_qk, self.mma_tiler, self.dtype, self.num_stages_q
         )
         sP_layout = sm100_utils.make_smem_layout_b(
-            tiled_mma_pv, (None, tile_hq_mma, tile_n), self.dtype, self.num_stages_p
+            tiled_mma_pv, (None, tile_cols_mma, tile_n), self.dtype, self.num_stages_p
         )
         sO_layout_atom = tcgen05.make_smem_layout_atom(
             tcgen05.mma.SmemLayoutAtomKind.MN_SW128, mO_partial_tma.element_type
         )
 
         # O staging tile uses the output dtype and reuses the K/V ring SMEM at the end.
-        O_shape = (num_d_tiles * tile_m, tile_hq_mma)
+        O_shape = (num_d_tiles * tile_m, tile_cols_mma)
         sO_layout = cute.tile_to_shape(sO_layout_atom, O_shape, order=(1, 0))
-        sO_layout = cute.flat_divide(sO_layout, (tile_m, tile_hq_mma))
+        sO_layout = cute.flat_divide(sO_layout, (tile_m, tile_cols_mma))
 
         sK_layout = self.plan_kv_ring(tiled_mma_qk, sQ_layout, sP_layout)
         sVt_layout = sm100_utils.make_smem_layout_a(
@@ -479,10 +480,10 @@ class _SwapABCore:
             cpasync.CopyBulkTensorTileS2GOp(),
             mO_partial_tma,
             cute.select(sO_layout, mode=[0, 1]),
-            (tile_m, tile_hq_mma),
+            (tile_m, tile_cols_mma),
         )
 
-        # Shared tile scheduler: one tile per (split, KV head, sequence); tile_hq covers every
+        # Shared tile scheduler: one tile per (split, KV head, sequence); tile_cols covers every
         # query head of a KV head (adapter-asserted). With per-sequence split counts it packs
         # the sequence's count into the split index and launches split-major.
         self.num_splits_dynamic = mNumSplitsDynamic is not None
@@ -495,7 +496,7 @@ class _SwapABCore:
             hdim,
             hdim_v,
             mQ.shape[0],
-            tile_shape_mn=(tile_hq, tile_n),
+            tile_shape_mn=(tile_cols, tile_n),
             mCuSeqlensQ=mCuSeqlensQ,
             qhead_per_kvhead_packgqa=qhead_per_kvhead,
             element_size=self.dtype.width // 8,
@@ -692,7 +693,7 @@ class _SwapABCore:
         hdim_v = self.head_dim_v
         _b, num_heads, num_heads_kv, _ = problem_size
         tile_n = self.tile_n
-        tile_hq = self.tile_hq
+        tile_cols = self.tile_cols
         qhead_per_kvhead = num_heads // num_heads_kv
         seqlen_k = seqlen_info.seqlen_k
         # This split's KV blocks are [n_block_min, n_block_max). With per-sequence split counts
@@ -739,7 +740,7 @@ class _SwapABCore:
                 softmax_scale = softmax_scale * qk_descale
 
         mma_tiler = self.mma_tiler
-        tile_m, tile_hq_mma, tile_k = self.mma_tiler
+        tile_m, tile_cols_mma, tile_k = self.mma_tiler
         num_s_subtiles, num_k_tiles, num_d_tiles, num_pv_k_tiles = self.subtile_counts
 
         mma_kq_instr_shape_k = cute.size(tiled_mma_qk.shape_mnk, mode=[2])
@@ -747,10 +748,10 @@ class _SwapABCore:
         qk_k_blocks = tile_k // mma_kq_instr_shape_k
         pv_k_blocks = tile_k // mma_vp_instr_shape_k
 
-        # The 32-head tile needs redistribution for its softmax / correction row state.
+        # The 32-column tile needs redistribution for its softmax / correction row state.
         # O-tail size alone does not capture the row-vector state or compiler liveness.
         # Keep sufficient registers in the MMA / load warps as well.
-        setmaxreg = tile_hq > 16
+        setmaxreg = tile_cols > 16
         # Per-thread setmaxnreg targets: 64 + 2 * 120 + 208 = 512 = 64K registers / 128 threads.
         num_regs_mma_load, num_regs_softmax, num_regs_correction = 64, 120, 208
 
@@ -781,25 +782,25 @@ class _SwapABCore:
         # column 0 instead of the allocator's pointer, which holds only because the kernel allocates
         # every column: keep num_tmem_cols at the maximum.
         acc_shape = thr_mma_qk.partition_shape_C(mma_tiler[:2])
-        num_s_cols = self.num_stages_s * num_s_subtiles * tile_hq_mma
-        num_l_cols = self.num_stages_l * tile_hq_mma
-        num_o_cols = self.num_stages_o * num_d_tiles * tile_hq_mma
+        num_s_cols = self.num_stages_s * num_s_subtiles * tile_cols_mma
+        num_l_cols = self.num_stages_l * tile_cols_mma
+        num_o_cols = self.num_stages_o * num_d_tiles * tile_cols_mma
         num_tmem_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
         assert num_s_cols + num_l_cols + num_o_cols <= num_tmem_cols
-        # ((tile_m, tile_hq_mma), 1, 1, subtile, stage)
+        # ((tile_m, tile_cols_mma), 1, 1, subtile, stage)
         tStS = thr_mma_qk.make_fragment_C(
             cute.append(cute.append(acc_shape, num_s_subtiles), self.num_stages_s)
         )
         tLtL = thr_mma_qk.make_fragment_C(cute.append(acc_shape, self.num_stages_l))
         tLtL = cute.make_tensor(tStS.iterator + num_s_cols, tLtL.layout)
-        # ((tile_m, tile_hq_mma), 1, 1, d tile, slot)
+        # ((tile_m, tile_cols_mma), 1, 1, d tile, slot)
         tOtO = thr_mma_pv.make_fragment_C(
             cute.append(cute.append(acc_shape, num_d_tiles), self.num_stages_o)
         )
         tOtO = cute.make_tensor(tStS.iterator + num_s_cols + num_l_cols, tOtO.layout)
 
         tLtL_0 = tLtL[(None, None), 0, 0, 0]
-        t2r_rep = tcgen05.Repetition(tile_hq)
+        t2r_rep = tcgen05.Repetition(tile_cols)
         t2r_atom = cute.make_copy_atom(
             tcgen05.Ld32x32bOp(t2r_rep, tcgen05.Pack.NONE), self.qk_acc_dtype
         )
@@ -817,16 +818,16 @@ class _SwapABCore:
         thr_r2s_O = tiled_r2s_O.get_slice(thr_in_wg)
         vec_layout = thr_t2r.partition_D(tLtL_0).layout
         vec_size = cute.cosize(vec_layout)
-        assert vec_size == tile_hq_mma
-        assert vec_layout.shape == ((tile_hq, 1), 1, tile_hq_mma // tile_hq)
+        assert vec_size == tile_cols_mma
+        assert vec_layout.shape == ((tile_cols, 1), 1, tile_cols_mma // tile_cols)
 
         sRowMax = storage.sRowMax.get_tensor(vec_layout)
         sRowSumWarp = storage.sRowSumWarp.get_tensor(
-            cute.make_layout(shape=(WARPS_PER_WG, tile_hq), stride=(tile_hq, 1))
+            cute.make_layout(shape=(WARPS_PER_WG, tile_cols), stride=(tile_cols, 1))
         )
-        lane_owns_head = lane_idx < tile_hq
+        lane_owns_column = lane_idx < tile_cols
         if warp_idx == load_q_store_o_warp_id:
-            if lane_owns_head:
+            if lane_owns_column:
                 sRowMax[lane_idx] = -Float32.inf
 
         # The KV ring carries K two blocks ahead of V: K(j) is loaded together with V(j - 2).
@@ -867,7 +868,7 @@ class _SwapABCore:
             # warp 3 initializes and produces this barrier, so the load starts before the
             # CTA-wide prologue barrier; warp 0 waits on it only after that barrier.
             if not is_empty_split:
-                gQ = cute.local_tile(mQ, (tile_hq_mma, tile_k), (0, None, q_bh_idx))
+                gQ = cute.local_tile(mQ, (tile_cols_mma, tile_k), (0, None, q_bh_idx))
                 load_Q, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_Q, 0, cute.make_layout(1), thr_mma_qk.partition_B(gQ), sQ
                 )
@@ -929,10 +930,10 @@ class _SwapABCore:
         if is_empty_split:
             if wg_idx == correction_wg_id:
                 bar_max_done.arrive()
-                if lane_idx < tile_hq:
+                if lane_idx < tile_cols:
                     sRowSumWarp[wg_warp_idx, lane_idx] = Float32(0.0)
                 bar_sum_done.arrive()
-            for o_idx in cutlass.range(thread_id, hdim_v * tile_hq, NUM_WG * WG_SIZE):
+            for o_idx in cutlass.range(thread_id, hdim_v * tile_cols, NUM_WG * WG_SIZE):
                 head = o_idx // hdim_v
                 if head < qhead_per_kvhead and q_row < num_q_rows:
                     global_head = (bh_idx % num_heads_kv) * qhead_per_kvhead + head
@@ -948,7 +949,7 @@ class _SwapABCore:
             bar_o_done.arrive_and_wait()
             for dm in cutlass.range_constexpr(num_d_tiles):
                 gO = cute.local_tile(
-                    mO_partial_tma, (tile_m, tile_hq_mma), (dm, 0, q_bh_idx, split_id)
+                    mO_partial_tma, (tile_m, tile_cols_mma), (dm, 0, q_bh_idx, split_id)
                 )
                 store_O, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_O, 0, cute.make_layout(1), sO[None, None, dm, 0], gO, single_stage=True
@@ -1198,12 +1199,12 @@ class _SwapABCore:
                 cute.arch.setmaxregister_decrease(num_regs_softmax)
 
             # Softmax WGs. Each thread owns one token row of each 128-token sub-tile, i.e. 2 rows of the
-            # block, and tile_hq query-head columns.
+            # block, and its tile_cols columns.
 
             tStS_0 = tStS[(None, None), 0, 0, None, 0]
-            t2r_rep_S = tcgen05.Repetition(tile_hq)
-            if cutlass.const_expr(tile_hq_mma == tile_hq):
-                t2r_rep_S = tcgen05.Repetition(tile_hq * num_s_subtiles)
+            t2r_rep_S = tcgen05.Repetition(tile_cols)
+            if cutlass.const_expr(tile_cols_mma == tile_cols):
+                t2r_rep_S = tcgen05.Repetition(tile_cols * num_s_subtiles)
             t2r_atom_S = cute.make_copy_atom(
                 tcgen05.Ld32x32bOp(t2r_rep_S, tcgen05.Pack.NONE),
                 self.qk_acc_dtype,
@@ -1213,20 +1214,20 @@ class _SwapABCore:
             thr_t2r_S = tiled_t2r_S.get_slice(thr_in_wg)
             thr_r2s_P = tiled_r2s_P.get_slice(thr_in_wg)
             tSrS_layout = thr_t2r_S.partition_D(tStS_0).layout
-            assert cute.cosize(tSrS_layout) == tile_hq_mma * num_s_subtiles
+            assert cute.cosize(tSrS_layout) == tile_cols_mma * num_s_subtiles
 
             tSrP_layout = cute.make_layout(
                 (*vec_layout.shape, num_s_subtiles),
                 stride=(*vec_layout.stride, vec_size),
             )
             scores_layout = cute.make_layout(
-                shape=(tile_hq, num_s_subtiles),
+                shape=(tile_cols, num_s_subtiles),
                 stride=(1, vec_size),
             )
             # (token row, head, subtile) -> one P stage's logical (head, token) index, head + N * token.
             sP_view_layout = cute.make_layout(
-                shape=(tile_m, tile_hq_mma, num_s_subtiles),
-                stride=(tile_hq_mma, 1, tile_m * tile_hq_mma),
+                shape=(tile_m, tile_cols_mma, num_s_subtiles),
+                stride=(tile_cols_mma, 1, tile_m * tile_cols_mma),
             )
 
             tSrS = cute.make_rmem_tensor(tSrS_layout, self.qk_acc_dtype)
@@ -1285,21 +1286,21 @@ class _SwapABCore:
                                 thr_in_wg + sm * tile_m - valid_rows + self.query_len_in_heads
                             )
                             if hidden_tokens > 0:
-                                for gi in cutlass.range_constexpr(tile_hq):
+                                for gi in cutlass.range_constexpr(tile_cols):
                                     if gi < hidden_tokens * heads_per_token:
                                         scores_r[gi, sm] = -Float32.inf
 
                 if cutlass.const_expr(self.apply_score_mods):
                     batch_idx = bh_idx // num_heads_kv
                     # score_mod runs on one score per call: a register column holds one KV token
-                    # across tile_hq heads, not the consecutive tokens of one head that the
+                    # across tile_cols columns, not the consecutive tokens of one head that the
                     # shared helper's vector chunks assume.
                     score_tiles = cute.zipped_divide(scores_r, (1, 1))
                     for sm in cutlass.range_constexpr(num_s_subtiles):
                         kv_idx = (s + n_block_min) * tile_n + thr_in_wg + sm * tile_m
                         # (q, kv) coordinate of this thread's token; the decode query is q = 0.
                         tScS = cute.domain_offset((0, kv_idx), cute.make_identity_tensor((1, 1)))
-                        for gi in cutlass.range_constexpr(tile_hq):
+                        for gi in cutlass.range_constexpr(tile_cols):
                             value = -Float32.inf
                             if gi < qhead_per_kvhead and kv_idx < seqlen_k:
                                 global_head = (bh_idx % num_heads_kv) * qhead_per_kvhead + gi
@@ -1349,12 +1350,12 @@ class _SwapABCore:
                         cute.ReductionOp.MAX,
                         -Float32.inf,
                         (None, 0),
-                    ).reshape((tile_hq,))
+                    ).reshape((tile_cols,))
                 )
 
-                # Block max per head: reduce over this warp's rows; lane h then holds the max of head h.
+                # Block max per column: reduce over this warp's rows; lane c then holds column c's max.
                 lane_max = -Float32.inf
-                for j in cutlass.range_constexpr(tile_hq):
+                for j in cutlass.range_constexpr(tile_cols):
                     row_max_r[j] = warp_reduce_max(row_max_r[j])
                     if j == lane_idx:
                         lane_max = row_max_r[j]
@@ -1365,7 +1366,7 @@ class _SwapABCore:
                 # bar_max_turn: take -> wait for correction to read M(j-1) -> atomic max -> publish -> pass.
                 bar_max_turn.arrive_and_wait_w_index(phase)
                 bar_max_empty.arrive_and_wait()
-                if lane_owns_head:
+                if lane_owns_column:
                     sRowMax_ptr = sRowMax.iterator + sRowMax.layout(lane_idx)
                     smem_atomic_max(sRowMax_ptr, lane_max)
 
@@ -1379,22 +1380,22 @@ class _SwapABCore:
 
                 if cutlass.const_expr(self.apply_score_mods):
                     # Only the local exponent bias is zeroed; shared final maxima stay -inf.
-                    for gi in cutlass.range_constexpr(tile_hq):
+                    for gi in cutlass.range_constexpr(tile_cols):
                         if row_max_valid[gi] == -Float32.inf:
                             row_max_valid[gi] = Float32(0.0)
                 elif cutlass.const_expr(self.check_empty_rows):
                     # Hidden keys alone leave a head no key only in a split whose first block
                     # holds fewer than query_len_in_heads keys.
                     if (s == 0) & (valid_rows < self.query_len_in_heads):
-                        for gi in cutlass.range_constexpr(tile_hq):
+                        for gi in cutlass.range_constexpr(tile_cols):
                             if row_max_valid[gi] == -Float32.inf:
                                 row_max_valid[gi] = Float32(0.0)
-                row_max_tile = row_max_valid.load().reshape((tile_hq, 1))
+                row_max_tile = row_max_valid.load().reshape((tile_cols, 1))
                 if cutlass.const_expr(self.max_offset != 0):
                     row_max_tile = row_max_tile - Float32(self.max_offset)
                 probs = exp2_fast(softmax_scale_log2 * scores - row_max_tile)
 
-                if cutlass.const_expr(tile_hq < tile_hq_mma):
+                if cutlass.const_expr(tile_cols < tile_cols_mma):
                     tSrP.fill(self.dtype(0))
 
                 probs_r.store(probs.to(self.dtype))
@@ -1404,14 +1405,14 @@ class _SwapABCore:
                 pipeline_p.producer_commit(p_state)
                 p_state.advance()
 
-                # This WG's TMEM mailbox carries this thread's two-token sums per head, not P.
+                # This WG's TMEM mailbox carries this thread's two-token sums per column, not P.
                 # Cross-thread reduction runs once in the correction tail.
                 row_sum_valid.store(
                     probs.reduce(
                         cute.ReductionOp.ADD,
                         Float32(0.0),
                         (None, 0),
-                    ).reshape((tile_hq,))
+                    ).reshape((tile_cols,))
                 )
 
                 bar_sum_empty.arrive_and_wait_w_index(phase)
@@ -1427,7 +1428,7 @@ class _SwapABCore:
             if cutlass.const_expr(setmaxreg):
                 cute.arch.setmaxregister_increase(num_regs_correction)
 
-            # Correction WG. Thread t owns TMEM lane t (one head_dim_v row of O, all heads) and keeps one
+            # Correction WG. Thread t owns TMEM lane t (one head_dim_v row of O, all columns) and keeps one
             # row-sum accumulator per O slot.
             l_slot_shape = (*vec_layout.shape, self.num_stages_o)
             l_slot_stride = (*vec_layout.stride, vec_size)
@@ -1461,7 +1462,7 @@ class _SwapABCore:
                 if not (preload_idx == 1 and num_n_blocks == 1):
                     bar_max_full.arrive_and_wait_unaligned()
                     row_max_prev = Float32(0.0)
-                    if lane_owns_head:
+                    if lane_owns_column:
                         row_max_prev = sRowMax[lane_idx]
                     bar_max_empty.arrive()
 
@@ -1483,7 +1484,7 @@ class _SwapABCore:
                 if s == num_n_blocks - self.num_stages_o - 1:
                     bar_max_done.arrive()
                 row_max_cur = Float32(0.0)
-                if lane_owns_head:
+                if lane_owns_column:
                     row_max_cur = sRowMax[lane_idx]
                 bar_max_empty.arrive()
 
@@ -1493,7 +1494,7 @@ class _SwapABCore:
                 if cutlass.const_expr(self.check_empty_rows):
                     if row_max_prev2 == -Float32.inf and row_max_cur == -Float32.inf:
                         acc_scale_lane = Float32(1.0)
-                for gi in cutlass.range_constexpr(tile_hq):
+                for gi in cutlass.range_constexpr(tile_cols):
                     acc_scale[gi] = cute.arch.shuffle_sync(acc_scale_lane, gi)
 
                 for dm in cutlass.range_constexpr(num_d_tiles):
@@ -1525,7 +1526,7 @@ class _SwapABCore:
             if cutlass.const_expr(self.check_empty_rows):
                 if row_max_prev2 == -Float32.inf and row_max_prev == -Float32.inf:
                     acc_scale_lane = Float32(1.0)
-            for gi in cutlass.range_constexpr(tile_hq):
+            for gi in cutlass.range_constexpr(tile_cols):
                 acc_scale[gi] = cute.arch.shuffle_sync(acc_scale_lane, gi)
 
             tail_phase = num_n_blocks % self.num_stages_o
@@ -1553,7 +1554,7 @@ class _SwapABCore:
                     )
 
             # Sum the row sums across the 32 lanes, then per warp into SMEM for the split-stats warp.
-            for gi in cutlass.range_constexpr(tile_hq):
+            for gi in cutlass.range_constexpr(tile_cols):
                 row_sum_final[gi] = cute.arch.warp_reduction_sum(row_sum_final[gi])
                 if lane_idx == 0:
                     sRowSumWarp[wg_warp_idx, gi] = row_sum_final[gi]
@@ -1598,7 +1599,7 @@ class _SwapABCore:
                     cute.make_layout((vec_size, num_d_tiles)), self.qk_acc_dtype
                 )
                 normalized.store(tOrO_final)
-                for gi in cutlass.range_constexpr(tile_hq):
+                for gi in cutlass.range_constexpr(tile_cols):
                     if tLrL[gi] == Float32(0.0):
                         for dm in cutlass.range_constexpr(num_d_tiles):
                             normalized[gi, dm] = Float32(0.0)
@@ -1612,7 +1613,7 @@ class _SwapABCore:
         # After its loads, warp 2 normalizes this split's statistics, not other CTAs'.
         if warp_idx == split_stats_warp_id:
             self.store_split_stats(
-                tile_hq,
+                tile_cols,
                 (split_id, q_bh_idx),
                 lane_idx,
                 is_empty_split,
@@ -1632,7 +1633,7 @@ class _SwapABCore:
     @staticmethod
     @cute.jit
     def store_split_stats(
-        tile_hq: int,
+        tile_cols: int,
         block_idx: Tuple[Int32, Int32],
         lane_idx: Int32,
         is_empty_split: cutlass.Boolean,
@@ -1645,16 +1646,16 @@ class _SwapABCore:
         max_offset: cutlass.Constexpr[int] = 0,
     ):
         split_id, bh_idx = block_idx
-        lane_owns_head = lane_idx < tile_hq
+        lane_owns_column = lane_idx < tile_cols
         row_max_lane = -Float32.inf
 
         cute.arch.fence_acq_rel_cta()
         bar_max_done.arrive_and_wait()
-        if lane_owns_head:
+        if lane_owns_column:
             row_max_lane = sRowMax[lane_idx]
 
         bar_sum_done.arrive_and_wait()
-        if lane_owns_head:
+        if lane_owns_column:
             row_sum_w01 = sRowSumWarp[0, lane_idx] + sRowSumWarp[1, lane_idx]
             row_sum_w23 = sRowSumWarp[2, lane_idx] + sRowSumWarp[3, lane_idx]
             row_sum = row_sum_w01 + row_sum_w23
@@ -1726,7 +1727,7 @@ class FlashAttentionForwardSm100SwapAB:
         self.is_local = is_local
         self.score_mod = score_mod
         self.mask_mod = mask_mod
-        self.tile_hq = config.tile_m
+        self.tile_cols = config.tile_m
         self.tile_n = config.tile_n
         self.query_len_in_heads = query_len_in_heads
 
@@ -1820,7 +1821,7 @@ class FlashAttentionForwardSm100SwapAB:
         if const_expr(self.is_split_kv):
             assert mO_core.element_type == Float32 and mLSE_core is not None
         core = _SwapABCore(
-            self.tile_hq,
+            self.tile_cols,
             self.tile_n,
             self.head_dim,
             mQ.element_type,
