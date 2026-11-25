@@ -169,33 +169,41 @@ def test_dense(dims, dtype, ns):
     check(*decode_inputs(*dims, dtype=dtype), ns=ns)
 
 
-# (dims, GQA ratio, ns): hd256 decode at 6 and 24 heads per KV head (the 32-column tile), and the
-# other head-dim kernels.
+E4M3, E5M2 = torch.float8_e4m3fn, torch.float8_e5m2
+DTYPE_IDS = {torch.bfloat16: "bf16", torch.float16: "fp16", E4M3: "e4m3", E5M2: "e5m2"}
+# (dims, GQA ratio, ns, dtype): hd256 decode at 6 and 24 heads per KV head (the 32-column tile),
+# and the other head-dim kernels.
 FP8_CASES = [
-    ((256, 256), 6, 1),
-    ((256, 256), 6, 3),
-    ((256, 256), 24, 3),
-    ((128, 128), 8, 3),
-    ((64, 64), 3, 1),
+    ((256, 256), 6, 1, E4M3),
+    ((256, 256), 6, 3, E4M3),
+    ((256, 256), 24, 3, E4M3),
+    ((128, 128), 8, 3, E4M3),
+    ((64, 64), 3, 1, E4M3),
+    ((256, 256), 6, 3, E5M2),
+    ((128, 128), 8, 1, E5M2),
 ]
 
 
 @pytest.mark.parametrize(
-    "dims,ratio,ns",
-    [pytest.param(d, r, n, id=f"hd{d[0]}-gqa{r}-ns{n}") for d, r, n in FP8_CASES],
+    "dims,ratio,ns,dtype",
+    [
+        pytest.param(d, r, n, t, id=f"hd{d[0]}-gqa{r}-ns{n}-{DTYPE_IDS[t]}")
+        for d, r, n, t in FP8_CASES
+    ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_fp8(dims, ratio, ns):
-    """E4M3 Q/K/V with per-(batch, KV head) descales vs the fp32 oracle on the dequantized inputs.
+def test_fp8(dims, ratio, ns, dtype):
+    """FP8 Q/K/V with per-(batch, KV head) descales vs the fp32 oracle on the dequantized inputs.
 
-    The error baseline rounds P to e4m3 as the kernel does: exp(S - max) * 2^8, so P <= 256.
+    The error baseline rounds P to the input dtype as the kernel does: exp(S - max) * 2^8, so
+    P <= 256.
     """
     q, k, v = decode_inputs(*dims, ratio=ratio, length=1537)
     descales = [torch.rand(2, 2, device="cuda") + 0.5 for _ in range(3)]  # (batch, KV heads)
     per_head = [descales[0].repeat_interleave(ratio, dim=1)[:, None, :, None]] + [
         d[:, None, :, None] for d in descales[1:]
     ]
-    q8, k8, v8 = ((x / d).to(torch.float8_e4m3fn) for x, d in zip((q, k, v), per_head))
+    q8, k8, v8 = ((x / d).to(dtype) for x, d in zip((q, k, v), per_head))
     o, lse, *_ = _flash_attn_fwd(
         q8, k8, v8, num_splits=ns, return_lse=True, scales=TensorwiseScales(*descales)
     )
@@ -207,9 +215,9 @@ def test_fp8(dims, ratio, ns):
         "bqhd,bkhd->bhqk", q_ref, k_ref.repeat_interleave(ratio, dim=2)
     ) / math.sqrt(dims[0])
     p = torch.exp(scores - scores.amax(-1, keepdim=True))
-    p_e4m3 = (p * 256).to(torch.float8_e4m3fn).float() / 256
+    p_fp8 = (p * 256).to(dtype).float() / 256
     out_pt = torch.einsum(
-        "bhqk,bkhd->bqhd", p_e4m3, v_ref.repeat_interleave(ratio, dim=2)
+        "bhqk,bkhd->bqhd", p_fp8, v_ref.repeat_interleave(ratio, dim=2)
     ) / p.sum(-1).transpose(1, 2)[..., None]
     assert_decode_close(o, lse, ref._replace(out_pt=out_pt))
 
@@ -727,12 +735,12 @@ def verify_rows(n):
 
 
 def verify_inputs(qpk, n, head_dim, dtype, *, pages_per_row=9, heads_kv=2, seed=5):
-    """Varlen verify rows over permuted 128-token pages, with fp8 descales for e4m3.
+    """Varlen verify rows over permuted 128-token pages, with descales for fp8.
 
     Unused pages hold NaN, and Q holds 4 NaN rows past cu_seqlens_q[-1]: the last row's extra
     columns load them. Returns (q, k, v, page_table, seqused_k, cu_seqlens_q, scales, deq),
-    where deq maps the e4m3 tensors back to fp32 for the oracle. e4m3 clamps the finite
-    garbage to 448, its largest finite value.
+    where deq maps the fp8 tensors back to fp32 for the oracle. FP8 clamps the finite garbage
+    to the dtype's largest finite value.
     """
     torch.manual_seed(seed)
     rows = verify_rows(n)
@@ -752,7 +760,7 @@ def verify_inputs(qpk, n, head_dim, dtype, *, pages_per_row=9, heads_kv=2, seed=
         k[num_pages], v[num_pages] = float("nan"), float("nan")
         q[total_q:] = float("nan")
     scales, deq = None, lambda x, which: x.float()
-    if dtype == torch.float8_e4m3fn:
+    if dtype.itemsize == 1:
         descales = [torch.rand(batch, heads_kv, device="cuda") + 0.5 for _ in range(3)]
         token_row = torch.tensor(
             [row for row, q_len in enumerate(q_lens) for _ in range(q_len)], device="cuda"
@@ -767,7 +775,8 @@ def verify_inputs(qpk, n, head_dim, dtype, *, pages_per_row=9, heads_kv=2, seed=
         )
         kv_scale = [d[page_row][:, None, :, None] for d in descales[1:]]
         q = (q / q_scale).to(dtype)
-        k, v = ((x / s).clamp(-448, 448).to(dtype) for x, s in zip((k, v), kv_scale))
+        dtype_max = torch.finfo(dtype).max
+        k, v = ((x / s).clamp(-dtype_max, dtype_max).to(dtype) for x, s in zip((k, v), kv_scale))
         scales = TensorwiseScales(*descales)
         per_tensor = {"q": q_scale, "k": kv_scale[0], "v": kv_scale[1]}
         deq = lambda x, which: x.float() * per_tensor[which]
@@ -802,13 +811,14 @@ def verify_reference(q, k, v, table, used, cu, deq, *, causal=True):
     q_ref = deq(q, "q")[tokens][:, None]
     k_ref, v_ref = deq(k, "k"), deq(v, "v")
     ref = decode_reference(q_ref, k_ref, v_ref, page_table=table_tok, seqused=used_tok, keep=keep)
-    if q.dtype == torch.float8_e4m3fn:
-        ref = ref._replace(out_pt=e4m3_baseline(q_ref, k_ref, v_ref, table_tok, used_tok, keep))
+    if q.dtype.itemsize == 1:
+        out_pt = fp8_baseline(q_ref, k_ref, v_ref, table_tok, used_tok, keep, q.dtype)
+        ref = ref._replace(out_pt=out_pt)
     return ref, tokens
 
 
-def e4m3_baseline(q, k, v, table, used, keep):
-    """Error baseline for e4m3: P rounded to e4m3 as the kernel does, exp(S - max) * 2^8."""
+def fp8_baseline(q, k, v, table, used, keep, dtype):
+    """Error baseline for fp8: P rounded to `dtype` as the kernel does, exp(S - max) * 2^8."""
     k = k[table.long()].flatten(1, 2)
     v = v[table.long()].flatten(1, 2)
     qpk = q.shape[2] // k.shape[2]
@@ -820,8 +830,8 @@ def e4m3_baseline(q, k, v, table, used, keep):
     scores = torch.einsum("bqhd,bkhd->bhqk", q, k) / math.sqrt(q.shape[-1])
     scores = scores.masked_fill(~key_mask[:, :, None, :], -math.inf)
     p = torch.exp(scores - scores.amax(-1, keepdim=True)).nan_to_num(0.0)
-    p_e4m3 = (p * 256).to(torch.float8_e4m3fn).float() / 256
-    out = torch.einsum("bhqk,bkhd->bqhd", p_e4m3, v) / p.sum(-1).transpose(1, 2)[..., None]
+    p_fp8 = (p * 256).to(dtype).float() / 256
+    out = torch.einsum("bhqk,bkhd->bqhd", p_fp8, v) / p.sum(-1).transpose(1, 2)[..., None]
     return out.nan_to_num(0.0)
 
 
@@ -853,6 +863,7 @@ VERIFY_CASES = [
     (torch.bfloat16, 1, 2, 128, 3),
     # An 8-column e4m3 tile.
     (torch.float8_e4m3fn, 2, 4, 128, 1),
+    (torch.float8_e5m2, 6, 4, 256, 3),
     # Per-sequence split counts (a 32K-token page-table capacity).
     (torch.bfloat16, 6, 4, 256, 0),
 ]
@@ -861,8 +872,10 @@ VERIFY_CASES = [
 @pytest.mark.parametrize(
     "dtype,qpk,n,head_dim,ns",
     [
-        pytest.param(*case, id=f"{str(case[0])[12:]}-qpk{case[1]}-n{case[2]}-hd{case[3]}-ns{case[4]}")
-        for case in VERIFY_CASES
+        pytest.param(
+            dtype, qpk, n, hd, ns, id=f"{DTYPE_IDS[dtype]}-qpk{qpk}-n{n}-hd{hd}-ns{ns}"
+        )
+        for dtype, qpk, n, hd, ns in VERIFY_CASES
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
@@ -874,7 +887,7 @@ def test_verify_rows(dtype, qpk, n, head_dim, ns, monkeypatch):
         qpk, n, head_dim, dtype, pages_per_row=pages_per_row
     )
     total_q = q.shape[0] - 4
-    out_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    out_dtype = torch.bfloat16 if dtype.itemsize == 1 else dtype
     out = torch.full(q.shape, 7.0, device="cuda", dtype=out_dtype)
     lse = torch.full((q.shape[1], q.shape[0]), 7.0, device="cuda")
     kw = dict(
@@ -888,8 +901,8 @@ def test_verify_rows(dtype, qpk, n, head_dim, ns, monkeypatch):
         return
     ref, tokens = verify_reference(q, k, v, table, used, cu, deq)
     padding = list(range(total_q, q.shape[0]))
-    # e4m3 rounds P in each kernel at its own running max.
-    atol = 1e-2 if dtype == torch.float8_e4m3fn else 2e-3
+    # FP8 rounds P in each kernel at its own running max; e5m2 keeps 2 mantissa bits.
+    atol = {torch.float8_e4m3fn: 1e-2, torch.float8_e5m2: 4e-2}.get(dtype, 2e-3)
     assert_verify_close(out, lse, std_out, std_lse, ref, tokens, padding, atol)
 
 

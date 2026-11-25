@@ -1313,9 +1313,8 @@ class SwapABPolicy:
             f"query heads x query tokens per KV head over {self.max_columns} columns": (
                 columns > self.max_columns
             ),
-            # TODO: e5m2: admit it here and in the SwapAB adapter's dtype assert, with a test; the
-            # kernel's FP8 math is not e4m3-specific.
-            "dtype": inputs.dtype not in ("torch.float16", "torch.bfloat16", "torch.float8_e4m3fn"),
+            "dtype": inputs.dtype
+            not in ("torch.float16", "torch.bfloat16", "torch.float8_e4m3fn", "torch.float8_e5m2"),
             "MXFP8 block scales": inputs.mxfp8_path is not None,
             "head dimensions": not self.supports_head_dims(inputs.head_dim, inputs.head_dim_v),
             f"page size must be a multiple of {self.page_multiple}": (

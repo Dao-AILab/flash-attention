@@ -114,7 +114,7 @@ _UNSUPPORTED = [
     ({**_VARLEN_PAGED, "max_seqlen_q": 9}, "over 32 columns"),
     # A tensor (device) max_seqlen_q is no host bound.
     ({**_VARLEN_PAGED, "has_max_seqlen_q_hint": False}, "needs a host max_seqlen_q"),
-    ({"dtype": "torch.float8_e5m2"}, "dtype"),
+    ({"dtype": "torch.float32"}, "dtype"),
     ({"mxfp8_path": "qk"}, "MXFP8 block scales"),
     ({"head_dim": 192, "head_dim_v": 128}, "head dimensions"),
     ({"num_heads": 66, "num_heads_kv": 2}, "over 32 columns"),

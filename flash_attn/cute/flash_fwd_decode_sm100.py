@@ -14,8 +14,9 @@
 # prepare-scheduler kernel), split CTAs past their sequence's count exit without writing.
 # One CTA = 16 warps: 0 QK MMA, 1 PV MMA, 2 K/V load + final statistics,
 # 3 Q load + O store, WGs 1/2 alternating softmax, WG3 O correction (and the O store in token mode).
-# FP8 (e4m3) Q/K/V run both MMAs in e4m3 with the standard kernel's tensorwise descales, and P is
-# cast to e4m3 scaled by 2^max_offset (Note [Low Precision Scaling] in flash_fwd_sm100.py).
+# FP8 (e4m3 or e5m2) Q/K/V run both MMAs in their dtype with the standard kernel's tensorwise
+# descales, and P is cast to that dtype scaled by 2^max_offset (Note [Low Precision Scaling] in
+# flash_fwd_sm100.py).
 
 import math
 from functools import partial
@@ -253,7 +254,8 @@ class _SwapABCore:
         self.head_dim_v = head_dim_v
         self.dtype = dtype
         self.qk_acc_dtype = cutlass.Float32
-        # FP8 P = exp2(S - M + max_offset) <= 2^8, below e4m3's max of 448 (the running max is exact).
+        # FP8 P = exp2(S - M + max_offset) <= 2^8, below the e4m3 and e5m2 maxima (448, 57344); the
+        # running max is exact.
         self.max_offset = 8 if dtype.width == 8 else 0
         self.score_mod = score_mod
         self.mask_mod = mask_mod
@@ -1906,7 +1908,12 @@ class FlashAttentionForwardSm100SwapAB:
             assert value is None, "swap-AB adapter: unsupported argument"
         assert len(mQ.shape) == (3 if self.is_varlen_q else 4)
         assert len(mK.shape) == 4 and len(mV.shape) == 4
-        assert mQ.element_type in (cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN)
+        assert mQ.element_type in (
+            cutlass.Float16,
+            cutlass.BFloat16,
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E5M2,
+        )
         assert mQ.element_type == mK.element_type == mV.element_type
         is_fp8 = mQ.element_type.width == 8
         assert descale_tensors is None or is_fp8
