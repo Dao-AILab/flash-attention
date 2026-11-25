@@ -3831,6 +3831,135 @@ def test_flash_attn_fp8_partial_descales(present):
     assert torch.equal(out, out_ref)
 
 
+def _fp8_varlen_inputs(varlen, seed=0):
+    """FP8 Q/K/V (2 sequences of 128 tokens, 4 query and 2 KV heads, hd128) with descales."""
+    torch.manual_seed(seed)
+    batch_size, seqlen, nheads, nheads_kv, d = 2, 128, 4, 2, 128
+    q, k, v = [
+        torch.randn(batch_size, seqlen, h, d, device="cuda").to(torch.float8_e4m3fn)
+        for h in (nheads, nheads_kv, nheads_kv)
+    ]
+    scales = TensorwiseScales(
+        *(torch.rand(batch_size, nheads_kv, device="cuda") + 0.5 for _ in range(3))
+    )
+    if not varlen:
+        return (q, k, v), dict(causal=True, scales=scales)
+    cu = torch.arange(0, (batch_size + 1) * seqlen, seqlen, device="cuda", dtype=torch.int32)
+    kwargs = dict(
+        cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=seqlen, max_seqlen_k=seqlen, causal=True,
+        scales=scales,
+    )
+    return tuple(t.flatten(0, 1) for t in (q, k, v)), kwargs
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 descales are SM100-only")
+@pytest.mark.parametrize("varlen", [False, True], ids=["dense", "varlen"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_out_lse_buffers(varlen):
+    """out= and lse= are written in place and returned, even with return_lse=False, bitwise
+    equal to the allocating call."""
+    (q, k, v), kwargs = _fp8_varlen_inputs(varlen)
+    fn = flash_attn_varlen_func if varlen else flash_attn_func
+    out_ref, lse_ref = fn(q, k, v, return_lse=True, **kwargs)
+    out = torch.empty(out_ref.shape, device="cuda", dtype=out_ref.dtype)
+    lse = torch.empty(lse_ref.shape, device="cuda", dtype=lse_ref.dtype)
+    out_ret, lse_ret = fn(q, k, v, out=out, lse=lse, **kwargs)
+    if is_fake_mode():
+        return
+    assert out_ret is out and lse_ret is lse
+    assert torch.equal(out, out_ref) and torch.equal(lse, lse_ref)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100 forward")
+@pytest.mark.parametrize("grad_input", ["q", "aux_tensor", "out"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_out_refuses_autograd(grad_input):
+    """The backward saves out, so out= raises when the call would record autograd (an aux tensor
+    or out itself counts); under torch.no_grad() it runs."""
+    torch.manual_seed(0)
+    q, k, v = [torch.randn(2, 128, h, 128, device="cuda", dtype=torch.bfloat16) for h in (4, 2, 2)]
+    out = torch.empty_like(q)
+    kwargs = {}
+    if grad_input == "q":
+        q.requires_grad_()
+    elif grad_input == "out":
+        out.requires_grad_()
+    else:
+        kwargs = dict(aux_tensors=[torch.zeros(1, device="cuda", requires_grad=True)])
+    with pytest.raises(ValueError, match=rf"forward-only calls, but \['{grad_input[:3]}"):
+        flash_attn_func(q, k, v, out=out, **kwargs)
+    if grad_input != "q":
+        return
+    with torch.no_grad():
+        out_ret, _ = flash_attn_func(q, k, v, out=out)
+        out_ref, _ = flash_attn_func(q, k, v)
+    if is_fake_mode():
+        return
+    assert out_ret is out and torch.equal(out, out_ref)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="MLA forward is SM100-only")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_out_with_shared_kv_mla():
+    """flash_attn_func rewrites a shared K/V call (k is v, head dim 512) into qv-only MLA; out=
+    and lse= (heads last) go through that rewrite."""
+    torch.manual_seed(0)
+    qv = torch.randn(1, 128, 64, 512, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(1, 256, 1, 512, device="cuda", dtype=torch.bfloat16)
+    out_ref, lse_ref = flash_attn_func(qv, kv, kv, return_lse=True)
+    out = torch.empty_like(out_ref)
+    lse = torch.empty_like(lse_ref)
+    out_ret, lse_ret = flash_attn_func(qv, kv, kv, out=out, lse=lse)
+    if is_fake_mode():
+        return
+    assert out_ret is out and lse_ret is lse
+    assert torch.equal(out, out_ref) and torch.equal(lse, lse_ref)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 descales are SM100-only")
+@pytest.mark.parametrize(
+    "pattern", ["scalar", "per_batch", "per_head", "per_batch_strided", "per_head_strided"]
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_broadcast_descales(pattern):
+    """Broadcast descales match contiguous ones bitwise. Those whose other strides are 1 run
+    without a copy kernel. Strides: scalar (0, 0), per_batch (1, 0), per_head (0, 1),
+    per_batch_strided (2, 0), per_head_strided (0, 2)."""
+    (q, k, v), kwargs = _fp8_varlen_inputs(varlen=True)
+    batch_size, nheads_kv = kwargs["scales"].q.shape
+    values = {
+        "scalar": torch.full((), 0.7, device="cuda"),
+        "per_batch": torch.rand(batch_size, 1, device="cuda") + 0.5,
+        "per_head": torch.rand(1, nheads_kv, device="cuda") + 0.5,
+        # Slices of wider tables: per_batch's and per_head's broadcast dims, other strides 2.
+        "per_batch_strided": (torch.rand(batch_size, 2, device="cuda") + 0.5)[:, :1],
+        "per_head_strided": (torch.rand(1, 2 * nheads_kv, device="cuda") + 0.5)[:, ::2],
+    }[pattern]
+    broadcast = values.expand(batch_size, nheads_kv)
+    kwargs_bcast = dict(kwargs, scales=TensorwiseScales(broadcast, broadcast, broadcast))
+    contiguous = broadcast.contiguous()
+    kwargs_dense = dict(kwargs, scales=TensorwiseScales(contiguous, contiguous, contiguous))
+    out_ref, _ = flash_attn_varlen_func(q, k, v, **kwargs_dense)
+    strided = pattern.endswith("_strided")
+    if strided:
+        # The unit-stride view with the same broadcast dims runs first, so its kernel exists.
+        unit = values.contiguous().expand(batch_size, nheads_kv)
+        flash_attn_varlen_func(q, k, v, **dict(kwargs, scales=TensorwiseScales(unit, unit, unit)))
+    out, _ = flash_attn_varlen_func(q, k, v, **kwargs_bcast)
+    if is_fake_mode():
+        return
+    assert torch.equal(out, out_ref)
+    if strided:
+        return
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        flash_attn_varlen_func(q, k, v, **kwargs_bcast)
+        torch.cuda.synchronize()
+    kernels = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    # ATen copy kernels only: CuTe kernel names contain "CopyAtom".
+    copies = [name for name in kernels if "at::native" in name and "copy" in name.lower()]
+    assert kernels and not copies, copies
+
+
 @pytest.mark.parametrize("page_size", [16, 64, 256])
 @pytest.mark.parametrize("seqlen_q", [64, 128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)

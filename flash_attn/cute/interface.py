@@ -498,8 +498,11 @@ def _validate_tensorwise_scales(
 ) -> TensorwiseScales:
     """Check FP8 descales against the inputs; return them in a kernel-compatible layout.
 
-    maybe_contiguous keeps ABI-valid strided or broadcast tensors as they are. All-unset scales
-    pass through.
+    maybe_contiguous keeps ABI-valid strided tensors as they are. Broadcast views whose other
+    strides are 1 (e.g. `s[:, None].expand(b, h)`) stay as given: the kernels read one fp32 per
+    (batch, KV head), so a copy would only add a kernel per call. Other broadcast views are
+    copied: CuTe keeps unit strides static, and the compile key holds only the broadcast dims.
+    All-unset scales pass through.
     """
     if all(t is None for t in scales):
         return scales
@@ -519,7 +522,10 @@ def _validate_tensorwise_scales(
             "MLA without q / k (no rope part) reads the latent cache as v: pass its descale as "
             "scales.v (scales.k, if given, must be the same tensor)"
         )
-    return TensorwiseScales(*(maybe_contiguous(t, align_bytes=4) for t in scales))
+    return TensorwiseScales(
+        *(t if t is not None and 0 in t.stride() and set(t.stride()) <= {0, 1}
+          else maybe_contiguous(t, align_bytes=4) for t in scales)
+    )
 
 
 def _validate_block_scales(
@@ -1360,8 +1366,15 @@ def _flash_attn_fwd(
         else:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
+        # A kept broadcast descale has strides 0 and 1 only: both stay static, and the key holds them.
         descale_tensors_tensor = (
-            DescaleTensors(*(to_cute_tensor(t, assumed_align=4, leading_dim=1) for t in descales))
+            DescaleTensors(*(
+                to_cute_tensor(
+                    t, assumed_align=4, leading_dim=1,
+                    fully_dynamic=t is not None and t.stride(-1) != 1,
+                )
+                for t in descales
+            ))
             if has_descale
             else None
         )
@@ -3498,8 +3511,11 @@ class FlashAttnFunc(torch.autograd.Function):
         gather_bwd_token_chunk: Optional[int] = None,
         config: FwdConfig | MlaFwdConfig | None = None,
         scales: TensorwiseScales | BlockScales | None = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
+        caller_buffers = [t for t in (out, lse) if t is not None]
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
             _check_shared_kv_scales(scales)
@@ -3531,7 +3547,11 @@ class FlashAttnFunc(torch.autograd.Function):
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             config=config,
             scales=scales,
+            out=out,
+            lse=lse,
         )
+        if caller_buffers:
+            ctx.mark_dirty(*caller_buffers)
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
         ctx.shared_kv = shared_kv
@@ -3578,9 +3598,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 18)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 18)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3609,7 +3629,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 18)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3651,8 +3671,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         gather_bwd_token_chunk: Optional[int] = None,
         config: FwdConfig | MlaFwdConfig | None = None,
         scales: TensorwiseScales | None = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
+        caller_buffers = [t for t in (out, lse) if t is not None]
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
             _check_shared_kv_scales(scales)
@@ -3695,7 +3718,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             config=config,
             scales=scales,
+            out=out,
+            lse=lse,
         )
+        if caller_buffers:
+            ctx.mark_dirty(*caller_buffers)
         ctx.save_for_backward(
             q,
             k,
@@ -3768,9 +3795,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 18)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 20)
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 18)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 20)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3804,7 +3831,22 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 18)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 20)
+
+
+def _check_forward_only_buffers(out, lse, q, k, v, qv, learnable_sink, aux_tensors) -> None:
+    """Raise if out= or lse= meets a call that records autograd: the backward saves the output,
+    and the caller owns that buffer."""
+    if (out is None and lse is None) or not torch.is_grad_enabled():
+        return
+    inputs = dict(out=out, lse=lse, q=q, k=k, v=v, qv=qv, learnable_sink=learnable_sink)
+    inputs.update((f"aux_tensors[{i}]", t) for i, t in enumerate(aux_tensors or ()))
+    needs_grad = [name for name, t in inputs.items() if t is not None and t.requires_grad]
+    if needs_grad:
+        raise ValueError(
+            f"out= and lse= are only supported for forward-only calls, but {needs_grad} require "
+            "grad while grad mode is on (use torch.no_grad() or torch.inference_mode())"
+        )
 
 
 def _validate_gather_bwd_kwargs(
@@ -3870,9 +3912,12 @@ def flash_attn_func(
     gather_bwd_token_chunk: Optional[int] = None,
     config: FwdConfig | MlaFwdConfig | None = None,
     scales: TensorwiseScales | BlockScales | None = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
 ):
     """Compute attention.
 
+    out / lse: forward-only caller buffers, as in flash_attn_varlen_func.
     scales: dequantization scales of low-precision Q/K/V, forward-only; None for unscaled inputs
         (FP8 then uses descale 1).
         - TensorwiseScales: FP8 Q/K/V.
@@ -3902,6 +3947,7 @@ def flash_attn_func(
             "the backward will run unchunked (full-size dS transient).",
             stacklevel=2,
         )
+    _check_forward_only_buffers(out, lse, q, k, v, qv, learnable_sink, aux_tensors)
     return FlashAttnFunc.apply(
         q,
         k,
@@ -3928,6 +3974,8 @@ def flash_attn_func(
         gather_bwd_token_chunk,
         config,
         scales,
+        out,
+        lse,
     )
 
 
@@ -3967,6 +4015,8 @@ def flash_attn_varlen_func(
     gather_bwd_token_chunk: Optional[int] = None,
     config: FwdConfig | MlaFwdConfig | None = None,
     scales: TensorwiseScales | None = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
 ):
     """
     Tensor arguments:
@@ -4049,6 +4099,14 @@ def flash_attn_varlen_func(
     scales: dequantization scales of low-precision Q/K/V; TensorwiseScales for FP8, which is
         forward-only. None for unscaled inputs (FP8 then uses descale 1). MXFP8 BlockScales
         support only dense attention, through flash_attn_func.
+    out / lse: caller buffers with the Return shapes and dtypes (out is bf16 for FP8 inputs, lse
+        fp32), written in place and returned. A given lse is always written and returned:
+        return_lse only matters when lse is None. Forward-only: with grad mode on, a call where
+        any input (aux_tensors included) requires grad raises ValueError, since the backward
+        saves out.
+        Example, a CUDA-graph decode step writing into a persistent buffer:
+            with torch.inference_mode():
+                flash_attn_varlen_func(q, k_cache, v_cache, ..., out=o_buf, lse=lse_buf)
     """
     if isinstance(scales, BlockScales):
         raise NotImplementedError(
@@ -4057,6 +4115,7 @@ def flash_attn_varlen_func(
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
+    _check_forward_only_buffers(out, lse, q, k, v, qv, learnable_sink, aux_tensors)
     return FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -4093,6 +4152,8 @@ def flash_attn_varlen_func(
         gather_bwd_token_chunk,
         config,
         scales,
+        out,
+        lse,
     )
 
 
