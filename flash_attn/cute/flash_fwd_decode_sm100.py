@@ -1405,7 +1405,8 @@ class _SwapABCore:
                 # Causal token j sees keys up to seqlen_k - seqlen_q + j: only the last
                 # seqlen_q - 1 keys hide from some tokens, so a CTA-uniform branch skips the
                 # other blocks. It runs after score_mod, which could lift a masked score.
-                # Causal handling costs ~2% of a 32-column verify call (~180 B more register spills).
+                # Causal handling costs ~2% of a 32-column verify call at 256-token KV blocks
+                # (~180 B more register spills).
                 if cutlass.const_expr(self.causal_tokens):
                     if valid_rows < tile_n + seqlen_q - 1:
                         for sm in cutlass.range_constexpr(num_s_subtiles):

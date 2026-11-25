@@ -909,11 +909,13 @@ def test_verify_rows(dtype, qpk, n, head_dim, ns, monkeypatch):
     assert_verify_close(out, lse, std_out, std_lse, ref, tokens, padding, atol)
 
 
+# Head dim 256 token rows take 128-token KV blocks (SwapABPolicy.select_tile_n); 128 takes 256.
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("layout", ["dense_q", "noncausal"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_verify_rows_layouts(layout, monkeypatch):
+def test_verify_rows_layouts(layout, head_dim, monkeypatch):
     """Token mode with dense Q (batch, n, heads, d), and without the causal mask."""
-    q, k, v, table, used, cu, _, deq = verify_inputs(6, 4, 128, torch.bfloat16)
+    q, k, v, table, used, cu, _, deq = verify_inputs(6, 4, head_dim, torch.bfloat16)
     causal = layout != "noncausal"
     kw = dict(page_table=table, seqused_k=used, causal=causal, num_splits=3, return_lse=True)
     if layout == "dense_q":
@@ -1009,13 +1011,14 @@ def keep_by_token(b, h, q_idx, kv_idx, seqlen_info, aux_tensors):
     return (kv_idx + q_idx) % 3 != 0
 
 
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kind", ["mask_mod", "score_mod", "local"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_verify_rows_modifiers(kind, monkeypatch):
+def test_verify_rows_modifiers(kind, head_dim, monkeypatch):
     """Token mode hands each column's token to modifiers as q_idx (score_mod reads aux data at
     offset_q + q_idx) and centers a local window on the token's position, as the standard kernel
     does."""
-    q, k, v, table, used, cu, _, _ = verify_inputs(4, 3, 128, torch.bfloat16)
+    q, k, v, table, used, cu, _, _ = verify_inputs(4, 3, head_dim, torch.bfloat16)
     kw = dict(
         cu_seqlens_q=cu, max_seqlen_q=3, page_table=table, seqused_k=used, num_splits=3,
         return_lse=True, causal=kind != "mask_mod",
