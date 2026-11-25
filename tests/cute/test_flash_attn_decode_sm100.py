@@ -26,7 +26,7 @@ from decode_test_utils import (
 from flash_attn.cute import interface
 from flash_attn.cute.config import select_fwd_config
 from flash_attn.cute.interface import _flash_attn_fwd, flash_attn_func, TensorwiseScales
-from flash_attn.cute.testing import is_fake_mode, maybe_fake_tensor_mode
+from flash_attn.cute.testing import check_tensor_vs_ref, is_fake_mode, maybe_fake_tensor_mode
 
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 
@@ -866,6 +866,9 @@ VERIFY_CASES = [
     (torch.float8_e5m2, 6, 4, 256, 3),
     # Per-sequence split counts (a 32K-token page-table capacity).
     (torch.bfloat16, 6, 4, 256, 0),
+    # Head dims 64 (one 64-dim Q box) and 96 (a partial second box).
+    (torch.bfloat16, 8, 4, 64, 1),
+    (torch.float8_e4m3fn, 4, 2, 96, 3),
 ]
 
 
@@ -930,6 +933,30 @@ def test_verify_rows_layouts(layout, monkeypatch):
         lse, std_lse = lse.transpose(0, 1).flatten(1, 2), std_lse.transpose(0, 1).flatten(1, 2)
     ref, tokens = verify_reference(q_flat, k, v, table, used, cu, deq, causal=causal)
     assert_verify_close(out, lse, std_out, std_lse, ref, tokens, padding=[])
+
+
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_verify_rows_without_lse(monkeypatch):
+    """An fp8 verify call at 1 split with return_lse=False (no LSE output, its own kernel): O vs
+    the fp32 oracle and the standard kernel."""
+    q, k, v, table, used, cu, scales, deq = verify_inputs(6, 4, 256, torch.float8_e4m3fn)
+    kw = dict(
+        cu_seqlens_q=cu, max_seqlen_q=4, page_table=table, seqused_k=used, causal=True,
+        num_splits=1, return_lse=False, scales=scales,
+    )
+    out, lse, *_ = _flash_attn_fwd(q, k, v, **kw)
+    monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "standard")
+    std_out, *_ = _flash_attn_fwd(q, k, v, **kw)
+    if is_fake_mode():
+        return
+    assert lse is None
+    ref, tokens = verify_reference(q, k, v, table, used, cu, deq)
+    check_tensor_vs_ref("out", out[tokens, None], ref.out.to(out.dtype), ref.out_pt)
+    seen = ~torch.isneginf(ref.lse[:, :, 0].T)  # (heads, tokens)
+    torch.testing.assert_close(
+        out[tokens].float().transpose(0, 1)[seen], std_out[tokens].float().transpose(0, 1)[seen],
+        atol=1e-2, rtol=0,
+    )
 
 
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)

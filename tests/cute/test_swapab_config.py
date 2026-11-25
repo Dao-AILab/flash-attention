@@ -67,25 +67,28 @@ def test_admitted_decode_selects_swapab(changes):
     assert select_fwd_config(inputs._replace(requested_use_swapab=True)) == config
 
 
-# Verify rows (token mode): N holds npo2(query heads per KV head) x npo2(max_seqlen_q) columns.
+# Verify rows (token mode): N holds npo2(query heads per KV head) x npo2(max_seqlen_q) columns;
+# head dim 256 takes 128-token KV blocks.
 @pytest.mark.parametrize(
-    ("changes", "tile_m"),
+    ("changes", "tile_m", "tile_n"),
     [
         # 6 query heads per KV head, 1 + 3 drafts: 8 x 4.
-        ({"num_heads": 12, **_VARLEN_PAGED, "total_q": 12, "max_seqlen_q": 4}, 32),
+        ({"num_heads": 12, **_VARLEN_PAGED, "total_q": 12, "max_seqlen_q": 4}, 32, 256),
+        ({"num_heads": 12, **_VARLEN_PAGED, "total_q": 12, "max_seqlen_q": 4, "head_dim": 256,
+          "head_dim_v": 256}, 32, 128),
         # Dense Q of 4 tokens per sequence.
-        ({"num_heads": 12, "total_q": 16, "max_seqlen_q": 4}, 32),
-        ({**_VARLEN_PAGED, "total_q": 9, "max_seqlen_q": 3}, 16),
-        ({"num_heads": 2, **_VARLEN_PAGED, "total_q": 96, "max_seqlen_q": 32}, 32),
+        ({"num_heads": 12, "total_q": 16, "max_seqlen_q": 4}, 32, 256),
+        ({**_VARLEN_PAGED, "total_q": 9, "max_seqlen_q": 3}, 16, 256),
+        ({"num_heads": 2, **_VARLEN_PAGED, "total_q": 96, "max_seqlen_q": 32}, 32, 256),
         # Each column's token reaches modifiers as q_idx and centers its local window.
         ({**_VARLEN_PAGED, "total_q": 9, "max_seqlen_q": 3, "local": True,
-          "window_size_left": 31, "has_score_mod": True, "has_mask_mod": True}, 16),
+          "window_size_left": 31, "has_score_mod": True, "has_mask_mod": True}, 16, 256),
     ],
 )
-def test_admitted_verify_rows_select_swapab(changes, tile_m):
+def test_admitted_verify_rows_select_swapab(changes, tile_m, tile_n):
     config = select_fwd_config(decode(**changes)._replace(requested_use_swapab=True))
 
-    assert config.use_swapab and config.tile_m == tile_m
+    assert config.use_swapab and (config.tile_m, config.tile_n) == (tile_m, tile_n)
 
 
 def test_verify_rows_over_32_columns_take_the_standard_kernel():

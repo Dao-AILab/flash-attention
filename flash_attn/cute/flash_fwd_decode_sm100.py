@@ -387,7 +387,7 @@ class _SwapABCore:
         tile_m = 128
         # tcgen05 takes an MN-major 8-bit B operand (P^T in the PV MMA) only with N % 16 == 0, so
         # FP8 tiles of up to 8 columns pad N to 16. A K-major P^T store keeps N = 8 but measured no
-        # faster: +0.2% median, -2.6% .. +1.8% over 270 FP8 decode shapes (GB300).
+        # faster.
         tile_cols_mma = max(2 * MMA_N_MIN if self.dtype.width == 8 else MMA_N_MIN, tile_cols)
         tile_k = 64
         assert tile_cols_mma % tile_cols == 0
@@ -731,7 +731,7 @@ class _SwapABCore:
         # This split's KV blocks are [n_block_min, n_block_max). With per-sequence split counts
         # the scheduler packed the count into split_idx's high 16 bits.
         packed_splits = self.num_splits_dynamic
-        # tile_m = the row's tokens, so a local window's right edge reaches the last token's keys.
+        # tile_m = the token tile, so a local window's right edge reaches the last token's keys.
         block_info = BlockInfo(
             tile_m=self.tokens_tile,
             tile_n=tile_n,
@@ -1405,9 +1405,7 @@ class _SwapABCore:
                 # Causal token j sees keys up to seqlen_k - seqlen_q + j: only the last
                 # seqlen_q - 1 keys hide from some tokens, so a CTA-uniform branch skips the
                 # other blocks. It runs after score_mod, which could lift a masked score.
-                # TODO: token mode is 4.9% slower than decode at the same 32 columns (26-row fp8
-                # verify call, GB300): ~2.4% this branch (~180 B more spills), ~2.4% not found
-                # (not the per-column O stores).
+                # Causal handling costs ~2% of a 32-column verify call (~180 B more register spills).
                 if cutlass.const_expr(self.causal_tokens):
                     if valid_rows < tile_n + seqlen_q - 1:
                         for sm in cutlass.range_constexpr(num_s_subtiles):
@@ -1856,7 +1854,7 @@ class FlashAttentionForwardSm100SwapAB:
         self.tile_n = config.tile_n
         # tile_m = heads tile x tokens tile (SwapABPolicy.config); one token is decode, where
         # one query at the end of seqused_k makes causal and noncausal agree.
-        self.tokens_tile = config.tile_m // SWAPAB.tile_hq(qhead_per_kvhead)
+        self.tokens_tile = config.tile_m // SWAPAB.heads_tile(qhead_per_kvhead)
         self.is_causal = is_causal
 
     @cute.jit
