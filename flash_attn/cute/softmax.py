@@ -51,10 +51,16 @@ def apply_learnable_sink(
     max_offset: Float32 = 0.0,
     empty_row_sum: Float32 = 1.0,
 ) -> tuple[Float32, Float32, Float32]:
-    """Add one zero-value column. Return the new log2 maximum, sum, and numerator scale.
+    """Fold one sink logit per query head into the final softmax statistics.
 
-    The sink is in natural-log units. The exponent offset used for FP8 scales the
-    unit weight to ``empty_row_sum = 2**max_offset``; it does not change the maximum.
+    The sink is in natural-log units and is not multiplied by ``softmax_scale``.
+    It has no value vector: it adds weight to the denominator, not the numerator.
+    If all keys are masked, a finite sink gives zero output and LSE equal to the sink.
+
+    Return the updated log2 maximum, sum, and correction. When the sink raises
+    the maximum, multiply the accumulated output numerator by the correction.
+    The FP8 exponent offset scales the unit weight to ``empty_row_sum = 2**max_offset``
+    without changing the maximum.
     """
     sink_log2 = sink_val * utils.LOG2_E
     correction = Float32(1.0)

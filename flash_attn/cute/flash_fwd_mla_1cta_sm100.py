@@ -3425,8 +3425,11 @@ class FlashAttentionMLAForward1CtaSm100:
         m_block: Int32,
         tidx: Int32,
     ) -> None:
-        # The sink belongs to split 0 even if the tile has no KV work. Only one
-        # epilogue thread per valid row stores O here; the normal O path is skipped.
+        """Store partial results for a tile with no KV work.
+
+        On split 0 with a sink, one thread per valid row writes zero output and
+        the sink logit as LSE. Other empty splits write only an LSE of -inf.
+        """
         lse = -Float32.inf
         if const_expr(learnable_sink is not None):
             if split_idx == 0 and tidx < self.cta_tile_m:
