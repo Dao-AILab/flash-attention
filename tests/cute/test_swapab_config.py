@@ -275,10 +275,11 @@ def test_split_count_bounds():
         # One split needs no counts.
         ({"has_seqused_k": True, "max_seqlen_k": 262144, "requested_num_splits": 1}, False, 1),
         # Token rows at batch x KV heads 33-64, where the static count is 1 split, take counts
-        # from 8K; 32 or 128 (2 static splits, or over 64) and decode rows keep the static count.
+        # from 8K; 32 (2 static splits), 66 and 128 (over 64) and decode rows keep the static count.
         (_TOKENS | {"batch_size": 32, "total_q": 128, "max_seqlen_k": 8192}, True, 19),
         (_TOKENS | {"batch_size": 32, "total_q": 128, "max_seqlen_k": 8191}, False, 1),
         (_TOKENS | {"batch_size": 16, "total_q": 64, "max_seqlen_k": 8192}, False, 2),
+        (_TOKENS | {"batch_size": 33, "total_q": 132, "max_seqlen_k": 8192}, False, 1),
         (_TOKENS | {"batch_size": 64, "total_q": 256, "max_seqlen_k": 8192}, False, 1),
         (_TOKENS | {"batch_size": 32, "total_q": 32, "max_seqlen_q": 1, "max_seqlen_k": 8192},
          False, 1),

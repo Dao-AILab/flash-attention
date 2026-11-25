@@ -1228,11 +1228,12 @@ class SwapABPolicy:
     per_sequence_min_capacity: int = 32768
     # Token rows (2+ query tokens) whose static count is 1 split at batch * KV heads <=
     # token_per_sequence_max_heads take per-sequence counts from token_per_sequence_min_capacity:
-    # that grid leaves over half of the SMs idle. GB300 sweep at 4 tokens per row (fp8 and bf16,
-    # batch x KV heads 48 and 64, KV 8K-16K): 0.62-0.92x of the standard kernel's time on rows
-    # spread 0.25x-1.75x of the mean length (1 split: 1.11-2.29x), 0.73-1.17x on rows of one
-    # length (1 split: 0.97-1.66x). At 96 and 128+, they took up to 1.4x the time of 1 split on
-    # rows of one length.
+    # that grid leaves over half of the SMs idle. GB300 sweep at 4 tokens per row (fp8 hd128/256
+    # and bf16 hd256, batch x KV heads 48 and 64, KV 8K-16K): per-sequence counts took 0.66-1.01x
+    # the time of 1 split on rows of one length and 0.39-0.65x on rows spread 0.25x-1.75x of the
+    # mean length. At 96 they took 1.12x (up to 1.30x) on rows of one length but 0.73x on spread
+    # rows; at 128+, up to 1.36x on rows of one length. The band keeps only what won on both.
+    # 33-47 and 65-95 were not timed.
     token_per_sequence_min_capacity: int = 8192
     token_per_sequence_max_heads: int = 64
     # Automatic selection keeps the standard kernel for many short sequences at head dims <= 128:
