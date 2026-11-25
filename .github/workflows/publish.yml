@@ -8,9 +8,9 @@
 name: Build wheels and deploy
 
 on:
-  create:
+  push:
     tags:
-      - v*
+      - 'v*'
 
 jobs:
   setup_release:
