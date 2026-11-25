@@ -3873,7 +3873,7 @@ def flash_attn_func(
 ):
     """Compute attention.
 
-    learnable_sink: one extra softmax logit per query head; forward-only on SM80/SM12x.
+    learnable_sink: one extra softmax logit per query head; forward-only on SM8x/SM12x.
 
     scales: dequantization scales of low-precision Q/K/V, forward-only; None for unscaled inputs
         (FP8 then uses descale 1).
@@ -3972,7 +3972,7 @@ def flash_attn_varlen_func(
 ):
     """
     Tensor arguments:
-        learnable_sink: one extra softmax logit per query head; forward-only on SM80/SM12x.
+        learnable_sink: one extra softmax logit per query head; forward-only on SM8x/SM12x.
         q:  (total_q, nheads,   hdim)   or (batch, seqlen_q, nheads,   hdim)
         k:  (total_k, nheads_k, hdim)   or (batch, seqlen_k, nheads_k, hdim)
         v:  (total_k, nheads_k, hdim_v) or (batch, seqlen_k, nheads_k, hdim_v)
