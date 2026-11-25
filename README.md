@@ -146,6 +146,15 @@ FlashAttention-2 with CUDA currently supports:
 2. Datatype fp16 and bf16 (bf16 requires Ampere, Ada, or Hopper GPUs).
 3. All head dimensions up to 256. ~~Head dim > 192 backward requires A100/A800 or H100/H800~~. Head dim 256 backward now works on consumer GPUs (if there's no dropout) as of flash-attn 2.5.5.
 
+Head dimension 512 is also supported on SM89 (Ada, including RTX 4090) for
+FP16/BF16 forward and backward. This covers Gemma4-E4B global attention layers.
+The dense and variable-length APIs support MHA, MQA, GQA, causal attention,
+and deterministic backward. D512 requires zero attention dropout and does not
+support local attention, softcap, ALiBi, paged KV, split KV, `leftpad_k`,
+`seqused_k`, or `flash_attn_with_kvcache`. Other head dimensions keep their
+existing feature support. See `tests/test_flash_attn_sm89_d512.py` and
+`benchmarks/benchmark_flash_attention_d512.py` for validation and timing.
+
 ### AMD ROCm Support
 ROCm version has two backends. There is [composable_kernel](https://github.com/ROCm/composable_kernel) (ck) which is the default backend and a [Triton](https://github.com/triton-lang/triton) backend. They provide an implementation of FlashAttention-2.
 

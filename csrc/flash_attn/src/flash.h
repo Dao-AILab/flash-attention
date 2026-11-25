@@ -195,4 +195,7 @@ template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispa
 
 template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 
+void run_mha_fwd_hdim512(Flash_fwd_params &params, cudaStream_t stream);
+void run_mha_bwd_hdim512(Flash_bwd_params &params, cudaStream_t stream);
+
 }  // namespace FLASH_NAMESPACE
