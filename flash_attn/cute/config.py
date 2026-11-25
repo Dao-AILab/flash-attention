@@ -1226,6 +1226,15 @@ class SwapABPolicy:
     # costs (~1.5-2.5 us on B300; 256-token pages with a tight page table measured 1.2-1.7x slower
     # at <= 8K tokens and within ~2% at 32K+).
     per_sequence_min_capacity: int = 32768
+    # Token rows (2+ query tokens) whose static count is 1 split at batch * KV heads <=
+    # token_per_sequence_max_heads take per-sequence counts from token_per_sequence_min_capacity:
+    # that grid leaves over half of the SMs idle. GB300 sweep at 4 tokens per row (fp8 and bf16,
+    # batch x KV heads 48 and 64, KV 8K-16K): 0.62-0.92x of the standard kernel's time on rows
+    # spread 0.25x-1.75x of the mean length (1 split: 1.11-2.29x), 0.73-1.17x on rows of one
+    # length (1 split: 0.97-1.66x). At 96 and 128+, they took up to 1.4x the time of 1 split on
+    # rows of one length.
+    token_per_sequence_min_capacity: int = 8192
+    token_per_sequence_max_heads: int = 64
     # Automatic selection keeps the standard kernel for many short sequences at head dims <= 128:
     # at most short_kv_max_tokens of KV capacity (two KV blocks, so per-CTA fixed cost dominates)
     # and at least short_kv_min_heads (batch * KV heads) CTAs without splitting.
@@ -1241,12 +1250,14 @@ class SwapABPolicy:
     # token_short_kv_max_tokens, or token_mid_kv_max_tokens with at least token_mid_kv_min_heads
     # (batch * KV heads). Source: GB300 CUDA-graph sweep at 4 tokens per row (fp8 and bf16, causal,
     # num_splits=0, 128-token pages, the head configs above, batch 1-256, KV 512-128K, rows of one
-    # length): SwapAB was 1.14x (fp8) and 1.13x (bf16) slower at the median on the 77 such shapes
-    # (bf16 24/4 hd256: 0.87x). Elsewhere it was 0.99x / 1.00x, up to 1.24x / 1.37x slower.
-    # Rows spread 0.25x-1.75x of the mean length favor SwapAB (KV 8K-128K: 0.92x at the median;
-    # 26 MTP-3 rows, 24/4 hd256, 27k-107k: 0.79x). Selection sees only the capacity, so the rule
-    # stops at 2K. A vLLM-style page table (max_model_len wide) puts the capacity far above the
-    # real lengths, so its calls never take the rule.
+    # length): SwapAB was 1.13x slower at the median (fp8 and bf16) on the 77 such shapes (bf16
+    # 24/4 hd256: 0.87x). Elsewhere it was 0.97x / 1.00x, up to 1.24x / 1.43x slower.
+    # Rows spread 0.25x-1.75x of the mean length favor SwapAB (KV 8K-128K: 0.92x at the median at
+    # batch x KV heads >= 128, 0.76x (fp8) and 0.86x (bf16) below; 26 MTP-3 rows, 24/4 hd256,
+    # 27k-107k: 0.79x). bf16 32/4 hd64 keeps SwapAB at KV 8K+: 1.18x on rows of one length at
+    # batch x KV heads >= 128, but 1.00x on spread rows. Selection sees only the capacity, so the
+    # rule stops at 2K. A vLLM-style page table (max_model_len wide) puts the capacity far above
+    # the real lengths, so its calls never take the rule.
     token_short_kv_max_tokens: int = 512
     token_mid_kv_max_tokens: int = 2048
     token_mid_kv_min_heads: int = 128
@@ -1389,10 +1400,20 @@ class SwapABPolicy:
 
         Lengths vary per sequence with varlen Q or seqused_k (the SwapAB tile scheduler reads the
         counts for dense Q too), but only a capacity of per_sequence_min_capacity tokens leaves
-        room for the counts to pay for the prepare launch.
+        room for the counts to pay for the prepare launch; see token_per_sequence_min_capacity
+        for token rows.
         """
         lengths_vary = inputs.is_varlen_q or inputs.has_seqused_k
-        return lengths_vary and self.seqlen_k_capacity(inputs) >= self.per_sequence_min_capacity
+        bh = inputs.batch_size * inputs.num_heads_kv
+        one_static_split = 2 * bh > self.static_target_ctas(inputs)
+        min_capacity = self.per_sequence_min_capacity
+        if (
+            self.tokens_tile(inputs) > 1
+            and one_static_split
+            and bh <= self.token_per_sequence_max_heads
+        ):
+            min_capacity = self.token_per_sequence_min_capacity
+        return lengths_vary and self.seqlen_k_capacity(inputs) >= min_capacity
 
     def needs_split_metadata(self, inputs: FwdHeuristicInputs, num_splits: int) -> bool:
         """Whether SwapAB prepares per-sequence split counts and launches split-major."""
@@ -1400,10 +1421,11 @@ class SwapABPolicy:
 
     def select_num_splits(self, inputs: FwdHeuristicInputs) -> int:
         """Automatic split count; with per-sequence splits, the cap of the per-sequence counts."""
-        # Token rows keep this policy. GB300 sweep at 4 tokens per row (fp8 and bf16, batch x KV
-        # heads >= 128, 32K-128K capacity): 1 split was 2% faster at the median on rows of one
-        # length, but 10-19% slower (up to 1.8x) on rows spread 0.25x-1.75x of the mean, where
-        # per-sequence counts balance the work. Selection cannot see the lengths.
+        # Token rows keep this policy from 32K of capacity. GB300 sweep at 4 tokens per row (fp8
+        # and bf16, 32K-128K): at batch x KV heads >= 128, 1 split was 2% faster at the median on
+        # rows of one length, but 10-19% slower (up to 1.8x) on rows spread 0.25x-1.75x of the
+        # mean, where per-sequence counts balance the work; below 128, 4 splits took 1.4x (equal)
+        # and 1.7x (spread) its time at the median. Selection cannot see the lengths.
         seqlen_k = self.seqlen_k_capacity(inputs)
         bh = inputs.batch_size * inputs.num_heads_kv
         # An empty batch has no tiles to split, as in num_splits_heuristic.

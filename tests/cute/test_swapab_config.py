@@ -25,6 +25,8 @@ _DECODE = FwdHeuristicInputs(
 )
 # Varlen Q decode (cu_seqlens_q, host max_seqlen_q=1) over paged KV with used lengths.
 _VARLEN_PAGED = dict(has_cu_seqlens_q=True, total_q=3, has_seqused_k=True, page_size=128)
+# Varlen verify rows of 4 query tokens over paged KV with used lengths (2 KV heads).
+_TOKENS = dict(has_cu_seqlens_q=True, max_seqlen_q=4, has_seqused_k=True, page_size=128)
 
 
 def decode(**changes) -> FwdHeuristicInputs:
@@ -272,6 +274,14 @@ def test_split_count_bounds():
         ({"max_seqlen_k": 262144}, False, 8),
         # One split needs no counts.
         ({"has_seqused_k": True, "max_seqlen_k": 262144, "requested_num_splits": 1}, False, 1),
+        # Token rows at batch x KV heads 33-64, where the static count is 1 split, take counts
+        # from 8K; 32 or 128 (2 static splits, or over 64) and decode rows keep the static count.
+        (_TOKENS | {"batch_size": 32, "total_q": 128, "max_seqlen_k": 8192}, True, 19),
+        (_TOKENS | {"batch_size": 32, "total_q": 128, "max_seqlen_k": 8191}, False, 1),
+        (_TOKENS | {"batch_size": 16, "total_q": 64, "max_seqlen_k": 8192}, False, 2),
+        (_TOKENS | {"batch_size": 64, "total_q": 256, "max_seqlen_k": 8192}, False, 1),
+        (_TOKENS | {"batch_size": 32, "total_q": 32, "max_seqlen_q": 1, "max_seqlen_k": 8192},
+         False, 1),
     ],
 )
 def test_per_sequence_splits(changes, per_sequence, num_splits):
