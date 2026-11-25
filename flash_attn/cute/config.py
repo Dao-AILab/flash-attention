@@ -2726,11 +2726,19 @@ class Mxfp8Mirror(enum.Enum):
     backward] in flash_bwd_sm100.py)."""
 
     QK = "qk"  # MXFP8 Q / K, BF16 P and V: the plain kernel on the dequantized Q / K
+    PV = "pv"  # native PV: E4M3 P for dV and V-hat in dP, BF16 P and V on the causal band
 
     @property
     def p_offset(self) -> int:
         """The forward's P exponent offset (BlockScales.stats_out): P~ = 2^(S c - M + p_offset)."""
-        return 0
+        return 8 if self is Mxfp8Mirror.PV else 0
+
+
+# The causal native PV forward's BF16 band (FlashAttentionForwardSm100.get_n_block_min_bf16):
+# query work tiles of MXFP8_BAND_ROWS rows (q_stage 2 x tile_m 128, 1CTA) and KV blocks of
+# MXFP8_BAND_BLOCK_N keys. The forward rejects other causal native PV tiles (_flash_attn_fwd).
+MXFP8_BAND_ROWS = 256
+MXFP8_BAND_BLOCK_N = 128
 
 
 @dataclass(frozen=True)
@@ -2848,6 +2856,11 @@ class BwdHeuristicInputs(NamedTuple):
     def is_hdim256(self) -> bool:
         return self.head_dim == 256 and self.head_dim_v == 256
 
+    @property
+    def mxfp8_band(self) -> bool:
+        """Whether the mirrored backward reproduces the causal native PV forward's BF16 band."""
+        return self.mxfp8_mirror is Mxfp8Mirror.PV and self.causal
+
 
 def bwd_sparse_q_block_size(inputs: BwdHeuristicInputs) -> int | None:
     """Sparse Q block size the backward tiles must divide; SM90 defaults to 128."""
@@ -2898,6 +2911,22 @@ def bwd_tile_hdim(head_dim: int) -> int:
     return round_up(head_dim, 32)
 
 
+def mxfp8_band_splits_pair(inputs: BwdHeuristicInputs, *, tile_n: int) -> bool:
+    """Whether the MXFP8 causal band can switch between the two KV tiles of a 2CTA pair.
+
+    Block b is in the band of forward work tile t iff (b + 1) * 128 > 256 t + seqlen_k - seqlen_q
+    (NOTE [MXFP8 mirrored BF16 backward]); a pair of 128-key tiles (blocks 2w, 2w + 1) agrees for
+    every t iff (seqlen_k - seqlen_q) mod 256 < 128. Both CTAs must swap V at the same step,
+    since the leader's barrier counts both CTAs' V bytes. 64-key tiles pair inside one block.
+    """
+    pair_keys = 2 * tile_n
+    return (
+        inputs.mxfp8_band
+        and pair_keys > MXFP8_BAND_BLOCK_N
+        and (inputs.max_seqlen_k - inputs.max_seqlen_q) % MXFP8_BAND_ROWS >= MXFP8_BAND_BLOCK_N
+    )
+
+
 def can_use_bwd_2cta(inputs: BwdHeuristicInputs, *, tile_n: int) -> bool:
     """Whether the SM100 backward supports 2CTA instructions for this problem."""
     # 2CTA tiles pair adjacent KV tiles, so a sparse KV block must cover an even count.
@@ -2905,7 +2934,9 @@ def can_use_bwd_2cta(inputs: BwdHeuristicInputs, *, tile_n: int) -> bool:
         not inputs.use_block_sparsity
         or bwd_kv_subtile_factor(inputs.sparse_block_size_kv, tile_n) % 2 == 0
     )
-    return inputs.head_dim >= 128 and sparse_ok
+    return (
+        inputs.head_dim >= 128 and sparse_ok and not mxfp8_band_splits_pair(inputs, tile_n=tile_n)
+    )
 
 
 def can_use_bwd_tile_n_64(inputs: BwdHeuristicInputs, *, use_2cta_instrs: bool) -> bool:
@@ -3274,17 +3305,20 @@ def can_fold_LSE_dPsum(
     )
 
 
-def mxfp8_mirror_rejection(inputs: BwdHeuristicInputs) -> str | None:
+def mxfp8_mirror_rejection(config: BwdConfig, inputs: BwdHeuristicInputs) -> str | None:
     """Why the mirrored BF16 backward of an MXFP8 forward cannot run this problem, or None.
 
     Scope (NOTE [MXFP8 mirrored BF16 backward] in flash_bwd_sm100.py): the SM100 family's general
-    kernel on BF16 Q-hat / K-hat / V, dense (the MXFP8 forward is dense only), causal or not, MHA
-    or GQA, deterministic or not, at the head dims of the MXFP8 forward (64, 128, 256).
+    kernel on BF16 operands, dense (the MXFP8 forward is dense only), causal or not, MHA or GQA,
+    deterministic or not; QK-only at head dims 64, 128, and 256, native PV at 64 and 128 (the 1CTA
+    or the pipelined 2CTA schedule).
     """
     if inputs.device_capacity not in (10, 11):
         return f"needs SM100 / SM110, got SM{inputs.device_capacity}"
-    if any(bwd_tile_hdim(d) not in (64, 128, 256) for d in (inputs.head_dim, inputs.head_dim_v)):
-        return "needs head dims padded to 64, 128, or 256"
+    head_dims = {bwd_tile_hdim(d) for d in (inputs.head_dim, inputs.head_dim_v)}
+    supported = (64, 128, 256) if inputs.mxfp8_mirror is Mxfp8Mirror.QK else (64, 128)
+    if not head_dims <= set(supported):
+        return f"in {inputs.mxfp8_mirror.name} mode needs head dims padded to {supported}"
     if inputs.dtype != "torch.bfloat16":
         return "needs BF16 Q-hat / K-hat / V-hat"
     unsupported = {
@@ -3299,6 +3333,11 @@ def mxfp8_mirror_rejection(inputs: BwdHeuristicInputs) -> str | None:
     }
     if names := [name for name, present in unsupported.items() if present]:
         return "does not support " + ", ".join(names)
+    if config.use_2cta_instrs and mxfp8_band_splits_pair(inputs, tile_n=config.tile_n):
+        return (
+            "with 2CTA needs (seqlen_k - seqlen_q) mod 256 < 128 so both KV tiles of a pair "
+            "share the causal band; use the 1CTA config"
+        )
     return None
 
 
@@ -3621,7 +3660,7 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
         raise ValueError(
             f"Config targets SM{config.device_capacity}, but the problem targets SM{capacity}"
         )
-    if inputs.mxfp8_mirror is not None and (reason := mxfp8_mirror_rejection(inputs)):
+    if inputs.mxfp8_mirror is not None and (reason := mxfp8_mirror_rejection(config, inputs)):
         raise ValueError(f"The mirrored MXFP8 backward {reason}")
     if config.tile_m <= 0 or config.tile_n <= 0:
         raise ValueError(f"Tile dimensions must be positive, got {(config.tile_m, config.tile_n)}")
