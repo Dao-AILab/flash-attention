@@ -4130,6 +4130,34 @@ class FlashAttentionBackwardSm100:
             # exchange copy below).
             q_half = tScS_t2r[0][1] // (self.tile_m // 2)
 
+        if const_expr(
+            self.is_causal
+            and self.use_2cta_instrs
+            and self.tile_hdim == 128
+            and not self.fold_LSE_dPsum
+            and not self.acc_m64
+        ):
+            # Materialize each complete broadcast address before the loop. On DSL
+            # 4.8 this avoids per-load rematerialization of its uniform offset.
+            lse_base = cute.arch.inline_ptx(
+                "mov.b32 {$w0}, {$r0};",
+                write_only_types=[Int32],
+                read_only_args=[Int32(tSsLSE.iterator.toint())],
+            )
+            dpsum_base = cute.arch.inline_ptx(
+                "mov.b32 {$w0}, {$r0};",
+                write_only_types=[Int32],
+                read_only_args=[Int32(tSsdPsum.iterator.toint())],
+            )
+            tSsLSE = cute.make_tensor(
+                cute.make_ptr(Float32, lse_base, cute.AddressSpace.smem, assumed_align=16),
+                tSsLSE.layout,
+            )
+            tSsdPsum = cute.make_tensor(
+                cute.make_ptr(Float32, dpsum_base, cute.AddressSpace.smem, assumed_align=16),
+                tSsdPsum.layout,
+            )
+
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         dS_cluster_empty_phase = Int32(1)
         # 2-CTA: CTA 0 exchanges stage 1 (bottom half), CTA 1 exchanges stage 0 (top half)
