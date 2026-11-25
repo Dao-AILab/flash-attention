@@ -28,6 +28,31 @@ for _lib_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
     if Path(_lib_path).exists():
         ctypes.CDLL(_lib_path, mode=ctypes.RTLD_GLOBAL)
 
+# Re-arm Python's faulthandler after the cutlass/tvm_ffi imports above.
+#
+# libtvm_ffi installs its own SIGSEGV handler from a library constructor
+# (tvm_ffi/src/ffi/backtrace.cc, TVMFFIInstallSignalHandler), which overrides the
+# handler that PYTHONFAULTHANDLER=1 enabled at interpreter startup. Its backtrace
+# only unwinds frames with registered unwind info, and the CuTe DSL JIT maps the
+# host launcher through LLVM RuntimeDyld sections that carry no FDEs visible to
+# libbacktrace. A fault whose program counter is inside that JIT-mapped launcher
+# therefore prints just the "!!!!!!! Segfault encountered !!!!!!" marker followed
+# by an empty backtrace, hiding which Python frame was compiling or launching the
+# kernel. Restoring faulthandler keeps the Python-level stack dump that
+# PYTHONFAULTHANDLER=1 asked for. Set FLASH_ATTENTION_CUTE_DSL_FAULTHANDLER=1 to
+# get the same re-arm without PYTHONFAULTHANDLER. faulthandler.disable() is needed
+# first: enable() alone is a no-op when faulthandler is already enabled, which is
+# exactly the case under PYTHONFAULTHANDLER=1. On the faulting signal Python's
+# handler runs first and then re-raises into the handler it replaced, so
+# libtvm_ffi's native backtrace is still printed for faults in regular code.
+if os.environ.get("PYTHONFAULTHANDLER", "") not in ("", "0", "false") or os.environ.get(
+    "FLASH_ATTENTION_CUTE_DSL_FAULTHANDLER", ""
+) in ("1", "true", "yes"):
+    import faulthandler
+
+    faulthandler.disable()
+    faulthandler.enable()
+
 CompileKeyType: TypeAlias = tuple[Hashable, ...]
 CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
 
