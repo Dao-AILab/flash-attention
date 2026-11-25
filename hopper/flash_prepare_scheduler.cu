@@ -154,7 +154,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
         total_blocks = total_blocks_smem[0];
         // 10% margin
         int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.1f * float(num_head) / float(num_sm)));
-        // blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
+        // Empty query/key sequences can leave total_blocks at zero.
+        blocks_per_sm = std::max(1, blocks_per_sm);
         num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
         // num_n_blocks per work tile for the batch
         num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 
