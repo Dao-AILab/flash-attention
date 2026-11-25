@@ -956,7 +956,10 @@ def test_mxfp8_kv_stages_fit_the_scales(mxfp8_path, pv_normalizer, head_dim, cau
         q_o += pv_ones_bytes(device_arch, causal)  # all-ones tiles of the P row-sum MMAs
     bf16_v = mxfp8_path == "qk" or causal  # causal native PV: BF16 diagonal V blocks
     kv_stage_bytes = 128 * head_dim * (2 if bf16_v else 1) + 512
-    assert config.kv_stage == min((224 * 1024 - q_o) // kv_stage_bytes, 32)
+    # sm_107 causal hd128 native PV takes a 288 KiB budget (SM107_MXFP8_PV_TUNING).
+    sm107_causal_hd128_pv = (device_arch, mxfp8_path, causal, head_dim) == (107, "pv", True, 128)
+    budget_kib = 288 if sm107_causal_hd128_pv else 224
+    assert config.kv_stage == min((budget_kib * 1024 - q_o) // kv_stage_bytes, 32)
     for has_lse in (False, True):
         smem_bytes = sm100_fwd_smem_bytes(config, inputs._replace(has_lse=has_lse))
         assert smem_bytes <= sm100_smem_capacity(device_arch)
@@ -1077,3 +1080,32 @@ def test_mxfp8_pv_fp32_policy():
     assert not select_fwd_config(
         fp32._replace(pv_normalizer=PvNormalizer.ROUNDED_P)
     ).sm_stats_cross_stage
+
+
+@pytest.mark.parametrize("pv_normalizer", list(PvNormalizer))
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_sm107_native_pv_schedule_follows_its_table(pv_normalizer, causal, head_dim):
+    inputs = make_inputs(dtype="torch.float8_e4m3fn", head_dim=head_dim, head_dim_v=head_dim,
+                         causal=causal, device_arch=107, mxfp8_path="pv",
+                         pv_normalizer=pv_normalizer)
+    config = select_fwd_config(inputs)
+    tuning = config_module.SM107_MXFP8_PV_TUNING.get(
+        (pv_normalizer, head_dim, causal), config_module.Sm107PvTuning()
+    )
+    schedule = (config.split_p_k64, config.sm_stats_mbarrier, config.sm_stats_early)
+    assert schedule == (tuning.split_p, tuning.stats_mbarrier, tuning.early_stats)
+    # Each field is an explicit choice on sm_107 native PV; derive keeps a set one.
+    flipped = derive_fwd_config(config, inputs, split_p_k64=not config.split_p_k64)
+    assert flipped.split_p_k64 != config.split_p_k64
+    # Off that path the fields stay False and validation rejects them.
+    for changes in (
+        {"device_arch": 100},
+        {"mxfp8_path": "qk", "pv_normalizer": PvNormalizer.ROUNDED_P},
+    ):
+        other = inputs._replace(**changes)
+        other_config = select_fwd_config(other)
+        assert not (other_config.split_p_k64 or other_config.sm_stats_mbarrier
+                    or other_config.sm_stats_early)
+        with pytest.raises(ValueError, match="need sm_107 native MXFP8 PV"):
+            validate_fwd_config(replace(other_config, sm_stats_early=True), other)
