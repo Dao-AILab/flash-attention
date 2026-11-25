@@ -24,6 +24,7 @@ from quack import sm90_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 from flash_attn.cute import utils
+from flash_attn.cute import copy_utils as fa_copy_utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -330,9 +331,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.use_tma_O):
             mO_tma = mO_og if const_expr(self.pack_gqa) else mO
             if const_expr(self.varlen_q):
-                mO_tma = copy_utils.create_ragged_tensor_for_tma(
-                    mO_tma, ragged_dim=0, ptr_shift=True
-                )
+                mO_tma = fa_copy_utils.create_ragged_tensor_for_tma_store(mO_tma, ragged_dim=0)
             tma_atom_O, tma_tensor_O = make_tiled_tma_atom_fn(
                 gmem_tiled_copy_O,
                 mO_tma,

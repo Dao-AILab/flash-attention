@@ -14,6 +14,33 @@ import cutlass.pipeline
 
 
 @dsl_user_op
+def create_ragged_tensor_for_tma_store(
+    T: cute.Tensor, ragged_dim: int = 0, *, loc=None, ip=None
+) -> cute.Tensor:
+    """quack's ptr_shift ragged view (copy_utils.create_ragged_tensor_for_tma), sized by the
+    ragged extent E = T.shape[ragged_dim] instead of 2**30 rows; quack's offset_ragged_tensor
+    indexes either. Stores only: TMA loads prefetch past the footprint (#3068).
+
+    ptr_shift puts the descriptor base big_int rows before T so the coordinate shift clips each
+    sequence's end. At 2**30 rows that is 64 TiB before a 64-head MLA output (64 KiB rows),
+    which wraps below address 0 when T sits lower (x86 B200 allocates near 43 TiB); a store
+    from such a descriptor faults (Xid 13 "Out Of Range Address") when another context's
+    exception preempts it. E bounds every sequence's offset + length, so it clips the same
+    rows from a base E rows before T: one tensor for a packed (total, ...) T, one batch slice
+    for a dense one. The extra mode needs E + 1 coordinates (a sequence ending at row E).
+    """
+    rank = cute.rank(T)
+    if ragged_dim < 0:
+        ragged_dim += rank
+    assert rank <= 4, "a ptr_shift ragged tensor supports up to 4 dimensions"
+    extent = T.shape[ragged_dim]
+    ptr_offset = (None,) * ragged_dim + (-extent,) + (None,) * (rank - ragged_dim - 1)
+    new_ptr = cute.domain_offset(ptr_offset, T, loc=loc, ip=ip).iterator
+    layout = cute.make_layout(T.shape + (extent + 1,), stride=T.stride + (T.stride[ragged_dim],))
+    return cute.make_tensor(new_ptr, layout, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def cvt_copy(
     atom: cute.CopyAtom,
     src: cute.Tensor,
