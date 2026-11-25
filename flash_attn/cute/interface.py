@@ -24,6 +24,7 @@ from flash_attn.cute.config import (
     BwdConfig,
     BwdHeuristicInputs,
     FwdConfig,
+    Mxfp8Mirror,
     FwdHeuristicInputs,
     MlaFwdConfig,
     MlaFwdHeuristicInputs,
@@ -496,6 +497,30 @@ class BlockScales(NamedTuple):
     v_bf16: torch.Tensor | None = None
     pv_normalizer: Literal["rounded_p", "fp32"] = "rounded_p"
     stats_out: torch.Tensor | None = None
+
+
+class MxMirrorBwd(NamedTuple):
+    """The MXFP8 forward a mirrored BF16 backward differentiates (`_flash_attn_bwd(mx_mirror=...)`;
+    NOTE [MXFP8 mirrored BF16 backward] in flash_bwd_sm100.py).
+
+    The backward's q / k / v are then the forward's operands in BF16: its Q / K payloads
+    dequantized (Q-hat, K-hat; exact for E4M3 x 2^k) and its BF16 V. stats is the forward's
+    BlockScales.stats_out.
+    """
+
+    stats: torch.Tensor
+    mode: Mxfp8Mirror
+
+
+def _validate_mx_mirror(mx: MxMirrorBwd, q, softcap, unsupported_args) -> None:
+    """Per-call checks of a mirrored backward; the config validates the problem's scope."""
+    stats = mx.stats
+    if stats.dtype != torch.float32 or not stats.is_contiguous() or stats.device != q.device:
+        raise ValueError("mx_mirror.stats must be the forward's contiguous FP32 stats_out")
+    if q.ndim != 4 or stats.shape != (q.shape[0], q.shape[2], q.shape[1], 2):
+        raise ValueError("mx_mirror.stats must have shape (batch, nheads, seqlen_q, 2)")
+    if any(t is not None for t in unsupported_args) or softcap != 0.0:
+        raise ValueError("The mirrored MXFP8 backward does not support dlse, seqused, or softcap")
 
 
 def _check_shared_kv_scales(scales) -> None:
@@ -1897,6 +1922,7 @@ def _compile_bwd_preprocess(
     has_cu_total_m_blocks,
     hdim_multiple_of,
     has_o_lo=False,
+    mirror_offset=None,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1923,6 +1949,12 @@ def _compile_bwd_preprocess(
     softmax_scale = Float32(1.0)
     mCuTotalMBlocks = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cu_total_m_blocks else None
     mOlo = fake_tensor(dtype, mO.shape, divisibility=128 // dtype.width) if has_o_lo else None
+    mStats = mdOScaled = None
+    if mirror_offset is not None:  # mirror mode: stats_out (b, h, s, 2), dO' like dO
+        stats_shape = (mO.shape[0], mLSE.shape[1], mLSE.shape[2], 2)
+        mStats = fake_tensor(Float32, stats_shape, divisibility=2)
+        mdOScaled = fake_tensor(dtype, mdO.shape, divisibility=128 // dtype.width)
+        mLSE = None
     fa_bwd_pre = FlashAttentionBackwardPreprocess(
         dtype, head_dim, head_dim_v, m_block_size,
         use_padded_offsets=use_padded_offsets,
@@ -1931,13 +1963,24 @@ def _compile_bwd_preprocess(
         qhead_per_kvhead=qhead_per_kvhead,
         nheads_kv=nheads_kv,
         hdim_multiple_of=hdim_multiple_of,
+        mirror_offset=mirror_offset,
     )
     return cute.compile(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
-        mRowMax, mScaleP, softmax_scale, mCuTotalMBlocks, mOlo,
+        mRowMax, mScaleP, softmax_scale, mCuTotalMBlocks, mOlo, mStats, mdOScaled,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
+
+
+class MirrorPreprocess(NamedTuple):
+    """The preprocess's mirror mode: an MXFP8 forward's stats_out (B, H, S, 2) in,
+    dO' = bf16(dO / L) (dout's shape) out, and the forward's P exponent offset
+    (Mxfp8Mirror.p_offset)."""
+
+    stats: torch.Tensor
+    dout_scaled: torch.Tensor
+    offset: int
 
 
 def _bwd_preprocess(
@@ -1951,16 +1994,19 @@ def _bwd_preprocess(
     pack_gqa=PackGQA.OFF,
     qhead_per_kvhead=1,  # only used with pack_gqa
     nheads_kv=1,         # only used with pack_gqa
-    softmax_scale=1.0,   # only used with scale_p
+    softmax_scale=1.0,   # only used with scale_p and the mirror mode
     cu_total_m_blocks=None,
     hdim_multiple_of=32,
     o_lo=None,
     *,
     fake_mode,
+    mirror: MirrorPreprocess | None = None,
 ):
     """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
 
     If o_lo (the bf16 rounding residual of out) is given, dpsum is formed from out + o_lo.
+    mirror replaces LSE by an MXFP8 forward's stats (lse must be None) and writes
+    mirror.dout_scaled (NOTE [MXFP8 mirrored BF16 backward] in flash_bwd_sm100.py).
     """
     if row_max is not None:
         assert scale_p is not None
@@ -1998,12 +2044,17 @@ def _bwd_preprocess(
         hdim_multiple_of,
         o_lo is not None,
     )
+    mirror_args = (None, None)
+    if mirror is not None:
+        assert lse is None
+        compile_key += (mirror.offset,)
+        mirror_args = (mirror.stats, mirror.dout_scaled)
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
     if not fake_mode:
         _bwd_preprocess.compile_cache[compile_key](
             out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse,
-            row_max, scale_p, softmax_scale, cu_total_m_blocks, o_lo,
+            row_max, scale_p, softmax_scale, cu_total_m_blocks, o_lo, *mirror_args,
         )
 
 
@@ -2195,11 +2246,14 @@ def _flash_attn_bwd(
     learnable_sink: Optional[torch.Tensor] = None,
     *,
     config: BwdConfig | None = None,
+    mx_mirror: MxMirrorBwd | None = None,
 ) -> Tuple[torch.Tensor, ...]:
     """Attention backward. ``config`` replaces the selected BwdConfig and is validated.
 
     The legacy tile, stage, MMA-layout, thread-count, and pack_gqa arguments are ignored:
     BwdConfig owns them. V_in_regs is the only one still read, as the SM90 request.
+    mx_mirror differentiates an MXFP8 forward in BF16 (MxMirrorBwd): q / k / v are its operands in
+    BF16 and lse is unused (the stats replace it).
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
@@ -2290,11 +2344,14 @@ def _flash_attn_bwd(
         has_softcap=softcap != 0.0, zero_softmax_scale=softmax_scale == 0.0,
         has_mask_mod=mask_mod is not None,
         has_learnable_sink=learnable_sink is not None,
+        mxfp8_mirror=mx_mirror.mode if mx_mirror is not None else None,
     )
     if config is None:
         config = select_bwd_config(inputs)
     else:
         validate_bwd_config(config, inputs)
+    if mx_mirror is not None:
+        _validate_mx_mirror(mx_mirror, q, softcap, (dlse, seqused_q, seqused_k))
     tile_m, tile_n = config.tile_m, config.tile_n
     cluster_size = config.cluster_size
     q_subtile_factor = bwd_q_subtile_factor(config, inputs)
@@ -2371,7 +2428,7 @@ def _flash_attn_bwd(
     else:
         assert out.shape == (batch_size, seqlen_q, num_head, head_dim_v)
         assert dout.shape == (batch_size, seqlen_q, num_head, head_dim_v)
-        assert lse.shape == (batch_size, num_head, seqlen_q), (
+        assert mx_mirror is not None or lse.shape == (batch_size, num_head, seqlen_q), (
             "lse must have shape (batch_size, num_head, seqlen_q)"
         )
 
@@ -2382,7 +2439,7 @@ def _flash_attn_bwd(
     for t in [cu_seqlens_q, cu_seqlens_k]:
         if t is not None:
             assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k must be int32"
-    assert lse.dtype == torch.float32, "lse must be float32"
+    assert mx_mirror is not None or lse.dtype == torch.float32, "lse must be float32"
     if dlse is not None:
         dlse = maybe_contiguous(dlse)
     if learnable_sink is not None:
@@ -2554,6 +2611,14 @@ def _flash_attn_bwd(
 
     dsink = torch.empty_like(learnable_sink) if learnable_sink is not None else None
 
+    # NOTE [MXFP8 mirrored BF16 backward]: the preprocess turns the stats into the LSE slot and
+    # dO' = bf16(dO / L), which the main kernel reads in place of dO.
+    mirror_pre = None
+    if mx_mirror is not None:
+        mirror_pre = MirrorPreprocess(
+            mx_mirror.stats, torch.empty_like(dout), mx_mirror.mode.p_offset
+        )
+        lse = None
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
     _bwd_preprocess(
         out, dout, dpsum, lse, lse_log2, dq_accum,
@@ -2567,7 +2632,11 @@ def _flash_attn_bwd(
         cu_total_m_blocks=cu_total_m_blocks_q,
         fake_mode=fake_mode,
         hdim_multiple_of=hdim_multiple_of,
+        softmax_scale=softmax_scale,  # read by the mirror mode's LSE slot
+        mirror=mirror_pre,
     )
+    if mx_mirror is not None:
+        dout = mirror_pre.dout_scaled
     # Backward kernel: compute dk, dv, dq_accum.
     score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
     score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False

@@ -98,6 +98,25 @@ from flash_attn.cute.block_sparse_utils import (
 # score_mod_bwd reads the raw S.
 
 
+# NOTE [MXFP8 mirrored BF16 backward]
+# The backward of an MXFP8 forward differentiates the function that forward computed in BF16 on
+# this kernel: its quantizers and P roundings are straight-through, and its saved row max and
+# normalizer replace recomputing them (the derivative flows through the normalizer as the D term
+# and vanishes through the max by shift invariance). The interface feeds the forward's dequantized
+# payloads Q-hat / K-hat (exact in BF16) as Q / K, and the preprocess's mirror mode turns
+# BlockScales.stats_out (m, L) into one stat slot and a scaled dO:
+#   LSE slot = fp32(m * scale_log2) - off   (off = Mxfp8Mirror.p_offset), so the kernel's
+#              P~ = exp2(S * scale_log2 - slot) is the forward's exponent up to the S
+#              accumulation order (and, with the hdim64 LSE fold, the fold's MMA rounding);
+#   dO' = bf16(dO / L),  dPsum = rowsum(dO' * O)   (L folded into dO: no second stat slot).
+# Then dV = P^T dO', dS = P~ (dP - dPsum) with dP = dO' V^T, dK = scale dS^T Q-hat, and
+# dQ = scale dS K-hat come out at true scale. QK-only (Mxfp8Mirror.QK: BF16 P and V) needs no
+# kernel change: bf16(P~) is already the forward's PV operand.
+# P~ is recomputed at the final max. Blocks the forward visited under an earlier running max were
+# rounded at that max and rescaled, so their P is reproduced only up to that rounding
+# (BlockScales.stats_out); that difference is the mirror's inherent error.
+
+
 # NOTE [SM100 backward coordinate spaces]
 # C = cta_group_size, N = tile_n; a work tile spans C * N KV rows.
 #

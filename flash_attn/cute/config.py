@@ -2721,6 +2721,18 @@ class Sm100BwdRegisters:
 BwdRegisters = Sm90BwdRegisters | Sm100BwdRegisters | None
 
 
+class Mxfp8Mirror(enum.Enum):
+    """The MXFP8 forward a mirrored BF16 backward differentiates (NOTE [MXFP8 mirrored BF16
+    backward] in flash_bwd_sm100.py)."""
+
+    QK = "qk"  # MXFP8 Q / K, BF16 P and V: the plain kernel on the dequantized Q / K
+
+    @property
+    def p_offset(self) -> int:
+        """The forward's P exponent offset (BlockScales.stats_out): P~ = 2^(S c - M + p_offset)."""
+        return 0
+
+
 @dataclass(frozen=True)
 class BwdConfig:
     """Fully resolved backward launch configuration.
@@ -2821,6 +2833,8 @@ class BwdHeuristicInputs(NamedTuple):
     # to the heuristic.
     requested_head_loop: bool | None = None
     disable_2cta: bool = False
+    # The MXFP8 forward a mirrored BF16 backward differentiates; None is the plain backward.
+    mxfp8_mirror: Mxfp8Mirror | None = None
 
     @property
     def device_capacity(self) -> int:
@@ -3260,6 +3274,34 @@ def can_fold_LSE_dPsum(
     )
 
 
+def mxfp8_mirror_rejection(inputs: BwdHeuristicInputs) -> str | None:
+    """Why the mirrored BF16 backward of an MXFP8 forward cannot run this problem, or None.
+
+    Scope (NOTE [MXFP8 mirrored BF16 backward] in flash_bwd_sm100.py): the SM100 family's general
+    kernel on BF16 Q-hat / K-hat / V, dense (the MXFP8 forward is dense only), causal or not, MHA
+    or GQA, deterministic or not, at the head dims of the MXFP8 forward (64, 128, 256).
+    """
+    if inputs.device_capacity not in (10, 11):
+        return f"needs SM100 / SM110, got SM{inputs.device_capacity}"
+    if any(bwd_tile_hdim(d) not in (64, 128, 256) for d in (inputs.head_dim, inputs.head_dim_v)):
+        return "needs head dims padded to 64, 128, or 256"
+    if inputs.dtype != "torch.bfloat16":
+        return "needs BF16 Q-hat / K-hat / V-hat"
+    unsupported = {
+        "local attention": inputs.local,
+        "varlen": inputs.has_cu_seqlens,
+        "block sparsity": inputs.use_block_sparsity,
+        "score_mod / softcap": (
+            inputs.has_score_mod or inputs.has_score_mod_bwd or inputs.has_softcap
+        ),
+        "mask_mod": inputs.has_mask_mod,
+        "learnable_sink": inputs.has_learnable_sink,
+    }
+    if names := [name for name, present in unsupported.items() if present]:
+        return "does not support " + ", ".join(names)
+    return None
+
+
 # fmt: off
 def select_sm90_bwd_tile(
     head_dim: int,
@@ -3579,6 +3621,8 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
         raise ValueError(
             f"Config targets SM{config.device_capacity}, but the problem targets SM{capacity}"
         )
+    if inputs.mxfp8_mirror is not None and (reason := mxfp8_mirror_rejection(inputs)):
+        raise ValueError(f"The mirrored MXFP8 backward {reason}")
     if config.tile_m <= 0 or config.tile_n <= 0:
         raise ValueError(f"Tile dimensions must be positive, got {(config.tile_m, config.tile_n)}")
     if config.tile_m % 16 != 0 or config.tile_n % 16 != 0:
