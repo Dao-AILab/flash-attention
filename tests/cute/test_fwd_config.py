@@ -47,7 +47,7 @@ def make_inputs(*, pack_gqa: bool | None = None, **changes) -> FwdHeuristicInput
 @pytest.mark.parametrize(("d", "dv", "causal", "tile"), [
     (64, 64, True, (64, 128)), (64, 64, False, (128, 64)),
     (128, 128, False, (64, 64)), (256, 256, True, (64, 64)),
-    (64, 320, True, (64, 64)),  # narrow causal tile exceeds SM12x shared memory
+    (64, 128, False, (128, 128)),  # preserve space for the wider O epilogue
 ])
 def test_sm12x_fwd_tile(arch, dtype, d, dv, causal, tile):
     inputs = make_inputs(device_arch=arch, dtype=dtype, head_dim=d, head_dim_v=dv, causal=causal)
