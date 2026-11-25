@@ -77,12 +77,12 @@ def parse_args(argv=None):
         if (
             min(batch, hq, hkv, seqlen) < 1
             or hq % hkv
-            or hq // hkv > SWAPAB.max_qhead_per_kvhead
+            or hq // hkv > SWAPAB.max_columns
             or not SWAPAB.supports_head_dims(dim, dim)
         ):
             parser.error(
                 "shapes require positive sizes, a GQA ratio SwapAB admits "
-                f"(<= {SWAPAB.max_qhead_per_kvhead}), and a head dim it supports"
+                f"(<= {SWAPAB.max_columns}), and a head dim it supports"
             )
     end = len(args.selected_shapes) if args.end is None else args.end
     if not 0 <= args.start < end <= len(args.selected_shapes):

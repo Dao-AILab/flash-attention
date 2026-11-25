@@ -61,8 +61,9 @@ class FwdConfig:
     overlap_sO_sQ and kv_stage are the SM100 forward SMEM layout (see
     sm100_fwd_smem_bytes); other architectures carry False and 0.
     use_swapab selects the SM100/SM103 SwapAB decode kernel (flash_fwd_decode_sm100.py), where
-    tile_m is the query-head tile and only num_splits is tunable; see SwapABPolicy.config. The
-    SwapAB kernel sizes its own SMEM stages, so its configs carry the neutral layout.
+    tile_m is the query heads x query tokens per CTA and only num_splits is tunable; see
+    SwapABPolicy.config. The SwapAB kernel sizes its own SMEM stages, so its configs carry the
+    neutral layout.
     use_dynamic_varlen runs SM100 varlen on DynamicPersistentVarlenScheduler with a semaphore the
     interface allocates. validate_fwd_config rejects this flag with caller scheduler metadata.
     A caller-provided tile_count_semaphore selects the same scheduler through
@@ -1189,11 +1190,11 @@ class SwapABPolicy:
     (flash_fwd_decode_sm100.py). The selector, validation, and interface use SWAPAB."""
 
     # Kernel shapes. Each 256-token KV block is two 128-row MMA subtiles, and pages are resolved
-    # per subtile, so a page holds a whole number of subtiles. One lane owns one query head in
-    # the softmax and correction warpgroups.
+    # per subtile, so a page holds a whole number of subtiles. One lane owns one column (a query
+    # head of one query token) in the softmax and correction warpgroups.
     tile_n: int = 256
     page_multiple: int = 128
-    max_qhead_per_kvhead: int = 32
+    max_columns: int = 32
     # Split policy. Decode is bandwidth bound and DRAM saturates with roughly this many CTAs
     # (hd64 moves fewer bytes per tile, so it needs more); more splits only add per-CTA fixed
     # cost and combine work. Fitted on B200 within 2% of the best split on average over a
@@ -1240,6 +1241,18 @@ class SwapABPolicy:
         """Query heads per CTA: the next power of two, so one head block covers the group."""
         return 1 << (qhead_per_kvhead - 1).bit_length()
 
+    def tile_tokens(self, inputs: FwdHeuristicInputs) -> int:
+        """Query tokens per CTA: the next power of two of the longest row (1 for decode).
+
+        Example: varlen verify rows of 1 + 3 drafts (max_seqlen_q 4) at 6 query heads per KV
+        head take 4 tokens x 8 heads = 32 columns; 5 tokens would take 8 x 8 = 64.
+        """
+        if inputs.has_cu_seqlens_q:
+            max_tokens = inputs.max_seqlen_q
+        else:
+            max_tokens = inputs.total_q // max(inputs.batch_size, 1)
+        return 1 << (max(max_tokens, 1) - 1).bit_length()
+
     def target_ctas(self, head_dim: int) -> int:
         return self.hd64_target_ctas if head_dim == 64 else self.default_target_ctas
 
@@ -1275,12 +1288,13 @@ class SwapABPolicy:
     def rejection(self, inputs: FwdHeuristicInputs) -> str | None:
         """Why the SwapAB decode kernel cannot run this problem, or None when it can.
 
-        SwapAB is inference with one query token per sequence: dense Q of seqlen 1, or varlen Q
-        (cu_seqlens_q) with a host max_seqlen_q of 1. A new forward option needs a
-        FwdHeuristicInputs fact that is rejected here, unless SwapAB supports it. The split
-        count's grid limit is grid_rejection.
+        SwapAB is inference with up to max_columns (query head, query token) pairs per KV head
+        and row: dense Q, or varlen Q (cu_seqlens_q) with a host max_seqlen_q. A new forward
+        option needs a FwdHeuristicInputs fact that is rejected here, unless SwapAB supports it.
+        The split count's grid limit is grid_rejection.
         """
         is_dense_q = not inputs.has_cu_seqlens_q
+        columns = self.tile_hq(inputs.qhead_per_kvhead) * self.tile_tokens(inputs)
         unsupported = {
             "cu_seqlens_k": inputs.has_cu_seqlens_k,
             "seqused_q": inputs.has_seqused_q,
@@ -1293,15 +1307,19 @@ class SwapABPolicy:
             # B200 (SM100) and B300 (SM103) share the tcgen05/TMEM features and SMEM capacity used.
             "architecture must be SM100 or SM103": inputs.device_arch not in (100, 103),
             "training": inputs.requires_grad,
-            "varlen Q needs max_seqlen_q == 1": not is_dense_q
-            and not (inputs.has_max_seqlen_q_hint and inputs.max_seqlen_q == 1),
-            "single query token per sequence": is_dense_q and inputs.total_q != inputs.batch_size,
+            # A tensor max_seqlen_q gives no host bound for the token tile.
+            "varlen Q needs a host max_seqlen_q": not is_dense_q
+            and not inputs.has_max_seqlen_q_hint,
+            f"query heads x query tokens per KV head over {self.max_columns} columns": (
+                columns > self.max_columns
+            ),
+            "token mode with a local window, score_mod or mask_mod": self.tile_tokens(inputs) > 1
+            and (inputs.local or inputs.has_score_mod or inputs.has_mask_mod),
             # TODO: e5m2: admit it here and in the SwapAB adapter's dtype assert, with a test; the
             # kernel's FP8 math is not e4m3-specific.
             "dtype": inputs.dtype not in ("torch.float16", "torch.bfloat16", "torch.float8_e4m3fn"),
             "MXFP8 block scales": inputs.mxfp8_path is not None,
             "head dimensions": not self.supports_head_dims(inputs.head_dim, inputs.head_dim_v),
-            "GQA ratio": inputs.qhead_per_kvhead > self.max_qhead_per_kvhead,
             f"page size must be a multiple of {self.page_multiple}": (
                 inputs.page_size is not None and inputs.page_size % self.page_multiple != 0
             ),
@@ -1377,11 +1395,12 @@ class SwapABPolicy:
         )
 
     def config(self, inputs: FwdHeuristicInputs, num_splits: int) -> FwdConfig:
-        """The one SwapAB config for a problem: a power-of-two query-head tile covering the GQA
-        group, a 256-token KV tile, and no standard-kernel scheduling features."""
+        """The one SwapAB config for a problem: power-of-two query-head and query-token tiles
+        covering the GQA group and the longest row, a 256-token KV tile, and no standard-kernel
+        scheduling features."""
         return FwdConfig(
             device_capacity=inputs.device_capacity,
-            tile_m=self.tile_hq(inputs.qhead_per_kvhead),
+            tile_m=self.tile_hq(inputs.qhead_per_kvhead) * self.tile_tokens(inputs),
             tile_n=self.tile_n,
             mma_pv_is_rs=False,
             intra_wg_overlap=False,

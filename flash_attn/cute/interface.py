@@ -652,7 +652,6 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
-    query_len_in_heads: int = 1,
     *,
     config: FwdConfig | MlaFwdConfig | None = None,
 ) -> Tuple[
@@ -675,12 +674,6 @@ def _flash_attn_fwd(
             BlockScales). BlockScales give BF16 output and support only dense, unsplit,
             forward-only attention. BlockScales.v selects native MXFP8 PV with e4m3 V, which
             is also nonlocal and unmodified; causal native PV also needs BlockScales.v_bf16.
-        query_len_in_heads: SwapAB decode only: each KV head's query heads hold n =
-            query_len_in_heads query tokens of the sequence, token-major, and token j sees keys
-            up to seqused_k - n + j. n must divide the query heads per KV head, and takes no
-            local window, score_mod or mask_mod.
-            Example, n = 4 tokens of a 6-head GQA group: q holds 24 heads per KV head,
-            heads 0-5 token 0 (keys < seqused_k - 3), ..., heads 18-23 token 3 (every key).
         config: Fully resolved forward config, or None for the default: an MlaFwdConfig with qv,
             else a FwdConfig.
     """
@@ -965,28 +958,6 @@ def _flash_attn_fwd(
     mla_1cta = mla_kernel in ("1cta", "1cta_kb64")
     mla_1cta_kb64 = mla_kernel == "1cta_kb64"
     use_swapab = mla_kernel is None and config.use_swapab
-    if query_len_in_heads > 1:
-        if qhead_per_kvhead % query_len_in_heads != 0:
-            raise ValueError(
-                f"query_len_in_heads={query_len_in_heads} must divide the query heads per KV "
-                f"head: {num_head} // {num_head_kv} = {qhead_per_kvhead}"
-            )
-
-        # The window and the modifiers see the decode query's position (q_idx 0) for every
-        # packed token, so each token would get the last token's window or mask.
-        if local or score_mod is not None or mask_mod is not None:
-            raise ValueError(
-                f"query_len_in_heads={query_len_in_heads} takes no local window, score_mod or "
-                f"mask_mod, got window ({window_size_left}, {window_size_right}), "
-                f"score_mod={score_mod}, mask_mod={mask_mod}"
-            )
-
-        if not use_swapab:
-            raise ValueError(
-                f"query_len_in_heads={query_len_in_heads} needs the SwapAB decode kernel, but "
-                f"the config selects another: {config}"
-            )
-
     prepare_split_metadata = mla_kernel is None and needs_split_metadata(config, inputs)
     use_dynamic_varlen = (
         mla_kernel is None and config.use_dynamic_varlen and scheduler_metadata is None
@@ -1136,7 +1107,8 @@ def _flash_attn_fwd(
             tile_n=config.tile_n,
             headdim_v=head_dim_v,
             pack_gqa=config.pack_gqa,
-            # SwapAB's single query needs no causal L2 head swizzle.
+            # SwapAB splits all of a row's keys (it masks causal query tokens itself) and needs
+            # no L2 head swizzle.
             causal=causal and not use_swapab,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
@@ -1343,7 +1315,6 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
         tensormap_workspace is not None,
-        query_len_in_heads,
     )
 
     if qk_blockscaled:
@@ -1548,13 +1519,12 @@ def _flash_attn_fwd(
             else:
                 fwd_cls = FlashAttentionForwardSm100
                 # SwapAB never runs block scales (config.SWAPAB.rejection).
-                kernel_kwargs = (
+                mxfp8_kwargs = (
                     dict(qk_blockscaled=True, pv_blockscaled=pv_blockscaled) if qk_blockscaled else {}
                 )
                 if use_swapab:
                     from flash_attn.cute.flash_fwd_decode_sm100 import FlashAttentionForwardSm100SwapAB
                     fwd_cls = FlashAttentionForwardSm100SwapAB
-                    kernel_kwargs["query_len_in_heads"] = query_len_in_heads
                 fa_fwd = fwd_cls(
                     head_dim,
                     head_dim_v,
@@ -1571,7 +1541,7 @@ def _flash_attn_fwd(
                     kv_subtile_factor=kv_subtile_factor,
                     seqlen_k_per_split=seqlen_k_per_split,
                     has_tile_count_semaphore=tile_count_semaphore is not None,
-                    **kernel_kwargs,
+                    **mxfp8_kwargs,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity

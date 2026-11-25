@@ -169,8 +169,8 @@ def test_dense(dims, dtype, ns):
     check(*decode_inputs(*dims, dtype=dtype), ns=ns)
 
 
-# (dims, GQA ratio, ns): hd256 decode and a 4-token MTP verify group (24 heads per KV head, the
-# 32-head tile), and the other head-dim kernels.
+# (dims, GQA ratio, ns): hd256 decode at 6 and 24 heads per KV head (the 32-column tile), and the
+# other head-dim kernels.
 FP8_CASES = [
     ((256, 256), 6, 1),
     ((256, 256), 6, 3),
@@ -212,81 +212,6 @@ def test_fp8(dims, ratio, ns):
         "bhqk,bkhd->bqhd", p_e4m3, v_ref.repeat_interleave(ratio, dim=2)
     ) / p.sum(-1).transpose(1, 2)[..., None]
     assert_decode_close(o, lse, ref._replace(out_pt=out_pt))
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "e4m3"])
-@pytest.mark.parametrize(
-    "length",
-    [4 * 256 + 3, 4 * 256 + 2, 4 * 256 + 1],
-    ids=["hidden-in-last-block", "one-hidden-key-in-earlier-block", "hidden-across-blocks"],
-)
-@pytest.mark.parametrize("ns", [1, 3])
-@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_query_len_in_heads(ns, length, dtype):
-    """4 query tokens of a 6-head GQA group as 24 heads per KV head: token j sees keys
-    < length - 3 + j. With 3 splits the last split holds only keys hidden from token 0 (its heads
-    get an empty split).
-
-        length 4 * 256 + 3: hidden keys 1024-1026, all in the last 256-key block
-        length 4 * 256 + 2: hidden keys 1023-1025, only key 1023 in block 3
-        length 4 * 256 + 1: hidden keys 1022-1024, across blocks 3 and 4
-    """
-    query_len, group = 4, 6
-    ratio = query_len * group
-    q, k, v = decode_inputs(256, 256, ratio=ratio, length=length)
-    scales = None
-    if dtype == torch.float8_e4m3fn:
-        descales = [torch.rand(2, 2, device="cuda") + 0.5 for _ in range(3)]  # (batch, KV heads)
-        per_head = [descales[0].repeat_interleave(ratio, dim=1)[:, None, :, None]] + [
-            d[:, None, :, None] for d in descales[1:]
-        ]
-        q, k, v = ((x / d).to(dtype) for x, d in zip((q, k, v), per_head))
-        scales = TensorwiseScales(*descales)
-    o, lse, *_ = _flash_attn_fwd(
-        q, k, v, num_splits=ns, return_lse=True, query_len_in_heads=query_len, scales=scales
-    )
-    if is_fake_mode():
-        return
-    token = torch.arange(q.shape[2], device="cuda") % ratio // group
-    keep = torch.arange(length, device="cuda")[None, :] < length - query_len + 1 + token[:, None]
-    keep = keep.expand(q.shape[0], -1, -1)
-    if scales is None:
-        assert_decode_close(o, lse, decode_reference(q, k, v, keep=keep))
-        return
-
-    # e4m3: the oracle runs on the dequantized inputs; the error baseline rounds P to e4m3 as the
-    # kernel does (test_fp8).
-    q_ref, k_ref, v_ref = (x.float() * d for x, d in zip((q, k, v), per_head))
-    ref = decode_reference(q_ref, k_ref, v_ref, keep=keep)
-    scores = torch.einsum(
-        "bqhd,bkhd->bhqk", q_ref, k_ref.repeat_interleave(ratio, dim=2)
-    ) / math.sqrt(256)
-    scores = scores.masked_fill(~keep[:, :, None, :], -math.inf)
-    p = torch.exp(scores - scores.amax(-1, keepdim=True))
-    p_e4m3 = (p * 256).to(torch.float8_e4m3fn).float() / 256
-    out_pt = torch.einsum(
-        "bhqk,bkhd->bqhd", p_e4m3, v_ref.repeat_interleave(ratio, dim=2)
-    ) / p.sum(-1).transpose(1, 2)[..., None]
-    assert_decode_close(o, lse, ref._replace(out_pt=out_pt))
-
-
-@pytest.mark.parametrize(
-    "kwargs,match",
-    [
-        pytest.param(dict(query_len_in_heads=4), "must divide", id="heads-not-divisible"),
-        pytest.param(dict(window_size_left=31), "takes no local window", id="local"),
-        pytest.param(dict(mask_mod=keep_every_third), "takes no local window", id="mask_mod"),
-        pytest.param(dict(score_mod=batch_bias), "takes no local window", id="score_mod"),
-    ],
-)
-@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_query_len_in_heads_rejects(kwargs, match):
-    """query_len_in_heads raises when it does not divide the query heads per KV head (6 heads,
-    n = 4), or with a local window or modifier, which would see the last token's position."""
-    q, k, v = decode_inputs(ratio=6)
-    kwargs = {"query_len_in_heads": 3, **kwargs}
-    with pytest.raises(ValueError, match=match):
-        _flash_attn_fwd(q, k, v, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -481,7 +406,8 @@ def test_swapab_request_falls_back(kind, monkeypatch):
     q, k, v = decode_inputs()
     kw = {}
     if kind == "prefill":
-        q = q.expand(-1, 2, -1, -1).contiguous()
+        # 16 tokens of 3 query heads need 16 x 4 = 64 columns, over SwapAB's 32.
+        q = q.expand(-1, 16, -1, -1).contiguous()
     else:
         kw["pack_gqa"] = False
     outs = {}
@@ -758,30 +684,6 @@ def test_varlen_paged_decode(ns):
     assert torch.all(out[3] == 7.0)
 
 
-@pytest.mark.parametrize("ns", [1, 3])
-@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_query_len_in_heads_varlen_paged(ns):
-    """query_len_in_heads in a serving layout (varlen Q, 128-token pages, seqused_k): 4 tokens of
-    a 2-head GQA group as 8 heads per KV head, token j sees keys < seqused_k - 3 + j."""
-    query_len, group = 4, 2
-    q, q_var, k, v, table, used, cu, rows = varlen_paged_inputs()
-    out = torch.full_like(q_var, 7.0)
-    _, lse, *_ = _flash_attn_fwd(
-        q_var, k, v, cu_seqlens_q=cu, max_seqlen_q=1, page_table=table, seqused_k=used,
-        num_splits=ns, out=out, return_lse=True, query_len_in_heads=query_len,
-    )
-    if is_fake_mode():
-        return
-    token = torch.arange(q.shape[2], device="cuda") % (query_len * group) // group
-    capacity = table.shape[1] * k.shape[1]
-    last_seen_key = used[:, None, None] - query_len + token[None, :, None]
-    keep = torch.arange(capacity, device="cuda")[None, None, :] <= last_seen_key
-    ref = decode_reference(q, k, v, page_table=table, seqused=used, keep=keep)
-    ref = ref._replace(out=ref.out[rows], lse=ref.lse[rows], out_pt=ref.out_pt[rows])
-    assert_decode_close(out[:3, None], lse[:, :3].T[:, :, None], ref)
-    assert torch.all(out[3] == 7.0)
-
-
 @cute.jit
 def global_q_bias(score, b, h, q_idx, kv_idx, seqlen_info, aux_tensors):
     """Score bias read at the global query index, the FA4 varlen modifier convention."""
@@ -808,6 +710,257 @@ def test_varlen_modifier_sees_global_query_index(monkeypatch):
         return
     torch.testing.assert_close(out[:3], std_out[:3], atol=2e-3, rtol=0)
     torch.testing.assert_close(lse[:, :3], std_lse[:, :3], atol=1e-4, rtol=0)
+
+
+# Verify rows (token mode): (query tokens, KV length) per row. Token j of a row of seqlen_q tokens
+# sees keys < L - seqlen_q + 1 + j, so with n = 4:
+#
+#     n tokens, L 1027      hidden keys 1024-1026, all in the last 256-key block
+#     n tokens, L 1026      hidden keys 1023-1025: key 1023 in block 3
+#     n tokens, L 1025      hidden keys 1022-1024, across blocks 3 and 4
+#     n - 1 tokens, L 700   a ragged row: its extra columns load the next row's first token
+#     1 token, L 513
+#     0 tokens, L 300       no query: writes nothing
+#     n tokens, L n - 1     token 0 sees no key: O = 0, LSE = -inf
+def verify_rows(n):
+    return [(n, 1027), (n, 1026), (n, 1025), (n - 1, 700), (1, 513), (0, 300), (n, n - 1)]
+
+
+def verify_inputs(qpk, n, head_dim, dtype, *, pages_per_row=9, heads_kv=2, seed=5):
+    """Varlen verify rows over permuted 128-token pages, with fp8 descales for e4m3.
+
+    Unused pages hold NaN, and Q holds 4 NaN rows past cu_seqlens_q[-1]: the last row's extra
+    columns load them. Returns (q, k, v, page_table, seqused_k, cu_seqlens_q, scales, deq),
+    where deq maps the e4m3 tensors back to fp32 for the oracle. e4m3 clamps the finite
+    garbage to 448, its largest finite value.
+    """
+    torch.manual_seed(seed)
+    rows = verify_rows(n)
+    page_size, batch = 128, len(rows)
+    # Host lists: fake-tensor mode (pass 1 of two-pass testing) can't read tensor values.
+    q_lens = [q_len for q_len, _ in rows]
+    total_q = sum(q_lens)
+    cu = torch.tensor([sum(q_lens[:i]) for i in range(batch + 1)], device="cuda", dtype=torch.int32)
+    q = torch.randn(total_q + 4, qpk * heads_kv, head_dim, device="cuda")
+    num_pages = batch * pages_per_row
+    k = torch.randn(num_pages + 1, page_size, heads_kv, head_dim, device="cuda")
+    v = torch.randn_like(k)
+    table = torch.randperm(num_pages, device="cuda").to(torch.int32).view(batch, pages_per_row)
+    used = torch.tensor([kv_len for _, kv_len in rows], device="cuda", dtype=torch.int32)
+    if not is_fake_mode():
+        poison_unused_kv(k, v, used, table)
+        k[num_pages], v[num_pages] = float("nan"), float("nan")
+        q[total_q:] = float("nan")
+    scales, deq = None, lambda x, which: x.float()
+    if dtype == torch.float8_e4m3fn:
+        descales = [torch.rand(batch, heads_kv, device="cuda") + 0.5 for _ in range(3)]
+        token_row = torch.tensor(
+            [row for row, q_len in enumerate(q_lens) for _ in range(q_len)], device="cuda"
+        )
+        q_scale = torch.ones(total_q + 4, heads_kv, device="cuda")
+        q_scale[:total_q] = descales[0][token_row]
+        q_scale = q_scale.repeat_interleave(qpk, dim=1)[..., None]
+        # Pages are row-owned (a permutation), so each page takes its row's K/V descales.
+        page_row = torch.full((num_pages + 1,), batch - 1, device="cuda", dtype=torch.long)
+        page_row[table.long().flatten()] = torch.arange(batch, device="cuda").repeat_interleave(
+            pages_per_row
+        )
+        kv_scale = [d[page_row][:, None, :, None] for d in descales[1:]]
+        q = (q / q_scale).to(dtype)
+        k, v = ((x / s).clamp(-448, 448).to(dtype) for x, s in zip((k, v), kv_scale))
+        scales = TensorwiseScales(*descales)
+        per_tensor = {"q": q_scale, "k": kv_scale[0], "v": kv_scale[1]}
+        deq = lambda x, which: x.float() * per_tensor[which]
+    else:
+        q, k, v = (x.to(dtype) for x in (q, k, v))
+    return q, k, v, table, used, cu, scales, deq
+
+
+def verify_reference(q, k, v, table, used, cu, deq, *, causal=True):
+    """Oracle per query token: each token is a one-query sequence with its row's pages, and
+    causal token j of a row keeps keys < L - seqlen_q + 1 + j. Returns (ref, tokens), where
+    tokens are the indices into q of every row's tokens."""
+    q_lens = (cu[1:] - cu[:-1]).tolist()
+    starts = cu[:-1].tolist()
+    tokens = [start + j for start, q_len in zip(starts, q_lens) for j in range(q_len)]
+    token_row = torch.tensor(
+        [row for row, q_len in enumerate(q_lens) for _ in range(q_len)], device="cuda"
+    )
+    token_idx = torch.tensor([j for q_len in q_lens for j in range(q_len)], device="cuda")
+    # Pages past the longest row hold only masked keys; dropping them keeps the oracle small.
+    page_size = k.shape[1]
+    pages = -(-int(used.max()) // page_size)
+    table_tok = table[token_row, :pages]
+    used_tok = used[token_row]
+    capacity = pages * page_size
+    keep = None
+    if causal:
+        q_len_tok = (cu[1:] - cu[:-1])[token_row]
+        last_seen = used_tok - q_len_tok + token_idx
+        keep = torch.arange(capacity, device="cuda")[None, :] <= last_seen[:, None]
+        keep = keep[:, None, :].expand(-1, q.shape[1], -1)
+    q_ref = deq(q, "q")[tokens][:, None]
+    k_ref, v_ref = deq(k, "k"), deq(v, "v")
+    ref = decode_reference(q_ref, k_ref, v_ref, page_table=table_tok, seqused=used_tok, keep=keep)
+    if q.dtype == torch.float8_e4m3fn:
+        ref = ref._replace(out_pt=e4m3_baseline(q_ref, k_ref, v_ref, table_tok, used_tok, keep))
+    return ref, tokens
+
+
+def e4m3_baseline(q, k, v, table, used, keep):
+    """Error baseline for e4m3: P rounded to e4m3 as the kernel does, exp(S - max) * 2^8."""
+    k = k[table.long()].flatten(1, 2)
+    v = v[table.long()].flatten(1, 2)
+    qpk = q.shape[2] // k.shape[2]
+    k, v = (x.repeat_interleave(qpk, dim=2) for x in (k, v))
+    key_mask = torch.arange(k.shape[1], device="cuda")[None, None, :] < used[:, None, None]
+    if keep is not None:
+        key_mask = key_mask & keep
+    k, v = (x.nan_to_num(0.0) for x in (k, v))
+    scores = torch.einsum("bqhd,bkhd->bhqk", q, k) / math.sqrt(q.shape[-1])
+    scores = scores.masked_fill(~key_mask[:, :, None, :], -math.inf)
+    p = torch.exp(scores - scores.amax(-1, keepdim=True)).nan_to_num(0.0)
+    p_e4m3 = (p * 256).to(torch.float8_e4m3fn).float() / 256
+    out = torch.einsum("bhqk,bkhd->bqhd", p_e4m3, v) / p.sum(-1).transpose(1, 2)[..., None]
+    return out.nan_to_num(0.0)
+
+
+def assert_verify_close(out, lse, std_out, std_lse, ref, tokens, padding, atol=2e-3):
+    """SwapAB O/LSE of every row's tokens vs the oracle, and vs the standard kernel where a token
+    sees keys; the padding rows past cu_seqlens_q[-1] keep the caller's 7.0."""
+    assert_decode_close(out[tokens, None], lse[:, tokens].T[:, :, None], ref)
+    seen = ~torch.isneginf(ref.lse[:, :, 0].T)  # (heads, tokens)
+    torch.testing.assert_close(
+        out[tokens].float().transpose(0, 1)[seen], std_out[tokens].float().transpose(0, 1)[seen],
+        atol=atol, rtol=0,
+    )
+    torch.testing.assert_close(lse[:, tokens][seen], std_lse[:, tokens][seen], atol=1e-4, rtol=0)
+    assert torch.all(out[padding] == 7.0) and torch.all(lse[:, padding] == 7.0)
+
+
+# (dtype, query heads per KV head, query tokens n, head dim, num_splits)
+VERIFY_CASES = [
+    # 6 query heads per KV head, 1 + 3 drafts: 8 heads x 4 tokens, the 32-column tile.
+    (torch.bfloat16, 6, 4, 256, 3),
+    (torch.float8_e4m3fn, 6, 4, 256, 3),
+    (torch.bfloat16, 6, 2, 256, 1),
+    # 3 tokens in a 4-token tile.
+    (torch.bfloat16, 4, 3, 128, 3),
+    (torch.bfloat16, 4, 8, 128, 1),
+    # The longest row: a (1, 32) TMA box, 31 hidden keys across a block edge.
+    (torch.bfloat16, 1, 32, 128, 3),
+    # 2 columns in an 8-column MMA tile: the padding columns load more tokens.
+    (torch.bfloat16, 1, 2, 128, 3),
+    # An 8-column e4m3 tile.
+    (torch.float8_e4m3fn, 2, 4, 128, 1),
+    # Per-sequence split counts (a 32K-token page-table capacity).
+    (torch.bfloat16, 6, 4, 256, 0),
+]
+
+
+@pytest.mark.parametrize(
+    "dtype,qpk,n,head_dim,ns",
+    [
+        pytest.param(*case, id=f"{str(case[0])[12:]}-qpk{case[1]}-n{case[2]}-hd{case[3]}-ns{case[4]}")
+        for case in VERIFY_CASES
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_verify_rows(dtype, qpk, n, head_dim, ns, monkeypatch):
+    """Varlen causal rows of up to n query tokens (max_seqlen_q = n) over paged KV, one CTA per
+    (KV head, row), vs the fp32 oracle and the standard kernel."""
+    pages_per_row = 256 if ns == 0 else 9
+    q, k, v, table, used, cu, scales, deq = verify_inputs(
+        qpk, n, head_dim, dtype, pages_per_row=pages_per_row
+    )
+    total_q = q.shape[0] - 4
+    out_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    out = torch.full(q.shape, 7.0, device="cuda", dtype=out_dtype)
+    lse = torch.full((q.shape[1], q.shape[0]), 7.0, device="cuda")
+    kw = dict(
+        cu_seqlens_q=cu, max_seqlen_q=n, page_table=table, seqused_k=used, causal=True,
+        num_splits=ns, return_lse=True, scales=scales,
+    )
+    _flash_attn_fwd(q, k, v, out=out, lse=lse, **kw)
+    monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "standard")
+    std_out, std_lse, *_ = _flash_attn_fwd(q, k, v, **kw)
+    if is_fake_mode():
+        return
+    ref, tokens = verify_reference(q, k, v, table, used, cu, deq)
+    padding = list(range(total_q, q.shape[0]))
+    # e4m3 rounds P in each kernel at its own running max.
+    atol = 1e-2 if dtype == torch.float8_e4m3fn else 2e-3
+    assert_verify_close(out, lse, std_out, std_lse, ref, tokens, padding, atol)
+
+
+@pytest.mark.parametrize("layout", ["dense_q", "noncausal"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_verify_rows_layouts(layout, monkeypatch):
+    """Token mode with dense Q (batch, n, heads, d), and without the causal mask."""
+    q, k, v, table, used, cu, _, deq = verify_inputs(6, 4, 128, torch.bfloat16)
+    causal = layout != "noncausal"
+    kw = dict(page_table=table, seqused_k=used, causal=causal, num_splits=3, return_lse=True)
+    if layout == "dense_q":
+        # Every row holds 4 tokens: dense Q takes the rows at 4-token strides.
+        cu = torch.arange(0, 4 * 7 + 1, 4, device="cuda", dtype=torch.int32)
+        q_in = torch.randn(7, 4, *q.shape[1:], device="cuda").to(q.dtype)
+        q_flat = q_in.flatten(0, 1)
+    else:
+        q_in, q_flat, kw = q, q, dict(kw, cu_seqlens_q=cu, max_seqlen_q=4)
+    out, lse, *_ = _flash_attn_fwd(q_in, k, v, **kw)
+    monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "standard")
+    std_out, std_lse, *_ = _flash_attn_fwd(q_in, k, v, **kw)
+    if is_fake_mode():
+        return
+    if layout == "dense_q":
+        out, std_out = out.flatten(0, 1), std_out.flatten(0, 1)
+        lse, std_lse = lse.transpose(0, 1).flatten(1, 2), std_lse.transpose(0, 1).flatten(1, 2)
+    ref, tokens = verify_reference(q_flat, k, v, table, used, cu, deq, causal=causal)
+    assert_verify_close(out, lse, std_out, std_lse, ref, tokens, padding=[])
+
+
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_verify_rows_graph_replay():
+    """Replays read the mutated cu_seqlens_q (rows of 0-4 tokens move) and seqused_k through
+    stable pointers, and the NaN-prefilled caller buffers are overwritten for every token."""
+    q, k, v, table, used, cu, _, deq = verify_inputs(6, 4, 256, torch.bfloat16)
+    steps = [
+        ([0, 4, 8, 12, 15, 16, 16, 20], [1027, 1026, 1025, 700, 513, 300, 3]),
+        ([0, 1, 5, 5, 9, 13, 17, 20], [5, 1027, 0, 260, 4, 1100, 1]),
+    ]
+    out = torch.empty(q.shape, device="cuda", dtype=q.dtype)
+    lse = torch.empty((q.shape[1], q.shape[0]), device="cuda")
+
+    def run():
+        _flash_attn_fwd(
+            q, k, v, cu_seqlens_q=cu, max_seqlen_q=4, page_table=table, seqused_k=used,
+            causal=True, num_splits=3, out=out, lse=lse, return_lse=True,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    if is_fake_mode():
+        return
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    for cu_list, lengths in steps:
+        cu.copy_(torch.tensor(cu_list, device="cuda", dtype=torch.int32))
+        used.copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
+        q[: cu_list[-1]] = torch.randn_like(q[: cu_list[-1]])
+        k.copy_(torch.randn_like(k))
+        v.copy_(torch.randn_like(v))
+        poison_unused_kv(k, v, used, table)
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        graph.replay()
+        ref, tokens = verify_reference(q, k, v, table, used, cu, deq)
+        assert_decode_close(out[tokens, None], lse[:, tokens].T[:, :, None], ref)
+    torch.cuda.synchronize()
 
 
 @pytest.fixture

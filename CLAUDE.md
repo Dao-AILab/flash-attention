@@ -97,7 +97,7 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-b
 
 - `flash_fwd.py` — `FlashAttentionForwardSm90`: Hopper forward. No SplitKV or paged KV.
 - `flash_fwd_sm100.py` — `FlashAttentionForwardSm100`: Blackwell forward. Full features including SplitKV, paged KV cache, persistent kernels, 2CTA instructions.
-- `flash_fwd_decode_sm100.py` — `FlashAttentionForwardSm100SwapAB`: SM100/SM103 single-query-token inference decode (dense or varlen Q, dense or paged KV) with query heads on the MMA N side. `select_fwd_config` routes admitted calls to it; `FLASH_ATTENTION_SM100_BACKEND=auto|swapab|standard` (default `auto`) lets the selector choose, prefers SwapAB wherever it can serve the call (falling back to the standard kernel otherwise), or disables it.
+- `flash_fwd_decode_sm100.py` — `FlashAttentionForwardSm100SwapAB`: SM100/SM103 inference decode (dense or varlen Q, dense or paged KV) with query heads on the MMA N side; token mode also puts a row's query tokens there (up to 32 query heads x query tokens per KV head, e.g. MTP verify rows). `select_fwd_config` routes admitted calls to it; `FLASH_ATTENTION_SM100_BACKEND=auto|swapab|standard` (default `auto`) lets the selector choose, prefers SwapAB wherever it can serve the call (falling back to the standard kernel otherwise), or disables it.
 - `flash_fwd_combine.py` — `FlashAttentionForwardCombine`: merges SplitKV partial results.
 
 ### Backward Kernels

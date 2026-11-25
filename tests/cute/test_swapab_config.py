@@ -67,6 +67,32 @@ def test_admitted_decode_selects_swapab(changes):
     assert select_fwd_config(inputs._replace(requested_use_swapab=True)) == config
 
 
+# Verify rows (token mode): N holds npo2(query heads per KV head) x npo2(max_seqlen_q) columns.
+@pytest.mark.parametrize(
+    ("changes", "tile_m"),
+    [
+        # 6 query heads per KV head, 1 + 3 drafts: 8 x 4.
+        ({"num_heads": 12, **_VARLEN_PAGED, "total_q": 12, "max_seqlen_q": 4}, 32),
+        # Dense Q of 4 tokens per sequence.
+        ({"num_heads": 12, "total_q": 16, "max_seqlen_q": 4}, 32),
+        ({**_VARLEN_PAGED, "total_q": 9, "max_seqlen_q": 3}, 16),
+        ({"num_heads": 2, **_VARLEN_PAGED, "total_q": 96, "max_seqlen_q": 32}, 32),
+    ],
+)
+def test_admitted_verify_rows_select_swapab(changes, tile_m):
+    config = select_fwd_config(decode(**changes)._replace(requested_use_swapab=True))
+
+    assert config.use_swapab and config.tile_m == tile_m
+
+
+def test_verify_rows_over_32_columns_take_the_standard_kernel():
+    """6 query heads per KV head at 1 + 4 drafts need 8 x 8 = 64 columns."""
+    inputs = decode(**{**_VARLEN_PAGED, "num_heads": 12, "total_q": 15, "max_seqlen_q": 5})
+
+    assert SWAPAB.rejection(inputs) == "query heads x query tokens per KV head over 32 columns"
+    assert not select_fwd_config(inputs._replace(requested_use_swapab=True)).use_swapab
+
+
 # Problems the SwapAB kernel cannot run, with the rejection reason.
 _UNSUPPORTED = [
     ({"has_cu_seqlens_k": True}, "cu_seqlens_k"),
@@ -80,14 +106,18 @@ _UNSUPPORTED = [
     ({"device_arch": 90}, "SM100 or SM103"),
     ({"device_arch": 110}, "SM100 or SM103"),
     ({"requires_grad": True}, "training"),
-    ({"total_q": 8, "max_seqlen_q": 2}, "single query token"),
-    ({**_VARLEN_PAGED, "max_seqlen_q": 2}, "max_seqlen_q == 1"),
+    # 4 query heads x 16 tokens (9 tokens round up to 16) is 64 columns.
+    ({"total_q": 4 * 16, "max_seqlen_q": 16}, "over 32 columns"),
+    ({**_VARLEN_PAGED, "max_seqlen_q": 9}, "over 32 columns"),
     # A tensor (device) max_seqlen_q is no host bound.
-    ({**_VARLEN_PAGED, "has_max_seqlen_q_hint": False}, "max_seqlen_q == 1"),
+    ({**_VARLEN_PAGED, "has_max_seqlen_q_hint": False}, "needs a host max_seqlen_q"),
+    ({**_VARLEN_PAGED, "max_seqlen_q": 4, "local": True, "window_size_left": 31},
+     "token mode with a local window"),
+    ({**_VARLEN_PAGED, "max_seqlen_q": 4, "has_score_mod": True}, "token mode with a local window"),
     ({"dtype": "torch.float8_e5m2"}, "dtype"),
     ({"mxfp8_path": "qk"}, "MXFP8 block scales"),
     ({"head_dim": 192, "head_dim_v": 128}, "head dimensions"),
-    ({"num_heads": 66, "num_heads_kv": 2}, "GQA ratio"),
+    ({"num_heads": 66, "num_heads_kv": 2}, "over 32 columns"),
     ({"page_size": 64}, "page size must be a multiple of 128"),
 ]
 # Selection requests that keep the selector off SwapAB.

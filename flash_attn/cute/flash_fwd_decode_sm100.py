@@ -1,14 +1,19 @@
-# SM100 swap-AB single-token decode, adapted from NVIDIA CUTLASS gqa_decode_opt
+# SM100 swap-AB decode, adapted from NVIDIA CUTLASS gqa_decode_opt
 # (examples/python/CuTeDSL/cute_ext/blackwell/attention/gqa_decode_opt.py).
 # It computes S^T = K Q^T and O^T = V^T P^T, so KV tokens fill the 128-row MMA M dimension
-# and the query heads of one KV head fill the small N dimension.
+# and the query heads of one KV head fill the small N dimension. Token mode (tokens_tile > 1,
+# e.g. MTP verify rows) puts a row's query tokens in N too, so the row's KV is read once:
+#
+#   column = head + heads_tile * token          qpk 6, 4 tokens: heads_tile 8, 32 columns
 #
 # Core contract: Q is (B,H,Dqk), K is (B,S,Hkv,Dqk), V is (B,S,Hkv,Dv), O is (splits,B,H,Dv),
-# optional LSE is (splits,B,H) fp32 natural log. Empty splits write O=0 and, when requested, LSE=-inf.
+# optional LSE is (splits,B,H) fp32 natural log. Token mode adds a query-token mode: Q is
+# (B,Sq,H,Dqk), O (splits,B,Sq,H,Dv), LSE (splits,B,H,Sq); varlen Q is B = 1 with rows at
+# cu_seqlens_q. Empty splits write O=0 and, when requested, LSE=-inf.
 # The caller launches the shared FA4 combine if splits>1. With per-sequence split counts (from the
 # prepare-scheduler kernel), split CTAs past their sequence's count exit without writing.
 # One CTA = 16 warps: 0 QK MMA, 1 PV MMA, 2 K/V load + final statistics,
-# 3 Q load + O store, WGs 1/2 alternating softmax, WG3 O correction.
+# 3 Q load + O store, WGs 1/2 alternating softmax, WG3 O correction (and the O store in token mode).
 # FP8 (e4m3) Q/K/V run both MMAs in e4m3 with the standard kernel's tensorwise descales, and P is
 # cast to e4m3 scaled by 2^max_offset (Note [Low Precision Scaling] in flash_fwd_sm100.py).
 
@@ -29,7 +34,7 @@ from quack import copy_utils
 
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.config import FwdConfig
+from flash_attn.cute.config import SWAPAB, FwdConfig
 from flash_attn.cute.compat import SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, FlashAttentionForwardSm100
@@ -211,14 +216,18 @@ def load_kv_stage(
     return kv_state, pipeline_kv.producer_try_acquire(kv_state)
 
 
-def gemm_view(mX, order, head_idx=None, qhead_per_kvhead=None, num_heads_kv=None):
+def gemm_view(mX, order, head_idx=None, qhead_per_kvhead=None, num_heads_kv=None, seqlen_idx=None):
     """mX with its modes permuted to order and the (kv head, batch) modes 2 and 3 grouped.
 
     With head_idx, the head mode is first split into (qhead_per_kvhead, num_heads_kv) as in
     pack_gqa_layout, so order indexes (qhead_per_kvhead, mode 0, ..., num_heads_kv, ...).
+    With seqlen_idx too, qhead_per_kvhead folds into that mode as (qhead_per_kvhead, seqlen).
     """
     if head_idx is not None:
-        mX = cute.flatten(pack_gqa_layout(mX, qhead_per_kvhead, num_heads_kv, head_idx))
+        if seqlen_idx is None:
+            mX = cute.flatten(pack_gqa_layout(mX, qhead_per_kvhead, num_heads_kv, head_idx))
+        else:
+            mX = pack_gqa_layout(mX, qhead_per_kvhead, num_heads_kv, head_idx, seqlen_idx)
     return cute.group_modes(select_modes(mX, order), 2, 4)
 
 
@@ -234,9 +243,10 @@ class _SwapABCore:
         is_local=False,
         *,
         head_dim_v,
-        query_len_in_heads=1,
+        tokens_tile=1,
+        is_causal=False,
     ):
-        # MMA N columns per CTA: the query heads of one KV head.
+        # MMA N columns per CTA: heads_tile query heads of one KV head x tokens_tile query tokens.
         self.tile_cols = tile_cols
         self.tile_n = tile_n
         self.head_dim = head_dim
@@ -253,15 +263,18 @@ class _SwapABCore:
         )
         self.is_local = is_local
         self.apply_score_mods = score_mod is not None or mask_mod is not None or is_local
-        # Each KV head's query heads hold query_len_in_heads tokens, token-major (MTP verify rows).
-        # Token j sees keys up to seqlen_k - query_len_in_heads + j, so a split may hide all of a
-        # head's keys, as masking can.
-        self.query_len_in_heads = query_len_in_heads
-        self.check_empty_rows = self.apply_score_mods or query_len_in_heads > 1
+        self.tokens_tile = tokens_tile
+        self.heads_tile = tile_cols // tokens_tile
+        # Causal token j of a row sees keys up to seqlen_k - seqlen_q + j, so a split may hide all
+        # of a column's keys, as masking can.
+        self.causal_tokens = is_causal and tokens_tile > 1
+        self.check_empty_rows = self.apply_score_mods or self.causal_tokens
+        # config.SWAPAB.rejection refuses token mode with a local window, score_mod or mask_mod.
+        assert tokens_tile == 1 or not self.apply_score_mods
 
         assert head_dim > 0 and head_dim % 16 == 0
         assert self.head_dim_v > 0 and self.head_dim_v % 16 == 0
-        assert tile_cols in (1, 2, 4, 8, 16, 32)
+        assert tile_cols in (1, 2, 4, 8, 16, 32) and tile_cols % tokens_tile == 0
         assert tile_n > 0 and tile_n % 128 == 0 and tile_n <= 256
 
     def make_shared_storage(self, sQ_layout, sK_layout, sP_layout):
@@ -317,11 +330,13 @@ class _SwapABCore:
     def __call__(
         self,
         problem_size: Tuple[Int32, Int32, Int32, Int32],
-        mQ: cute.Tensor,  # (batch, num_heads, head_dim), head_dim contiguous
+        mQ: cute.Tensor,  # (batch, num_heads, head_dim), head_dim contiguous; token mode below
         mK: cute.Tensor,  # (batch, seqlen_k, num_heads_kv, head_dim), head_dim contiguous
         mV: cute.Tensor,  # (batch, seqlen_k, num_heads_kv, head_dim_v), last dim contiguous
         mO_partial: cute.Tensor,  # (num_splits, batch, num_heads, head_dim_v)
         mLSE_partial: cute.Tensor | None,  # (num_splits, batch, num_heads), natural log
+        # Token mode: Q (batch, seqlen_q, ...), O (num_splits, batch, seqlen_q, ...), and LSE
+        # (num_splits, batch, num_heads, seqlen_q).
         mSeqUsedK: cute.Tensor | None,  # (batch,) int32: KV tokens actually used per sequence
         softmax_scale: Float32,
         stream: cuda.CUstream,
@@ -352,13 +367,19 @@ class _SwapABCore:
         mK_qk = gemm_view(mK, [1, 3, 2, 0])  # (seqlen_k, d, (h_kv, b))
         mVt_pv = gemm_view(mV, [3, 1, 2, 0])  # (d_v, seqlen_k, (h_kv, b))
         gqa = (qhead_per_kvhead, num_heads_kv)
-        mQ_qk = gemm_view(mQ, [0, 3, 2, 1], 1, *gqa)  # (qpk, d, (h_kv, b))
-        # (d_v, qpk, (h_kv, b), ns)
-        mO_partial_tma = gemm_view(mO_partial, [4, 0, 3, 2, 1], 2, *gqa)
-        mLSE_partial_fwd = None
-        if cutlass.const_expr(mLSE_partial is not None):
-            # (ns, qpk, (h_kv, b))
-            mLSE_partial_fwd = gemm_view(mLSE_partial, [1, 0, 3, 2], 2, *gqa)
+        # Token mode stores O and LSE per column from registers (attn_cta): raw layouts.
+        mO_partial_tma = None
+        mLSE_partial_fwd = mLSE_partial
+        if const_expr(self.tokens_tile > 1):
+            # ((qpk, s), d, (h_kv, b)): the row's query tokens join its query heads in N.
+            mQ_qk = gemm_view(mQ, [1, 3, 2, 0], 2, *gqa, seqlen_idx=1)
+        else:
+            mQ_qk = gemm_view(mQ, [0, 3, 2, 1], 1, *gqa)  # (qpk, d, (h_kv, b))
+            # (d_v, qpk, (h_kv, b), ns)
+            mO_partial_tma = gemm_view(mO_partial, [4, 0, 3, 2, 1], 2, *gqa)
+            if cutlass.const_expr(mLSE_partial is not None):
+                # (ns, qpk, (h_kv, b))
+                mLSE_partial_fwd = gemm_view(mLSE_partial, [1, 0, 3, 2], 2, *gqa)
 
         # MMA tile: M is always 128 (even for head_dim 64) so S and O use the canonical TMEM
         # accumulator layout. The K-step is 64 for both GEMMs so that a K tile (128 tokens x 64 dims)
@@ -416,7 +437,7 @@ class _SwapABCore:
             tiled_mma_pv, (None, tile_cols_mma, tile_n), self.dtype, self.num_stages_p
         )
         sO_layout_atom = tcgen05.make_smem_layout_atom(
-            tcgen05.mma.SmemLayoutAtomKind.MN_SW128, mO_partial_tma.element_type
+            tcgen05.mma.SmemLayoutAtomKind.MN_SW128, mO_partial.element_type
         )
 
         # O staging tile uses the output dtype and reuses the K/V ring SMEM at the end.
@@ -435,17 +456,23 @@ class _SwapABCore:
         vt_stage_bytes = cute.size_in_bytes(self.dtype, cute.select(sVt_layout, mode=[0, 1, 2]))
         assert vt_stage_bytes == k_stage_bytes
         assert cute.size_in_bytes(self.dtype, sVt_layout) <= ring_bytes
-        o_bytes = cute.size_in_bytes(mO_partial_tma.element_type, sO_layout)
+        o_bytes = cute.size_in_bytes(mO_partial.element_type, sO_layout)
         assert o_bytes <= ring_bytes
 
         # TMA atoms; the returned coordinate tensors replace the GEMM views in the kernel.
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
         cluster_shape_vmnk = (1, 1, 1, 1)
+        # Token mode tiles N by (heads, tokens) mode, so one TMA box packs the row's tokens. MMA
+        # padding columns (tile_cols_mma > tile_cols) load further tokens, which are never stored.
+        q_tma_tiler = self.mma_tiler
+        if const_expr(self.tokens_tile > 1):
+            self.q_tokens = tile_cols_mma // self.heads_tile
+            q_tma_tiler = (tile_m, (self.heads_tile, self.q_tokens), tile_k)
         tma_atom_Q, mQ_tma = cute.nvgpu.make_tiled_tma_atom_B(
             tma_load_op,
             mQ_qk,
             cute.select(sQ_layout, mode=[0, 1, 2]),
-            self.mma_tiler,
+            q_tma_tiler,
             tiled_mma_qk,
             cluster_shape_vmnk,
         )
@@ -476,17 +503,20 @@ class _SwapABCore:
         )
         if const_expr(self.ragged_tma_V):
             assert tensormap_workspace is not None, "ragged V TMA loads need a tensormap workspace"
-        tma_atom_O, mO_tma = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            mO_partial_tma,
-            cute.select(sO_layout, mode=[0, 1]),
-            (tile_m, tile_cols_mma),
-        )
+        tma_atom_O, mO_tma = None, None
+        if const_expr(mO_partial_tma is not None):
+            tma_atom_O, mO_tma = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                mO_partial_tma,
+                cute.select(sO_layout, mode=[0, 1]),
+                (tile_m, tile_cols_mma),
+            )
 
         # Shared tile scheduler: one tile per (split, KV head, sequence); tile_cols covers every
         # query head of a KV head (adapter-asserted). With per-sequence split counts it packs
         # the sequence's count into the split index and launches split-major.
         self.num_splits_dynamic = mNumSplitsDynamic is not None
+        total_q = mQ.shape[0] if const_expr(self.tokens_tile == 1) else mQ.shape[0] * mQ.shape[1]
         tile_sched_args = TileSchedulerArguments(
             1,
             num_heads_kv,
@@ -495,7 +525,7 @@ class _SwapABCore:
             problem_size[3],
             hdim,
             hdim_v,
-            mQ.shape[0],
+            total_q,
             tile_shape_mn=(tile_cols, tile_n),
             mCuSeqlensQ=mCuSeqlensQ,
             qhead_per_kvhead_packgqa=qhead_per_kvhead,
@@ -558,8 +588,8 @@ class _SwapABCore:
         mK: cute.Tensor,
         tma_atom_V: cute.CopyAtom,
         mV: cute.Tensor,
-        tma_atom_O: cute.CopyAtom,
-        mO_partial_tma: cute.Tensor,
+        tma_atom_O: cute.CopyAtom | None,
+        mO_partial_tma: cute.Tensor | None,
         mO_partial_raw: cute.Tensor,  # direct stores; mO_partial_tma holds TMA coordinates
         mLSE_partial: cute.Tensor | None,
         mSeqUsedK: cute.Tensor | None,
@@ -596,9 +626,11 @@ class _SwapABCore:
             is_valid = is_valid & ((split_idx & 0xFFFF) < num_splits_seq)
         _b, _h, num_heads_kv, seqlen_k = problem_size
         bh_idx = batch_idx * num_heads_kv + kv_head_idx
+        # Dense token-mode rows hold seqlen_q tokens; varlen rows read theirs from cu_seqlens_q.
+        seqlen_q_static = 1 if const_expr(self.tokens_tile == 1) else mO_partial_raw.shape[2]
         seqlen_info = SeqlenInfoQK.create(
             batch_idx=batch_idx,
-            seqlen_q_static=1,
+            seqlen_q_static=seqlen_q_static,
             seqlen_k_static=seqlen_k,
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedK=mSeqUsedK,
@@ -650,8 +682,8 @@ class _SwapABCore:
         mK: cute.Tensor,
         tma_atom_V: cute.CopyAtom,
         mV: cute.Tensor,
-        tma_atom_O: cute.CopyAtom,
-        mO_partial_tma: cute.Tensor,
+        tma_atom_O: cute.CopyAtom | None,
+        mO_partial_tma: cute.Tensor | None,
         mO_partial_raw: cute.Tensor,
         mLSE_partial: cute.Tensor | None,
         softmax_scale_log2: Float32,
@@ -717,16 +749,26 @@ class _SwapABCore:
         split_id = split_idx
         if const_expr(packed_splits):
             split_id = split_idx & 0xFFFF
-        # Q, O and LSE rows: the sequence index, or with varlen Q the token of the sequence
-        # (max_seqlen_q == 1, host-checked). A sequence without a query token takes the empty-split
-        # path, and its out-of-range row fails the direct-store guards.
-        num_q_rows = mO_partial_raw.shape[1]
-        q_row = bh_idx // num_heads_kv
-        if const_expr(seqlen_info.has_cu_seqlens_q):
-            has_q = seqlen_info.seqlen_q > 0
-            q_row = seqlen_info.offset_q if has_q else num_q_rows
-            num_n_blocks = num_n_blocks if has_q else Int32(0)
-        q_bh_idx = q_row * num_heads_kv + bh_idx % num_heads_kv
+        seqlen_q = seqlen_info.seqlen_q
+        if const_expr(self.tokens_tile > 1):
+            # Token mode: the row is tokens q_start .. q_start + seqlen_q - 1 of Q batch entry
+            # q_batch (varlen Q is one entry). A row without tokens takes the empty-split path.
+            kv_head_idx = bh_idx % num_heads_kv
+            q_start = seqlen_info.offset_q
+            q_batch = 0 if const_expr(seqlen_info.has_cu_seqlens_q) else bh_idx // num_heads_kv
+            num_n_blocks = num_n_blocks if seqlen_q > 0 else Int32(0)
+            q_bh_idx = q_batch * num_heads_kv + kv_head_idx
+        else:
+            # Q, O and LSE rows: the sequence index, or with varlen Q the token of the sequence
+            # (max_seqlen_q == 1, host-checked). A sequence without a query token takes the
+            # empty-split path, and its out-of-range row fails the direct-store guards.
+            num_q_rows = mO_partial_raw.shape[1]
+            q_row = bh_idx // num_heads_kv
+            if const_expr(seqlen_info.has_cu_seqlens_q):
+                has_q = seqlen_q > 0
+                q_row = seqlen_info.offset_q if has_q else num_q_rows
+                num_n_blocks = num_n_blocks if has_q else Int32(0)
+            q_bh_idx = q_row * num_heads_kv + bh_idx % num_heads_kv
 
         # FP8 descales of this sequence and KV head: q and k fold into the softmax scale, v scales
         # the final O.
@@ -759,7 +801,8 @@ class _SwapABCore:
 
         if warp_idx == load_kv_warp_id:
             for tma_atom in (tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_O):
-                cpasync.prefetch_descriptor(tma_atom)
+                if const_expr(tma_atom is not None):
+                    cpasync.prefetch_descriptor(tma_atom)
 
         storage = SmemAllocator().allocate(self.shared_storage)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
@@ -864,11 +907,17 @@ class _SwapABCore:
                 cute.arch.mbarrier_init(mbar_q_full, 1)
                 cute.arch.mbarrier_init_fence()
                 cute.arch.mbarrier_arrive_and_expect_tx(mbar_q_full, q_tx_bytes)
-            # Q: all query heads of this KV head, loaded once, one 64-dim chunk per stage. Only
+            # Q: all columns of this KV head, loaded once, one 64-dim chunk per stage. Only
             # warp 3 initializes and produces this barrier, so the load starts before the
             # CTA-wide prologue barrier; warp 0 waits on it only after that barrier.
             if not is_empty_split:
-                gQ = cute.local_tile(mQ, (tile_cols_mma, tile_k), (0, None, q_bh_idx))
+                if const_expr(self.tokens_tile > 1):
+                    # The row's first token is an unaligned coordinate in the tokens mode.
+                    mQ_row = cute.domain_offset(((0, q_start), 0, 0), mQ)
+                    q_tile = ((self.heads_tile, self.q_tokens), tile_k)
+                    gQ = cute.local_tile(mQ_row, q_tile, ((0, 0), None, q_bh_idx))
+                else:
+                    gQ = cute.local_tile(mQ, (tile_cols_mma, tile_k), (0, None, q_bh_idx))
                 load_Q, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_Q, 0, cute.make_layout(1), thr_mma_qk.partition_B(gQ), sQ
                 )
@@ -934,30 +983,45 @@ class _SwapABCore:
                     sRowSumWarp[wg_warp_idx, lane_idx] = Float32(0.0)
                 bar_sum_done.arrive()
             for o_idx in cutlass.range(thread_id, hdim_v * tile_cols, NUM_WG * WG_SIZE):
-                head = o_idx // hdim_v
-                if head < qhead_per_kvhead and q_row < num_q_rows:
-                    global_head = (bh_idx % num_heads_kv) * qhead_per_kvhead + head
-                    mO_partial_raw[split_id, q_row, global_head, o_idx % hdim_v] = (
-                        mO_partial_raw.element_type(0.0)
-                    )
+                if const_expr(self.tokens_tile > 1):
+                    column = o_idx // hdim_v
+                    head, token = column % self.heads_tile, column // self.heads_tile
+                    if head < qhead_per_kvhead and token < seqlen_q:
+                        global_head = kv_head_idx * qhead_per_kvhead + head
+                        o_coord = (split_id, q_batch, q_start + token, global_head, o_idx % hdim_v)
+                        mO_partial_raw[o_coord] = mO_partial_raw.element_type(0.0)
+                else:
+                    head = o_idx // hdim_v
+                    if head < qhead_per_kvhead and q_row < num_q_rows:
+                        global_head = (bh_idx % num_heads_kv) * qhead_per_kvhead + head
+                        mO_partial_raw[split_id, q_row, global_head, o_idx % hdim_v] = (
+                            mO_partial_raw.element_type(0.0)
+                        )
 
         elif warp_idx == load_q_store_o_warp_id:
             if cutlass.const_expr(setmaxreg):
                 cute.arch.setmaxregister_decrease(num_regs_mma_load)
 
             # Wait until the correction WG has staged the final O, then TMA-store this split's partial.
-            bar_o_done.arrive_and_wait()
-            for dm in cutlass.range_constexpr(num_d_tiles):
-                gO = cute.local_tile(
-                    mO_partial_tma, (tile_m, tile_cols_mma), (dm, 0, q_bh_idx, split_id)
-                )
-                store_O, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_O, 0, cute.make_layout(1), sO[None, None, dm, 0], gO, single_stage=True
-                )
-                store_O()
-            cute.arch.cp_async_bulk_commit_group()
-            # The ring SMEM must stay valid until the bulk store has read it.
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            # In token mode the correction WG stores O itself.
+            if const_expr(self.tokens_tile == 1):
+                bar_o_done.arrive_and_wait()
+                for dm in cutlass.range_constexpr(num_d_tiles):
+                    gO = cute.local_tile(
+                        mO_partial_tma, (tile_m, tile_cols_mma), (dm, 0, q_bh_idx, split_id)
+                    )
+                    store_O, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_O,
+                        0,
+                        cute.make_layout(1),
+                        sO[None, None, dm, 0],
+                        gO,
+                        single_stage=True,
+                    )
+                    store_O()
+                cute.arch.cp_async_bulk_commit_group()
+                # The ring SMEM must stay valid until the bulk store has read it.
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
 
         elif warp_idx == load_kv_warp_id:
             if cutlass.const_expr(setmaxreg):
@@ -1272,24 +1336,6 @@ class _SwapABCore:
                     if thr_in_wg + sm * tile_m >= valid_rows:
                         scores_r[None, sm].fill(-Float32.inf)
 
-                # Only the last query_len_in_heads - 1 keys hide from some tokens: a CTA-uniform
-                # branch skips the other blocks.
-                # TODO: with query_len_in_heads = 4 this kernel is still 3-5% slower than without
-                # it (96 heads, GB300); the cause is not found.
-                if cutlass.const_expr(self.query_len_in_heads > 1):
-                    if valid_rows < tile_n + self.query_len_in_heads - 1:
-                        # This row's key is hidden from tokens j < hidden_tokens, i.e. from heads
-                        # gi < hidden_tokens * heads_per_token.
-                        heads_per_token = qhead_per_kvhead // self.query_len_in_heads
-                        for sm in cutlass.range_constexpr(num_s_subtiles):
-                            hidden_tokens = (
-                                thr_in_wg + sm * tile_m - valid_rows + self.query_len_in_heads
-                            )
-                            if hidden_tokens > 0:
-                                for gi in cutlass.range_constexpr(tile_cols):
-                                    if gi < hidden_tokens * heads_per_token:
-                                        scores_r[gi, sm] = -Float32.inf
-
                 if cutlass.const_expr(self.apply_score_mods):
                     batch_idx = bh_idx // num_heads_kv
                     # score_mod runs on one score per call: a register column holds one KV token
@@ -1344,6 +1390,22 @@ class _SwapABCore:
                                 value = value if keep else -Float32.inf
                             scores_r[gi, sm] = value
 
+                # Causal token j sees keys up to seqlen_k - seqlen_q + j: only the last
+                # seqlen_q - 1 keys hide from some tokens, so a CTA-uniform branch skips the
+                # other blocks. It runs after score_mod, which could lift a masked score.
+                # TODO: token mode is 4.9% slower than decode at the same 32 columns (26-row fp8
+                # verify call, GB300): ~2.4% this branch (~180 B more spills), ~2.4% not found
+                # (not the per-column O stores).
+                if cutlass.const_expr(self.causal_tokens):
+                    if valid_rows < tile_n + seqlen_q - 1:
+                        for sm in cutlass.range_constexpr(num_s_subtiles):
+                            # This row's key is hidden from tokens j < hidden_tokens.
+                            hidden_tokens = thr_in_wg + sm * tile_m - valid_rows + seqlen_q
+                            if hidden_tokens > 0:
+                                for gi in cutlass.range_constexpr(tile_cols):
+                                    if gi // self.heads_tile < hidden_tokens:
+                                        scores_r[gi, sm] = -Float32.inf
+
                 scores = scores_r.load()
                 row_max_valid.store(
                     scores.reduce(
@@ -1384,9 +1446,9 @@ class _SwapABCore:
                         if row_max_valid[gi] == -Float32.inf:
                             row_max_valid[gi] = Float32(0.0)
                 elif cutlass.const_expr(self.check_empty_rows):
-                    # Hidden keys alone leave a head no key only in a split whose first block
-                    # holds fewer than query_len_in_heads keys.
-                    if (s == 0) & (valid_rows < self.query_len_in_heads):
+                    # Causal tokens alone leave a column no key only in a split whose first
+                    # block holds fewer than seqlen_q keys.
+                    if (s == 0) & (valid_rows < seqlen_q):
                         for gi in cutlass.range_constexpr(tile_cols):
                             if row_max_valid[gi] == -Float32.inf:
                                 row_max_valid[gi] = Float32(0.0)
@@ -1491,7 +1553,9 @@ class _SwapABCore:
                 pipeline_o.consumer_wait(o_state, pipeline_o.consumer_try_wait(o_state))
 
                 acc_scale_lane = exp2_fast(row_max_prev2 - row_max_cur)
-                if cutlass.const_expr(self.check_empty_rows):
+                # This loop runs only with 3+ blocks, and every token sees the first block's keys,
+                # so only modifiers can leave a column empty here.
+                if cutlass.const_expr(self.apply_score_mods):
                     if row_max_prev2 == -Float32.inf and row_max_cur == -Float32.inf:
                         acc_scale_lane = Float32(1.0)
                 for gi in cutlass.range_constexpr(tile_cols):
@@ -1593,25 +1657,53 @@ class _SwapABCore:
             tOrO_final *= tLrL.load().reshape((vec_size, 1))
             if cutlass.const_expr(descale_tensors is not None):
                 tOrO_final *= v_descale
-            if cutlass.const_expr(self.check_empty_rows):
-                # Select real zeros for fully masked heads, never rely on 0 * NaN.
-                normalized = cute.make_rmem_tensor(
-                    cute.make_layout((vec_size, num_d_tiles)), self.qk_acc_dtype
-                )
-                normalized.store(tOrO_final)
-                for gi in cutlass.range_constexpr(tile_cols):
-                    if tLrL[gi] == Float32(0.0):
+            if const_expr(self.tokens_tile > 1):
+                # Store each column straight to global memory: a TMA box cannot stop at a ragged
+                # row's end. Thread t holds O row t of each d tile, so a warp's store of one
+                # column is 32 consecutive elements.
+                tOrO_out = cute.make_rmem_tensor(cute.make_layout((vec_size, num_d_tiles)), o_dtype)
+                tOrO_out.store(tOrO_final.to(o_dtype))
+                for column in cutlass.range_constexpr(tile_cols):
+                    head, token = column % self.heads_tile, column // self.heads_tile
+                    if head < qhead_per_kvhead and token < seqlen_q:
+                        global_head = kv_head_idx * qhead_per_kvhead + head
                         for dm in cutlass.range_constexpr(num_d_tiles):
-                            normalized[gi, dm] = Float32(0.0)
-                tOrO_final = normalized.load()
-            tOsO = thr_r2s_O.partition_D(sO[None, None, None, 0])
-            tOsO.store(tOrO_final.to(o_dtype).reshape(tOsO.shape))
+                            dv_idx = dm * tile_m + thr_in_wg
+                            if dv_idx < hdim_v:
+                                value = tOrO_out[column, dm]
+                                if cutlass.const_expr(self.check_empty_rows):
+                                    # A select, never 0 * O: an empty column's O may be NaN.
+                                    if tLrL[column] == Float32(0.0):
+                                        value = o_dtype(0.0)
+                                o_coord = (split_id, q_batch, q_start + token, global_head, dv_idx)
+                                mO_partial_raw[o_coord] = value
+            else:
+                if cutlass.const_expr(self.check_empty_rows):
+                    # Select real zeros for fully masked heads, never rely on 0 * NaN.
+                    normalized = cute.make_rmem_tensor(
+                        cute.make_layout((vec_size, num_d_tiles)), self.qk_acc_dtype
+                    )
+                    normalized.store(tOrO_final)
+                    for gi in cutlass.range_constexpr(tile_cols):
+                        if tLrL[gi] == Float32(0.0):
+                            for dm in cutlass.range_constexpr(num_d_tiles):
+                                normalized[gi, dm] = Float32(0.0)
+                    tOrO_final = normalized.load()
+                tOsO = thr_r2s_O.partition_D(sO[None, None, None, 0])
+                tOsO.store(tOrO_final.to(o_dtype).reshape(tOsO.shape))
 
-            cute.arch.fence_view_async_shared()
-            bar_o_done.arrive()
+                cute.arch.fence_view_async_shared()
+                bar_o_done.arrive()
 
         # After its loads, warp 2 normalizes this split's statistics, not other CTAs'.
         if warp_idx == split_stats_warp_id:
+            mLSE_split = mLSE_partial
+            token_columns = None
+            if const_expr(self.tokens_tile > 1 and mLSE_partial is not None):
+                # This row's (heads, tokens) block of the (ns, b, h, s) LSE.
+                lse_start = (split_id, q_batch, kv_head_idx * qhead_per_kvhead, q_start)
+                mLSE_split = cute.domain_offset(lse_start, mLSE_partial)[0, 0, None, None]
+                token_columns = (self.heads_tile, qhead_per_kvhead, seqlen_q)
             self.store_split_stats(
                 tile_cols,
                 (split_id, q_bh_idx),
@@ -1622,8 +1714,9 @@ class _SwapABCore:
                 bar_stats_ready,
                 sRowMax,
                 sRowSumWarp,
-                mLSE_partial,
+                mLSE_split,
                 max_offset=self.max_offset,
+                token_columns=token_columns,
             )
 
         # Free TMEM once every role is done with it.
@@ -1644,7 +1737,14 @@ class _SwapABCore:
         sRowSumWarp: cute.Tensor,
         mLSE_partial: cute.Tensor | None,
         max_offset: cutlass.Constexpr[int] = 0,
+        token_columns: Tuple[int, Int32, Int32] | None = None,
     ):
+        """Publish 1/L per column in sRowMax and write this split's LSE.
+
+        token_columns = (heads_tile, qhead_per_kvhead, seqlen_q) in token mode, where lane c is
+        query head c % heads_tile of token c // heads_tile and mLSE_partial is the row's
+        (heads, tokens) LSE block.
+        """
         split_id, bh_idx = block_idx
         lane_owns_column = lane_idx < tile_cols
         row_max_lane = -Float32.inf
@@ -1663,14 +1763,16 @@ class _SwapABCore:
             if row_sum > Float32(0.0):
                 inv_sum = cute.arch.rcp_approx(row_sum)
             sRowMax[lane_idx] = inv_sum
-            if cutlass.const_expr(mLSE_partial is not None):
+            if cutlass.const_expr(mLSE_partial is not None and token_columns is not None):
+                heads_tile, qhead_per_kvhead, seqlen_q = token_columns
+                head, token = lane_idx % heads_tile, lane_idx // heads_tile
+                if head < qhead_per_kvhead and token < seqlen_q:
+                    mLSE_partial[head, token] = _SwapABCore.split_lse(
+                        row_max_lane, row_sum, max_offset
+                    )
+            elif cutlass.const_expr(mLSE_partial is not None):
                 if lane_idx < mLSE_partial.shape[1]:
-                    lse = -Float32.inf
-                    if row_sum > Float32(0.0):
-                        log2_sum = cute.math.log2(row_sum, fastmath=True)
-                        if cutlass.const_expr(max_offset != 0):
-                            log2_sum -= Float32(max_offset)
-                        lse = (row_max_lane + log2_sum) * math.log(2.0)
+                    lse = _SwapABCore.split_lse(row_max_lane, row_sum, max_offset)
                     num_heads_kv = mLSE_partial.shape[2][0]
                     bh_coord = (bh_idx % num_heads_kv, bh_idx // num_heads_kv)
                     if bh_coord[1] < mLSE_partial.shape[2][1]:
@@ -1683,9 +1785,22 @@ class _SwapABCore:
         if not is_empty_split:
             bar_stats_ready.arrive()
 
+    @staticmethod
+    @cute.jit
+    def split_lse(row_max: Float32, row_sum: Float32, max_offset: cutlass.Constexpr[int]):
+        """Natural-log LSE of one column from its log2-domain max and row sum; -inf if empty."""
+        lse = -Float32.inf
+        if row_sum > Float32(0.0):
+            log2_sum = cute.math.log2(row_sum, fastmath=True)
+            if cutlass.const_expr(max_offset != 0):
+                log2_sum -= Float32(max_offset)
+            lse = (row_max + log2_sum) * math.log(2.0)
+        return lse
+
 
 class FlashAttentionForwardSm100SwapAB:
-    """Standard forward ABI for single-query inference; interface owns allocation and combine.
+    """Standard forward ABI for inference decode and short query rows (token mode); interface
+    owns allocation and combine.
 
     The swap-AB mainloop (_SwapABCore) is private. Split outputs are normalized FP32 O and natural-log
     LSE; the single-split case writes directly to the input-dtype output tensor.
@@ -1709,7 +1824,6 @@ class FlashAttentionForwardSm100SwapAB:
         is_varlen_q: bool = False,
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
-        query_len_in_heads: int = 1,
         *,
         config: FwdConfig,
     ):
@@ -1720,7 +1834,6 @@ class FlashAttentionForwardSm100SwapAB:
         assert seqlen_k_per_split is None and q_subtile_factor == kv_subtile_factor == 1
         self.head_dim = head_dim
         self.head_dim_v = head_dim if head_dim_v is None else head_dim_v
-        # For one query at the end of seqused_k, causal and noncausal bounds agree.
         # pack_gqa does not alter the external tensor ABI: the core packs heads itself.
         self.is_split_kv = config.num_splits > 1
         self.is_varlen_q = is_varlen_q
@@ -1729,16 +1842,19 @@ class FlashAttentionForwardSm100SwapAB:
         self.mask_mod = mask_mod
         self.tile_cols = config.tile_m
         self.tile_n = config.tile_n
-        self.query_len_in_heads = query_len_in_heads
+        # tile_m = heads tile x tokens tile (SwapABPolicy.config); one token is decode, where
+        # one query at the end of seqused_k makes causal and noncausal agree.
+        self.tokens_tile = config.tile_m // SWAPAB.tile_hq(qhead_per_kvhead)
+        self.is_causal = is_causal
 
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,  # (b, 1, h, d)
+        mQ: cute.Tensor,  # (b, s, h, d), varlen (total_q, h, d)
         mK: cute.Tensor,  # (b, s_k, h_k, d)
         mV: cute.Tensor,  # (b, s_k, h_k, d)
-        mO: cute.Tensor,  # split: out_partial (ns, b, 1, h, d) fp32 ; else out (b, 1, h, d)
-        mLSE: Optional[cute.Tensor],  # split: lse_partial (ns, b, h, 1) ; else lse (b, h, 1) | None
+        mO: cute.Tensor,  # split: out_partial (ns, b, s, h, d) fp32 ; else out (b, s, h, d)
+        mLSE: Optional[cute.Tensor],  # split: lse_partial (ns, b, h, s) ; else lse (b, h, s) | None
         softmax_scale: Float32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
@@ -1796,11 +1912,31 @@ class FlashAttentionForwardSm100SwapAB:
         num_heads_kv, seqlen_k = mK.shape[2], mK.shape[1]
         if const_expr(mPageTable is not None):
             seqlen_k = mPageTable.shape[1] * mK.shape[1]
-        # The core takes Q as (rows, h, d), O as (ns, rows, h, d) and LSE as (ns, rows, h), where
-        # rows are sequences, or tokens with varlen Q. A missing split mode (one split, or the
-        # dense seqlen_q mode of extent 1, host-checked) becomes a split mode of extent 1.
+        # Decode: the core takes Q as (rows, h, d), O as (ns, rows, h, d) and LSE as (ns, rows, h),
+        # where rows are sequences, or tokens with varlen Q. A missing split mode (one split, or
+        # the dense seqlen_q mode of extent 1, host-checked) becomes a split mode of extent 1.
+        # Token mode: Q (b, s, h, d), O (ns, b, s, h, d), LSE (ns, b, h, s), where varlen Q is
+        # one batch entry of total_q tokens.
         mLSE_core = None
-        if const_expr(self.is_varlen_q):
+        if const_expr(self.tokens_tile > 1 and self.is_varlen_q):
+            mQ_core = cute.prepend_ones(mQ, up_to_rank=4)  # (total_q, h, d)
+            if const_expr(self.is_split_kv):
+                # out_partial (ns, total_q, h, d), lse_partial (ns, h, total_q)
+                mO_core = select_modes(cute.prepend_ones(mO, up_to_rank=5), [1, 0, 2, 3, 4])
+                mLSE_core = select_modes(cute.prepend_ones(mLSE, up_to_rank=4), [1, 0, 2, 3])
+            else:
+                mO_core = cute.prepend_ones(mO, up_to_rank=5)  # out (total_q, h, d)
+                if const_expr(mLSE is not None):
+                    mLSE_core = cute.prepend_ones(mLSE, up_to_rank=4)  # lse (h, total_q)
+        elif const_expr(self.tokens_tile > 1):
+            mQ_core = mQ
+            if const_expr(self.is_split_kv):
+                mO_core, mLSE_core = mO, mLSE
+            else:
+                mO_core = cute.prepend_ones(mO, up_to_rank=5)  # out (b, s, h, d)
+                if const_expr(mLSE is not None):
+                    mLSE_core = cute.prepend_ones(mLSE, up_to_rank=4)  # lse (b, h, s)
+        elif const_expr(self.is_varlen_q):
             mQ_core = mQ  # (total_q, h, d)
             if const_expr(self.is_split_kv):
                 mO_core = mO  # out_partial (ns, total_q, h, d)
@@ -1829,7 +1965,8 @@ class FlashAttentionForwardSm100SwapAB:
             mask_mod=self.mask_mod,
             is_local=self.is_local,
             head_dim_v=self.head_dim_v,
-            query_len_in_heads=self.query_len_in_heads,
+            tokens_tile=self.tokens_tile,
+            is_causal=self.is_causal,
         )
         problem_size = (batch, num_heads, num_heads_kv, seqlen_k)
         # Stock conventions carried through: window sizes as resolved by
