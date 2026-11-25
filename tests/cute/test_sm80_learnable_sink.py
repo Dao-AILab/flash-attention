@@ -1,71 +1,98 @@
-"""Regression tests for learnable_sink (attention-sink) support on the SM80/Ampere/Ada
-CuTeDSL forward kernel (flash_attn.cute.flash_fwd.FlashAttentionForwardSm80).
+"""Forward attention-sink coverage for the SM80-family kernels."""
 
-Before this fix, FlashAttentionForwardSm80.__call__ hardcoded
-`assert learnable_sink is None`, so sink-attention models (e.g. gpt-oss, StreamingLLM-style
-architectures) had no FA4 CuTeDSL forward path on Ampere/Ada (A100, RTX 3090/4090) or
-consumer-Blackwell (RTX 50-series, which shares this base kernel via FlashAttentionForwardSm120).
-`tests/cute/test_flash_attn.py::test_flash_attn_output` already parametrizes
-`has_learnable_sink=[False, True]` with no SM80-specific skip, so it exercises this path too;
-this file adds a few focused, fast cases at the shapes most relevant to the fix (GQA with
-pack_gqa, plain MHA, and a multi-n-block causal case) so the sink path has direct regression
-coverage independent of the full parametrized matrix.
-"""
+import math
+import os
 
 import pytest
 import torch
 
 from flash_attn.cute.interface import flash_attn_func
-from flash_attn.cute.testing import attention_ref
+from flash_attn.cute.testing import attention_ref, is_fake_mode, maybe_fake_tensor_mode
 
-IS_SM80_FAMILY = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (8, 12)
-
-
-@pytest.mark.skipif(
-    not IS_SM80_FAMILY, reason="Targets the SM80-family (Ampere/Ada/SM120) forward kernel"
+SM_MAJOR = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else None
+USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", "0")) == 1
+pytestmark = pytest.mark.skipif(
+    SM_MAJOR not in (8, 12), reason="Requires an SM80-family kernel"
 )
+
+
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k,nheads,nheads_kv,d",
     [
-        # gpt-oss-20b production shape: D=64, GQA 8:1, single-tile prefill (pack_gqa path).
-        (64, 64, 64, 8, 64),
-        # Same GQA ratio but long enough seqlen_k to exercise the multi-n-block mainloop.
-        (64, 512, 64, 8, 64),
-        # Plain MHA (no pack_gqa), larger head_dim, for generality.
-        (128, 256, 16, 16, 128),
+        pytest.param(64, 64, 64, 8, 64, id="gqa"),
+        pytest.param(64, 512, 64, 8, 64, id="gqa-multiblock"),
+        pytest.param(128, 256, 16, 16, 128, id="mha"),
     ],
 )
-def test_sm80_learnable_sink_matches_reference(seqlen_q, seqlen_k, nheads, nheads_kv, d, causal):
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_sm80_learnable_sink_matches_reference(
+    seqlen_q, seqlen_k, nheads, nheads_kv, d, causal
+):
     device = "cuda"
     dtype = torch.bfloat16
     torch.random.manual_seed(0)
     batch_size = 2
 
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=False) * 0.1
-    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=False) * 0.1
-    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=False) * 0.1
-    learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device) * 2.0
-
-    out, lse, *_ = flash_attn_func(
-        q, k, v, causal=causal, learnable_sink=learnable_sink, return_lse=True
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype) * 0.1
+    k = (
+        torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+        * 0.1
     )
+    v = torch.randn_like(k) * 0.1
+    sink = torch.randn(nheads, dtype=dtype, device=device) * 2.0
+
+    out, lse = flash_attn_func(
+        q, k, v, causal=causal, learnable_sink=sink, return_lse=True
+    )
+    if is_fake_mode():
+        return
+
     out_ref, _, lse_ref = attention_ref(
-        q, k, v, causal=causal, learnable_sink=learnable_sink, return_lse=True
+        q.float(),
+        k.float(),
+        v.float(),
+        causal=causal,
+        learnable_sink=sink.float(),
+        return_lse=True,
+    )
+    torch.testing.assert_close(out.float(), out_ref, rtol=0.01, atol=5e-4)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("sink_logit", [6.0, 100.0], ids=["moderate", "large"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_sm80_packed_gqa_sink_scales_output_per_head(sink_logit: float):
+    q = torch.zeros(1, 32, 4, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(1, 64, 2, 64, device=q.device, dtype=q.dtype)
+    v = torch.ones_like(k)
+    sink = torch.tensor([0.0, sink_logit, 3.0, 5.0], device=q.device, dtype=q.dtype)
+
+    out, lse = flash_attn_func(
+        q, k, v, pack_gqa=True, learnable_sink=sink, return_lse=True
+    )
+    if is_fake_mode():
+        return
+
+    # Real tokens have logit zero and value one; the sink contributes only to the denominator.
+    log_num_keys = math.log(k.shape[1])
+    expected_lse = torch.logaddexp(
+        torch.full_like(sink, log_num_keys, dtype=lse.dtype), sink.float()
+    )
+    expected_out = (log_num_keys - expected_lse).exp().to(out.dtype)
+    torch.testing.assert_close(
+        lse, expected_lse[None, :, None].expand_as(lse), atol=1e-5, rtol=1e-6
+    )
+    torch.testing.assert_close(
+        out,
+        expected_out[None, None, :, None].expand_as(out),
+        atol=0,
+        rtol=torch.finfo(out.dtype).eps,
     )
 
-    out_f, ref_f = out.float(), out_ref.float()
-    cos_sim = torch.nn.functional.cosine_similarity(out_f.flatten(), ref_f.flatten(), dim=0)
-    assert cos_sim.item() > 0.999, f"cosine similarity too low: {cos_sim.item()}"
-    assert (out_f - ref_f).abs().max().item() < 0.05
-    assert torch.allclose(lse.float(), lse_ref.float(), atol=0.05, rtol=0.05)
 
-
-@pytest.mark.skipif(
-    not IS_SM80_FAMILY, reason="Targets the SM80-family (Ampere/Ada/SM120) forward kernel"
-)
-def test_sm80_no_sink_regression():
-    """learnable_sink=None must reproduce pre-existing (no-sink) behavior exactly."""
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_sm80_without_sink_matches_reference():
     device = "cuda"
     dtype = torch.bfloat16
     torch.random.manual_seed(0)
@@ -73,10 +100,9 @@ def test_sm80_no_sink_regression():
     k = torch.randn(2, 64, 16, 64, device=device, dtype=dtype) * 0.1
     v = torch.randn(2, 64, 16, 64, device=device, dtype=dtype) * 0.1
 
-    out, *_ = flash_attn_func(q, k, v, causal=True)
-    assert not torch.isnan(out).any()
-    out_ref, _ = attention_ref(q, k, v, causal=True)
-    cos_sim = torch.nn.functional.cosine_similarity(
-        out.float().flatten(), out_ref.float().flatten(), dim=0
-    )
-    assert cos_sim.item() > 0.999
+    out, _ = flash_attn_func(q, k, v, causal=True)
+    if is_fake_mode():
+        return
+
+    out_ref, _ = attention_ref(q.float(), k.float(), v.float(), causal=True)
+    torch.testing.assert_close(out.float(), out_ref, rtol=0.01, atol=5e-4)

@@ -648,7 +648,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
 
-        learnable_sink: optional per-head fp32 attention-sink logit (shape (num_head,)),
+        learnable_sink: optional per-head attention-sink logit (shape (num_head,)),
         folded into the softmax denominator as an extra column, i.e.
         row_sum += exp(sink[head] - row_max). None reproduces the previous behavior exactly.
         """
