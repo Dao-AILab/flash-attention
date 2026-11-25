@@ -3914,6 +3914,37 @@ def test_flash_attn_out_with_shared_kv_mla():
     assert torch.equal(out, out_ref) and torch.equal(lse, lse_ref)
 
 
+@pytest.mark.skipif(not IS_SM100, reason="FP8 descales are SM100-only")
+@pytest.mark.parametrize("pattern", ["scalar", "per_batch", "per_head"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_broadcast_descales(pattern):
+    """Broadcast (stride-0) descales run without a copy kernel and match contiguous ones
+    bitwise. Strides: scalar (0, 0), per_batch (1, 0), per_head (0, 1)."""
+    (q, k, v), kwargs = _fp8_varlen_inputs(varlen=True)
+    batch_size, nheads_kv = kwargs["scales"].q.shape
+    values = {
+        "scalar": torch.full((), 0.7, device="cuda"),
+        "per_batch": torch.rand(batch_size, 1, device="cuda") + 0.5,
+        "per_head": torch.rand(1, nheads_kv, device="cuda") + 0.5,
+    }[pattern]
+    broadcast = values.expand(batch_size, nheads_kv)
+    kwargs_bcast = dict(kwargs, scales=TensorwiseScales(broadcast, broadcast, broadcast))
+    contiguous = broadcast.contiguous()
+    kwargs_dense = dict(kwargs, scales=TensorwiseScales(contiguous, contiguous, contiguous))
+    out_ref, _ = flash_attn_varlen_func(q, k, v, **kwargs_dense)
+    out, _ = flash_attn_varlen_func(q, k, v, **kwargs_bcast)
+    if is_fake_mode():
+        return
+    assert torch.equal(out, out_ref)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        flash_attn_varlen_func(q, k, v, **kwargs_bcast)
+        torch.cuda.synchronize()
+    kernels = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    # ATen copy kernels only: CuTe kernel names contain "CopyAtom".
+    copies = [name for name in kernels if "at::native" in name and "copy" in name.lower()]
+    assert kernels and not copies, copies
+
+
 @pytest.mark.parametrize("page_size", [16, 64, 256])
 @pytest.mark.parametrize("seqlen_q", [64, 128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)

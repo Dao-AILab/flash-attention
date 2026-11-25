@@ -498,8 +498,9 @@ def _validate_tensorwise_scales(
 ) -> TensorwiseScales:
     """Check FP8 descales against the inputs; return them in a kernel-compatible layout.
 
-    maybe_contiguous keeps ABI-valid strided or broadcast tensors as they are. All-unset scales
-    pass through.
+    maybe_contiguous keeps ABI-valid strided tensors as they are. Broadcast (stride-0) descales
+    stay as given: the kernels read one fp32 per (batch, KV head), so a copy would only add a
+    kernel per call. All-unset scales pass through.
     """
     if all(t is None for t in scales):
         return scales
@@ -519,7 +520,10 @@ def _validate_tensorwise_scales(
             "MLA without q / k (no rope part) reads the latent cache as v: pass its descale as "
             "scales.v (scales.k, if given, must be the same tensor)"
         )
-    return TensorwiseScales(*(maybe_contiguous(t, align_bytes=4) for t in scales))
+    return TensorwiseScales(
+        *(t if t is not None and 0 in t.stride() else maybe_contiguous(t, align_bytes=4)
+          for t in scales)
+    )
 
 
 def _validate_block_scales(
@@ -1360,8 +1364,15 @@ def _flash_attn_fwd(
         else:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
+        # A broadcast descale may have no unit stride; its zero strides stay static (and keyed).
         descale_tensors_tensor = (
-            DescaleTensors(*(to_cute_tensor(t, assumed_align=4, leading_dim=1) for t in descales))
+            DescaleTensors(*(
+                to_cute_tensor(
+                    t, assumed_align=4, leading_dim=1,
+                    fully_dynamic=t is not None and t.stride(-1) != 1,
+                )
+                for t in descales
+            ))
             if has_descale
             else None
         )
