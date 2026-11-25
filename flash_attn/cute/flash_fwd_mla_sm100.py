@@ -3135,9 +3135,10 @@ class FlashAttentionMLAForwardSm100:
             row_sum1 = sRowSum[tidx % self.cta_tile_m, 1]
             row_sum = row_sum0 + row_sum1
 
-            row_max = 0.0
+            row_max_log2 = Float32(0.0)
+            output_correction = Float32(1.0)
             if const_expr(mLSE is not None or learnable_sink is not None):
-                row_max = sRowMax[tidx % self.cta_tile_m, 0]
+                row_max_log2 = sRowMax[tidx % self.cta_tile_m, 0] * softmax_scale_log2
             if const_expr(learnable_sink is not None):
                 sink_val = load_learnable_sink(
                     learnable_sink,
@@ -3147,10 +3148,13 @@ class FlashAttentionMLAForwardSm100:
                     self.pack_gqa,
                     self.qhead_per_kvhead_valid if const_expr(self.pad_qheads) else None,
                 )
-                row_max, row_sum = apply_learnable_sink(row_max, row_sum, sink_val, softmax_scale_log2)
+                row_max_log2, row_sum, output_correction = apply_learnable_sink(
+                    row_max_log2, row_sum, sink_val
+                )
 
             acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
             scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+            scale = scale * output_correction
             # seqlen_k == 0 with TMA KV: the fully masked dummy block still loaded a KV tile, and
             # P = 0 times a NaN V row is NaN (scaling by 0 would keep it): write zeros instead.
             zero_O = seqlen.seqlen_k == 0 if const_expr(self.use_tma_KV) else False
@@ -3176,8 +3180,7 @@ class FlashAttentionMLAForwardSm100:
                 if tidx < self.cta_tile_m:
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True))
-                        * LN2
+                        (row_max_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )

@@ -3386,22 +3386,26 @@ class FlashAttentionForwardSm100:
                     else:
                         row_sum_lse = row_sum
                     pipeline_sm_stats.consumer_release_w_index(sm_stats_index)
+                    row_max_log2 = row_max * softmax_scale_log2_eff if const_expr(row_max is not None) else None
+                    output_correction = Float32(1.0)
                     if const_expr(learnable_sink is not None):
                         # Only the first split owns the sink column; empty rows occur with splitKV.
                         if const_expr(not self.is_split_kv) or split_idx == 0:
-                            row_max, row_sum = apply_learnable_sink(
-                                row_max,
+                            row_max_log2, row_sum, output_correction = apply_learnable_sink(
+                                row_max_log2,
                                 row_sum,
                                 learnable_sink_val[stage],
-                                softmax_scale_log2_eff,
                                 max_offset=max_offset,
                                 empty_row_sum=max_offset_scale,
                             )
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
-                    stats[stage] = (row_sum_lse if const_expr(self.pv_blockscaled) else row_sum,
-                                    row_max, acc_O_mn_row_is_zero_or_nan)
+                    stats[stage] = (
+                        row_sum_lse if const_expr(self.pv_blockscaled) else row_sum,
+                        row_max_log2,
+                        acc_O_mn_row_is_zero_or_nan,
+                    )
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
-                    scale = scale * v_descale
+                    scale = scale * output_correction * v_descale
                     # Wait for the last O to be ready from the MMA warp
                     if const_expr(self.use_s_ping_pong):
                         pipeline_o_acc.consumer_wait_w_index_phase(
@@ -3482,7 +3486,6 @@ class FlashAttentionForwardSm100:
                         sm_stats_consumer_phase,
                         o_corr_consumer_phase,
                         corr_epi_producer_phase,
-                        softmax_scale_log2_eff,
                         max_offset,
                         max_offset_scale,
                         mO_cur,
@@ -3506,12 +3509,10 @@ class FlashAttentionForwardSm100:
                         mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
                 for stage in cutlass.range_constexpr(self.q_stage):
                     q_block = self._q_block(work_m, stage, mma_tile_coord_v)
-                    row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
-                    # if tidx == 0 and stage <= 1:
-                    #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
+                    row_sum, row_max_log2, acc_O_mn_row_is_zero_or_nan = stats[stage]
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2_eff + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
+                        (row_max_log2 + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )

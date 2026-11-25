@@ -3295,10 +3295,11 @@ class FlashAttentionMLAForward1CtaSm100:
                 row_sum = row_sum0 + row_sum1
                 LN2 = math.log(2.0)
 
-                # Both threads of a row need row_max once the sink rescales row_sum.
-                row_max = 0.0
+                # Both threads of a row need the maximum when folding in the sink.
+                row_max_log2 = Float32(0.0)
+                output_correction = Float32(1.0)
                 if const_expr(mLSE is not None or learnable_sink is not None):
-                    row_max = sRowMax[tidx % self.cta_tile_m, 0]
+                    row_max_log2 = sRowMax[tidx % self.cta_tile_m, 0] * softmax_scale_log2_eff
                 if const_expr(learnable_sink is not None):
                     # Only the first split owns the sink column (as in flash_fwd_sm100).
                     if const_expr(not self.is_split_kv) or split_idx == 0:
@@ -3311,11 +3312,10 @@ class FlashAttentionMLAForward1CtaSm100:
                             # padded heads (sparse) get -inf: no sink
                             qhead_per_kvhead_valid=self.qhead_per_kvhead_valid,
                         )
-                        row_max, row_sum = apply_learnable_sink(
-                            row_max,
+                        row_max_log2, row_sum, output_correction = apply_learnable_sink(
+                            row_max_log2,
                             row_sum,
                             sink_val,
-                            softmax_scale_log2_eff,
                             max_offset=self.max_offset,
                             empty_row_sum=float(2**self.max_offset),
                         )
@@ -3326,7 +3326,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 # fp8: dequantize O by v_descale here (never in the running rescale,
                 # and never in LSE -- LSE is a function of the dequantized scores only).
                 scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
-                scale = scale * v_descale
+                scale = scale * output_correction * v_descale
                 # seqlen_k == 0 with TMA KV: the fully masked dummy block still loaded a KV tile, and
                 # P = 0 times a NaN V row is NaN (scaling by 0 would keep it): write zeros instead.
                 zero_O = seqlen.seqlen_k == 0 if const_expr(not self.use_cpasync_load_KV) else False
@@ -3335,13 +3335,9 @@ class FlashAttentionMLAForward1CtaSm100:
 
                 # compute and store lse to gmem
                 if const_expr(mLSE is not None):
-                    # row_sum carries the fp8 2^max_offset pre-scale; subtract it here
-                    # (O needs no correction -- it cancels in O / row_sum).
+                    # The fp8 2^max_offset pre-scale cancels in O / row_sum but not in LSE.
                     lse = (
-                        (
-                            row_max * softmax_scale_log2_eff
-                            + (cute.math.log2(row_sum, fastmath=True) - self.max_offset)
-                        )
+                        (row_max_log2 + (cute.math.log2(row_sum, fastmath=True) - self.max_offset))
                         * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
