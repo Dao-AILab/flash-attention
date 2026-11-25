@@ -641,7 +641,9 @@ class FlashAttentionBackwardSm90:
             block=[self.num_threads, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=True,
+            # Ragged K/V initializes global descriptors before the producer wait.
+            # Order these writes after any previous writes to the workspace.
+            use_pdl=not self.ragged_kv_tma,
         )
 
     @cute.kernel
