@@ -1137,6 +1137,7 @@ class dQdQvGemmKernel:
                         tTR_dQvtAcc_mn = tTR_dQvtAcc[(None, None, None, subtile_idx)]
                         cute.copy(tiled_copy_dQ_t2r, tTR_dQtAcc_mn, tTR_dQrAcc)
                         cute.copy(tiled_copy_dQv_t2r, tTR_dQvtAcc_mn, tTR_dQvrAcc)
+                        cute.arch.fence_view_async_tmem_load()
 
                         # convert to output dtype
                         tRS_rdQ.store(tiled_copy_dQ_r2s.retile(tTR_dQrAcc).load().to(self.dq_dtype))
