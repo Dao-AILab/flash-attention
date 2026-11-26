@@ -228,7 +228,7 @@ def test_split_selection(changes, expected_splits, expected_tile_n):
         # Selection-time rejections.
         ({"device_arch": 70}, {}, "Unsupported forward architecture family SM7"),
         ({"device_arch": 120, "page_size": 128}, {}, "SM120 forward does not support"),
-        ({"device_arch": 120, "requested_num_splits": 3}, {}, "SM120 forward only supports num_s"),
+        ({"device_arch": 120, "requested_num_splits": 3}, {}, None),
         ({"head_dim": 72, "head_dim_v": 72, "page_size": 64}, {}, "head dimensions divisible"),
         # Geometry and architecture.
         ({}, dict(tile_m=64), "tile_m=128"),
@@ -1002,3 +1002,12 @@ def test_mxfp8_pv_keeps_hardware_exp2():
     assert fp8.ex2_emu_freq > 0
     config = select_fwd_config(pv)
     assert (config.ex2_emu_freq, config.ex2_emu_start_frg) == (0, 0)
+
+
+@pytest.mark.parametrize("dtype", ["torch.bfloat16", "torch.float8_e4m3fn"])
+@pytest.mark.parametrize("num_splits", [1, 3, 16])
+def test_sm120_config_preserves_explicit_split_count(dtype, num_splits):
+    inputs = make_inputs(device_arch=120, dtype=dtype, requested_num_splits=num_splits)
+    config = select_fwd_config(inputs)
+    assert config.num_splits == num_splits
+    validate_fwd_config(config, inputs)
