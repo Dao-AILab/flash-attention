@@ -82,6 +82,7 @@ from flash_attn.cute.config import (
     SM100_MAX_KV_STAGE,
     SM100_THREADS_PER_CTA,
     FwdConfig,
+    sm100_num_softmax_stats,
     sm100_smem_capacity,
     sm100_uneven_kv_smem,
 )
@@ -194,9 +195,12 @@ class FlashAttentionForwardSm100:
         config: FwdConfig,
         qk_blockscaled: bool = False,
         pv_blockscaled: bool = False,
+        pv_normalizer: str = "rounded_p",
     ):
         """config is a validated SM100/SM110 FwdConfig; the kernel copies its fields."""
         self.pv_blockscaled = pv_blockscaled
+        assert pv_normalizer == "rounded_p" or pv_blockscaled
+        self.pv_fp32_normalizer = pv_normalizer == "fp32"
         self.pv_causal_bf16 = pv_blockscaled and is_causal
         if pv_blockscaled:
             assert qk_blockscaled and not is_local
@@ -948,10 +952,12 @@ class FlashAttentionForwardSm100:
         load_epi_mbar_size = 2 if const_expr(self.overlap_sO_sQ) else 0
         sf_overlap_mbar_size = 4 if const_expr(self.sf_overlap) else 0
         sfp_size = 512 if const_expr(self.pv_blockscaled) else 0
-        # Native PV normalizes O with sum(quantized P); LSE needs sum(FP32 P),
-        # stored as a third per-row statistic when requested.
-        self.track_unquantized_sum = self.pv_blockscaled and mLSE is not None
-        self.num_stats = 3 if self.track_unquantized_sum else 2
+        # Track the FP32 sum for LSE or the FP32 normalizer.
+        self.track_unquantized_sum = self.pv_blockscaled and (mLSE is not None or self.pv_fp32_normalizer)
+        self.num_stats = sm100_num_softmax_stats(
+            native_pv=self.pv_blockscaled, has_lse=mLSE is not None,
+            fp32_normalizer=self.pv_fp32_normalizer, dedicated_sf=self.dedicated_sf,
+        )
 
         @cute.struct
         class SharedStorage:
@@ -2952,7 +2958,7 @@ class FlashAttentionForwardSm100:
                     else:
                         sm_stats_index = stage
                     sScale[tidx + sm_stats_index * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(self.track_unquantized_sum):
+                    if const_expr(self.num_stats == 3):
                         sScale[tidx + (stage + 2 * self.q_stage) * self.m_block_size] = softmax.row_sum_unquantized[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
@@ -3124,7 +3130,7 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=p_dtype), tSrS_t2r.layout
         )
         unquantized_sum_init = None
-        if const_expr(self.track_unquantized_sum and not self.dedicated_sf):
+        if const_expr(self.track_unquantized_sum and (not self.dedicated_sf or self.pv_fp32_normalizer)):
             unquantized_sum_init = Float32(0.0)
             if const_expr(not is_first):
                 unquantized_sum_init = softmax.row_sum_unquantized[0] * acc_scale
@@ -3163,7 +3169,10 @@ class FlashAttentionForwardSm100:
             )
         else:
             pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
-        if const_expr(self.pv_blockscaled and not self.dedicated_sf):
+        if const_expr(self.pv_fp32_normalizer):
+            # O and LSE share the FP32 sum reduced per fragment in apply_exp2_convert.
+            softmax.row_sum[0] = softmax.row_sum_unquantized[0]
+        elif const_expr(self.pv_blockscaled and not self.dedicated_sf):
             softmax.update_row_sum_quantized_streaming(tSrP_r2t_f32, p_dtype, acc_scale, is_first)
         elif const_expr(self.pv_blockscaled):
             # E4M3 is exact in FP16, but BF16's small probabilities are not.
@@ -3390,7 +3399,7 @@ class FlashAttentionForwardSm100:
                         row_max = sScale[tidx + sm_stats_index * self.m_block_size + self.s_p_o_stage * self.m_block_size]
                     else:
                         row_max = None
-                    if const_expr(self.track_unquantized_sum):
+                    if const_expr(self.num_stats == 3):
                         row_sum_lse = sScale[tidx + (stage + 2 * self.q_stage) * self.m_block_size]
                     else:
                         row_sum_lse = row_sum

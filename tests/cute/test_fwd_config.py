@@ -10,6 +10,7 @@ from flash_attn.cute.config import (
     SM100_SMEM_BYTES,
     FwdConfig,
     FwdHeuristicInputs,
+    PvNormalizer,
     Sm90Registers,
     Sm100Registers,
     TunedSm100Overrides,
@@ -917,19 +918,27 @@ def test_mxfp8_qk_policy_follows_its_own_rows():
     assert select_fwd_config(causal_hd64._replace(device_arch=103)).sm_stats_cross_stage
 
 
-@pytest.mark.parametrize("mxfp8_path", ["qk", "pv"])
+_PV_FP32 = dict(mxfp8_path="pv", pv_normalizer=PvNormalizer.FP32)
+# (mxfp8_path, pv_normalizer): QK-only, then native PV with each normalizer.
+_MXFP8_MODES = [
+    ("qk", PvNormalizer.ROUNDED_P), ("pv", PvNormalizer.ROUNDED_P), ("pv", PvNormalizer.FP32)
+]
+
+
+@pytest.mark.parametrize(("mxfp8_path", "pv_normalizer"), _MXFP8_MODES)
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("device_arch", [100, 103, 107])
-def test_mxfp8_kv_stages_fit_the_scales(mxfp8_path, head_dim, causal, device_arch):
+def test_mxfp8_kv_stages_fit_the_scales(mxfp8_path, pv_normalizer, head_dim, causal, device_arch):
     inputs = make_inputs(dtype="torch.float8_e4m3fn", head_dim=head_dim, head_dim_v=head_dim,
-                         causal=causal, device_arch=device_arch, mxfp8_path=mxfp8_path)
+                         causal=causal, device_arch=device_arch, mxfp8_path=mxfp8_path,
+                         pv_normalizer=pv_normalizer)
     config = select_fwd_config(inputs)
     # Fixed storage: E4M3 Q + Q scales + BF16 O (+ one P-scale chunk for native PV).
     # Each K/V stage: max(K bytes, V bytes) + one shared scale chunk.
     rows = config.q_stage * 128
     q_o = rows * head_dim + config.q_stage * 512 + rows * head_dim * 2
-    q_o += 512 if mxfp8_path == "pv" else 0
+    q_o += 0 if mxfp8_path == "qk" else 512
     bf16_v = mxfp8_path == "qk" or causal  # causal native PV: BF16 diagonal V blocks
     kv_stage_bytes = 128 * head_dim * (2 if bf16_v else 1) + 512
     assert config.kv_stage == min((224 * 1024 - q_o) // kv_stage_bytes, 32)
@@ -982,6 +991,9 @@ _MXFP8_CLC_HD64 = Sm100Registers(softmax=184, correction=64, other=80)
         ({"mxfp8_path": "pv", "device_arch": 100}, True, None),
         ({"mxfp8_path": "pv", "device_arch": 103}, True, _MXFP8_CLC_HD64),
         ({"mxfp8_path": "pv", "device_arch": 107}, False, None),
+        ({**_PV_FP32, "device_arch": 103, **_HD128}, True, _MXFP8_CLC_HD64),
+        ({**_PV_FP32, "device_arch": 107, **_HD128}, True, None),
+        ({**_PV_FP32, "device_arch": 103}, True, None),
     ],
 )
 def test_causal_mxfp8_clc_cells(changes, clc, registers):
@@ -1002,3 +1014,39 @@ def test_mxfp8_pv_keeps_hardware_exp2():
     assert fp8.ex2_emu_freq > 0
     config = select_fwd_config(pv)
     assert (config.ex2_emu_freq, config.ex2_emu_start_frg) == (0, 0)
+    emulated = replace(config, ex2_emu_freq=8, ex2_emu_start_frg=1)
+    with pytest.raises(ValueError, match="requires hardware exp2"):
+        validate_fwd_config(emulated, pv)
+    validate_fwd_config(emulated, pv._replace(pv_normalizer=PvNormalizer.FP32))
+
+
+@pytest.mark.parametrize("mxfp8_path", [None, "qk"])
+def test_fp32_normalizer_requires_native_pv(mxfp8_path):
+    inputs = make_inputs(dtype="torch.float8_e4m3fn", mxfp8_path=mxfp8_path)
+    config = select_fwd_config(inputs)
+    with pytest.raises(ValueError, match="requires native MXFP8 PV"):
+        validate_fwd_config(config, inputs._replace(pv_normalizer=PvNormalizer.FP32))
+
+
+def test_mxfp8_pv_fp32_policy():
+    fp32 = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128, **_PV_FP32)
+    # sm_100 "fp32" has its own spill-free splits; sm_103 keeps the "rounded_p" ones.
+    assert astuple(select_fwd_config(fp32).registers) == (176, 64, 96)
+    assert select_fwd_config(fp32._replace(device_arch=103)).registers == select_fwd_config(
+        fp32._replace(device_arch=103, pv_normalizer=PvNormalizer.ROUNDED_P)
+    ).registers
+    assert astuple(select_fwd_config(fp32._replace(device_arch=107)).registers) == (168, 96, 80)
+    # Causal "fp32" hd128 runs CLC with its own split on sm_100 and sm_103.
+    causal_inputs = fp32._replace(causal=True)
+    causal = select_fwd_config(causal_inputs)
+    assert causal.use_clc_scheduler and astuple(causal.registers) == (184, 64, 80)
+    no_clc = derive_fwd_config(causal, causal_inputs, use_clc_scheduler=False)
+    assert astuple(no_clc.registers) == (192, 64, 64)
+    # "fp32" emulates half the exp2 pairs in eligible fragments (32 of 128 columns); the first and
+    # last fragments stay on MUFU.EX2.
+    assert (causal.ex2_emu_freq, causal.ex2_emu_start_frg) == (8, 1)
+    assert select_fwd_config(fp32._replace(device_arch=103)).ex2_emu_freq == 0
+    assert select_fwd_config(fp32).sm_stats_cross_stage
+    assert not select_fwd_config(
+        fp32._replace(pv_normalizer=PvNormalizer.ROUNDED_P)
+    ).sm_stats_cross_stage

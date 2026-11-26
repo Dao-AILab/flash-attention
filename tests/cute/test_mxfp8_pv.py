@@ -38,13 +38,14 @@ def inputs(batch, sq, sk, hq, hk, dim, dim_v=None):
     )
 
 
-def reference(q, k, v, causal=False, v_bf16=None):
-    """Independent reverse-block online attention with e4m3 P and FP32 statistics.
+def reference(q, k, v, pv_normalizer="rounded_p", causal=False, v_bf16=None):
+    """Return online-recipe output, FP64 attention, and FP64 LSE.
 
-    Causal attention runs every KV block that intersects a query tile's diagonal (128 rows, or
-    256 when seqlen_q > 128) with BF16 P and v_bf16, as the kernel does, and the fully visible
-    blocks with E4M3 P and v. O is normalized by the sum of the P each PV consumed.
+    Reverse 128-key blocks; "rounded_p" sums rounded P and "fp32" sums FP32 P.
+    Causal query tiles span 128 rows if seqlen_q <= 128, otherwise 256;
+    intersecting KV blocks use BF16 P and v_bf16, others E4M3 P and v.
     """
+    fp32_sum = pv_normalizer == "fp32"
     rep = q.shape[2] // k.shape[2]
     k, v = [x.repeat_interleave(rep, dim=2).transpose(1, 2).double() for x in (k, v)]
     q = q.transpose(1, 2).double()
@@ -91,12 +92,12 @@ def reference(q, k, v, causal=False, v_bf16=None):
         )
         p = p32.to(torch.float8_e4m3fn).float()
         pv = p @ v[..., start : start + 128, :].float()
-        psum = p.sum(-1)
+        psum = (p32 if fp32_sum else p).sum(-1)
         if causal:
             bf16 = (start // 128 >= first_bf16_block)[:, None]  # per query row
             p16 = p32.to(torch.bfloat16).float()
             pv = torch.where(bf16, p16 @ v_bf16[..., start : start + 128, :].float(), pv)
-            psum = torch.where(bf16[..., 0], p16.sum(-1), psum)
+            psum = torch.where(bf16[..., 0], (p32 if fp32_sum else p16).sum(-1), psum)
         out = out * alpha[..., None] + pv
         rowsum = rowsum * alpha + psum
         maximum = new_max
@@ -114,12 +115,15 @@ def reference(q, k, v, causal=False, v_bf16=None):
         (128, 64, 257, 385, 4, 1),
     ],
 )
-def test_mxfp8_pv(dim, dim_v, sq, sk, hq, hk):
+@pytest.mark.parametrize("pv_normalizer", ["rounded_p", "fp32"])
+def test_mxfp8_pv(dim, dim_v, sq, sk, hq, hk, pv_normalizer):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family GPU")
     (q, k, v, sfq, sfk, sfv), deq = inputs(2, sq, sk, hq, hk, dim, dim_v)
-    expected, fp64, lse_ref = reference(*deq)
-    actual, lse = flash_attn_func(q, k, v, scales=BlockScales(sfq, sfk, sfv), return_lse=True)
+    expected, fp64, lse_ref = reference(*deq, pv_normalizer=pv_normalizer)
+    actual, lse = flash_attn_func(
+        q, k, v, scales=BlockScales(sfq, sfk, sfv, pv_normalizer=pv_normalizer), return_lse=True
+    )
     assert torch.isfinite(actual).all()
     # 2e-3: BF16 output rounding (2^-9 per element, about 1.1e-3 RMS) plus FP32 summation order.
     assert (actual.float() - expected).norm() / expected.norm() <= 2e-3
@@ -128,10 +132,78 @@ def test_mxfp8_pv(dim, dim_v, sq, sk, hq, hk):
     ).norm() + 2e-3 * fp64.norm()
     torch.testing.assert_close(lse, lse_ref.float(), atol=2e-4, rtol=2e-5)
     ones, sfones, _ = quantize_v_to_fp8_with_sf(torch.ones_like(deq[2]))
-    normalized, _ = flash_attn_func(q, k, ones, scales=BlockScales(sfq, sfk, sfones))
-    torch.testing.assert_close(
-        normalized.float(), torch.ones_like(normalized.float()), atol=1e-5, rtol=0
+    normalized, _ = flash_attn_func(
+        q, k, ones, scales=BlockScales(sfq, sfk, sfones, pv_normalizer=pv_normalizer)
     )
+    # "rounded_p" must return one for V = 1; "fp32" uses the FP32 denominator, so
+    # allow E4M3 rounding error on these inputs, not a universal row-error bound.
+    atol = 1e-5 if pv_normalizer == "rounded_p" else 2**-4
+    torch.testing.assert_close(
+        normalized.float(), torch.ones_like(normalized.float()), atol=atol, rtol=0
+    )
+
+
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("pv_normalizer", ["rounded_p", "fp32"])
+def test_mxfp8_pv_normalizer_selects_the_denominator(pv_normalizer, return_lse):
+    """With V = 1 the two normalizers differ by more than BF16 rounding, with and without LSE."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family GPU")
+    # One key at logit 0 and 127 at -7 / sqrt(128): each of the latter has weight 0.539, which
+    # E4M3 rounds up by 4%, so the FP32 sum is smaller than the sum of the rounded P.
+    q = torch.zeros(1, 128, 1, 128, device="cuda")
+    q[..., 0] = 1.0
+    k = torch.zeros_like(q)
+    k[:, 1:, :, 0] = -7.0
+    q8, sfq, qs = quantize_to_fp8_with_sf(q)
+    k8, sfk, ks = quantize_to_fp8_with_sf(k)
+    ones, sfones, ones_scale = quantize_v_to_fp8_with_sf(torch.ones_like(q))
+    deq = (
+        dequantize_fp8_with_sf(q8, qs),
+        dequantize_fp8_with_sf(k8, ks),
+        dequantize_v_fp8_with_sf(ones, ones_scale),
+    )
+    expected = {n: reference(*deq, pv_normalizer=n)[0] for n in ("rounded_p", "fp32")}
+    atol = 2**-7  # one BF16 ulp in [1, 2)
+    assert (expected["fp32"] - expected["rounded_p"]).abs().min() > 2 * atol
+    out, lse = flash_attn_func(
+        q8, k8, ones, return_lse=return_lse,
+        scales=BlockScales(
+            interleave_sf(sfq), interleave_sf(sfk), sfones, pv_normalizer=pv_normalizer
+        ),
+    )
+    assert (lse is not None) == return_lse
+    torch.testing.assert_close(out.float(), expected[pv_normalizer], atol=atol, rtol=0)
+
+
+@pytest.mark.parametrize("pv_normalizer", ["rounded_p", "fp32"])
+def test_mxfp8_pv_preserves_tail_mass(pv_normalizer):
+    """Collectively significant small probabilities must survive the E4M3 P (as in #2731)."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100-family GPU")
+    # The last key, visited first, sets the row max. The other 4095 keys have weight 2^-15 each
+    # (11% of the output), which E4M3 keeps only because P is biased by 2^8.
+    sk = 4096
+    q = torch.zeros(1, 128, 1, 128, device="cuda")
+    q[..., 0] = 1.0
+    k = torch.zeros(1, sk, 1, 128, device="cuda")
+    k[:, :-1, :, 0] = -15.0
+    v = torch.ones_like(k)
+    v[:, -1] = 0.0
+    q8, sfq, qs = quantize_to_fp8_with_sf(q)
+    k8, sfk, ks = quantize_to_fp8_with_sf(k)
+    v8, sfv, vs = quantize_v_to_fp8_with_sf(v)
+    out, _ = flash_attn_func(
+        q8, k8, v8, softmax_scale=math.log(2),
+        scales=BlockScales(interleave_sf(sfq), interleave_sf(sfk), sfv, pv_normalizer=pv_normalizer),
+    )
+    qd, kd, vd = (
+        dequantize_fp8_with_sf(q8, qs)[0, :, 0].double(),
+        dequantize_fp8_with_sf(k8, ks)[0, :, 0].double(),
+        dequantize_v_fp8_with_sf(v8, vs)[0, :, 0].double(),
+    )
+    expected = torch.softmax(qd @ kd.T * math.log(2), -1) @ vd
+    torch.testing.assert_close(out[0, :, 0].double(), expected, atol=2e-3, rtol=1e-2)
 
 
 @pytest.mark.skipif(
@@ -183,7 +255,8 @@ def test_mxfp8_pv_persistent_replay(scale_operand):
         (128, 128, 300, 2, 2),  # one Q stage (128-row tile)
     ],
 )
-def test_mxfp8_pv_causal_no_future_leakage(dim, sq, sk, hq, hk):
+@pytest.mark.parametrize("pv_normalizer", ["rounded_p", "fp32"])
+def test_mxfp8_pv_causal_no_future_leakage(dim, sq, sk, hq, hk, pv_normalizer):
     """Scaling V at future positions must leave every earlier row bitwise unchanged."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family GPU")
@@ -198,27 +271,29 @@ def test_mxfp8_pv_causal_no_future_leakage(dim, sq, sk, hq, hk):
     def run(v_bf16):
         v8, sfv, vs = quantize_v_to_fp8_with_sf(v_bf16)
         out, lse = flash_attn_func(
-            q8, k8, v8, scales=BlockScales(sfq, sfk, sfv, v_bf16=v_bf16), causal=True,
-            return_lse=True,
+            q8, k8, v8,
+            scales=BlockScales(sfq, sfk, sfv, v_bf16=v_bf16, pv_normalizer=pv_normalizer),
+            causal=True, return_lse=True,
         )
         return out, lse, dequantize_v_fp8_with_sf(v8, vs)
 
     out, lse, v_deq = run(v)
     assert torch.isfinite(out).all()
     expected, fp64, lse_ref = reference(
-        dequantize_fp8_with_sf(q8, qs), dequantize_fp8_with_sf(k8, ks), v_deq, causal=True,
-        v_bf16=v,
+        dequantize_fp8_with_sf(q8, qs), dequantize_fp8_with_sf(k8, ks), v_deq,
+        pv_normalizer=pv_normalizer, causal=True, v_bf16=v,
     )
     # Same recipe as the kernel (E4M3 P and MXFP8 V off the diagonal, BF16 on it), so the only
     # slack is BF16 output rounding and FP32 summation order; same bound as the non-causal test.
     assert (out.float() - expected).norm() / expected.norm() <= 2e-3
     assert (out.double() - fp64).norm() <= (expected.double() - fp64).norm() + 2e-3 * fp64.norm()
     torch.testing.assert_close(lse, lse_ref.float(), atol=2e-4, rtol=2e-5, equal_nan=True)
-    # O is normalized by the sum of the P each PV consumed (BF16 or E4M3), so V = 1 gives 1 on
-    # every row that sees a key.
+    # "rounded_p" normalizes O by the sum of the P each PV consumed (BF16 or E4M3), so V = 1 gives 1
+    # on every row that sees a key; "fp32" divides by the FP32 sum (see test_mxfp8_pv).
     normalized, _, _ = run(torch.ones_like(v))
     visible = normalized[:, max(sq - sk, 0):].float()
-    torch.testing.assert_close(visible, torch.ones_like(visible), atol=1e-5, rtol=0)
+    atol = 1e-5 if pv_normalizer == "rounded_p" else 2**-4
+    torch.testing.assert_close(visible, torch.ones_like(visible), atol=atol, rtol=0)
     for t0 in (sk // 4 + 17, sk // 2 + 5, 3 * sk // 4 + 29):
         rows = t0 - (sk - sq)  # rows [0, rows) attend only keys < t0
         if rows <= 0 or t0 >= sk:
