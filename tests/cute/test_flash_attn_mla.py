@@ -832,7 +832,7 @@ def test_flash_attn_mla_1cta_learnable_sink_fp8(causal, num_splits):
     descale-folded softmax scale. Checked exactly against the same fp8 call without a sink
     (lse' = logaddexp(lse, sink), O' = O * exp(lse - lse')), then loosely against a
     dequantized fp32 reference."""
-    if not IS_SM100:
+    if not (IS_SM100 or IS_SM110):
         pytest.skip()
     torch.random.manual_seed(0)
     device, fp8 = "cuda", torch.float8_e4m3fn
@@ -900,7 +900,7 @@ def _mla_1cta_fp8_inputs(batch_size=2, seqlen_q=17, seqlen_k=257, nheads=6, nhea
 def test_flash_attn_mla_1cta_fp8_descales_cuda_graph(num_splits):
     """The descale checks must not sync the device: capture and replay a CUDA graph of
     the fp8 + descales + sink forward and compare it to the eager result."""
-    if not IS_SM100:
+    if not (IS_SM100 or IS_SM110):
         pytest.skip()
     q, qv, k, v, q_descale, kv_descale, sink = _mla_1cta_fp8_inputs()
 
@@ -934,7 +934,7 @@ def test_flash_attn_mla_1cta_fp8_descales_cuda_graph(num_splits):
 def test_flash_attn_mla_1cta_fp8_descales_must_be_shared():
     """K and V descales fold into one softmax scale, so they must be one tensor; equal
     values in separate allocations are rejected (checking values would sync the device)."""
-    if not IS_SM100:
+    if not (IS_SM100 or IS_SM110):
         pytest.skip()
     q, qv, k, v, q_descale, kv_descale, sink = _mla_1cta_fp8_inputs()
     with pytest.raises(AssertionError, match="scales.k and scales.v to be the same tensor"):
@@ -947,7 +947,7 @@ def test_flash_attn_mla_1cta_fp8_descales_must_be_shared():
 def test_flash_attn_mla_1cta_fp8_descale_without_rope(monkeypatch):
     """Without a rope part (q = k = None) S = Qv @ V^T, so the latent cache's descale is
     scales.v; a lone scales.k would be ignored, so it must be rejected."""
-    if not IS_SM100:
+    if not (IS_SM100 or IS_SM110):
         pytest.skip()
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "1")  # fp8 MLA is 1CTA-only
     _, qv, _, v, q_descale, kv_descale, _ = _mla_1cta_fp8_inputs()
@@ -967,7 +967,7 @@ def test_flash_attn_mla_1cta_fp8_descale_without_rope(monkeypatch):
 def test_flash_attn_mla_1cta_fp8_partial_descales(present, monkeypatch):
     """scales.q alone or the shared k / v descale alone: a missing one is 1 (bitwise equal
     to passing ones), with no member shifting slots across the kernel boundary."""
-    if not IS_SM100:
+    if not (IS_SM100 or IS_SM110):
         pytest.skip()
     monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "1")  # fp8 MLA is 1CTA-only
     q, qv, k, v, q_descale, kv_descale, sink = _mla_1cta_fp8_inputs()
@@ -1585,7 +1585,7 @@ def test_flash_attn_mla_1cta_sparse_fp8(nheads, causal):
     """fp8 sparse gather (4 V stages, 16-element cp.async chunks) with descales, with and
     without a sink: exact sink identity against the sink-free fp8 call, and a loose check
     against the dequantized fp32 reference."""
-    if not IS_SM100:
+    if not (IS_SM100 or IS_SM110):
         pytest.skip()
     device, fp8 = "cuda", torch.float8_e4m3fn
     b, s_q, s_k, topk = 2, 64, 2048, 512

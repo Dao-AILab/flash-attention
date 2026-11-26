@@ -709,7 +709,7 @@ def test_ex2_emu_matches_the_legacy_kernel_policy():
     masks = {"none": {}, "causal": {"causal": True}, "local": {"local": True}}
     varlen_q = {"dense": {}, "cu_seqlens_q": {"has_cu_seqlens_q": True}}
     for device_arch, dtype, (d, dv), mask, use_2cta, (qhead, pack_gqa), layout in itertools.product(
-        [90, 100, 103], ["torch.bfloat16", "torch.float8_e4m3fn"],
+        [90, 100, 103, 110], ["torch.bfloat16", "torch.float8_e4m3fn"],
         [(64, 64), (96, 96), (128, 128), (192, 128), (256, 256)],
         masks, [False, True], [(1, False), (3, False), (3, True)], varlen_q,
     ):
@@ -723,6 +723,8 @@ def test_ex2_emu_matches_the_legacy_kernel_policy():
             "float8" in dtype, inputs.head_dim_padded, mask == "causal", mask == "local",
             use_2cta, device_arch == 103, pack_gqa, layout != "dense",
         )
+        if device_arch == 110 and "float8" in dtype and inputs.head_dim_padded != 192:
+            expected = (0, 0)
         assert got == expected, (device_arch, dtype, d, mask, use_2cta, qhead, pack_gqa, layout)
 
 

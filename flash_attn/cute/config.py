@@ -474,6 +474,11 @@ def has_fp8_pv(inputs: FwdHeuristicInputs) -> bool:
     return "float8" in inputs.dtype and inputs.mxfp8_path != "qk"
 
 
+def is_sm110_fp8(inputs: FwdHeuristicInputs) -> bool:
+    """Whether P and V are FP8 on SM110, which keeps hardware exp2 (select_ex2_emu)."""
+    return inputs.device_capacity == 11 and has_fp8_pv(inputs)
+
+
 def select_sm_stats_cross_stage(inputs: FwdHeuristicInputs, *, use_s_ping_pong: bool) -> bool:
     """See NOTE [softmax stats release order]."""
     if inputs.device_capacity not in (10, 11) or use_s_ping_pong:
@@ -545,8 +550,8 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
     """Return (ex2_emu_freq, ex2_emu_start_frg) for the SM100/SM110 forward softmax.
 
     Untuned keys emulate up to head dim 128, and at 192 only for 2CTA non-causal non-local;
-    the SM103 family keeps hardware exp2. Disabled emulation, and every other architecture,
-    is (0, 0).
+    the SM103 family, and FP8 on SM110 at every head dim except 192, keep hardware exp2.
+    Disabled emulation, and every other architecture, is (0, 0).
     """
     if inputs.device_capacity not in (10, 11):
         return 0, 0
@@ -555,6 +560,10 @@ def select_ex2_emu(inputs: FwdHeuristicInputs, *, use_2cta_instrs: bool) -> tupl
         # changing the quantized P consumed by native PV.
         return 0, 0
     head_dim_padded = inputs.head_dim_padded
+    if is_sm110_fp8(inputs) and head_dim_padded != 192:
+        # Thor's exp2 unit is not the limit, so emulation only adds instructions (1.04-1.15x
+        # measured at head dims 64-256). Head dim 192 was not measured there.
+        return 0, 0
     is_sm103 = sm100_is_sm103_family(inputs.device_arch)
     key = (use_2cta_instrs, inputs.causal, head_dim_padded, is_sm103)
     tune = SM100_TUNING.get(key, {})

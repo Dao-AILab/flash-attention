@@ -247,9 +247,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     major, minor = torch.cuda.get_device_capability()
-    if major != 10:
+    if major not in (10, 11):
         raise RuntimeError(
-            f"This benchmark is for SM100 (compute capability 10.x). Got {major}.{minor}."
+            "This benchmark is for SM100/SM110 (compute capability 10.x or 11.x). "
+            f"Got {major}.{minor}."
         )
 
     torch.manual_seed(args.seed)
