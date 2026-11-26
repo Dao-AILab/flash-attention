@@ -3297,6 +3297,7 @@ class FlashAttentionMLAForwardSm100:
             tOtO_r2t_cur = tOtO_r2t[None, None, i]
 
             cute.copy(thr_tmem_load, tOtO_t2r_cur, tOrO_t2r_frg)
+            cute.arch.fence_view_async_tmem_load()
             for j in cutlass.range(0, cute.size(tOrO_t2r_frg), 2, unroll_full=True):
                 tOrO_t2r_frg[j], tOrO_t2r_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_t2r_frg[j], tOrO_t2r_frg[j + 1]), (scale, scale)
