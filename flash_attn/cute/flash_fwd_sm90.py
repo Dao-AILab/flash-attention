@@ -11,18 +11,17 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.base_dsl.arch import Arch
+from cutlass.cutlass_dsl import Arch
 
 from quack import copy_utils
 from quack import layout_utils
 from quack import sm90_utils
 
+from flash_attn.cute.compat import LayoutEnum, SmemAllocator, TensorMapManager, TensorMapUpdateMode
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 from flash_attn.cute import utils
 from flash_attn.cute import copy_utils as fa_copy_utils
 from flash_attn.cute.mask import AttentionMask
@@ -102,8 +101,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             Float32,
             atom_layout_mnk=(self.tile_m // 64, 1, 1),
             tiler_mn=(64, self.tile_n),
@@ -111,8 +110,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
             Float32,
             atom_layout_mnk=(self.tile_m // 64, 1, 1),  # Might need (1, 2, 1) for hdim 512
             tiler_mn=(64, self.tile_hdimv),
@@ -478,7 +477,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Mbarrier / pipeline init

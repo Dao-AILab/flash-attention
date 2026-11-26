@@ -29,11 +29,11 @@ import cutlass.utils.blockscaled_layout as blockscaled_layout
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import ClcDynamicPersistentTileScheduler
-from cutlass.base_dsl.arch import Arch
-from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import Arch, BaseDSL
 
 from quack import copy_utils, layout_utils
 
+from flash_attn.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from flash_attn.cute.copy_utils import store_zero_fp32_row
 from flash_attn.cute.paged_kv import PagedKVManager, resolve_paged_token
 from flash_attn.cute.tensormap_utils import acquire_tensormap, bound_rows, cta_tensormap_slot
@@ -589,7 +589,7 @@ class FlashAttentionForwardSm100:
         q_major_mode = cute.nvgpu.OperandMajorMode.K
         k_major_mode = cute.nvgpu.OperandMajorMode.K
         v_major_mode = cute.nvgpu.OperandMajorMode.MN
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+        self.o_layout = LayoutEnum.from_tensor(mO)
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = cute.nvgpu.OperandMajorMode.K
@@ -614,7 +614,7 @@ class FlashAttentionForwardSm100:
                 )
             else:
                 tiled_mma_qk = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
-                    self.q_dtype, q_major_mode, k_major_mode,
+                    self.q_dtype, self.q_dtype, q_major_mode, k_major_mode,
                     cutlass.Float8E8M0FNU, MXFP8_SF_VEC_SIZE, cta_group,
                     self.mma_tiler_qk[:2],
                 )
@@ -628,7 +628,7 @@ class FlashAttentionForwardSm100:
                 )
             else:
                 tiled_mma_pv = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
-                    self.v_dtype, p_major_mode, v_major_mode,
+                    self.v_dtype, self.v_dtype, p_major_mode, v_major_mode,
                     cutlass.Float8E8M0FNU, 32, cta_group,
                     self.mma_tiler_pv[:2], a_source=p_source,
                 )
@@ -1185,7 +1185,7 @@ class FlashAttentionForwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # TMEM handoffs span warp-role branches, so all waits and arrivals must be unaligned.
@@ -1199,7 +1199,7 @@ class FlashAttentionForwardSm100:
             ),
         )
         # Tensor memory dealloc barrier init
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
