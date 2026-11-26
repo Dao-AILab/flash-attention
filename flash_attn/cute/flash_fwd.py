@@ -16,12 +16,12 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
-from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import Arch, BaseDSL
 
 from quack import copy_utils
 from quack import layout_utils
 
-from flash_attn.cute.compat import Arch, SmemAllocator, get_smem_capacity_in_bytes
+from flash_attn.cute.compat import SmemAllocator, get_smem_capacity_in_bytes
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils

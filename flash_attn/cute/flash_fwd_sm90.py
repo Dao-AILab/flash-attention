@@ -14,18 +14,13 @@ from cutlass.cute.nvgpu import cpasync, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.cutlass_dsl import Arch
 
 from quack import copy_utils
 from quack import layout_utils
 from quack import sm90_utils
 
-from flash_attn.cute.compat import (
-    Arch,
-    LayoutEnum,
-    SmemAllocator,
-    TensorMapManager,
-    TensorMapUpdateMode,
-)
+from flash_attn.cute.compat import LayoutEnum, SmemAllocator, TensorMapManager, TensorMapUpdateMode
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute import copy_utils as fa_copy_utils

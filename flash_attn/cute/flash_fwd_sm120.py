@@ -6,8 +6,9 @@
 # FlashAttentionForwardSm80 and overrides the SMEM capacity check accordingly.
 
 import cutlass
+from cutlass.cutlass_dsl import Arch
 
-from flash_attn.cute.compat import Arch, get_smem_capacity_in_bytes
+from flash_attn.cute.compat import get_smem_capacity_in_bytes
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 
 

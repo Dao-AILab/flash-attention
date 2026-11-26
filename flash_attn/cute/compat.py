@@ -18,15 +18,8 @@ else:
     from cutlass.utils import SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
     from cutlass.utils import LayoutEnum, TensorMapManager, TensorMapUpdateMode
 
-# 4.7 moved Arch to cutlass.base_dsl.enums; the old module emits DSLDeprecationWarning from 4.7 on.
-if CUTEDSL_VERSION >= (4, 7):
-    from cutlass.base_dsl.enums import Arch
-else:
-    from cutlass.base_dsl.arch import Arch
-
 __all__ = [
     "CUTEDSL_VERSION",
-    "Arch",
     "LayoutEnum",
     "SmemAllocator",
     "TensorMapManager",

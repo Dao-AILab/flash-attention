@@ -29,11 +29,11 @@ import cutlass.utils.blockscaled_layout as blockscaled_layout
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import ClcDynamicPersistentTileScheduler
-from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import Arch, BaseDSL
 
 from quack import copy_utils, layout_utils
 
-from flash_attn.cute.compat import Arch, LayoutEnum, SmemAllocator, TmemAllocator
+from flash_attn.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from flash_attn.cute.copy_utils import store_zero_fp32_row
 from flash_attn.cute.paged_kv import PagedKVManager, resolve_paged_token
 from flash_attn.cute.tensormap_utils import acquire_tensormap, bound_rows, cta_tensormap_slot
