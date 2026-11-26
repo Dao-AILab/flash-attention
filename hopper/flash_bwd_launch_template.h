@@ -296,7 +296,8 @@ template<int Arch, typename T, int kBlockM, int kBlockN, int kHeadDim, bool Is_c
          int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
          bool V_in_regs=false>
 void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
-    VARLEN_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+    VARLEN_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr
+                  || params.seqused_q != nullptr || params.seqused_k != nullptr, Varlen, [&] {
         BOOL_SWITCH(params.h != params.h_k, GQA, [&] {
             BOOL_SWITCH(params.deterministic, Deterministic_, [&] {
                 static constexpr bool Deterministic = Deterministic_ && kHeadDim < 256;
