@@ -227,6 +227,15 @@ class FlashCrossAttention(nn.Module):
             )
 
 
+def _masked_softmax(scores, valid, dtype):
+    if valid is None:
+        return torch.softmax(scores, dim=-1, dtype=dtype)
+    # An empty row has zero attention and zero gradient, not softmax(all -inf).
+    empty = ~valid.any(dim=-1, keepdim=True)
+    scores.masked_fill_(~valid, -torch.inf).masked_fill_(empty, 0.0)
+    return torch.softmax(scores, dim=-1, dtype=dtype).masked_fill(empty, 0.0)
+
+
 class SelfAttention(nn.Module):
     """Implement the scaled dot product attention with softmax.
     Arguments
@@ -258,22 +267,11 @@ class SelfAttention(nn.Module):
         q, k, v = qkv.unbind(dim=2)
         softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
         scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
-        if key_padding_mask is not None:
-            padding_mask = torch.full(
-                (batch_size, seqlen), -10000.0, dtype=scores.dtype, device=scores.device
-            )
-            padding_mask.masked_fill_(key_padding_mask, 0.0)
-            # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
-            scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
+        valid = None if key_padding_mask is None else rearrange(key_padding_mask, "b s -> b 1 1 s")
         if causal:
-            # "triu_tril_cuda_template" not implemented for 'BFloat16'
-            # So we have to construct the mask in float
-            causal_mask = torch.triu(
-                torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1
-            )
-            # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
-            scores = scores + causal_mask.to(dtype=scores.dtype)
-        attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
+            causal_valid = torch.ones(seqlen, seqlen, dtype=torch.bool, device=q.device).tril()
+            valid = causal_valid if valid is None else valid & causal_valid
+        attention = _masked_softmax(scores, valid, v.dtype)
         attention_drop = self.drop(attention)
         output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
         return output
@@ -315,27 +313,18 @@ class CrossAttention(nn.Module):
         k, v = kv.unbind(dim=2)
         softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
         scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
-        if key_padding_mask is not None:
-            padding_mask = torch.full(
-                (batch_size, seqlen_k), -10000.0, dtype=scores.dtype, device=scores.device
-            )
-            padding_mask.masked_fill_(key_padding_mask, 0.0)
-            # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
-            scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
+        valid = None if key_padding_mask is None else rearrange(key_padding_mask, "b s -> b 1 1 s")
         if causal:
-            # causal mask needs to take into account the difference between seqlen_q and seqlen_k
-            row_idx = rearrange(
-                torch.arange(seqlen_q, device=q.device, dtype=torch.long), "s -> s 1"
-            )
-            col_idx = torch.arange(seqlen_k, device=kv.device, dtype=torch.long)
-            sk = (
-                seqlen_k
-                if key_padding_mask is None
-                else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
-            )
-            causal_mask = col_idx > row_idx + sk - seqlen_q
-            scores = scores.masked_fill(causal_mask, -10000.0)
-        attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
+            # Align the last query with the last valid key, including for padded KV pools.
+            row_idx = torch.arange(seqlen_q, device=q.device)[:, None] - seqlen_q
+            if key_padding_mask is None:
+                col_idx = torch.arange(seqlen_k, device=kv.device) - seqlen_k
+            else:
+                positions = key_padding_mask.cumsum(dim=-1)
+                col_idx = rearrange(positions - positions[:, -1:] - 1, "b s -> b 1 1 s")
+            causal_valid = col_idx <= row_idx
+            valid = causal_valid if valid is None else valid & causal_valid
+        attention = _masked_softmax(scores, valid, v.dtype)
         attention_drop = self.drop(attention)
         output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
         return output
