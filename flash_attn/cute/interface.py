@@ -2588,13 +2588,16 @@ def _flash_attn_bwd(
         cu_total_m_blocks_k is not None,
     )
 
-    # SM90 / SM100 bound the K/V TMA loads of varlen / seqused_k calls by rewriting per-CTA
-    # copies of the K, V (and 2-CTA Kt) descriptors on device (see FlashAttentionBackwardSm100 /
-    # Sm90): one 128-byte slot per descriptor per CTA, sized by an upper bound on the grid.
+    # Bound ragged TMA loads with per-CTA descriptors: K/V on SM90 and SM100, and Q/dO
+    # on SM100. Each descriptor needs one 128-byte slot per CTA.
     bwd_tensormap_workspace = None
     if (
         arch // 10 in [9, 10, 11]
-        and (cu_seqlens_k is not None or seqused_k is not None)
+        and (
+            cu_seqlens_k is not None
+            or seqused_k is not None
+            or (arch // 10 in [10, 11] and (cu_seqlens_q is not None or seqused_q is not None))
+        )
     ):
         # The schedulers pad every batch by up to one (cluster) tile: grid_x = (rows + batch *
         # (c * tile_n - 1)) // tile_n <= rows // tile_n + 2 * batch for c <= 2; the 2-CTA kernels
@@ -2603,7 +2606,10 @@ def _flash_attn_bwd(
         n_ctas = (
             max(n_blocks_bound * num_head * 2, 2 * get_num_sms_for_selection(device.index, arch)) + 8
         )
-        n_desc = 3 if arch // 10 in [10, 11] else 2
+        n_desc = 2 if arch // 10 == 9 else (
+            (3 if cu_seqlens_k is not None or seqused_k is not None else 0)
+            + (4 if cu_seqlens_q is not None or seqused_q is not None else 0)
+        )
         bwd_tensormap_workspace = torch.empty((n_ctas, n_desc, 16), dtype=torch.int64, device=device)
     compile_key = compile_key + (bwd_tensormap_workspace is not None,)
     compiled_bwd = _flash_attn_bwd.compile_cache.get(compile_key)

@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from flash_attn.cute import flash_attn_varlen_func
+from flash_attn.cute.interface import _flash_attn_bwd
 from flash_attn.cute.testing import is_fake_mode, maybe_fake_tensor_mode
 
 @pytest.mark.parametrize("B", [1, 7, 20])
@@ -143,6 +144,101 @@ def test_hd256_varlen_epilogue(seqlens, causal):
         causal=causal,
         mha_type="mqa",
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (10, 11),
+    reason="SM100/SM110-only test",
+)
+@pytest.mark.parametrize("mode", ("plain", "causal", "local"))
+@pytest.mark.parametrize("num_heads_q", (2, 8))
+@pytest.mark.parametrize("head_dim", (128, 256))
+@pytest.mark.parametrize("poison", ("q", "do", "both"))
+def test_varlen_backward_ignores_nan_padded_q_or_do(mode, num_heads_q, head_dim, poison):
+    torch.manual_seed(1234)
+    cu_seqlens_q = torch.tensor((0, 263, 526), device="cuda", dtype=torch.int32)
+    cu_seqlens_k = torch.tensor((0, 256, 512), device="cuda", dtype=torch.int32)
+    q0 = torch.randn(640, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16)
+    k0 = torch.randn(512, 2, head_dim, device="cuda", dtype=torch.bfloat16)
+    v0 = torch.randn_like(k0)
+    grad_out = torch.randn_like(q0)
+
+    def backward(padded_q, padded_do):
+        q = q0.clone()
+        q[526:] = padded_q
+        q.requires_grad_()
+        k = k0.clone().requires_grad_()
+        v = v0.clone().requires_grad_()
+        grad = grad_out.clone()
+        grad[526:] = padded_do
+        out, _ = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=263,
+            max_seqlen_k=256,
+            causal=mode == "causal",
+            window_size=(64, 16) if mode == "local" else (None, None),
+        )
+        out.backward(grad)
+        return q.grad[:526], k.grad, v.grad
+
+    dq_zero, dk_zero, dv_zero = backward(0, 0)
+    dq_nan, dk_nan, dv_nan = backward(
+        float("nan") if poison in ("q", "both") else 0,
+        float("nan") if poison in ("do", "both") else 0,
+    )
+    assert torch.isfinite(dq_nan).all()
+    assert torch.isfinite(dk_nan).all()
+    assert torch.isfinite(dv_nan).all()
+    torch.testing.assert_close(dq_nan, dq_zero, rtol=0, atol=0)
+    torch.testing.assert_close(dk_nan, dk_zero, rtol=1e-2, atol=2e-3)
+    torch.testing.assert_close(dv_nan, dv_zero, rtol=1e-2, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (10, 11),
+    reason="SM100/SM110-only test",
+)
+@pytest.mark.parametrize("packed", (False, True))
+@pytest.mark.parametrize("num_heads_q", (2, 8))
+def test_backward_seqused_q_ignores_nan_padding(packed, num_heads_q):
+    torch.manual_seed(1234)
+    lengths = (100, 256, 37, 200, 129)
+    batch, capacity, d = len(lengths), 256, 128
+    q = torch.randn(batch, capacity, num_heads_q, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, capacity, 2, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    seqused_q = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    valid = torch.arange(capacity, device="cuda")[None, :] < seqused_q[:, None]
+    kwargs = dict(seqused_q=seqused_q, max_seqlen_q=capacity, max_seqlen_k=capacity)
+    if packed:
+        cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * capacity
+        kwargs.update(cu_seqlens_q=cu, cu_seqlens_k=cu)
+        q, k, v = (t.flatten(0, 1) for t in (q, k, v))
+        valid = valid.flatten()
+
+    out, lse = flash_attn_varlen_func(q, k, v, return_lse=True, **kwargs)
+    dout = torch.randn_like(out)
+
+    def backward(q_input, dout_input):
+        return _flash_attn_bwd(q_input, k, v, out, dout_input, lse, **kwargs)[:3]
+
+    reference = backward(q, dout)
+    for poison in ("q", "do", "both"):
+        q_nan, dout_nan = q.clone(), dout.clone()
+        if poison in ("q", "both"):
+            q_nan[~valid] = float("nan")
+        if poison in ("do", "both"):
+            dout_nan[~valid] = float("nan")
+        grads = backward(q_nan, dout_nan)
+        for name, got, want in zip(("dq", "dk", "dv"), grads, reference):
+            if name == "dq":
+                got, want = got[valid], want[valid]
+            assert torch.isfinite(got).all(), f"{poison}: {name} has NaN/Inf"
+            torch.testing.assert_close(got, want, rtol=1e-2, atol=2e-3)
 
 
 def _padded_cu_seqlens(lengths, capacity):
