@@ -30,6 +30,8 @@ env:
     or test_flash_attn_lse_grad and 128-128-256-2-False-dtype0
     or test_flash_attn_lse_grad and 128-128-256-2-True-dtype0
     or test_cuda_graph
+    or test_varlen_backward_ignores_nan_padded_q_or_do
+    or test_backward_seqused_q_ignores_nan_padding
 
 jobs:
   lint:
