@@ -139,6 +139,11 @@ void set_params_fprop(Flash_fwd_params &params,
         params.scale_softmax_log2 = softmax_scale * M_LOG2E;
     }
 
+    TORCH_CHECK(
+      p_dropout >= 0.f && p_dropout < 1.f,
+      "dropout_p must be in [0, 1)"
+    );
+  
     // Set this to probability of keeping an element to simplify things.
     params.p_dropout = 1.f - p_dropout;
     // Convert p from float to int so we don't have to convert the random uint to float to compare.
@@ -148,7 +153,6 @@ void set_params_fprop(Flash_fwd_params &params,
     params.p_dropout_in_uint8_t = uint8_t(std::floor(params.p_dropout * 255.0));
     params.rp_dropout = 1.f / params.p_dropout;
     params.scale_softmax_rp_dropout = params.rp_dropout * params.scale_softmax;
-    TORCH_CHECK(p_dropout < 1.f);
     #ifdef FLASHATTENTION_DISABLE_DROPOUT
         TORCH_CHECK(p_dropout == 0.0f, "This flash attention build does not support dropout.");
     #endif
