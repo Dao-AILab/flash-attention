@@ -153,7 +153,7 @@ def test_hd256_varlen_epilogue(seqlens, causal):
 )
 @pytest.mark.parametrize("mode", ("plain", "causal", "local"))
 @pytest.mark.parametrize("num_heads_q", (2, 8))
-@pytest.mark.parametrize("head_dim", (128, 256))
+@pytest.mark.parametrize("head_dim", (64, 128, 256))
 @pytest.mark.parametrize("poison", ("q", "do", "both"))
 def test_varlen_backward_ignores_nan_padded_q_or_do(mode, num_heads_q, head_dim, poison):
     torch.manual_seed(1234)
