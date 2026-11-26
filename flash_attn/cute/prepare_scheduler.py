@@ -10,6 +10,7 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr, Float32
 from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cutlass_dsl import Arch, BaseDSL
+from flash_attn.cute.compat import SmemAllocator
 import flash_attn.cute.utils as utils
 
 
@@ -232,7 +233,7 @@ class FlashPrepareScheduler:
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         total_blocks_smem = storage.total_blocks_smem.get_tensor((1,))
 

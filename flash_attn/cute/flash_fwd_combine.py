@@ -14,6 +14,7 @@ from cutlass import Float32, Int32, Boolean, const_expr
 
 from quack.cute_dsl_utils import ParamsBase
 
+from flash_attn.cute.compat import SmemAllocator
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.seqlen_info import SeqlenInfo
@@ -105,7 +106,7 @@ class FlashAttentionForwardCombine:
 
         # Async copy atom for O partial load
         atom_async_copy_partial = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
             self.dtype_partial,
             num_bits_per_copy=universal_copy_bits,
         )
@@ -146,7 +147,7 @@ class FlashAttentionForwardCombine:
 
         # Async copy atom for LSE load
         atom_async_copy_lse = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
+            cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.ALWAYS),
             Float32,
             num_bits_per_copy=lse_copy_bits,
         )
@@ -391,7 +392,7 @@ class FlashAttentionForwardCombine:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sLSE = storage.sLSE.get_tensor(smem_layout_lse)
         sMaxValidSplit = storage.sMaxValidSplit.get_tensor((self.tile_m,))

@@ -1,6 +1,6 @@
 import itertools
 from contextlib import nullcontext
-from dataclasses import asdict, replace
+from dataclasses import asdict, astuple, replace
 from unittest import mock
 
 import pytest
@@ -42,6 +42,19 @@ def make_inputs(*, pack_gqa: bool | None = None, **changes) -> FwdHeuristicInput
     return _BASE_INPUTS._replace(pack_gqa=pack_gqa, **changes)
 
 
+@pytest.mark.parametrize("arch", [120, 121])
+@pytest.mark.parametrize("dtype", ["torch.float16", "torch.bfloat16"])
+@pytest.mark.parametrize(("d", "dv", "causal", "tile"), [
+    (64, 64, True, (64, 128)), (64, 64, False, (128, 64)),
+    (128, 128, False, (64, 64)), (256, 256, True, (64, 64)),
+    (64, 128, False, (128, 128)),  # preserve space for the wider O epilogue
+])
+def test_sm12x_fwd_tile(arch, dtype, d, dv, causal, tile):
+    inputs = make_inputs(device_arch=arch, dtype=dtype, head_dim=d, head_dim_v=dv, causal=causal)
+    config = select_fwd_config(inputs)
+    assert (config.tile_m, config.tile_n) == tile
+
+
 @pytest.mark.parametrize("device_arch", [80, 90, 100, 103, 110, 120])
 @pytest.mark.parametrize("causal", [False, True])
 def test_every_architecture_selects_a_valid_default(device_arch, causal):
@@ -58,6 +71,14 @@ def test_every_architecture_selects_a_valid_default(device_arch, causal):
         ({}, True, True),
         ({"device_arch": 90, "num_heads": 24, "num_heads_kv": 8, **_HD128}, None, True),
         ({"num_heads": 24, "num_heads_kv": 8, **_HD256}, None, False),
+        ({"num_heads": 24, "num_heads_kv": 8, **_HD256, "page_size": 128}, None, False),
+        # hd256 prefers 2CTA over PackGQA only where 2CTA is possible: not with other page
+        # sizes or FLASH_ATTENTION_DISABLE_2CTA (#3146). Block sparsity stays unpacked
+        # (non-divisible PackGQA faults, see test_flash_attn_hd256_features.py).
+        ({"num_heads": 24, "num_heads_kv": 8, **_HD256, "page_size": 896}, None, True),
+        ({"num_heads": 24, "num_heads_kv": 8, **_HD256, "disable_2cta": True}, None, True),
+        ({"num_heads": 24, "num_heads_kv": 8, **_HD256, "page_size": 896,
+          "use_block_sparsity": True}, None, False),
         # Per-head sparse masks force pack_gqa off, even over an explicit request.
         ({"num_heads_kv": 4, "use_block_sparsity": True, "sparse_mask_per_head": True},
          True, False),
@@ -864,3 +885,120 @@ def test_tuned_rule_boundaries(rule, changes, fires):
     changed = {name for name in tuned if tuned[name] != untuned[name]}
 
     assert tuned_fields <= changed if fires else not changed
+
+def test_mxfp8_qk_selects_a_1cta_unpacked_config():
+    inputs = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128,
+                         num_heads=16, num_heads_kv=4, mxfp8_path="qk")
+    config = select_fwd_config(inputs)
+    assert not (config.pack_gqa or config.use_2cta_instrs or config.use_s_ping_pong)
+    # V and P stay BF16, so the BF16 register split and exp2 tuning apply rather than the FP8 ones.
+    hd64 = inputs._replace(head_dim=64, head_dim_v=64)
+    assert select_fwd_config(hd64).registers == Sm100Registers(softmax=200, correction=64, other=48)
+    causal = select_fwd_config(inputs._replace(causal=True))
+    assert (causal.ex2_emu_freq, causal.ex2_emu_start_frg) == (16, 1)
+    with pytest.raises(ValueError, match="MXFP8 forward requires 128 x 128 tiles"):
+        validate_fwd_config(replace(config, tile_n=64), inputs)
+    decode = inputs._replace(max_seqlen_q=1, total_q=2)
+    assert not select_fwd_config(decode).use_s_ping_pong
+    # SplitKV would raise for long-KV decode, so automatic selection keeps one split.
+    assert select_fwd_config(decode._replace(requested_num_splits=None)).num_splits == 1
+    with pytest.raises(ValueError, match="MXFP8 forward requires SM10x"):
+        select_fwd_config(inputs._replace(device_arch=90))
+
+
+def test_mxfp8_qk_policy_follows_its_own_rows():
+    causal_hd64 = make_inputs(dtype="torch.float8_e4m3fn", causal=True, mxfp8_path="qk")
+    # Causal CLC: the "mxfp8_qk" rows, not the FP8 ones. hd64 measured faster on SM100 only.
+    assert select_fwd_config(causal_hd64).use_clc_scheduler
+    assert not select_fwd_config(causal_hd64._replace(device_arch=103)).use_clc_scheduler
+    assert select_fwd_config(causal_hd64._replace(device_arch=103, **_HD128)).use_clc_scheduler
+    # Softmax stats release: hd64 causal keeps cross-stage on SM103.
+    assert not select_fwd_config(causal_hd64).sm_stats_cross_stage
+    assert select_fwd_config(causal_hd64._replace(device_arch=103)).sm_stats_cross_stage
+
+
+@pytest.mark.parametrize("mxfp8_path", ["qk", "pv"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("device_arch", [100, 103, 107])
+def test_mxfp8_kv_stages_fit_the_scales(mxfp8_path, head_dim, causal, device_arch):
+    inputs = make_inputs(dtype="torch.float8_e4m3fn", head_dim=head_dim, head_dim_v=head_dim,
+                         causal=causal, device_arch=device_arch, mxfp8_path=mxfp8_path)
+    config = select_fwd_config(inputs)
+    # Fixed storage: E4M3 Q + Q scales + BF16 O (+ one P-scale chunk for native PV).
+    # Each K/V stage: max(K bytes, V bytes) + one shared scale chunk.
+    rows = config.q_stage * 128
+    q_o = rows * head_dim + config.q_stage * 512 + rows * head_dim * 2
+    q_o += 512 if mxfp8_path == "pv" else 0
+    bf16_v = mxfp8_path == "qk" or causal  # causal native PV: BF16 diagonal V blocks
+    kv_stage_bytes = 128 * head_dim * (2 if bf16_v else 1) + 512
+    assert config.kv_stage == min((224 * 1024 - q_o) // kv_stage_bytes, 32)
+    for has_lse in (False, True):
+        assert sm100_fwd_smem_bytes(config, inputs._replace(has_lse=has_lse)) <= SM100_SMEM_BYTES
+
+
+def test_mxfp8_pv_register_splits():
+    pv = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128, mxfp8_path="pv")
+
+    def registers(**changes):
+        config = select_fwd_config(pv._replace(**changes))
+        assert not (config.use_2cta_instrs or config.use_s_ping_pong)
+        return astuple(config.registers)
+
+    # sm_100/sm_103: the MMA warp needs more than the hd128 FP8 default leaves it.
+    assert registers() == (184, 80, 64)
+    assert registers(head_dim=64, head_dim_v=64) == (192, 64, 64)
+    assert registers(device_arch=103) == (168, 96, 80)
+    # sm_107 has dedicated scale columns: only hd64 overrides the FP8 split.
+    assert registers(device_arch=107, head_dim=64, head_dim_v=64) == (160, 96, 96)
+    assert registers(device_arch=107) == astuple(
+        select_fwd_config(pv._replace(device_arch=107, mxfp8_path=None, pack_gqa=False,
+                                      disable_2cta=True)).registers
+    )
+    # Causal native PV without CLC runs a single-tile scheduler, so sm_103 keeps the sm_100
+    # split, and sm_107 hd64 keeps the FP8 one.
+    causal_103 = pv._replace(device_arch=103, causal=True)
+    no_clc = derive_fwd_config(select_fwd_config(causal_103), causal_103, use_clc_scheduler=False)
+    assert astuple(no_clc.registers) == (184, 80, 64)
+    assert registers(device_arch=107, head_dim=64, head_dim_v=64, causal=True) == (168, 96, 80)
+
+
+_MXFP8_CAUSAL = dict(dtype="torch.float8_e4m3fn", causal=True)
+_MXFP8_CLC_HD128 = Sm100Registers(softmax=168, correction=88, other=88)
+_MXFP8_CLC_HD64 = Sm100Registers(softmax=184, correction=64, other=80)
+
+
+@pytest.mark.parametrize(
+    ("changes", "clc", "registers"),
+    [
+        # QK-only MXFP8 keeps its own rows, all with the default split.
+        ({"mxfp8_path": "qk", "device_arch": 100}, True, None),
+        ({"mxfp8_path": "qk", "device_arch": 103}, False, None),
+        ({"mxfp8_path": "qk", "device_arch": 103, **_HD128}, True, None),
+        # Native PV's default splits spill once persistent; those cells name their own.
+        ({"mxfp8_path": "pv", "device_arch": 100, **_HD128}, True, _MXFP8_CLC_HD128),
+        ({"mxfp8_path": "pv", "device_arch": 103, **_HD128}, True, _MXFP8_CLC_HD128),
+        ({"mxfp8_path": "pv", "device_arch": 107, **_HD128}, True, None),
+        ({"mxfp8_path": "pv", "device_arch": 100}, True, None),
+        ({"mxfp8_path": "pv", "device_arch": 103}, True, _MXFP8_CLC_HD64),
+        ({"mxfp8_path": "pv", "device_arch": 107}, False, None),
+    ],
+)
+def test_causal_mxfp8_clc_cells(changes, clc, registers):
+    inputs = make_inputs(**_MXFP8_CAUSAL, **changes)
+    config = select_fwd_config(inputs)
+
+    assert config.use_clc_scheduler is clc
+    if clc:
+        # A cell without its own split keeps the one the nonpersistent grid uses.
+        grid = derive_fwd_config(config, inputs, use_clc_scheduler=False)
+        assert config.registers == (grid.registers if registers is None else registers)
+
+
+def test_mxfp8_pv_keeps_hardware_exp2():
+    # FP8 hd128 emulates exp2 on SM100; native PV must not, so PV consumes the reference P.
+    pv = make_inputs(dtype="torch.float8_e4m3fn", head_dim=128, head_dim_v=128, mxfp8_path="pv")
+    fp8 = select_fwd_config(pv._replace(mxfp8_path=None, pack_gqa=False, disable_2cta=True))
+    assert fp8.ex2_emu_freq > 0
+    config = select_fwd_config(pv)
+    assert (config.ex2_emu_freq, config.ex2_emu_start_frg) == (0, 0)

@@ -21,6 +21,7 @@ _BASE_INPUTS = BwdHeuristicInputs(
     head_dim_v=128,
     num_heads=16,
     num_heads_kv=16,
+    dtype="torch.bfloat16",
 )
 
 
@@ -133,10 +134,8 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
         )
         legacy["registers"] = legacy_sm90_kernel_registers(384, legacy["single"])
     else:
-        n = 128
-        hd256_generic = head_dim == 256 and head_dim_v == 256 and inputs.hd256_generic
-        if hd256_generic:
-            n = 64
+        is_hdim256 = head_dim == 256 and head_dim_v == 256
+        n = 64 if is_hdim256 else 128
 
         def subtile(n_block_size):
             if not inputs.use_block_sparsity or block_size is None:
@@ -165,7 +164,7 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
             n = 64
         needs_2cta = (
             "SM100 backward with head_dim=256"
-            if hd256_generic
+            if is_hdim256
             else (
                 "SM100 block-sparse backward with head_dim=192"
                 if inputs.use_block_sparsity and head_dim == 192
@@ -183,7 +182,6 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
             )
             raise ValueError(f"{needs_2cta} requires 2CTA; {reason}.")
         cluster_size = 2 if use_2cta else 1
-        dedicated = head_dim == 256 and head_dim_v == 256 and not inputs.hd256_generic
         legacy = dict(
             m=128,
             n=n,
@@ -192,24 +190,20 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
             NdKV=1,
             MdQ=1,
             cluster_size=cluster_size,
-            use_2cta=use_2cta or dedicated,
-            dedicated=dedicated,
+            use_2cta=use_2cta,
             kv_subtile=kv_subtile_factor,
             # The legacy sweep is MHA, which never packs.
             pack_factor=1,
             head_loop=False,
         )
-        if dedicated:
-            legacy["registers"] = None
-        else:
-            # The old kernel derived its stages and register split itself.
-            legacy.update(
-                Q=1 if use_2cta else 2,
-                dO=1,
-                registers=legacy_sm100_kernel_registers(
-                    causal, local, inputs.deterministic, use_2cta, cluster_size, head_dim
-                ),
-            )
+        # The old kernel derived its stages and register split itself.
+        legacy.update(
+            Q=1 if use_2cta else 2,
+            dO=1,
+            registers=legacy_sm100_kernel_registers(
+                causal, local, inputs.deterministic, use_2cta, cluster_size, head_dim
+            ),
+        )
         spt_given = inputs.use_block_sparsity and inputs.sparse_spt is not None
         legacy["spt"] = (
             inputs.sparse_spt and inputs.deterministic
@@ -223,7 +217,7 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
             f"tile_m={m}; got {sparse_q}."
         )
     legacy["q_subtile"] = sparse_q // m if sparse_q is not None else 2
-    generic_sm100 = arch // 10 in (10, 11) and not legacy["dedicated"]
+    generic_sm100 = arch // 10 in (10, 11)
     if generic_sm100 and -(-head_dim // 32) * 32 in (192, 256) and not legacy["use_2cta"]:
         raise LegacyKernelAssert
     return legacy
@@ -246,7 +240,6 @@ _CONFIG_FIELDS = dict(
     num_threads="num_threads",
     cluster_size="cluster_size",
     use_2cta="use_2cta_instrs",
-    dedicated="use_dedicated_hd256_kernel",
     spt="spt",
     registers="registers",
     pack_factor="pack_factor",
@@ -281,18 +274,17 @@ _SPARSE = [  # (use_block_sparsity, block_size, spt)
     (True, (64, 64), None),
     (True, (128, 192), None),
 ]
-_ENVS = [  # (disable_2cta, hd256_generic, requested_tile_n)
-    (False, False, None),
-    (True, False, None),
-    (False, True, None),
-    (True, True, None),
-    (False, False, 64),
+_ENVS = [  # (disable_2cta, requested_tile_n)
+    (False, None),
+    (True, None),
+    (False, 64),
 ]
 
 
 @pytest.mark.parametrize("device_arch", [90, 100, 103, 110, 120])
 def test_selection_matches_the_legacy_policy(device_arch):
-    # Dtype does not affect this policy; V_in_regs is only forwarded on SM90.
+    # Dtype only selects fold_LSE_dPsum, which the legacy policy did not own; V_in_regs is
+    # only forwarded on SM90.
     for (d, dv), mask, det, sparse, env in itertools.product(
         _HEAD_DIMS,
         ["none", "causal", "local"],
@@ -301,7 +293,7 @@ def test_selection_matches_the_legacy_policy(device_arch):
         _ENVS,
     ):
         use_block_sparsity, block_size, spt = sparse
-        disable_2cta, hd256_generic, tile_n = env
+        disable_2cta, tile_n = env
         inputs = make_inputs(
             device_arch=device_arch,
             head_dim=d,
@@ -316,7 +308,6 @@ def test_selection_matches_the_legacy_policy(device_arch):
             requested_V_in_regs=mask == "none",
             requested_tile_n=tile_n,
             disable_2cta=disable_2cta,
-            hd256_generic=hd256_generic,
         )
         try:
             expected = outcome(lambda: legacy_bwd_policy(inputs))
@@ -331,6 +322,22 @@ def test_selection_matches_the_legacy_policy(device_arch):
 
 
 _GQA8 = dict(num_heads=16, num_heads_kv=2, num_sms=148, max_seqlen_q=2048, max_seqlen_k=2048)
+_HD64 = dict(head_dim=64, head_dim_v=64)
+# Each problem change that keeps the SM100 LSE / dPsum fold off for a bf16 hdim-64 MHA call.
+_FOLD_OFF_CHANGES = {
+    "fp16": dict(_HD64, dtype="torch.float16"),
+    "gqa": dict(_HD64, num_heads=16, num_heads_kv=4, num_sms=148, requested_pack_gqa=False),
+    "deterministic": dict(_HD64, deterministic=True),
+    "hdim128_1cta": dict(head_dim=128, head_dim_v=128, disable_2cta=True),
+    "hdim_v128": dict(head_dim=64, head_dim_v=128),
+    "block_sparse": dict(
+        _HD64, use_block_sparsity=True, sparse_block_size_q=128, sparse_block_size_kv=128
+    ),
+    "score_mod_bwd": dict(_HD64, has_score_mod_bwd=True),
+    "zero_softmax_scale": dict(_HD64, zero_softmax_scale=True),
+    "softcap": dict(_HD64, has_softcap=True),
+    "sm120": dict(_HD64, device_arch=120),
+}
 
 
 def test_pack_gqa_explicit_configs():
@@ -345,7 +352,7 @@ def test_pack_gqa_explicit_configs():
     # A pack of 2 / 4 query heads per tile and the hdim 256 head loop over the rest by request.
     assert select_bwd_config(make_inputs(**_GQA8, requested_pack_gqa=4)).pack_factor == 4
     loop = make_inputs(
-        **_GQA8, head_dim=256, head_dim_v=256, hd256_generic=True, requested_pack_gqa=2,
+        **_GQA8, head_dim=256, head_dim_v=256, requested_pack_gqa=2,
         requested_head_loop=True,
     )
     assert (select_bwd_config(loop).pack_factor, select_bwd_config(loop).head_loop) == (2, True)
@@ -356,6 +363,19 @@ def test_pack_gqa_explicit_configs():
         total_q=8192, total_k=8192, causal=True,
     )
     assert select_bwd_config(long_mqa).pack_factor == 1
+
+
+def test_fold_LSE_dPsum_is_selected_for_bf16_hdim64_mha():
+    inputs = make_inputs(**_HD64)
+    config = select_bwd_config(inputs)
+    assert config.fold_LSE_dPsum
+    # An explicit config may leave it off.
+    validate_bwd_config(replace(config, fold_LSE_dPsum=False), inputs)
+
+
+@pytest.mark.parametrize("changes", _FOLD_OFF_CHANGES.values(), ids=_FOLD_OFF_CHANGES.keys())
+def test_fold_LSE_dPsum_is_off_outside_its_scope(changes):
+    assert not select_bwd_config(make_inputs(**changes)).fold_LSE_dPsum
 
 
 @pytest.mark.parametrize(
@@ -413,11 +433,17 @@ def test_pack_gqa_explicit_configs():
         ),
         (
             make_inputs(**_GQA8, head_dim=256, head_dim_v=256),
-            {"pack_factor": 8},
-            "query-head folds",
+            {"tile_n": 128},
+            "head_dim=256 needs tile_n=64",
         ),
-        (make_inputs(**_GQA8, device_arch=90), {"pack_factor": 8}, "2CTA or query-head fold"),
-        (make_inputs(**_GQA8, device_arch=120), {"pack_factor": 8}, "2CTA or query-head fold"),
+        (make_inputs(**_GQA8, device_arch=90), {"pack_factor": 8}, "SM100 options"),
+        (make_inputs(**_GQA8, device_arch=120), {"pack_factor": 8}, "SM100 options"),
+        *(
+            (make_inputs(**changes), {"fold_LSE_dPsum": True}, "fold_LSE_dPsum needs")
+            for changes in _FOLD_OFF_CHANGES.values()
+            if changes.get("device_arch") not in (90, 120)
+        ),
+        (make_inputs(**_HD64, device_arch=120), {"fold_LSE_dPsum": True}, "SM100 options"),
     ],
 )
 def test_invalid_configs_are_rejected(inputs, changes, error):
@@ -434,16 +460,20 @@ def choose_fold(
     causal,
     deterministic,
     varlen=False,
-    cluster_size=2,
-    m_block_size=128,
-    n_block_size=128,
+    cluster_size=None,
+    m_block_size=None,
+    n_block_size=None,
     head_dim=256,
     pack_gqa_override=None,
     head_loop_override=None,
 ):
-    """select_bwd_fold on B200 (148 SMs, 74 clusters) for a shape of batch x seqlen tokens on
-    the generic kernel; hdim 256 (the head loop) unless given, hdim 192 pairs with hdim_v 128."""
+    """The fold on B200 (148 SMs, 74 clusters) for a shape of batch x seqlen tokens on the
+    generic kernel; hdim 256 (the head loop) unless given, hdim 192 pairs with hdim_v 128.
+    Without a tile / cluster override this is the production fold of select_bwd_config (hdim
+    256: 128 x 64 on 2 CTAs); a row that gives one probes select_bwd_fold off the production
+    kernel, the other parameters staying at their production values."""
     inputs = BwdHeuristicInputs(
+        dtype="torch.bfloat16",
         device_arch=100,
         head_dim=head_dim,
         head_dim_v=128 if head_dim == 192 else head_dim,
@@ -458,17 +488,18 @@ def choose_fold(
         has_cu_seqlens=varlen,
         causal=causal,
         deterministic=deterministic,
-        hd256_generic=True,
         requested_pack_gqa=pack_gqa_override,
         requested_head_loop=head_loop_override,
     )
+    production = select_bwd_config(inputs)
+    if cluster_size is None and m_block_size is None and n_block_size is None:
+        return (production.pack_factor, production.head_loop)
     return tuple(
         select_bwd_fold(
             inputs,
-            tile_m=m_block_size,
-            tile_n=n_block_size,
-            cluster_size=cluster_size,
-            use_dedicated_hd256_kernel=False,
+            tile_m=production.tile_m if m_block_size is None else m_block_size,
+            tile_n=production.tile_n if n_block_size is None else n_block_size,
+            cluster_size=production.cluster_size if cluster_size is None else cluster_size,
         )
     )
 
@@ -746,6 +777,7 @@ def test_bwd_pack_gqa_heuristic_partial_pack_keeps_half_the_gain():
     """hdim 128 MQA 16/1 at 8k causal: the full-pack model still packs 4 heads as a 4-way
     partial pack (kv_group 4), the halved gain leaves it unpacked; non-causal still packs."""
     inputs = BwdHeuristicInputs(
+        dtype="torch.bfloat16",
         device_arch=100, head_dim=128, head_dim_v=128, num_heads=16, num_heads_kv=4,
         num_sms=148, batch_size=4, max_seqlen_q=8192, max_seqlen_k=8192,
         total_q=4 * 8192, total_k=4 * 8192, causal=True,
@@ -775,7 +807,7 @@ def _identity_score_mod(score, b, h, q_idx, kv_idx, aux_tensors):
     ("head_dim", "nheads", "score_mod", "can_pack"),
     [
         (128, 16, None, True),
-        (256, 16, None, False),
+        (256, 16, None, True),
         (128, 16, _identity_score_mod, False),
         # 6 query heads over 2 KV heads (ratio 3): no pack divides it and the head loop is
         # hdim 256 only, so there is no fold candidate to choose between
@@ -788,8 +820,8 @@ def test_cross_compiled_gqa_backward_needs_num_sms_only_to_pack(
 ):
     """A GQA backward cross-compiled for SM100 without a matching GPU or FLASH_ATTENTION_NUM_SMS
     selects its config unless the pack_gqa heuristic, the only reader of the SM count, runs:
-    it does not run without a fold candidate (hdim 256 on the dedicated kernel, score_mod, an
-    odd qhead_per_kvhead off hdim 256)."""
+    it does not run without a fold candidate (score_mod, an odd qhead_per_kvhead off hdim
+    256)."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     from flash_attn.cute import interface

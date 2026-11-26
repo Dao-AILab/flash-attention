@@ -11,14 +11,14 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
-from cutlass.cute.nvgpu import cpasync, warp, warpgroup
+from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Float32, const_expr
-from cutlass.utils import LayoutEnum
 
 from quack import copy_utils
 from quack import layout_utils
 from quack import sm90_utils
 
+from flash_attn.cute.compat import LayoutEnum, SmemAllocator
 from flash_attn.cute import utils
 from flash_attn.cute.bwd_accum_tile import AccumTileOrder, accum_tile_layout
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
@@ -114,7 +114,7 @@ class DSinkReduceKernel:
         mDSink: cute.Tensor,
     ):
         num_warps = self.num_threads // cute.arch.WARP_SIZE
-        sReduce = cutlass.utils.SmemAllocator().allocate_tensor(
+        sReduce = SmemAllocator().allocate_tensor(
             Float32, cute.make_layout(num_warps), byte_alignment=4
         )
         head_idx = cute.arch.block_idx()[0]
@@ -227,8 +227,8 @@ class FlashAttentionBackwardPostprocess:
             tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
                 self.dtype,
-                warpgroup.OperandMajorMode.K,  # These don't matter, we only care about the accum
-                warpgroup.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,  # These don't matter, we only care about the accum
+                cute.nvgpu.OperandMajorMode.K,
                 Float32,
                 atom_layout_mnk=(atom_layout_dQ if not self.dQ_swapAB else atom_layout_dQ[::-1])
                 + (1,),
@@ -259,7 +259,7 @@ class FlashAttentionBackwardPostprocess:
         universal_copy_bits = 128
         async_copy_elems_accum = universal_copy_bits // Float32.width
         atom_async_copy_accum = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
             Float32,
             num_bits_per_copy=universal_copy_bits,
         )
@@ -508,7 +508,7 @@ class FlashAttentionBackwardPostprocess:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
         sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
         if const_expr(self.arch // 10 in [8, 9, 12]):

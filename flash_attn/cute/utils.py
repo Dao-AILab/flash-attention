@@ -140,14 +140,6 @@ def _get_bwd_head_loop_override() -> Optional[bool]:
 
 
 @cache
-def _get_hd256_generic_bwd() -> bool:
-    """FLASH_ATTENTION_HD256_GENERIC_BWD=1 runs the SM100 hdim 256 backward on
-    FlashAttentionBackwardSm100 (64-row KV tile, serial 2CTA schedule) instead of the dedicated
-    kernels."""
-    return os.getenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "0") == "1"
-
-
-@cache
 def _get_bwd_tile_n_override() -> Optional[int]:
     """Test knob: FLASH_ATTENTION_BWD_TILE_N=64 selects the 64-row KV tile per CTA on the SM100
     2CTA backward (the layout the hd256 backward needs). Unset or 128 keeps the default."""
@@ -264,6 +256,17 @@ def compute_softmax_scale_log2(softmax_scale, score_mod):
         return softmax_scale * LOG2_E, None
     else:
         return LOG2_E, softmax_scale
+
+
+@cute.jit
+def clamp_index(idx, seqlen_divmod: FastDivmodDivisorV2):
+    """Clamp a tile index into [0, seqlen) so aux_tensors loads from a partial tile stay in bounds.
+
+    Scores and mask values at clamped (out-of-bounds) positions are masked afterwards, so any
+    in-bounds index works; a min is one instruction per element where a modulo is a fastdivmod.
+    Requires seqlen >= 1, which holds wherever a tile is processed.
+    """
+    return cutlass.min(idx, seqlen_divmod.divisor - 1)
 
 
 def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
@@ -905,6 +908,46 @@ def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Flo
 
 
 @dsl_user_op
+def add_packed_p_to_f32x4(
+    word: Float32, acc: Tuple[Float32, ...], p_dtype: cutlass.Constexpr, *, loc=None, ip=None
+) -> Tuple[Float32, ...]:
+    """Add one packed 32-bit P word to FP32 accumulators.
+
+    Four E4M3 values map to acc[0..3]; two BF16 values map to acc[0..1].
+    SM100 mixed FP32+FP16/BF16 adds (FHADD) avoid widening each value to FP32 first.
+    """
+    if const_expr(p_dtype.width == 8):
+        asm = (
+            "{\n\t.reg .b32 w, x, y;\n\t.reg .b16 a, b, x0, x1, y0, y1;\n\t"
+            "mov.b32 w, $4;\n\tmov.b32 {a, b}, w;\n\t"
+            "cvt.rn.f16x2.e4m3x2 x, a;\n\tcvt.rn.f16x2.e4m3x2 y, b;\n\t"
+            "mov.b32 {x0, x1}, x;\n\tmov.b32 {y0, y1}, y;\n\t"
+            "add.rn.f32.f16 $0, x0, $5;\n\tadd.rn.f32.f16 $1, x1, $6;\n\t"
+            "add.rn.f32.f16 $2, y0, $7;\n\tadd.rn.f32.f16 $3, y1, $8;\n\t}\n"
+        )
+        n = 4
+    else:
+        assert p_dtype == cutlass.BFloat16
+        asm = (
+            "{\n\t.reg .b32 w;\n\t.reg .b16 a, b;\n\t"
+            "mov.b32 w, $2;\n\tmov.b32 {a, b}, w;\n\t"
+            "add.rn.f32.bf16 $0, a, $3;\n\tadd.rn.f32.bf16 $1, b, $4;\n\t}\n"
+        )
+        n = 2
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * n),
+        [Float32(word).ir_value(loc=loc, ip=ip)]
+        + [Float32(a).ir_value(loc=loc, ip=ip) for a in acc[:n]],
+        asm,
+        ",".join(["=f"] * n + ["f"] * (n + 1)),
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(n))
+
+
+@dsl_user_op
 def domain_offset_aligned(
     coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None
 ) -> cute.Tensor:
@@ -1033,76 +1076,3 @@ def get_batch_from_cu_tensor(idx: Int32, cu_tensor: cute.Tensor) -> Int32:
             hi = mid
 
     return lo
-
-
-def as_bshkrd_tensor(
-    tensor: cute.Tensor,
-    h_k: Int32,
-    h_r: Int32,
-    varlen: bool,
-) -> cute.Tensor:
-    """Normalize (B,S,H,D)/(S,H,D) tensors to (B,S,H_k,H_r,D) view."""
-    if cutlass.const_expr(cute.rank(tensor.layout) == 5):
-        return tensor
-    if cutlass.const_expr(cute.rank(tensor.layout) == 4):
-        return cute.make_tensor(
-            tensor.iterator,
-            cute.make_layout(
-                (tensor.shape[0], tensor.shape[1], h_k, h_r, tensor.shape[3]),
-                stride=(
-                    tensor.stride[0],
-                    tensor.stride[1],
-                    tensor.stride[2] * h_r,
-                    tensor.stride[2],
-                    tensor.stride[3],
-                ),
-            ),
-        )
-    assert cutlass.const_expr(cute.rank(tensor.layout) == 3), "Expected rank-3 varlen tensor"
-    assert cutlass.const_expr(varlen), "Rank-3 input is only valid for varlen"
-    return cute.make_tensor(
-        tensor.iterator,
-        cute.make_layout(
-            (1, tensor.shape[0], h_k, h_r, tensor.shape[2]),
-            stride=(
-                0,
-                tensor.stride[0],
-                tensor.stride[1] * h_r,
-                tensor.stride[1],
-                tensor.stride[2],
-            ),
-        ),
-    )
-
-
-def as_shhb_tensor(
-    tensor: cute.Tensor,
-    h_k: Int32,
-    h_r: Int32,
-    b: Int32,
-    varlen: bool,
-) -> cute.Tensor:
-    """Normalize (B,H,S)/(H,S) tensors to (S, ((H_r, H_k), B)) view."""
-    if cutlass.const_expr(cute.rank(tensor.layout) == 3):
-        return cute.make_tensor(
-            tensor.iterator,
-            cute.make_layout(
-                (tensor.shape[2], ((h_r, h_k), tensor.shape[0])),
-                stride=(
-                    tensor.stride[2],
-                    ((tensor.stride[1], tensor.stride[1] * h_r), tensor.stride[0]),
-                ),
-            ),
-        )
-    assert cutlass.const_expr(cute.rank(tensor.layout) == 2), "Expected rank-2 varlen tensor"
-    assert cutlass.const_expr(varlen), "Rank-2 input is only valid for varlen"
-    return cute.make_tensor(
-        tensor.iterator,
-        cute.make_layout(
-            (tensor.shape[1], ((h_r, h_k), b)),
-            stride=(
-                tensor.stride[1],
-                ((tensor.stride[0], tensor.stride[0] * h_r), 0),
-            ),
-        ),
-    )

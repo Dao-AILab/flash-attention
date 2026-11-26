@@ -184,6 +184,9 @@ def assert_bwd_matches_reference(
 
     bwd_rtol = 2
     bwd_atol_floor = 1e-5 if min_seqlen >= 64 else 3e-5
+    if dk_cute.shape[-1] >= 256:
+        # dPsum from the bf16-rounded O: the residual dS grows with the head dim
+        bwd_atol_floor *= 2
     dq_atol = max(bwd_atol_floor, 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item())
     dk_atol = max(bwd_atol_floor, 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item())
     dv_atol = max(bwd_atol_floor, 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item())
@@ -767,7 +770,7 @@ def test_single_doc_bwd_minimal():
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_COMPREHENSIVE)
 @pytest.mark.parametrize("nheads", [16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
-@pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize("headdim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_block_sparsity", [True, False])
 @pytest.mark.parametrize(
@@ -808,7 +811,7 @@ def test_static_masks(
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_SMOKE)
 @pytest.mark.parametrize("nheads", [16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
-@pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize("headdim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_block_sparsity", [True, False])
 @pytest.mark.parametrize(
@@ -1091,7 +1094,7 @@ def test_sm100_block_sparse_bwd_kv_subtile_selects_cta_policy(
 ):
     inputs = BwdHeuristicInputs(
         device_arch=100, head_dim=128, head_dim_v=128, num_heads=4, num_heads_kv=4,
-        use_block_sparsity=sparse_block_size_kv is not None,
+        dtype="torch.bfloat16", use_block_sparsity=sparse_block_size_kv is not None,
         sparse_block_size_q=None if sparse_block_size_kv is None else 256,
         sparse_block_size_kv=sparse_block_size_kv,
     )

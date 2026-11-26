@@ -34,7 +34,7 @@ import cutlass
 from cutlass import Int32, const_expr
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.cute as cute
-import cutlass.cute.testing as testing
+import cutlass.testing as testing
 import cutlass.utils as utils
 from cutlass.utils.gemm.sm100 import (
     transform_partitioned_tensor_layout,
@@ -45,6 +45,12 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from flash_attn.cute.compat import (
+    LayoutEnum,
+    SmemAllocator,
+    TmemAllocator,
+    get_smem_capacity_in_bytes,
+)
 from flash_attn.cute.utils import get_batch_from_cu_tensor
 
 
@@ -88,7 +94,7 @@ class dKGemmKernel:
 
         # Output dKaccum: (total_q, seqlen_k, dim), dim-major
         self.c_dtype = cutlass.Float32
-        self.c_layout = utils.LayoutEnum.ROW_MAJOR
+        self.c_layout = LayoutEnum.ROW_MAJOR
 
         self.acc_dtype = cutlass.Float32
 
@@ -217,7 +223,7 @@ class dKGemmKernel:
             self.c_dtype, self.c_layout, self.epi_tile_dK, 1
         )
 
-        smem_capacity = utils.get_smem_capacity_in_bytes()
+        smem_capacity = get_smem_capacity_in_bytes()
 
         # TMEM pipeline stages
         # 64 TMEM columns per stage, 8 stages can fit in TMEM
@@ -461,7 +467,7 @@ class dKGemmKernel:
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -531,7 +537,7 @@ class dKGemmKernel:
             num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_id)),
         )
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],
@@ -1091,6 +1097,7 @@ class dKGemmKernel:
             #
             tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
             cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+            cute.arch.fence_view_async_tmem_load()
 
             #
             # Convert to C type

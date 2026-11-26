@@ -72,8 +72,8 @@ def mask_mod_keep(
 
     A vectorized mask_mod returns bit-packed Uint32 words for vec_size adjacent KV
     indices. Evaluate the aligned chunk that contains kv_idx and extract its bit.
-    Like the standard SM100 path, chunk indices past seqlen_k wrap when aux tensors
-    are present so the callback never reads out of bounds.
+    Like the standard SM100 path, chunk indices past seqlen_k are clamped when aux
+    tensors are present so the callback never reads out of bounds.
     """
     kv_ssa = scalar_to_ssa(kv_idx, Int32)
     if const_expr(vec_size == 1):
@@ -89,7 +89,7 @@ def mask_mod_keep(
         for j in cutlass.range_constexpr(vec_size):
             kv_j = chunk_start + j
             if const_expr(aux_data.tensors is not None):
-                kv_j = kv_j if kv_j < seqlen_k else kv_j % seqlen_k
+                kv_j = cutlass.min(kv_j, seqlen_k - 1)
             kv_vec[j] = kv_j
         words = cute.make_rmem_tensor(max(1, vec_size // 32), cutlass.Uint32)
         words.store(
@@ -375,6 +375,7 @@ class _SwapABCore:
         qk_b_major = OperandMajorMode.K
         tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
             self.dtype,
+            self.dtype,
             qk_a_major,
             qk_b_major,
             self.qk_acc_dtype,
@@ -386,6 +387,7 @@ class _SwapABCore:
         pv_a_major = OperandMajorMode.MN
         pv_b_major = OperandMajorMode.MN
         tiled_mma_pv = sm100_utils.make_trivial_tiled_mma(
+            self.dtype,
             self.dtype,
             pv_a_major,
             pv_b_major,

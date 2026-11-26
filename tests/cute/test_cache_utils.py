@@ -1,5 +1,10 @@
+import errno
 import logging
+import os
 from types import SimpleNamespace
+
+import pytest
+import torch
 
 import flash_attn.cute.cache_utils as cache_utils
 from flash_attn.cute import fa_logging
@@ -99,3 +104,83 @@ def test_persistent_cache_replaces_nonempty_unloadable_entry(tmp_path, monkeypat
     other_path.write_bytes(b"from another process")
     cache[other] = Good()
     assert other_path.read_bytes() == b"from another process"
+
+
+def test_get_jit_cache_falls_back_to_memory_when_dir_cannot_be_created(tmp_path, monkeypatch):
+    """A cache dir that cannot be created (e.g. on a read-only mount) must not make
+    get_jit_cache, which runs at import, raise; kernels are then cached in memory only."""
+
+    def read_only_mkdir(self, *_args, **_kwargs):
+        raise OSError(errno.EROFS, os.strerror(errno.EROFS), str(self))
+
+    monkeypatch.setattr(cache_utils, "CUTE_DSL_CACHE_ENABLED", True)
+    monkeypatch.setattr(cache_utils, "CUTE_DSL_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(cache_utils.Path, "mkdir", read_only_mkdir)
+    assert type(cache_utils.get_jit_cache("fwd")) is cache_utils.JITCache
+
+
+def test_read_only_persistent_cache_keeps_misses_in_memory(tmp_path, monkeypatch):
+    """On a read-only cache, entries already on disk still load, and a miss is kept in memory
+    instead of raising when its lock file cannot be created."""
+
+    class Good:
+        def export_to_c(self, object_file_path, function_name):
+            with open(object_file_path, "wb") as f:
+                f.write(b"object")
+
+    real_open = os.open
+
+    def read_only_open(path, flags, *args, **kwargs):
+        if flags & os.O_WRONLY or (flags & os.O_CREAT and not os.path.exists(path)):
+            raise OSError(errno.EROFS, os.strerror(errno.EROFS), path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(
+        cache_utils.cute.runtime,
+        "load_module",
+        lambda *_args, **_kwargs: SimpleNamespace(func=object()),
+    )
+    cache_utils.JITPersistentCache(tmp_path)[("hit",)] = Good()
+    monkeypatch.setattr(os, "open", read_only_open)
+
+    cache = cache_utils.JITPersistentCache(tmp_path)
+    assert ("hit",) in cache
+    assert ("miss",) not in cache
+    fn = Good()
+    cache[("miss",)] = fn
+    assert cache[("miss",)] is fn
+    assert not (tmp_path / f"{cache._key_to_hash(('miss',))}.o").exists()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="retry helper requires CUDA")
+def test_retry_on_oom_preserves_persistent_cache(tmp_path, monkeypatch):
+    from test_flash_attn import retry_on_oom
+    from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
+
+    fwd_cache = cache_utils.JITPersistentCache(tmp_path / "fwd")
+    bwd_cache = cache_utils.JITPersistentCache(tmp_path / "bwd")
+    disk_entries = []
+    for cache, key in ((fwd_cache, ("fwd",)), (bwd_cache, ("bwd",))):
+        cache.cache[key] = object()
+        entry = cache.cache_path / f"{cache._key_to_hash(key)}.o"
+        entry.write_bytes(b"cached kernel")
+        disk_entries.append(entry)
+
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", fwd_cache)
+    monkeypatch.setattr(_flash_attn_bwd, "compile_cache", bwd_cache)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    calls = 0
+
+    @retry_on_oom
+    def run():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise torch.OutOfMemoryError("CUDA out of memory.")
+        assert not fwd_cache.cache
+        assert not bwd_cache.cache
+        return "retried"
+
+    assert run() == "retried"
+    assert calls == 2
+    assert [entry.read_bytes() for entry in disk_entries] == [b"cached kernel"] * 2

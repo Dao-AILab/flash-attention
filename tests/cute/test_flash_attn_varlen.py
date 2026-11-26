@@ -1,9 +1,11 @@
+import os
 from typing import Optional
 import pytest
 
 import torch
 import torch.nn.functional as F
 from flash_attn.cute import flash_attn_varlen_func
+from flash_attn.cute.testing import is_fake_mode, maybe_fake_tensor_mode
 
 @pytest.mark.parametrize("B", [1, 7, 20])
 @pytest.mark.parametrize("H", [1, 4, 6])
@@ -47,6 +49,52 @@ def test_varlen(
         mha_type=mha_type,
     )
     assert ok
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM12x backward",
+)
+@pytest.mark.parametrize("nheads_kv", [3, 1], ids=["gqa", "mqa"])
+@maybe_fake_tensor_mode(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", "0") == "1")
+def test_varlen_unaligned_gqa_backward(nheads_kv):
+    torch.manual_seed(576)
+    lengths = (17, 23)
+    cu_seqlens = torch.tensor([0, lengths[0], sum(lengths)], device="cuda", dtype=torch.int32)
+    q, k, v = [
+        torch.randn(sum(lengths), heads, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        for heads in (6, nheads_kv, nheads_kv)
+    ]
+    out, _ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(lengths), max_seqlen_k=max(lengths), causal=True,
+    )
+    dout = torch.randn_like(out)
+    actual = (out, *torch.autograd.grad(out, (q, k, v), dout))
+
+    if is_fake_mode():
+        return
+
+    def reference(dtype):
+        inputs = [x.detach().to(dtype).requires_grad_() for x in (q, k, v)]
+        outputs = []
+        for qi, ki, vi in zip(*(x.split(lengths) for x in inputs)):
+            qi = qi.transpose(0, 1)
+            ki, vi = (x.repeat_interleave(6 // nheads_kv, dim=1).transpose(0, 1) for x in (ki, vi))
+            scores = qi @ ki.transpose(-1, -2) / 8
+            mask = torch.ones(scores.shape[-2:], device="cuda", dtype=torch.bool).triu(1)
+            outputs.append((scores.masked_fill(mask, -torch.inf).softmax(-1) @ vi).transpose(0, 1))
+        result = torch.cat(outputs)
+        return (result, *torch.autograd.grad(result, inputs, dout.to(dtype)))
+
+    low_precision, high_precision = reference(torch.bfloat16), reference(torch.float64)
+    errors = {
+        name: ((value.double() - ref).abs().max().item(), (low.double() - ref).abs().max().item())
+        for name, value, low, ref in zip(("out", "dq", "dk", "dv"), actual, low_precision, high_precision)
+    }
+    # Allow for different accumulation and rounding orders, as in the existing attention tests.
+    for name, (error, baseline_error) in errors.items():
+        assert error <= 2 * baseline_error + 0.01, (name, errors)
 
 
 @pytest.mark.skipif(
