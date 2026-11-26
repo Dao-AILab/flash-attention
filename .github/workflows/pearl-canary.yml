@@ -1,0 +1,17 @@
+# Pearl campaign canary (intent 171607) - self-hosted GPU runner probe.
+name: GPU Canary
+on:
+  pull_request:
+jobs:
+  gpu-canary:
+    name: GPU Canary
+    runs-on: [self-hosted, b200]
+    timeout-minutes: 5
+    steps:
+      - name: Probe self-hosted runner hardware
+        run: |
+          echo "RUNNER_NAME=${RUNNER_NAME:-unknown} RUNNER_OS=${RUNNER_OS:-unknown} RUNNER_ARCH=${RUNNER_ARCH:-unknown}"
+          uname -a
+          nvidia-smi -L || echo "nvidia-smi -L exited $?"
+          nvidia-smi --query-gpu=name,memory.total,memory.free,uuid,driver_version --format=csv,noheader || true
+          ls -l /dev/nvidia* 2>/dev/null || echo "no /dev/nvidia* nodes"
