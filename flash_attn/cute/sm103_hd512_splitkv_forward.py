@@ -1228,6 +1228,23 @@ class BlackwellHd512SplitKVFusedMultiHeadAttentionForward:
             tiled_mma_vp.set(tcgen05.Field.ACCUMULATE, True)
             tAsV_desc = thrblk_mma_vp.make_fragment_A(tAsV)
             tBsP_desc = thrblk_mma_vp.make_fragment_B(tBsP_nk)
+            # Match each shared V element to the sequence coordinate consumed
+            # by PV. V is transposed: A's K coordinate is the KV token.
+            tAcV = thrblk_mma_vp.partition_A(
+                cute.make_identity_tensor((mma_tile_m, mma_tile_k))
+            )
+            # Eight adjacent BF16 dimensions share one token's validity and
+            # form an aligned 128-bit store in the V shared-memory layout.
+            v_clear_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), v_dtype, num_bits_per_copy=128
+            )
+            v_clear_copy = cute.make_tiled_copy_tv(
+                v_clear_atom, cute.make_layout(warp_threads), cute.make_layout(8)
+            ).get_slice(lane_idx)
+            tVsV = v_clear_copy.partition_D(cute.group_modes(tAsV, 0, 3))
+            tVcV = v_clear_copy.partition_D(cute.group_modes(tAcV, 0, 3))
+            rV_zero = cute.make_fragment_like(tVsV[None, 0, 0])
+            rV_zero.fill(0)
 
             # Wait for BMM1
             cute.arch.barrier(barrier_id=mma_kq_nbar_id, number_of_threads=64)
@@ -1249,6 +1266,17 @@ class BlackwellHd512SplitKVFusedMultiHeadAttentionForward:
                     for dm in cutlass.range_constexpr(tiles_dm):
                         is_last_iter = sk == tiles_sk - 1 and dm == tiles_dm - 1
                         v_handle = v_consumer.wait_and_advance(v_token)
+                        kv_start = (kv_split_idx + s * kv_splits) * blk_tile_s + sk * mma_tile_k
+                        if kv_start + mma_tile_k > seqlen_k:
+                            # Masking P is insufficient: 0 * NaN/Inf is NaN.
+                            # Wait for TMA before clearing the invalid V lanes,
+                            # then publish every lane's stores to the async
+                            # proxy before the elected thread issues PV MMA.
+                            for i in cutlass.range(cute.size(tVcV, mode=[1])):
+                                if kv_start + tVcV[0, i][1] >= seqlen_k:
+                                    cute.copy(v_clear_atom, rV_zero, tVsV[None, i, v_handle.index])
+                            cute.arch.fence_view_async_shared()
+                            cute.arch.sync_warp()
                         # Signal BMM1 to start
                         if is_last_iter:
                             cute.arch.barrier_arrive(

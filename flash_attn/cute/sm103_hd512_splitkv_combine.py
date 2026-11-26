@@ -24,7 +24,9 @@ class BlackwellHd512SplitKVCombine:
     """Warp-cooperative combine for normalized FP32 SplitKV partials.
 
     This specialization consumes a fixed capacity of 32 splits for Q32/D512.
-    The per-request ``mNumSplitsDynamic`` value may be any value in [1, 32].
+    The per-request ``mNumSplitsDynamic`` value may be any value in [0, 32].
+    Zero valid splits denotes empty KV and writes zero output without reading
+    the inactive partial buffers. This adapter does not expose final LSE.
     """
 
     def __init__(self, head_dim: int = 512, num_heads: int = 32):
@@ -125,6 +127,9 @@ class BlackwellHd512SplitKVCombine:
 
             # valid_splits == 1 intentionally stores the only split.
             mO[batch, head, dim] = mO.element_type(out_acc / correction_sum)
+        else:
+            # Output storage can contain a previous request or graph replay.
+            mO[batch, head, dim] = mO.element_type(0.0)
 
 
 _COMPILE_OPTIONS = "--opt-level 2"
