@@ -3066,9 +3066,9 @@ class FlashAttentionForwardSm100:
                 hw_row_max = cute.arch.fmax(hw_row_max, tSrS_red[i])
         else:
             cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        cute.arch.fence_view_async_tmem_load()
         if const_expr(self.sf_overlap):
             # All lanes must finish the asynchronous S load before tcgen05.cp can reuse it.
-            cute.arch.fence_view_async_tmem_load()
             pipeline_sf_overlap.consumer_release_w_index(1 - stage)
         # tSrS_t2r = copy_utils.load_t2r(thr_tmem_load, tScS_shape, tStS_t2r)
         if cutlass.const_expr(self.score_mod is not None):
@@ -3617,6 +3617,7 @@ class FlashAttentionForwardSm100:
             tOrO_frg = cute.make_rmem_tensor(tOrO_t2r_shape, self.pv_acc_dtype)
             tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
             cute.copy(thr_tmem_load, tOtO_t2r_i, tOrO_frg)
+            cute.arch.fence_view_async_tmem_load()
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
                 tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
@@ -3723,6 +3724,7 @@ class FlashAttentionForwardSm100:
                             (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
                         )
                 copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
+            cute.arch.fence_view_async_tmem_load()
             cute.arch.fence_view_async_shared()
 
             if const_expr(self.use_correction_warps_for_epi):
