@@ -688,10 +688,19 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
                     inputs.sparse_q_block_size,
                     inputs.sparse_kv_block_size,
                 )
-        case 12 if inputs.head_dim > 64:
-            # SM120 has 99 KB SMEM: 128×128 is preferred for D<=64, and 128×64
-            # avoids the occupancy loss from a 96 KB tile for larger head dimensions.
-            tile_n = 64
+        case 12:
+            tile_n = 64 if inputs.head_dim > 64 else 128
+            # Tune equal-width heads only: O reuses Q storage in the epilogue.
+            if (
+                inputs.dtype in ("torch.float16", "torch.bfloat16")
+                and inputs.head_dim == inputs.head_dim_v <= 256
+            ):
+                if inputs.head_dim > 64:
+                    tile_m, tile_n = 64, 64
+                elif inputs.causal:
+                    tile_m, tile_n = 64, 128
+                else:
+                    tile_m, tile_n = 128, 64
 
     if inputs.requested_tile_m is not None:
         tile_m = inputs.requested_tile_m

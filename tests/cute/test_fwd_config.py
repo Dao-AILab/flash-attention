@@ -42,6 +42,19 @@ def make_inputs(*, pack_gqa: bool | None = None, **changes) -> FwdHeuristicInput
     return _BASE_INPUTS._replace(pack_gqa=pack_gqa, **changes)
 
 
+@pytest.mark.parametrize("arch", [120, 121])
+@pytest.mark.parametrize("dtype", ["torch.float16", "torch.bfloat16"])
+@pytest.mark.parametrize(("d", "dv", "causal", "tile"), [
+    (64, 64, True, (64, 128)), (64, 64, False, (128, 64)),
+    (128, 128, False, (64, 64)), (256, 256, True, (64, 64)),
+    (64, 128, False, (128, 128)),  # preserve space for the wider O epilogue
+])
+def test_sm12x_fwd_tile(arch, dtype, d, dv, causal, tile):
+    inputs = make_inputs(device_arch=arch, dtype=dtype, head_dim=d, head_dim_v=dv, causal=causal)
+    config = select_fwd_config(inputs)
+    assert (config.tile_m, config.tile_n) == tile
+
+
 @pytest.mark.parametrize("device_arch", [80, 90, 100, 103, 110, 120])
 @pytest.mark.parametrize("causal", [False, True])
 def test_every_architecture_selects_a_valid_default(device_arch, causal):

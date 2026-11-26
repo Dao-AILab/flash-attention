@@ -55,6 +55,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from cutlass._mlir.dialects import llvm
 
+from flash_attn.cute.compat import SmemAllocator, TmemAllocator
 from flash_attn.cute.pack_gqa import (
     pack_gqa_layout,
     qheads_first_tma_view,
@@ -509,7 +510,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             mQ_tma, mQv_tma = mQ, mQv
 
         # ==== MMAs (layout / descriptor providers of the .ws PTX helpers) ====
-        K, MN = tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN
+        K, MN = cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.MN
         make_mma = sm100_utils.make_trivial_tiled_mma
         # fmt: off
         # physical stage / rope tile layouts (what the gather writes): an M=64 N=64 K-major op
@@ -804,7 +805,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             cute.make_layout(self.cluster_shape_mnk), (tiled_mma_Sd.thr_id.shape,)
         )
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # ==== TMEM ====
@@ -812,7 +813,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.TmemPtr),
             num_threads=self.num_mma_threads + self.num_softmax_threads + self.num_epilogue_threads,
         )
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
@@ -2173,7 +2174,8 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
 
                 self.sm_stats_barrier_full.arrive_and_wait()
                 row_sum = sRowSum[tidx % self.cta_tile_m, 0] + sRowSum[tidx % self.cta_tile_m, 1]
-                row_max = sRowMax[tidx % self.cta_tile_m, 0]
+                row_max_log2 = sRowMax[tidx % self.cta_tile_m, 0] * softmax_scale_log2
+                output_correction = Float32(1.0)
                 if const_expr(learnable_sink is not None):
                     # split-KV: only the first split owns the sink column (as in flash_fwd_sm100)
                     if const_expr(not self.is_split_kv) or split_idx == 0:
@@ -2185,17 +2187,13 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                             self.pack_gqa,
                             qhead_per_kvhead_valid=self.qhead_per_kvhead_valid,
                         )
-                        row_max, row_sum = apply_learnable_sink(
-                            row_max,
-                            row_sum,
-                            sink_val,
-                            softmax_scale_log2,
-                            max_offset=self.max_offset,
-                            empty_row_sum=float(2**self.max_offset),
+                        row_max_log2, row_sum, output_correction = apply_learnable_sink(
+                            row_max_log2, row_sum, sink_val
                         )
                 self.sm_stats_barrier_empty.arrive()
                 acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                 scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                scale = scale * output_correction
                 # seqlen_k == 0 with TMA KV: the fully masked dummy block still loaded a KV tile, and
                 # P = 0 times a NaN V row is NaN (scaling by 0 would keep it): write zeros instead.
                 zero_O = seqlen.seqlen_k == 0 if const_expr(not self.use_cpasync_kv) else False
@@ -2203,7 +2201,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                 if const_expr(mLSE is not None):
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
+                        (row_max_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )
@@ -2266,11 +2264,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
                     consumer_states_O[split] = consumer_state_Oi
                 consumer_state_O0, consumer_state_O1 = consumer_states_O
             else:
-                # empty split: no O to reduce, but the combine kernel keys off LSE, so this split
-                # must be marked dead (O_partial is left unwritten)
-                if const_expr(mLSE is not None):
-                    self.store_lse(
-                        mLSE, seqlen, head_idx, batch_idx, split_idx, m_block, tidx, -Float32.inf
-                    )
+                if const_expr(self.is_split_kv and mLSE is not None):
+                    self.store_empty_split(mO, mLSE, learnable_sink, seqlen, head_idx, batch_idx, split_idx, m_block, tidx)
 
             work_tile = tile_scheduler.advance_to_next_work()

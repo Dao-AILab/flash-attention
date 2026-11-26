@@ -856,7 +856,6 @@ def handle_block_sparse_empty_tile_correction_sm100(
     sm_stats_consumer_phase: Int32,
     o_corr_consumer_phase: Int32,
     corr_epi_producer_phase: Int32,
-    softmax_scale_log2: Float32,
     max_offset: Float32,
     max_offset_scale: Float32,
     mO_cur: Optional[cute.Tensor] = None,
@@ -869,7 +868,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
     arrives `mbar_softmax_corr_full` (synthetic "no work") so the correction
     warp-group can:
 
-    - seed fully-masked-row stats (row_sum=1; row_max=-inf when tracked) for LSE
+    - seed fully-masked-row stats (scaled log2 max and sum) for LSE
     - run `correction_epilogue` with `scale=0` so the output tile is written as zeros
       (independent of any prior tmem contents)
     - wait on `mbar_softmax_corr_full` and arrive `mbar_softmax_corr_empty`
@@ -882,7 +881,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
 
     for stage in cutlass.range_constexpr(q_stage):
         row_sum_value = Float32(1.0)
-        row_max_value = (
+        row_max_log2 = (
             -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None
         )
         # Threads >= m_block_size hold no row; their stats are never stored.
@@ -897,11 +896,10 @@ def handle_block_sparse_empty_tile_correction_sm100(
                     qhead_per_kvhead,
                     pack_gqa,
                 )
-                row_max_value, row_sum_value = apply_learnable_sink(
-                    row_max_value,
-                    row_sum_value,
+                row_max_log2, row_sum_value, _ = apply_learnable_sink(
+                    row_max_log2,
+                    Float32(0.0),
                     sink_val,
-                    softmax_scale_log2,
                     max_offset=max_offset,
                     empty_row_sum=max_offset_scale,
                 )
@@ -909,9 +907,9 @@ def handle_block_sparse_empty_tile_correction_sm100(
             scale_row_idx = tidx + stage * m_block_size
             sScale[scale_row_idx] = row_sum_value
             if const_expr(mLSE is not None or learnable_sink is not None):
-                sScale[scale_row_idx + q_stage * m_block_size] = row_max_value
+                sScale[scale_row_idx + q_stage * m_block_size] = row_max_log2
         acc_flag = row_sum_value == Float32(0.0) or row_sum_value != row_sum_value
-        stats[stage] = (row_sum_value, row_max_value, acc_flag)
+        stats[stage] = (row_sum_value, row_max_log2, acc_flag)
 
         # See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
         # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)

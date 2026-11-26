@@ -28,6 +28,8 @@ DEFAULT_TEST_TARGETS = (
     "tests/cute/test_flash_attn.py::test_flash_attn_lse_grad",
     "tests/cute/test_flash_attn_mla.py",
     "tests/cute/test_cuda_graph.py",
+    "tests/cute/test_flash_attn_varlen.py::test_varlen_backward_ignores_nan_padded_q_or_do",
+    "tests/cute/test_flash_attn_varlen.py::test_backward_seqused_q_ignores_nan_padding",
 )
 
 

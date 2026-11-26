@@ -12,9 +12,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Int32
-import cutlass.utils as utils_basic
 
 from quack import layout_utils
+from flash_attn.cute.compat import SmemAllocator, get_smem_capacity_in_bytes
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
@@ -143,7 +143,7 @@ class FlashAttentionBackwardSm80:
         smem_usage_V = n_block_size * head_dim_v * 2
         smem_usage_QV = (smem_usage_Q + smem_usage_V) if not V_in_regs else max(smem_usage_Q, smem_usage_V)
         smem_usage = smem_usage_QV + smem_usage_dO + smem_usage_K
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
+        smem_capacity = get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
             return False
         return True
@@ -239,7 +239,7 @@ class FlashAttentionBackwardSm80:
         async_copy_elems = universal_copy_bits // self.dtype.width
         # atom_async_copy: async copy atom for QKV load
         atom_async_copy = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
             self.dtype,
             num_bits_per_copy=universal_copy_bits,
         )
@@ -280,7 +280,7 @@ class FlashAttentionBackwardSm80:
         if cutlass.const_expr(not self.varlen_q):
             async_copy_elems_accum = universal_copy_bits // cutlass.Float32.width
             atom_async_copy_accum = cute.make_copy_atom(
-                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+                cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
                 cutlass.Float32,
                 num_bits_per_copy=universal_copy_bits,
             )
@@ -606,7 +606,7 @@ class FlashAttentionBackwardSm80:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get shared memory buffer
             # ///////////////////////////////////////////////////////////////////////////////
-            smem = cutlass.utils.SmemAllocator()
+            smem = SmemAllocator()
             storage = smem.allocate(SharedStorage)
             sQ = storage.sQ.get_tensor(sQ_layout)
             sK = storage.sK.get_tensor(sK_layout)
@@ -1179,7 +1179,7 @@ class FlashAttentionBackwardSm80:
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
                 mdK_cur, mdV_cur = [t[batch_idx, head_idx_kv, None] for t in (mdK, mdV)]
             else:
-                padded_offset_k = seqlen.offset_k + batch_idx * self.n_block_size
+                padded_offset_k = seqlen.padded_offset_k
                 mdK_cur = cute.domain_offset((padded_offset_k * self.head_dim_padded,), mdK[head_idx_kv, None])
                 mdV_cur = cute.domain_offset((padded_offset_k * self.head_dim_v_padded,), mdV[head_idx_kv, None])
 
