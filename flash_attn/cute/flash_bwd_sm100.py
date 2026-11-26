@@ -1642,20 +1642,23 @@ class FlashAttentionBackwardSm100:
         if const_expr(self.use_2cta_instrs):
             if const_expr(dQaccum_empty_mbar_ptr is not None):
                 if warp_idx == 2:
-                    cute.arch.mbarrier_init(
-                        dQaccum_empty_mbar_ptr,
-                        len(self.reduce_warp_ids),
-                    )
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_init(
+                            dQaccum_empty_mbar_ptr,
+                            len(self.reduce_warp_ids),
+                        )
             if warp_idx == 4:
-                cute.arch.mbarrier_init(dS_cluster_full_mbar_ptr, 1)
-                cute.arch.mbarrier_init(dS_cluster_empty_mbar_ptr, 1)
-                cute.arch.mbarrier_init(dS_cluster_leader_mbar_ptr, 2)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(dS_cluster_full_mbar_ptr, 1)
+                    cute.arch.mbarrier_init(dS_cluster_empty_mbar_ptr, 1)
+                    cute.arch.mbarrier_init(dS_cluster_leader_mbar_ptr, 2)
 
         if const_expr(self.cluster_reduce_dQ):
             if warp_idx == 4:
-                for i in range(self.dQaccum_reduce_stage // 2):
-                    cute.arch.mbarrier_init(dQ_cluster_full_mbar_ptr + i, 1)
-                    cute.arch.mbarrier_init(dQ_cluster_empty_mbar_ptr + i, 1)
+                with cute.arch.elect_one():
+                    for i in range(self.dQaccum_reduce_stage // 2):
+                        cute.arch.mbarrier_init(dQ_cluster_full_mbar_ptr + i, 1)
+                        cute.arch.mbarrier_init(dQ_cluster_empty_mbar_ptr + i, 1)
 
         tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwdSm100.TmemPtr),
