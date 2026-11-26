@@ -1132,6 +1132,13 @@ def test_flash_attn_output(
         assert (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()
 
+def test_flash_attn_rejects_negative_dropout():
+    q = torch.randn(1, 16, 2, 32, device="cuda", dtype=torch.float16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    with pytest.raises(RuntimeError, match=r"dropout_p must be in \[0, 1\)"):
+        flash_attn_func(q, k, v, dropout_p=-0.1)
 
 @pytest.mark.parametrize("kvpacked", [True, False])
 # @pytest.mark.parametrize('kvpacked', [False])
