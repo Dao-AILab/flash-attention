@@ -217,23 +217,32 @@ def hash_callable(
     return hasher.hexdigest()
 
 
+# Multiply by 1 / softcap: an fp32 divide is an IEEE sequence with a slow path (taken by
+# exact-zero scores, e.g. padded rows) on every score. Cached so repeated calls reuse one
+# function and its __cute_hash__ (hashing a new closure reads its source on every call).
+@cache
 def create_softcap_scoremod(softcap_val):
+    inv_softcap = 1.0 / softcap_val
+
     @cute.jit
     def scoremod_premask_fn(
         acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
     ):
-        scores = acc_S_SSA / softcap_val
+        scores = acc_S_SSA * inv_softcap
         return softcap_val * cute.math.tanh(scores, fastmath=True)
 
     return scoremod_premask_fn
 
 
+@cache
 def create_softcap_scoremod_bwd(softcap_val):
+    inv_softcap = 1.0 / softcap_val
+
     @cute.jit
     def scoremod_bwd_fn(
         grad_out_SSA, score_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
     ):
-        scores = score_SSA / softcap_val
+        scores = score_SSA * inv_softcap
         tanh_scores = cute.math.tanh(scores, fastmath=True)
         return grad_out_SSA * (1.0 - tanh_scores * tanh_scores)
 
