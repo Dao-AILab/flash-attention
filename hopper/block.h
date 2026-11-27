@@ -70,6 +70,12 @@ struct BlockMN {
         auto [n_block_min, n_block_max] = get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, num_splits,
             window_size_left, window_size_right, attention_chunk_divmod, qhead_per_khead_divmod);
+        if constexpr (Is_local) {
+            // Every new key is appended, also those left of the first query's window, which no tile attends to:
+            // the first split of the first tile appends them.
+            int const split_idx_actual = !Split ? 0 : split_idx & 0x0000FFFF;
+            if (m_block == 0 && split_idx_actual == 0) { n_block_min = 0; }
+        }
         int const idx_k_new_min = std::max(n_block_min * kBlockN - seqlen_info.seqlen_k_og, 0);
         int const idx_k_new_max = std::min(n_block_max * kBlockN - seqlen_info.seqlen_k_og, seqlen_info.seqlen_k_new);
         int const n_block_new_min = idx_k_new_min / kBlockN;
