@@ -482,6 +482,32 @@ CUTLASS_DEVICE void clear_rows_from(Tensor<Engine, Layout> const &sX, int const 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Zero rows [row_limit, kRows) of a K-major GMMA tile in smem whose swizzle atoms are kAtomCols wide and are
+// stacked along the rows first. Each atom column then holds those rows as one contiguous range, since the
+// swizzle only permutes the 16-byte chunks within a row of an atom, so this zeros it with plain 16-byte stores.
+// Cheaper than clear_rows_from for a warp with few registers (the producer warp of the backward).
+template <int NumThreads, int kAtomCols, typename Engine, typename Layout>
+CUTLASS_DEVICE void clear_rows_from_contiguous(Tensor<Engine, Layout> const &sX, int const row_limit, int const thread_idx) {
+    using Element = typename Engine::value_type;
+    static constexpr int kRows = decltype(size<0>(sX))::value;
+    static constexpr int kCols = decltype(size<1>(sX))::value;
+    static_assert(kCols % kAtomCols == 0);
+    static constexpr int kAtomRowBytes = kAtomCols * sizeof(Element);
+    static_assert(kAtomRowBytes % sizeof(uint4) == 0);
+    int const num_stores = (kRows - row_limit) * (kAtomRowBytes / int(sizeof(uint4)));
+    // Not unrolled: it runs once per tile, and the producer warp has few registers
+    #pragma unroll 1
+    for (int a = 0; a < kCols / kAtomCols; ++a) {
+        // Start of row row_limit in atom column a (the swizzle can move the chunk of column a * kAtomCols)
+        uint4* const start = reinterpret_cast<uint4*>(
+            reinterpret_cast<uintptr_t>(&sX(row_limit, a * kAtomCols)) & ~uintptr_t(kAtomRowBytes - 1));
+        #pragma unroll 1
+        for (int i = thread_idx; i < num_stores; i += NumThreads) { start[i] = make_uint4(0, 0, 0, 0); }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Byte permute and shuffle to match register layout of
 // (FP8 downcasted) accumulator of GEMM-I to FP8 operand A of GEMM-II.
 template <typename Fragment>
