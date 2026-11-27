@@ -3863,6 +3863,55 @@ def _validate_gather_bwd_kwargs(
     return gather_bwd_token_chunk
 
 
+@torch.library.custom_op(
+    "flash_attn_cute::flash_attn_fwd_dense_inference",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor k, Tensor v, float? softmax_scale, bool causal, float softcap,"
+        " SymInt? window_size_left, SymInt? window_size_right, SymInt num_splits,"
+        " bool? pack_gqa, bool return_lse) -> (Tensor, Tensor?)"
+    ),
+)
+def _flash_attn_fwd_dense_inference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float],
+    causal: bool,
+    softcap: float,
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    num_splits: int,
+    pack_gqa: Optional[bool],
+    return_lse: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Keep dense inference kernel internals opaque to PT2 graph capture."""
+    out, lse, _, _, _ = _flash_attn_fwd(
+        q, k, v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        softcap=softcap,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        return_lse=return_lse,
+    )
+    return out, lse
+
+
+@_flash_attn_fwd_dense_inference.register_fake
+def _flash_attn_fwd_dense_inference_fake(
+    q, k, v, softmax_scale, causal, softcap,
+    window_size_left, window_size_right, num_splits, pack_gqa, return_lse,
+):
+    batch, seqlen_q, nheads, _ = q.shape
+    # _flash_attn_fwd allocates contiguous output, even for strided inputs.
+    out = q.new_empty((batch, seqlen_q, nheads, v.shape[-1]))
+    lse = q.new_empty((batch, nheads, seqlen_q), dtype=torch.float32) if return_lse else None
+    return out, lse
+
+
 def flash_attn_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3909,6 +3958,31 @@ def flash_attn_func(
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
+    # Dense inference only: keep training and richer attention APIs unchanged.
+    if (
+        q.dim() == 4
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and not any(t.requires_grad for t in (q, k, v))
+        and qv is None
+        and gather_kv_indices is None
+        and learnable_sink is None
+        and score_mod is None
+        and score_mod_bwd is None
+        and mask_mod is None
+        and aux_tensors is None
+        and aux_scalars is None
+        and block_sparse_tensors is None
+        and block_sparse_tensors_bwd is None
+        and not gather_bwd_recompute_p
+        and gather_bwd_token_chunk is None
+        and config is None
+        and scales is None
+        and not (k is v and v.shape[-1] == 512)
+    ):
+        return _flash_attn_fwd_dense_inference(
+            q, k, v, softmax_scale, causal, softcap,
+            window_size[0], window_size[1], num_splits, pack_gqa, return_lse,
+        )
     if (
         gather_bwd_token_chunk is not None
         and q.dim() == 4
