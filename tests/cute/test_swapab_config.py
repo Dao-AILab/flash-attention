@@ -13,6 +13,7 @@ from flash_attn.cute.config import (
     derive_fwd_config,
     select_fwd_config,
     needs_split_metadata,
+    split_counts_see_window,
     validate_fwd_config,
 )
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, TileSchedulerArguments
@@ -244,6 +245,59 @@ def test_per_sequence_splits(changes, per_sequence, num_splits):
     assert (needs_split_metadata(config, inputs), config.num_splits) == (
         per_sequence, num_splits
     )
+
+
+# A left window bounds the keys a decode query reads to window_size_left + 1 (window_seqlen_k adds
+# one KV block for an unaligned start). 16 sequences x 8 KV heads fill the CTA target (static 1).
+_WINDOW = dict(local=True, window_size_right=0, has_seqused_k=True, page_size=256,
+               max_seqlen_k=32768)
+_FULL_BATCH = dict(batch_size=16, total_q=16, num_heads=32, num_heads_kv=8)
+
+
+@pytest.mark.parametrize(
+    ("changes", "per_sequence", "num_splits"),
+    [
+        # Static count: no more splits than the window's KV blocks, ceil((1024 + 256) / 256) = 5
+        # and ceil((128 + 256) / 256) = 2 (8 without the window).
+        (_WINDOW | {"max_seqlen_k": 8192, "window_size_left": 1023}, False, 5),
+        (_WINDOW | {"max_seqlen_k": 8192, "window_size_left": 127}, False, 2),
+        # A short window (at most 16 KV blocks) keeps a static count of 1: no prepare launch, no
+        # combine.
+        (_WINDOW | _FULL_BATCH | {"window_size_left": 1023}, False, 1),
+        (_WINDOW | _FULL_BATCH | {"window_size_left": 3839}, False, 1),
+        (_WINDOW | _FULL_BATCH | {"window_size_left": 3840}, True, 10),
+        # Fewer CTAs keep per-sequence counts, capped by the capacity.
+        (_WINDOW | {"window_size_left": 1023}, True, 32),
+        # A right-only window bounds no key of a decode query.
+        (_WINDOW | {"window_size_left": None, "window_size_right": 5}, True, 32),
+    ],
+)
+def test_window_split_count(changes, per_sequence, num_splits):
+    inputs = decode(**changes)
+
+    config = select_fwd_config(inputs)
+
+    assert config.use_swapab
+    assert (needs_split_metadata(config, inputs), config.num_splits) == (
+        per_sequence, num_splits
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "see_window"),
+    [
+        (_WINDOW | {"window_size_left": 1023}, True),
+        # Past 16 KV blocks SwapAB counts whole sequences.
+        (_WINDOW | {"window_size_left": 3840}, False),
+        (_WINDOW | {"window_size_left": 3840, "requested_use_swapab": False}, True),
+        ({"has_seqused_k": True, "max_seqlen_k": 32768}, False),
+    ],
+)
+def test_split_counts_see_window(changes, see_window):
+    """Which per-sequence split counts the prepare kernel computes over a window's blocks."""
+    inputs = decode(**changes)
+
+    assert split_counts_see_window(select_fwd_config(inputs), inputs) is see_window
 
 
 def swapab_grid_shape(num_heads_kv: int, batch: int, num_splits: int, split_major: bool):

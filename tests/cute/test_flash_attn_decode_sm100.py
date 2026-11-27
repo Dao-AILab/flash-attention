@@ -728,6 +728,26 @@ def test_per_sequence_splits_follow_lengths(combine_split_counts):
     assert 1 < counts[3] < counts[4] <= 32
 
 
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_per_sequence_splits_follow_the_window(combine_split_counts):
+    """Under a short local window a row's split count follows the KV blocks its window leaves, not
+    its length: rows of 33024 and 40960 tokens both read 4 blocks of a 1024-token window and take
+    the same count, at most 4; the output matches the reference."""
+    window = 1023
+    q, k, v, table, used = ragged_paged_inputs([0, 1, 300, 33024, 40960])
+    o, lse, *_ = _flash_attn_fwd(
+        q, k, v, page_table=table, seqused_k=used, num_splits=0, window_size_left=window,
+        return_lse=True,
+    )
+    if is_fake_mode():
+        return
+    ref = decode_reference(q, k, v, page_table=table, seqused=used, window=window)
+    assert_decode_close(o, lse, ref)
+    counts = combine_split_counts[-1].tolist()
+    assert counts[:2] == [1, 1]
+    assert 1 < counts[3] == counts[4] <= 4
+
+
 # Varlen Q replay steps: (cu_seqlens_q, seqused_k). An empty-query sequence moves between
 # replays; the trailing token then belongs to no sequence. The lengths move the split counts and
 # which split owns a partial last KV block; the last step ends every sequence on a block boundary.

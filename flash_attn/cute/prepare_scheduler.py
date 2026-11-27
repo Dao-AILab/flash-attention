@@ -10,6 +10,7 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr, Float32
 from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cutlass_dsl import Arch, BaseDSL
+from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.compat import SmemAllocator
 import flash_attn.cute.utils as utils
 
@@ -35,6 +36,13 @@ class SchedulerMetadataTensorsTorch(NamedTuple):
     cu_total_m_blocks: Optional[torch.Tensor] = None
     cu_total_splits_m_blocks: Optional[torch.Tensor] = None
     blocks_to_batch_idx: Optional[torch.Tensor] = None
+
+
+class _SeqlensQK(NamedTuple):
+    """The query and key lengths of one sequence, as BlockInfo.get_n_block_min_max reads them."""
+
+    seqlen_q: Int32
+    seqlen_k: Int32
 
 
 @cute.jit
@@ -154,6 +162,8 @@ class FlashPrepareScheduler:
         virtual_batch_idx_ptr: Optional[cute.Tensor],
         num_nheads_in_l2_ptr: Optional[cute.Tensor],
         n_blocks_per_split: Optional[int],  # overrides heuristic
+        window_size_left: Int32 | int | None,  # local attention: count only the window's KV blocks
+        window_size_right: Int32 | int | None,
         stream: cuda.CUstream,
     ):
         tile_m_divmod = FastDivmodDivisorV2(self.tile_m)
@@ -192,6 +202,8 @@ class FlashPrepareScheduler:
             virtual_batch_idx_ptr,
             num_nheads_in_l2_ptr,
             n_blocks_per_split,
+            window_size_left,
+            window_size_right,
         ).launch(
             grid=grid,
             block=block,
@@ -222,6 +234,8 @@ class FlashPrepareScheduler:
         virtual_batch_idx_ptr: Optional[cute.Tensor],
         num_nheads_in_l2_ptr: Optional[cute.Tensor],
         n_blocks_per_split: Optional[Int32],
+        window_size_left: Optional[Int32],
+        window_size_right: Optional[Int32],
     ):
         bidx, _, _ = cute.arch.block_idx()
         # Let a PDL-launched consumer (SwapAB) start while this kernel runs; it waits for the
@@ -249,7 +263,7 @@ class FlashPrepareScheduler:
         bidb_start = batch_cta_idx_offset + self.k_num_batch_per_warp * warp_idx
         batch_idx = lane_idx + bidb_start
 
-        num_m_blocks, _ = self.get_num_m_blocks_and_seqlen(
+        num_m_blocks, seqlen_q = self.get_num_m_blocks_and_seqlen(
             lane_idx,
             batch_idx,
             mSeqUsedQ,
@@ -270,6 +284,10 @@ class FlashPrepareScheduler:
             mLeftPadK,
             tile_n_divmod,
             num_batch,
+            seqlen_q,
+            num_m_blocks,
+            window_size_left,
+            window_size_right,
         )
 
         num_splits_dynamic = Int32(1)
@@ -369,6 +387,10 @@ class FlashPrepareScheduler:
         mLeftPadK: Optional[cute.Tensor],
         tile_n_divmod: FastDivmodDivisorV2,
         num_batch: Int32,
+        seqlen_q: Int32,
+        num_m_blocks: Int32,
+        window_size_left: Optional[Int32] = None,
+        window_size_right: Optional[Int32] = None,
     ):
         leftpad_k = (
             mLeftPadK[batch_idx]
@@ -403,8 +425,26 @@ class FlashPrepareScheduler:
         else:
             seqlen_new = seqlen_k_new_static
         seqlen = seqlen - leftpad_k + seqlen_new
+        num_n_blocks = (seqlen + self.tile_n - 1) // tile_n_divmod
+        if const_expr(window_size_left is not None or window_size_right is not None):
+            # Splits divide only the KV blocks a local window leaves, so count those: the blocks of
+            # the sequence's last M tile, as the forward's BlockInfo computes them (exact for
+            # decode, which has one M tile).
+            block_info = BlockInfo(
+                self.tile_m,
+                self.tile_n,
+                is_causal=False,
+                is_local=True,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+                qhead_per_kvhead_packgqa=self.qhead_per_khead if const_expr(self.packgqa) else 1,
+            )
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                _SeqlensQK(seqlen_q, seqlen), cutlass.max(num_m_blocks - 1, 0)
+            )
+            num_n_blocks = cutlass.max(n_block_max - n_block_min, 0)
         return (
-            (seqlen + self.tile_n - 1) // tile_n_divmod
+            num_n_blocks
             if batch_idx < num_batch and lane_idx < self.k_num_batch_per_warp
             else Int32(0)
         )
