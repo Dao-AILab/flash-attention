@@ -1,10 +1,15 @@
 """Shared paged KV on Ampere, Ada, and RTX Blackwell."""
 
+import os
+
 import pytest
 import torch
 
 from flash_attn.cute import flash_attn_varlen_func
 from flash_attn.cute.interface import _flash_attn_fwd
+from flash_attn.cute.testing import is_fake_mode, maybe_fake_tensor_mode
+
+USE_FAKE_TENSOR = os.getenv("FLASH_ATTENTION_FAKE_TENSOR", "0") == "1"
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (8, 12),
@@ -110,6 +115,20 @@ def test_paged(dtype, d, dv, page_size, pack_gqa, mode):
         offset += sq
 
 
+def test_paged_backward_rejected():
+    q = torch.randn(2, 8, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    page_table = torch.tensor([[1], [0]], device="cuda", dtype=torch.int32)
+
+    with torch.no_grad():
+        inference_out, _ = flash_attn_varlen_func(q, k, v, page_table=page_table)
+    out, _ = flash_attn_varlen_func(q, k, v, page_table=page_table)
+    torch.testing.assert_close(out, inference_out)
+    with pytest.raises(NotImplementedError, match="Paged KV backward"):
+        out.sum().backward()
+
+
 @pytest.mark.parametrize("page_size", [1, 64])
 @pytest.mark.parametrize("heads_kv", [1, 3])
 @pytest.mark.parametrize("softcap", [0.0, 5.0])
@@ -210,3 +229,45 @@ def test_paged_distinct_logical_head_dims(d, dv, page_size, pack_gqa):
         pack_gqa=pack_gqa,
     )
     torch.testing.assert_close(out, torch.ones_like(out), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dv,tile_n", [(128, 128), (192, 64)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_paged_wide_output_epilogue(dv: int, tile_n: int) -> None:
+    torch.manual_seed(0)
+    d = 32
+    q = torch.randn(1, 127, 1, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2, 16, 1, d, device="cuda", dtype=q.dtype)
+    v = torch.randn(2, 16, 1, dv, device="cuda", dtype=q.dtype)
+    page_table = torch.tensor([[1, 0]], device="cuda", dtype=torch.int32)
+    out, lse, *_ = _flash_attn_fwd(
+        q, k, v, page_table=page_table, tile_mn=(128, tile_n), num_splits=1, return_lse=True
+    )
+    if is_fake_mode():
+        return
+
+    q_ref = q[0, :, 0].cpu().double()
+    page_order = page_table[0].cpu().long()
+    k_ref = k[:, :, 0].cpu()[page_order].reshape(-1, d).double()
+    v_ref = v[:, :, 0].cpu()[page_order].reshape(-1, dv).double()
+    scores = (q_ref @ k_ref.T) * d**-0.5
+    ref = scores.softmax(-1) @ v_ref
+    torch.testing.assert_close(out[0, :, 0].cpu().double(), ref, atol=6e-3, rtol=6e-3)
+    torch.testing.assert_close(lse[0, 0].cpu().double(), scores.logsumexp(-1), atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_local_wide_output_prefetch(paged):
+    """Run under racecheck: the last K prefetch must not overlap the wide O store."""
+    q = torch.zeros(1, 1, 1, 32, device="cuda", dtype=torch.float16)
+    k = torch.zeros(1, 129, 1, 32, device="cuda", dtype=q.dtype)
+    v = torch.randn(1, 129, 1, 192, device="cuda", dtype=q.dtype)
+    page_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32) if paged else None
+    out, lse, *_ = _flash_attn_fwd(
+        q, k, v, page_table=page_table, tile_mn=(128, 64), window_size_left=0,
+        window_size_right=0, num_splits=1, return_lse=True,
+    )
+    if not is_fake_mode():
+        torch.testing.assert_close(out, v[:, -1:], atol=0, rtol=0)
+        torch.testing.assert_close(lse, torch.zeros_like(lse), atol=0, rtol=0)

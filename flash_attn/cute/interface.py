@@ -215,6 +215,7 @@ def _get_fwd_config(
     the tile/MMA requests; _get_fwd_inputs adds the env knobs. mla holds the qv-only facts and
     selects the MLA policy.
     """
+    sparse_head_dim = 0 if block_sparse_tensors is not None and block_sparse_tensors.cu_total_m_blocks is not None else 1
     inputs = _get_fwd_inputs(
         **fields, device_arch=arch, dtype=dtype, num_splits=num_splits, pack_gqa=pack_gqa,
         read_sm100_backend=mla is None,
@@ -229,18 +230,12 @@ def _get_fwd_config(
         use_block_sparsity=block_sparse_tensors is not None,
         sparse_mask_per_head=(
             block_sparse_tensors is not None
-            and block_sparse_tensors.mask_block_cnt.shape[
-                0 if block_sparse_tensors.mask_block_cnt.ndim == 2 else 1
-            ] != 1
+            and any(t is not None and t.shape[sparse_head_dim] != 1 for t in block_sparse_tensors[:4])
         ),
-        # SM90 fits its tile to the sparse block size.
-        sparse_q_block_size=(
-            get_sparse_q_block_size(block_sparse_tensors, seqlen_q) if arch // 10 == 9 else None
-        ),
+        sparse_q_block_size=get_sparse_q_block_size(block_sparse_tensors, seqlen_q),
         sparse_kv_block_size=(
             block_sparse_tensors.block_size[1]
-            if arch // 10 == 9 and block_sparse_tensors is not None and block_sparse_tensors.block_size
-            else None
+            if block_sparse_tensors is not None and block_sparse_tensors.block_size else None
         ),
     )
     if mla is not None:
@@ -988,6 +983,7 @@ def _flash_attn_fwd(
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
 
     if use_block_sparsity:
+        assert qv is None, "block sparsity is not supported with qv"
         if cu_seqlens_q is not None:
             assert block_sparse_tensors.cu_total_m_blocks is not None, (
                 "Varlen block sparsity requires block_sparse_tensors.cu_total_m_blocks."
@@ -1012,10 +1008,10 @@ def _flash_attn_fwd(
             batch_size=batch_size,
             num_head=num_head,
             seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
+            seqlen_k=k_capacity,
             block_size=(config.tile_m, config.tile_n),
             q_stage=config.q_stage,
-            allow_kv_subtile=arch // 10 in [10, 11],
+            allow_kv_subtile=config.supports_sparse_kv_subtiles,
         )
         normalized_block_sparse_tensors = block_sparse_config.tensors
         block_sparse_broadcast_pattern = block_sparse_config.broadcast_pattern
@@ -1037,7 +1033,6 @@ def _flash_attn_fwd(
         assert softcap is None
         assert score_mod is None
         assert mask_mod is None
-        assert block_sparse_tensors is None, "block sparsity is not supported with qv"
 
         if page_table is not None:
             assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
@@ -1419,6 +1414,8 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                q_subtile_factor=q_subtile_factor,
+                kv_subtile_factor=kv_subtile_factor,
             )
         elif arch // 10 == 9:
             fa_fwd = FlashAttentionForwardSm90(
@@ -1560,6 +1557,8 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                q_subtile_factor=q_subtile_factor,
+                kv_subtile_factor=kv_subtile_factor,
             )
         else:
             raise ValueError(
@@ -3714,6 +3713,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_k,
             *(aux_tensors or ()),
         )
+        ctx.paged_kv = page_table is not None
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
         ctx.shared_kv = shared_kv
         ctx.softmax_scale = softmax_scale
@@ -3735,6 +3735,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
+        if ctx.paged_kv:
+            raise NotImplementedError("Paged KV backward is not supported")
         q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:

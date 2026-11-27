@@ -13,6 +13,8 @@
 #   pytest test_mask_mod.py                            # Run all tests
 
 import math
+import os
+from functools import partial
 from unittest import mock
 
 import pytest
@@ -26,6 +28,7 @@ from flash_attn.cute.interface import (
     _flash_attn_fwd,
     _flash_attn_bwd,
     flash_attn_func,
+    flash_attn_varlen_func,
 )
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
@@ -42,6 +45,7 @@ from flash_attn.cute.config import (
     select_bwd_config,
 )
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+from flash_attn.cute.testing import is_fake_mode, maybe_fake_tensor_mode
 from flash_attn.cute import utils
 from mask_mod_definitions import (
     get_mask_pair,
@@ -51,6 +55,7 @@ from mask_mod_definitions import (
     make_packed_mask_aux_tensor,
 )
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+USE_FAKE_TENSOR = os.getenv("FLASH_ATTENTION_FAKE_TENSOR", "0") == "1"
 
 
 @cute.jit
@@ -975,6 +980,121 @@ def test_cute_mask_mod_vectorized(
         assert torch.equal(out, out_ref), (
             f"{mask_name} vec_size={vec_size}: output mismatch vs scalar reference"
         )
+
+
+@cute.jit
+def even_key_mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors):
+    return kv_idx % 2 == 0
+
+
+@cute.jit
+def record_sparse_mask_keys(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors):
+    if q_idx[0] == 0:
+        aux_tensors[0][kv_idx[0]] = cutlass.Int32(1)
+    return kv_idx >= 0
+
+
+@pytest.mark.parametrize("used_k", [129, 0])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_sparse_mask_callback_respects_used_keys(used_k):
+    if COMPUTE_CAPABILITY not in (8, 12):
+        pytest.skip("SM80/SM120 forward kernel")
+    q = torch.zeros(1, 128, 1, 64, device="cuda", dtype=torch.float16)
+    k = torch.zeros(4, 64, 1, 64, device="cuda", dtype=q.dtype)
+    v = torch.ones_like(k)
+    index = partial(torch.tensor, device="cuda", dtype=torch.int32)
+    sparse = BlockSparseTensorsTorch(
+        mask_block_cnt=index([[[1]]]), mask_block_idx=index([[[[1]]]]), block_size=(128, 128),
+    )
+    # The selected block spans keys 128..255, but only key 128 can be valid.
+    visited = torch.zeros(256, device="cuda", dtype=torch.int32)
+    out, lse, *_ = _flash_attn_fwd(
+        q, k, v, page_table=index([[0, 1, 2, 3]]), seqused_k=index([used_k]),
+        block_sparse_tensors=sparse, mask_mod=record_sparse_mask_keys, aux_tensors=[visited],
+        tile_mn=(128, 64), return_lse=True,
+    )
+    if not is_fake_mode():
+        assert visited.nonzero().flatten().tolist() == ([128] if used_k else [])
+        torch.testing.assert_close(out, torch.full_like(out, 1 if used_k else 0), rtol=0, atol=0)
+        torch.testing.assert_close(lse, torch.full_like(lse, 0 if used_k else -torch.inf), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("paged", [False, True], ids=["packed-heads", "paged-per-head"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_sm80_sparse_attention_skips_blocks(paged):
+    if COMPUTE_CAPABILITY not in (8, 12):
+        pytest.skip("SM80/SM120 forward kernel")
+    torch.manual_seed(42)
+    qlen, klen, capacity, dim = 529, 427, 448, 64
+    q = torch.randn((1, qlen, 2, dim), dtype=torch.float16, device="cuda")
+    k, v = torch.randn((2, 1, capacity, 1, dim), dtype=q.dtype, device=q.device)
+    indices = partial(torch.tensor, dtype=torch.int32, device=q.device)
+    # Full blocks bypass mask_mod. Only their indices, not counts, vary by head when paged.
+    full_indices = [[[3], [0], [0]]]
+    if paged:
+        full_indices.append([[3], [1], [0]])
+    sparse = BlockSparseTensorsTorch(
+        mask_block_cnt=indices([[[2, 0, 0]]]),
+        mask_block_idx=indices([[[[2, 0], [0, 0], [0, 0]]]]),
+        full_block_cnt=indices([[[1, 1, 0]]]),
+        full_block_idx=indices([full_indices]),
+        block_size=(256, 128),
+    )
+    qi = torch.arange(qlen, device=q.device)[:, None]
+    ki = torch.arange(klen, device=q.device)[None, :]
+    second_block = torch.arange(2, device=q.device)[:, None, None] if paged else 0
+    visible = ((qi < 256) & ((ki >= 384) | ((ki // 128 != 1) & (ki % 2 == 0)))) | (
+        (qi >= 256) & (qi < 512) & (ki // 128 == second_block)
+    )
+    scores = (q[0].transpose(0, 1).float() @ k[0, :klen, 0].float().T) / math.sqrt(dim)
+    scores = scores.masked_fill(~visible, -torch.inf)
+    out_ref = (scores.softmax(-1).nan_to_num() @ v[0, :klen, 0].float()).transpose(0, 1)
+    lse_ref = scores.logsumexp(-1)
+    v[:, klen:] = torch.nan
+    page_table = None
+    if paged:
+        page_size = 16
+        perm = torch.randperm(capacity // page_size, device=q.device)
+        k, v = [x.reshape(-1, page_size, 1, dim)[perm] for x in (k, v)]
+        page_table = perm.argsort().int()[None]
+    out, lse = flash_attn_varlen_func(
+        q, k, v, page_table=page_table, seqused_k=indices([klen]), block_sparse_tensors=sparse,
+        mask_mod=even_key_mask, return_lse=True,
+    )
+    if is_fake_mode():
+        return
+    torch.testing.assert_close(out[0].float(), out_ref, rtol=1e-3, atol=3e-4)
+    torch.testing.assert_close(lse[0], lse_ref, rtol=1e-5, atol=1e-5)
+
+
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_sm80_sparse_varlen_batch_offsets():
+    if COMPUTE_CAPABILITY not in (8, 12):
+        pytest.skip("SM80/SM120 forward kernel")
+    torch.manual_seed(43)
+    indices = partial(torch.tensor, dtype=torch.int32, device="cuda")
+
+    q = torch.zeros((73 + 139, 1, 64), dtype=torch.float16, device="cuda")
+    k = q.new_zeros((55 + 257, 1, 64))
+    v = torch.randn_like(k)
+    sparse = BlockSparseTensorsTorch(
+        mask_block_cnt=indices([[1, 1, 1]]),
+        mask_block_idx=indices([[0, 4, 0, 0, 0, 0, 2, 0, 0, 0, 0]]),
+        cu_total_m_blocks=indices([0, 1, 3]),
+        cu_block_idx_offsets=indices([0, 1, 11]),
+    )
+    out, lse = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=indices([0, 73, 212]), cu_seqlens_k=indices([0, 55, 312]),
+        block_sparse_tensors=sparse, return_lse=True,
+    )
+    if is_fake_mode():
+        return
+    # Zero logits give uniform attention over precisely the selected logical tokens.
+    groups = ((slice(0, 73), v[:55]), (slice(73, 201), v[-1:]), (slice(201, 212), v[183:247]))
+    for q_rows, v_rows in groups:
+        expected = v_rows.float().mean(0).expand_as(out[q_rows])
+        torch.testing.assert_close(out[q_rows].float(), expected, rtol=6e-4, atol=1e-6)
+        torch.testing.assert_close(lse[0, q_rows], torch.full_like(lse[0, q_rows], math.log(len(v_rows))))
 
 
 def test_sm100_block_sparse_sink_all_masked():

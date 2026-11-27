@@ -569,7 +569,7 @@ class FlashAttentionBackwardSm90:
             softmax_scale_log2 = LOG2_E
 
         fastdiv_mods = None
-        if const_expr(aux_data.tensors is not None):
+        if const_expr(aux_data.tensors is not None and (self.score_mod is not None or self.score_mod_bwd is not None)):
             seqlen_q = cute.size(mQ.shape[0])
             seqlen_k = cute.size(mK.shape[0])
             seqlen_q_divmod = FastDivmodDivisorV2(seqlen_q)
@@ -1474,7 +1474,6 @@ class FlashAttentionBackwardSm90:
                         mask_local=self.is_local,
                         mask_mod=self.mask_mod,
                         aux_data=aux_data,
-                        fastdiv_mods=fastdiv_mods,
                     )
                     dKV_accumulate = False
                     for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
@@ -1507,7 +1506,6 @@ class FlashAttentionBackwardSm90:
                         q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
                         aux_data=aux_data,
-                        fastdiv_mods=fastdiv_mods,
                     )
 
                 if const_expr(self.qhead_per_kvhead == 1):

@@ -95,6 +95,10 @@ class FwdConfig:
     use_dynamic_varlen: bool = False
     lpt_global: bool = False
 
+    @property
+    def supports_sparse_kv_subtiles(self) -> bool:
+        return self.device_capacity in (8, 10, 11, 12)
+
 
 class FwdHeuristicInputs(NamedTuple):
     """Host metadata for config selection and validation.
@@ -279,14 +283,10 @@ def select_sm90_tile(
         return 128, tile_n, True, True
 
 
-def fit_sm90_tile_to_block_sparsity(
+def fit_tile_to_block_sparsity(
     tile_m: int, tile_n: int, sparse_block_size_q: int, sparse_block_size_kv: int
 ) -> tuple[int, int]:
-    """Shrink SM90 forward tiles to fit explicit sparse blocks.
-
-    Sparse Q blocks may span multiple M tiles, but SM90 requires tile_n to match the
-    sparse KV block. Unsupported sizes are rejected by normalize_block_sparse_config.
-    """
+    """Shrink forward tiles to fit explicit sparse blocks; normalization checks divisibility."""
     if sparse_block_size_q % tile_m != 0 and sparse_block_size_q % 64 == 0:
         tile_m = 64
     if sparse_block_size_kv < tile_n and sparse_block_size_kv % 16 == 0:
@@ -673,6 +673,8 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
     match inputs.device_capacity:
         case 8:
             tile_n = 64
+            if inputs.device_arch in (86, 89) and inputs.is_hdim256:
+                tile_m = 64
         case 9:
             tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap = select_sm90_tile(
                 inputs.head_dim,
@@ -681,16 +683,9 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
                 inputs.local,
                 inputs.sparse_q_block_size,
             )
-            if inputs.sparse_q_block_size is not None and inputs.sparse_kv_block_size is not None:
-                tile_m, tile_n = fit_sm90_tile_to_block_sparsity(
-                    tile_m,
-                    tile_n,
-                    inputs.sparse_q_block_size,
-                    inputs.sparse_kv_block_size,
-                )
         case 12:
             tile_n = 64 if inputs.head_dim > 64 else 128
-            # Tune equal-width heads only: O reuses Q storage in the epilogue.
+            # These tiles were tuned for equal-width heads.
             if inputs.dtype in ("torch.float16", "torch.bfloat16") and inputs.head_dim == inputs.head_dim_v <= 256:
                 if inputs.head_dim > 64:
                     tile_m, tile_n = 64, 64
@@ -699,6 +694,14 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
                 else:
                     tile_m, tile_n = 128, 64
 
+    if (
+        inputs.device_capacity in (8, 9, 12)
+        and inputs.sparse_q_block_size is not None
+        and inputs.sparse_kv_block_size is not None
+    ):
+        tile_m, tile_n = fit_tile_to_block_sparsity(
+            tile_m, tile_n, inputs.sparse_q_block_size, inputs.sparse_kv_block_size
+        )
     if inputs.requested_tile_m is not None:
         tile_m = inputs.requested_tile_m
     if inputs.requested_tile_n is not None:
@@ -1937,11 +1940,26 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
     ):
         raise ValueError(f"SM{capacity} forward does not expose SM90 MMA flags")
     if capacity not in (10, 11):
+        if inputs.device_arch in (86, 89):
+            # SM80 forward uses one stage and separate, 1024-byte-aligned Q, K, V buffers.
+            smem_bytes = sum(round_up(size, 1024) for size in (
+                config.tile_m * inputs.head_dim_padded * 2,
+                config.tile_n * inputs.head_dim_padded * 2,
+                config.tile_n * inputs.head_dim_v_padded * 2,
+            ))
+            if smem_bytes > 99 * 1024:
+                raise ValueError(
+                    f"SM{inputs.device_arch} forward needs {smem_bytes} bytes of shared memory; "
+                    f"SM{inputs.device_arch} provides {99 * 1024}"
+                )
+        if capacity in (8, 12) and inputs.page_size is not None:
+            if inputs.head_dim % 8 or inputs.head_dim_v % 8:
+                raise ValueError("SM8x/SM12x paged KV requires head dimensions divisible by 8")
         match capacity:
             case 9 if config.tile_m not in (64, 128, 192):
                 raise ValueError(f"SM90 tile_m must be 64, 128, or 192, got {config.tile_m}")
-            case 12 if inputs.use_block_sparsity:
-                raise ValueError("SM120 forward does not support block sparsity")
+            case 8 | 12 if inputs.use_block_sparsity and inputs.requires_grad:
+                raise ValueError("SM8x/SM12x block sparsity supports forward only")
         neutral = _FWD_SM100_ONLY_NEUTRAL_FIELDS
         mismatched = [name for name, value in neutral.items() if getattr(config, name) != value]
         if mismatched:

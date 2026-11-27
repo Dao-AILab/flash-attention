@@ -184,7 +184,6 @@ class AttentionMask:
         mask_local: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         aux_data: AuxData = AuxData(),
-        fastdiv_mods=(None, None),
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.swap_AB)
@@ -223,61 +222,42 @@ class AttentionMask:
         ):  # FlexAttention mask mod
             nrow = const_expr(cute.size(tScS_mn.shape[0]))
             ncol = const_expr(cute.size(tScS_mn.shape[1]))
-            has_fastdiv = const_expr(
-                fastdiv_mods is not None
-                and fastdiv_mods[0] is not None
-                and fastdiv_mods[1] is not None
-            )
-            bound_aux_indices = const_expr(
-                has_fastdiv and mask_seqlen and const_expr(aux_data.tensors is not None)
-            )
-
-            for r in cutlass.range_constexpr(nrow):
-                # Respect swap_AB: ROW/COL determine which coordinate component corresponds to Q/KV.
-                local_row = tScS_mn[r, 0][ROW]
-                global_row_idx = local_row + m_block * self.tile_m
-                row_for_mod = global_row_idx
-                head_idx_for_mod = head_idx
-                if const_expr(self.qhead_per_kvhead_packgqa != 1):
-                    head_offset = global_row_idx % self.qhead_per_kvhead_packgqa
-                    head_idx_for_mod = head_idx * self.qhead_per_kvhead_packgqa + head_offset
-                    row_for_mod = global_row_idx // self.qhead_per_kvhead_packgqa
-                row_for_seqlen = row_for_mod
-                if const_expr(bound_aux_indices):
-                    row_for_mod = utils.clamp_index(row_for_mod, fastdiv_mods[0])
-
-                for col in cutlass.range_constexpr(ncol):
-                    col_idx_local = t0ScS_mn[0, col][COL]
-                    # Convert to absolute column index
-                    global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
-                    col_for_mod = global_col_idx
-                    if const_expr(bound_aux_indices):
-                        col_for_mod = utils.clamp_index(global_col_idx, fastdiv_mods[1])
-
-                    batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
-                    head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
-                    q_idx_ssa = utils.scalar_to_ssa(row_for_mod, cutlass.Int32)
-                    kv_idx_ssa = utils.scalar_to_ssa(col_for_mod, cutlass.Int32)
-                    mask_value = call_mask_mod(
-                        mask_mod,
-                        batch_idx_ssa,
-                        head_idx_ssa,
-                        q_idx_ssa,
-                        kv_idx_ssa,
-                        self.seqlen_info,
-                        aux_data,
-                    )
-                    cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
-                    if const_expr(mask_seqlen):
-                        out_of_bounds = (row_for_seqlen >= self.seqlen_q) or (
-                            global_col_idx >= self.seqlen_k
+            # Padding may call the modifier at the last valid coordinate, but its score stays masked.
+            # An empty sequence has no safe coordinate for an auxiliary-tensor lookup.
+            if self.seqlen_q == 0 or self.seqlen_k == 0:
+                acc_S_mn.fill(-cutlass.Float32.inf)
+            else:
+                for r in cutlass.range_constexpr(nrow):
+                    # Respect swap_AB: ROW/COL determine which coordinate component corresponds to Q/KV.
+                    local_row = tScS_mn[r, 0][ROW]
+                    global_row_idx = local_row + m_block * self.tile_m
+                    row_for_mod = global_row_idx
+                    head_idx_for_mod = head_idx
+                    if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                        head_offset = global_row_idx % self.qhead_per_kvhead_packgqa
+                        head_idx_for_mod = head_idx * self.qhead_per_kvhead_packgqa + head_offset
+                        row_for_mod = global_row_idx // self.qhead_per_kvhead_packgqa
+                    for col in cutlass.range_constexpr(ncol):
+                        col_idx_local = t0ScS_mn[0, col][COL]
+                        # Convert to absolute column index
+                        global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
+                        valid = True
+                        safe_q, safe_k = row_for_mod, global_col_idx
+                        if const_expr(mask_seqlen):
+                            valid = (row_for_mod < self.seqlen_q) & (global_col_idx < self.seqlen_k)
+                            safe_q = cutlass.min(row_for_mod, self.seqlen_q - 1)
+                            safe_k = cutlass.min(global_col_idx, self.seqlen_k - 1)
+                        mask_value = call_mask_mod(
+                            mask_mod,
+                            utils.scalar_to_ssa(batch_idx, cutlass.Int32),
+                            utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32),
+                            utils.scalar_to_ssa(safe_q, cutlass.Int32),
+                            utils.scalar_to_ssa(safe_k, cutlass.Int32),
+                            self.seqlen_info,
+                            aux_data,
                         )
-                        if out_of_bounds:
-                            acc_S_mn[r, col] = -cutlass.Float32.inf
-                        else:
-                            acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
-                    else:
-                        acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
+                        cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
+                        acc_S_mn[r, col] = acc_S_mn[r, col] if (cond & valid) else -cutlass.Float32.inf
 
         else:  # Causal or local
             if const_expr(not self.swap_AB):

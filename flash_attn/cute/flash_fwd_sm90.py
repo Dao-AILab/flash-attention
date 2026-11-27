@@ -380,9 +380,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
         window_size_right = Int32(window_size_right) if window_size_right is not None else None
-        fastdiv_mods = utils.compute_fastdiv_mods(
-            mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors, mPageTable
-        )
+        fastdiv_mods = None
+        if const_expr(self.score_mod is not None):
+            fastdiv_mods = utils.compute_fastdiv_mods(
+                mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors, mPageTable
+            )
 
         self.kernel(
             tma_tensor_Q if const_expr(self.use_tma_Q) else mQ,
@@ -1165,7 +1167,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
                 aux_data=aux_data,
-                fastdiv_mods=fastdiv_mods,
             )
             score_mod_fn = None
             if const_expr(self.score_mod is not None):
@@ -1298,7 +1299,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     score_mod_fn,
                     O_should_accumulate,
                     self.mask_mod,
-                    fastdiv_mods,
                     self.intra_wg_overlap,
                     self.warp_scheduler_barrier_sync,
                     self.warp_scheduler_barrier_arrive,

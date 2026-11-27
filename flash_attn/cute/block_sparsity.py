@@ -180,13 +180,15 @@ def compute_dq_write_order_from_block_mask(
 
 def get_sparse_q_block_size(
     tensors: BlockSparseTensorsTorch | None,
-    seqlen_q: int,
+    seqlen_q: int | None,
 ) -> int | None:
     """Return the Q sparse block size, or None when sparsity is unset or ambiguous."""
     if tensors is None:
         return None
     if tensors.block_size is not None:
         return tensors.block_size[0]
+    if seqlen_q is None or tensors.cu_total_m_blocks is not None:
+        return None  # Flattened per-sequence block counts do not determine a Q block size.
     num_m_blocks = tensors.mask_block_idx.shape[2]
     min_block_size = ceildiv(seqlen_q, num_m_blocks)
     max_block_size = seqlen_q if num_m_blocks == 1 else (seqlen_q - 1) // (num_m_blocks - 1)

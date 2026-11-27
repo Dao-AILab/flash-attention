@@ -42,6 +42,29 @@ def make_inputs(*, pack_gqa: bool | None = None, **changes) -> FwdHeuristicInput
     return _BASE_INPUTS._replace(pack_gqa=pack_gqa, **changes)
 
 
+@pytest.mark.parametrize("arch", [80, 121])
+@pytest.mark.parametrize("d,dv", [(25, 32), (32, 25)])
+def test_paged_kv_rejects_partial_copy_vector(arch, d, dv):
+    inputs = make_inputs(device_arch=arch, page_size=16, head_dim=d, head_dim_v=dv)
+    with pytest.raises(ValueError, match="head dimensions divisible by 8"):
+        select_fwd_config(inputs)
+
+
+@pytest.mark.parametrize("arch", [86, 89])
+@pytest.mark.parametrize("dtype", ["torch.float16", "torch.bfloat16"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm86_sm89_hd256_fits_shared_memory(arch, dtype, causal):
+    inputs = make_inputs(device_arch=arch, dtype=dtype, causal=causal, **_HD256)
+    config = select_fwd_config(inputs)
+    # Q, K and V each occupy 64 x 256 x 2 bytes.
+    assert (config.tile_m, config.tile_n) == (64, 64)
+    validate_fwd_config(config, inputs)
+    with pytest.raises(ValueError, match="shared memory"):
+        select_fwd_config(inputs._replace(requested_tile_m=128))
+    with pytest.raises(ValueError, match="shared memory"):
+        validate_fwd_config(replace(config, tile_n=128), inputs)
+
+
 @pytest.mark.parametrize("arch", [120, 121])
 @pytest.mark.parametrize("dtype", ["torch.float16", "torch.bfloat16"])
 @pytest.mark.parametrize(("d", "dv", "causal", "tile"), [
@@ -236,7 +259,8 @@ def test_split_selection(changes, expected_splits, expected_tile_n):
     [
         # Selection-time rejections.
         ({"device_arch": 70}, {}, "Unsupported forward architecture family SM7"),
-        ({"device_arch": 120, "use_block_sparsity": True}, {}, "SM120 forward does not support"),
+        ({"device_arch": 120, "use_block_sparsity": True, "requires_grad": True}, {}, "forward only"),
+        ({"device_arch": 80, "use_block_sparsity": True, "requires_grad": True}, {}, "forward only"),
         ({"device_arch": 120, "requested_num_splits": 3}, {}, "SM120 forward only supports num_s"),
         ({"head_dim": 72, "head_dim_v": 72, "page_size": 64}, {}, "head dimensions divisible"),
         # Geometry and architecture.
