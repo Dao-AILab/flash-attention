@@ -3474,6 +3474,11 @@ def _sparse_mla_dk(
 _sparse_mla_dk.compile_cache = get_jit_cache("dk_gemm")
 
 
+def _check_sparse_backward(use_block_sparsity):
+    if use_block_sparsity and _get_device_arch() // 10 in (8, 12):
+        raise NotImplementedError("SM8x/SM12x block sparsity supports forward only")
+
+
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -3548,6 +3553,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.return_lse = return_lse
         ctx.score_mod = score_mod 
         ctx.score_mod_bwd = score_mod_bwd 
+        ctx.use_block_sparsity = block_sparse_tensors is not None
         ctx.mask_mod = mask_mod
         ctx.aux_scalars = aux_scalars
         ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
@@ -3557,6 +3563,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
+        _check_sparse_backward(ctx.use_block_sparsity)
         q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
@@ -3733,6 +3740,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.return_lse = return_lse
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
+        ctx.use_block_sparsity = block_sparse_tensors is not None
         ctx.mask_mod = mask_mod
         ctx.aux_scalars = aux_scalars
         ctx.gather_bwd_token_chunk = gather_bwd_token_chunk
@@ -3741,6 +3749,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
+        _check_sparse_backward(ctx.use_block_sparsity)
         if ctx.paged_kv:
             raise NotImplementedError("Paged KV backward is not supported")
         q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors

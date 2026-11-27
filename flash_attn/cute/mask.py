@@ -237,15 +237,17 @@ class AttentionMask:
                         head_offset = global_row_idx % self.qhead_per_kvhead_packgqa
                         head_idx_for_mod = head_idx * self.qhead_per_kvhead_packgqa + head_offset
                         row_for_mod = global_row_idx // self.qhead_per_kvhead_packgqa
+                    # The Q tile can have padding even when the K tile is full.
+                    q_in_bounds = row_for_mod < self.seqlen_q
+                    safe_q = cutlass.min(row_for_mod, self.seqlen_q - 1)
                     for col in cutlass.range_constexpr(ncol):
                         col_idx_local = t0ScS_mn[0, col][COL]
                         # Convert to absolute column index
                         global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
-                        valid = True
-                        safe_q, safe_k = row_for_mod, global_col_idx
+                        valid = q_in_bounds
+                        safe_k = global_col_idx
                         if const_expr(mask_seqlen):
-                            valid = (row_for_mod < self.seqlen_q) & (global_col_idx < self.seqlen_k)
-                            safe_q = cutlass.min(row_for_mod, self.seqlen_q - 1)
+                            valid = valid & (global_col_idx < self.seqlen_k)
                             safe_k = cutlass.min(global_col_idx, self.seqlen_k - 1)
                         mask_value = call_mask_mod(
                             mask_mod,

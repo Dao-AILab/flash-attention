@@ -2,8 +2,10 @@
 
 import os
 
+import cutlass
 import pytest
 import torch
+from cutlass import cute
 
 from flash_attn.cute import flash_attn_varlen_func
 from flash_attn.cute.interface import _flash_attn_fwd
@@ -113,6 +115,47 @@ def test_paged(dtype, d, dv, page_size, pack_gqa, mode):
         torch.testing.assert_close(actual.float(), ref, atol=6e-3, rtol=6e-3)
         torch.testing.assert_close(actual_lse, ref_lse, atol=2e-3, rtol=2e-3)
         offset += sq
+
+
+@cute.jit
+def record_padded_query_mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors):
+    if kv_idx[0] == 0 and q_idx[0] >= seqlen_info.seqlen_q:
+        aux_tensors[0][q_idx[0]] = cutlass.Int32(1)
+    return kv_idx == q_idx * 32
+
+
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_paged_mask_callback_respects_query_tail() -> None:
+    torch.manual_seed(0)
+    sq, sk, tile_m, tile_n, d = 5, 129, 64, 64, 64
+    q = torch.zeros(1, sq, 1, d, device="cuda", dtype=torch.float16)
+    k = torch.zeros(3, tile_n, 1, d, device=q.device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    page_table = torch.tensor([[1, 2, 0]], device=q.device, dtype=torch.int32)
+    seqused_k = torch.tensor([sk], device=q.device, dtype=torch.int32)
+    # One slot per possible Q lane; key zero is in an interior K tile.
+    padded_q_visits = torch.zeros(tile_m, device=q.device, dtype=torch.int32)
+    out, lse, *_ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        tile_mn=(tile_m, tile_n),
+        mask_mod=record_padded_query_mask,
+        aux_tensors=[padded_q_visits],
+        num_splits=1,
+        return_lse=True,
+    )
+    if is_fake_mode():
+        return
+
+    assert padded_q_visits.nonzero().flatten().tolist() == []
+    # Each valid Q sees exactly one logical key, including the last partial K tile.
+    selected_keys = torch.arange(sq, device=q.device) * 32
+    ref = v[page_table[0, selected_keys // tile_n].long(), selected_keys % tile_n]
+    torch.testing.assert_close(out[0], ref, atol=0, rtol=0)
+    torch.testing.assert_close(lse, torch.zeros_like(lse), atol=0, rtol=0)
 
 
 def test_paged_backward_rejected():

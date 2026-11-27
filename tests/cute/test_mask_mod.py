@@ -1067,6 +1067,28 @@ def test_sm80_sparse_attention_skips_blocks(paged):
     torch.testing.assert_close(lse[0], lse_ref, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("attention", [flash_attn_func, flash_attn_varlen_func])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_sm80_sparse_backward_rejected(attention):
+    if COMPUTE_CAPABILITY not in (8, 12):
+        pytest.skip("SM80/SM120 forward kernel")
+    q = torch.zeros((1, 32, 1, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+    k = torch.zeros_like(q)
+    v = torch.ones_like(q)
+    counts = torch.ones((1, 1, 1), device=q.device, dtype=torch.int32)
+    sparse = BlockSparseTensorsTorch(
+        mask_block_cnt=counts, mask_block_idx=torch.zeros_like(counts[..., None]),
+        block_size=(128, 128),
+    )
+    with torch.no_grad():
+        inference, _ = attention(q, k, v, block_sparse_tensors=sparse)
+    out, _ = attention(q, k, v, block_sparse_tensors=sparse)
+    with pytest.raises(NotImplementedError, match="block sparsity supports forward only"):
+        out.sum().backward()
+    if not is_fake_mode():
+        torch.testing.assert_close(inference, v)
+
+
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_sm80_sparse_varlen_batch_offsets():
     if COMPUTE_CAPABILITY not in (8, 12):

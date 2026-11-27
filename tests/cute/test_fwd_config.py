@@ -65,6 +65,36 @@ def test_sm86_sm89_hd256_fits_shared_memory(arch, dtype, causal):
         validate_fwd_config(replace(config, tile_n=128), inputs)
 
 
+@pytest.mark.parametrize("arch", [86, 89, 120, 121])
+def test_asymmetric_hd256_paged_kv_fits_shared_memory(arch):
+    inputs = make_inputs(device_arch=arch, head_dim=256, head_dim_v=128, page_size=32)
+    config = select_fwd_config(inputs)
+    # 128x64 needs 112 KiB for Q/K/V; 64x64 needs 80 KiB.
+    assert (config.tile_m, config.tile_n) == (64, 64)
+    # A narrower N tile lets the caller keep 128 Q rows.
+    explicit = select_fwd_config(inputs._replace(requested_tile_m=128, requested_tile_n=32))
+    assert (explicit.tile_m, explicit.tile_n) == (128, 32)
+
+
+@pytest.mark.parametrize("arch", [89, 120])
+def test_explicit_tile_rejects_shared_memory_overflow_after_padding(arch):
+    inputs = make_inputs(device_arch=arch, head_dim=248, head_dim_v=120, page_size=32)
+    config = select_fwd_config(inputs._replace(requested_tile_m=64, requested_tile_n=48))
+    # Raw widths would fit, but 256/128 padded widths need 100 KiB at 128x48.
+    with pytest.raises(ValueError, match="needs 102400 bytes of shared memory"):
+        validate_fwd_config(replace(config, tile_m=128), inputs)
+    with pytest.raises(ValueError, match="needs 102400 bytes of shared memory"):
+        select_fwd_config(inputs._replace(requested_tile_m=128, requested_tile_n=48))
+
+
+def test_explicit_tile_rejects_shared_memory_overflow_from_epilogue():
+    inputs = make_inputs(device_arch=86, head_dim=64, head_dim_v=256)
+    config = select_fwd_config(inputs)
+    # 256x64 fits the Q/K/V buffers in 72 KiB, but O needs 128 KiB.
+    with pytest.raises(ValueError, match="needs 131072 bytes of shared memory"):
+        validate_fwd_config(replace(config, tile_m=256), inputs)
+
+
 @pytest.mark.parametrize("arch", [120, 121])
 @pytest.mark.parametrize("dtype", ["torch.float16", "torch.bfloat16"])
 @pytest.mark.parametrize(("d", "dv", "causal", "tile"), [
@@ -259,8 +289,6 @@ def test_split_selection(changes, expected_splits, expected_tile_n):
     [
         # Selection-time rejections.
         ({"device_arch": 70}, {}, "Unsupported forward architecture family SM7"),
-        ({"device_arch": 120, "use_block_sparsity": True, "requires_grad": True}, {}, "forward only"),
-        ({"device_arch": 80, "use_block_sparsity": True, "requires_grad": True}, {}, "forward only"),
         ({"device_arch": 120, "requested_num_splits": 3}, {}, "SM120 forward only supports num_s"),
         ({"head_dim": 72, "head_dim_v": 72, "page_size": 64}, {}, "head dimensions divisible"),
         # Geometry and architecture.
