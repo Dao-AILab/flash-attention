@@ -67,14 +67,44 @@ def time_fwd_bwd(func, *args, **kwargs):
     return time_f[1].mean, time_b[1].mean
 
 
-repeats = 30
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Benchmark Flash Attention")
+    parser.add_argument("--batch-size", type=int, nargs="+", default=None,
+                        help="Batch sizes (default: derived from bs_seqlen pairs)")
+    parser.add_argument("--seqlen", type=int, nargs="+", default=None,
+                        help="Sequence lengths (default: derived from bs_seqlen pairs)")
+    parser.add_argument("--causal", type=int, nargs="+", default=None,
+                        help="Causal flags, 0 or 1 (default: [0, 1])")
+    parser.add_argument("--headdim", type=int, nargs="+", default=None,
+                        help="Head dimensions (default: [64, 128])")
+    parser.add_argument("--dim", type=int, default=2048, help="Model dimension (default: 2048)")
+    parser.add_argument("--repeats", type=int, default=30, help="Benchmark repeats (default: 30)")
+    return parser.parse_args()
+
+args = parse_args()
+
+repeats = args.repeats
 device = 'cuda'
 dtype = torch.float16
 
-bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
-causal_vals = [False, True]
-headdim_vals = [64, 128]
-dim = 2048
+_default_bs_seqlen = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
+if args.batch_size is not None and args.seqlen is not None:
+    if len(args.batch_size) == 1:
+        bs_seqlen_vals = [(args.batch_size[0], s) for s in args.seqlen]
+    elif len(args.batch_size) == len(args.seqlen):
+        bs_seqlen_vals = list(zip(args.batch_size, args.seqlen))
+    else:
+        raise ValueError("--batch-size must be a single value or match --seqlen length")
+elif args.batch_size is not None or args.seqlen is not None:
+    raise ValueError("--batch-size and --seqlen must be specified together")
+else:
+    bs_seqlen_vals = _default_bs_seqlen
+
+causal_vals = [bool(c) for c in args.causal] if args.causal is not None else [False, True]
+headdim_vals = args.headdim if args.headdim is not None else [64, 128]
+dim = args.dim
 dropout_p = 0.0
 
 methods = (["Flash2", "Pytorch"]
