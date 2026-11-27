@@ -71,7 +71,7 @@ class BlackwellHd512SplitKVFusedMultiHeadAttentionForward:
     and partial LSE tensors for :class:`FlashAttentionForwardCombine`.
 
     Supported contract: BF16 Q/K/V, Q32/KV4/D512, GQA ratio 8, one packed query
-    token per batch item, page size 64 or 128, and more than one KV split.
+    token per batch item, page size 64 or 128, and at least one KV split.
     """
 
     def __init__(
@@ -124,8 +124,8 @@ class BlackwellHd512SplitKVFusedMultiHeadAttentionForward:
     ):
         b, h_q, h_k, s_k, d = problem_shape
 
-        if kv_splits <= 1 or kv_splits > 256:
-            raise ValueError("SM103 hd512 SplitKV requires 2 to 256 splits")
+        if kv_splits < 1 or kv_splits > 256:
+            raise ValueError("SM103 hd512 SplitKV requires 1 to 256 splits")
         if self.page_size == 64 and self.sp_stages != 2:
             raise ValueError("page64 two-slot ID ring requires sp_stages=2")
         if b <= 0 or s_k <= 0 or s_k % self.page_size != 0:
@@ -225,8 +225,8 @@ class BlackwellHd512SplitKVFusedMultiHeadAttentionForward:
             or mLSEPartial.shape != (kv_splits, total_q, h_q)
         ):
             raise ValueError("partial tensors do not match Q and split dimensions")
-        if cutlass.const_expr(kv_splits <= 1 or kv_splits > 256):
-            raise ValueError("SM103 hd512 SplitKV requires 2 to 256 splits")
+        if cutlass.const_expr(kv_splits < 1 or kv_splits > 256):
+            raise ValueError("SM103 hd512 SplitKV requires 1 to 256 splits")
 
         # The pointer-derived descriptors require contiguous tensors. FA4's
         # Python boundary validates that contract before converting tensors to
@@ -1559,8 +1559,20 @@ class BlackwellHd512SplitKVFusedMultiHeadAttentionForward:
 
 # Increment whenever host-side specialization assumptions or the tensor ABI
 # changes. Every shape and stride below participates in CuTeDSL specialization.
-_ADAPTER_ABI_VERSION = 2
+_ADAPTER_ABI_VERSION = 3
 _COMPILE_OPTIONS = "--opt-level 2"
+
+
+def sm103_hd512_splitkv_num_splits(batch_size: int) -> int:
+    """Number of FP32 partial slots per request for a captured Q1 batch.
+
+    Four KV heads launch four producer CTAs per split per request. Target
+    the B1 grid of 128 CTAs; larger batches supply their own parallelism.
+    This uses the tensor batch, never the live device lengths.
+    """
+    if batch_size < 1:
+        raise ValueError("SM103 hd512 SplitKV requires a positive batch size")
+    return (32 + batch_size - 1) // batch_size
 
 
 @dataclass(frozen=True)
@@ -1613,7 +1625,7 @@ def _validate_sm103_hd512_decode_tensors(
     valid_splits: torch.Tensor,
     *,
     kv_layout: str,
-) -> int:
+) -> tuple[int, int]:
     if not q.is_cuda:
         raise ValueError("SM103 hd512 SplitKV requires CUDA tensors")
     device_index = q.device.index
@@ -1657,10 +1669,14 @@ def _validate_sm103_hd512_decode_tensors(
         )
     if v.shape != k.shape or v.stride() != k.stride():
         raise ValueError("K and V must have identical HND shapes and strides")
-    if tuple(out_partial.shape) != (32, batch, 32, 512):
-        raise ValueError("partial output must have shape (32, batch, 32, 512)")
-    if tuple(lse_partial.shape) != (32, batch, 32):
-        raise ValueError("partial LSE must have shape (32, batch, 32)")
+    splits = sm103_hd512_splitkv_num_splits(batch)
+    if out_partial.ndim != 4 or tuple(out_partial.shape[1:]) != (batch, 32, 512):
+        raise ValueError("partial output must have shape (capacity, batch, 32, 512)")
+    capacity = int(out_partial.shape[0])
+    if not splits <= capacity <= 32:
+        raise ValueError(f"partial output split capacity must be in [{splits}, 32], got {capacity}")
+    if tuple(lse_partial.shape) != (capacity, batch, 32):
+        raise ValueError("partial LSE must match the partial output capacity, batch and heads")
     if tuple(seqused_k.shape) != (batch,) or tuple(valid_splits.shape) != (batch,):
         raise ValueError("seqused_k and valid splits must have one entry per request")
     if page_table.ndim != 2 or int(page_table.shape[0]) != batch:
@@ -1685,7 +1701,7 @@ def _validate_sm103_hd512_decode_tensors(
     # positive so the pointer-derived TMA descriptors are valid.
     if k.stride(-1) != 1 or min(k.stride()) <= 0:
         raise ValueError(f"unsupported HND K/V strides: {k.stride()}")
-    return device_index
+    return device_index, splits
 
 
 def _get_compiled_sm103_hd512_decode(
@@ -1700,18 +1716,8 @@ def _get_compiled_sm103_hd512_decode(
     valid_splits: torch.Tensor,
     *,
     kv_layout: str,
+    device_index: int,
 ):
-    device_index = _validate_sm103_hd512_decode_tensors(
-        q,
-        k,
-        v,
-        out_partial,
-        lse_partial,
-        seqused_k,
-        page_table,
-        valid_splits,
-        kv_layout=kv_layout,
-    )
     capability = torch.cuda.get_device_capability(device_index)
     key = Sm103Hd512SplitKVCompileKey(
         adapter_abi_version=_ADAPTER_ABI_VERSION,
@@ -1782,10 +1788,24 @@ def run_sm103_hd512_splitkv_decode(
     page_table: torch.Tensor,
     valid_splits: torch.Tensor,
 ) -> None:
-    """Run the exact HND Q1 specialization and its warp-cooperative combine."""
+    """Run packed HND Q1 decode and combine using batch-aware SplitKV.
+
+    Allocate partials with ``sm103_hd512_splitkv_num_splits(batch)`` slots,
+    or reuse an existing workspace with up to 32 slots. Unused suffix slots
+    are untouched. On replay the producer derives valid splits per request
+    from the current device lengths, including zero for empty requests.
+    """
     if out.dtype != torch.bfloat16 or out.shape != q.shape or not out.is_contiguous():
         raise ValueError("SM103 hd512 SplitKV output must be contiguous BF16 and match Q")
 
+    device_index, splits = _validate_sm103_hd512_decode_tensors(
+        q, k, v, out_partial, lse_partial, seqused_k, page_table, valid_splits, kv_layout="HND"
+    )
+    if out_partial.shape[0] != splits:
+        # Zero-copy leading-dimension views: grid.x, partial descriptors and
+        # combine all agree on S, including for legacy 32-slot allocations.
+        out_partial = out_partial.narrow(0, 0, splits)
+        lse_partial = lse_partial.narrow(0, 0, splits)
     compiled = _get_compiled_sm103_hd512_decode(
         q,
         k,
@@ -1797,6 +1817,7 @@ def run_sm103_hd512_splitkv_decode(
         page_table,
         valid_splits,
         kv_layout="HND",
+        device_index=device_index,
     )
     q_cute = _as_cute_tensor(q, BFloat16, 16)
     k_cute = _as_cute_tensor(k, BFloat16, 16)
@@ -1834,5 +1855,6 @@ def run_sm103_hd512_splitkv_decode(
 __all__ = [
     "BlackwellHd512SplitKVFusedMultiHeadAttentionForward",
     "Sm103Hd512SplitKVCompileKey",
+    "sm103_hd512_splitkv_num_splits",
     "run_sm103_hd512_splitkv_decode",
 ]

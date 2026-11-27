@@ -2592,8 +2592,10 @@ def test_sm103_hd512_splitkv_packed_hnd_adapter(seqlens_k):
             scale=1.0,
             enable_gqa=True,
         ).view(nheads, d)
+    # This caller intentionally supplies its original 32-slot workspace.
+    scheduled_splits = math.ceil(32 / batch)
     expected_splits = torch.tensor(
-        [min(num_splits, math.ceil(seqlen_k / 128)) for seqlen_k in seqlens_k],
+        [min(scheduled_splits, math.ceil(seqlen_k / 128)) for seqlen_k in seqlens_k],
         dtype=torch.int32,
         device="cuda",
     )

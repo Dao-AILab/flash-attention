@@ -23,8 +23,8 @@ exp2 = partial(cute.math.exp2, fastmath=True)
 class BlackwellHd512SplitKVCombine:
     """Warp-cooperative combine for normalized FP32 SplitKV partials.
 
-    This specialization consumes a fixed capacity of 32 splits for Q32/D512.
-    The per-request ``mNumSplitsDynamic`` value may be any value in [0, 32].
+    This specialization consumes 1 to 32 split slots for Q32/D512. The
+    per-request ``mNumSplitsDynamic`` value ranges from zero to that capacity.
     Zero valid splits denotes empty KV and writes zero output without reading
     the inactive partial buffers. This adapter does not expose final LSE.
     """
@@ -58,9 +58,10 @@ class BlackwellHd512SplitKVCombine:
 
         splits, batch, heads, head_dim = mOPartial.shape
         if cutlass.const_expr(
-            splits != self.max_splits or heads != self.num_heads or head_dim != self.head_dim
+            splits < 1 or splits > self.max_splits
+            or heads != self.num_heads or head_dim != self.head_dim
         ):
-            raise ValueError("SM103 hd512 combine requires S32/Q32/D512")
+            raise ValueError("SM103 hd512 combine requires 1 to 32 splits and Q32/D512")
         if cutlass.const_expr(mLSEPartial.shape != (splits, batch, heads)):
             raise ValueError("LSE partial shape does not match O partial")
         if cutlass.const_expr(mO.shape != (batch, heads, head_dim)):
@@ -133,7 +134,7 @@ class BlackwellHd512SplitKVCombine:
 
 
 _COMPILE_OPTIONS = "--opt-level 2"
-_ADAPTER_ABI_VERSION = 1
+_ADAPTER_ABI_VERSION = 2
 _compiled_combine_cache: dict[tuple[object, ...], object] = {}
 
 
@@ -174,10 +175,10 @@ def run_sm103_hd512_splitkv_combine(
     if out.dtype != torch.bfloat16 or valid_splits.dtype != torch.int32:
         raise TypeError("SM103 hd512 combine requires BF16 output and int32 splits")
     if out_partial.ndim != 4 or tuple(out_partial.shape[2:]) != (32, 512):
-        raise ValueError("expected O partial shape (32, batch, 32, 512)")
+        raise ValueError("expected O partial shape (splits, batch, 32, 512)")
     splits, batch = (int(out_partial.shape[0]), int(out_partial.shape[1]))
-    if splits != 32:
-        raise ValueError("SM103 hd512 combine requires split capacity 32")
+    if not 1 <= splits <= 32:
+        raise ValueError("SM103 hd512 combine requires split capacity in [1, 32]")
     if tuple(lse_partial.shape) != (splits, batch, 32):
         raise ValueError("LSE partial shape does not match O partial")
     if tuple(out.shape) != (batch, 32, 512):

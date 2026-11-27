@@ -22,13 +22,15 @@ def _fp32_reference_precision(monkeypatch):
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
 
 
-def _make_decode_case(batch, capacity=8192):
+def _make_decode_case(batch, capacity=8192, workspace_splits=None):
     from flash_attn.cute.sm103_hd512_splitkv_forward import (
         run_sm103_hd512_splitkv_decode,
+        sm103_hd512_splitkv_num_splits,
     )
 
     torch.manual_seed(20261126 + batch)
-    heads, kv_heads, dim, page_size, splits = 32, 4, 512, 64, 32
+    heads, kv_heads, dim, page_size = 32, 4, 512, 64
+    splits = sm103_hd512_splitkv_num_splits(batch) if workspace_splits is None else workspace_splits
     table_width = math.ceil(capacity / page_size) + 2
     page_table = (
         torch.arange(batch * table_width, device="cuda", dtype=torch.int32)
@@ -114,8 +116,10 @@ def _poison_outputs(case):
 
 
 def _assert_result(case, lengths, reference):
+    # Count independent (sequence, KV head) CTAs before splitting the token axis.
+    split_cap = math.ceil(128 / (len(lengths) * 4))
     expected_splits = torch.tensor(
-        [min(32, math.ceil(length / 128)) for length in lengths],
+        [min(split_cap, math.ceil(length / 128)) for length in lengths],
         device="cuda",
         dtype=torch.int32,
     )
@@ -136,6 +140,24 @@ def _assert_result(case, lengths, reference):
                 case["out"][batch_idx].double(), reference[batch_idx].double(), dim=-1
             )
             assert torch.all(cosine >= 0.99999), cosine.min().item()
+
+
+@pytest.mark.parametrize("batch,splits", [(2, 16), (3, 11), (4, 8), (8, 4), (31, 2), (32, 1), (33, 1)])
+@pytest.mark.parametrize("legacy_workspace", [False, True])
+def test_sm103_hd512_batch_split_workspace(batch, splits, legacy_workspace):
+    from flash_attn.cute.sm103_hd512_splitkv_forward import sm103_hd512_splitkv_num_splits
+
+    assert sm103_hd512_splitkv_num_splits(batch) == splits
+    edge = 128 * splits  # Crossing this edge revisits split zero.
+    lengths = tuple((edge + 1, 0, edge - 1, edge, 65)[b % 5] for b in range(batch))
+    case = _make_decode_case(batch, capacity=edge + 1, workspace_splits=32 if legacy_workspace else splits)
+    _set_lengths_and_poison(case, lengths, math.inf)
+    reference = _reference(case, lengths, 0.5)
+    _poison_outputs(case)
+    case["invoke"](0.5)
+    _assert_result(case, lengths, reference)
+    assert torch.isnan(case["partial"][splits:]).all()
+    assert torch.isnan(case["lse"][splits:]).all()
 
 
 @pytest.mark.parametrize(
