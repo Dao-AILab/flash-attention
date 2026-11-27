@@ -661,15 +661,27 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     at::Tensor out;
-    if (out_.has_value()) {
+    if (seqlenq_ngroups_swapped) {
+        // The splitkv and combine kernels write `out` directly, so it must be produced in the
+        // final [batch, num_heads_k, ngroups, head_size] layout here; the o_*_stride override
+        // below points the kernels at it. A copy anywhere here would either discard the
+        // caller's buffer or detach the returned tensor from what the kernels wrote.
+        if (out_.has_value()) {
+            out = out_.value();
+            TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+            CHECK_DEVICE(out);
+            TORCH_CHECK(out.is_contiguous(), "Output tensor must be contiguous");
+            CHECK_SHAPE(out, sizes[0], sizes[1], head_size);
+            out = out.view({batch_size, num_heads_k, ngroups, head_size});
+        } else {
+            out = torch::empty({batch_size, num_heads_k, ngroups, head_size}, q.options());
+        }
+    } else if (out_.has_value()) {
         out = out_.value();
         TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, sizes[0], sizes[1], head_size);
-        if (seqlenq_ngroups_swapped) {
-            out = out.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size});
-        }
     } else {
         out = torch::empty_like(q);
     }
@@ -717,6 +729,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      softcap,
                      seqlenq_ngroups_swapped,
                      /*unpadded_lse*/true);
+    if (seqlenq_ngroups_swapped) {
+        // `out` is now [batch, num_heads_k, ngroups, head_size], so the kernels' (batch, head,
+        // row) indices map onto it directly. set_params_fprop derived the o_* strides from the
+        // packed (swapped) q layout, which describes a different tensor.
+        params.o_batch_stride = out.stride(0);
+        params.o_head_stride = out.stride(1);
+        params.o_row_stride = out.stride(2);
+    }
     params.total_q = total_q;
 
     if (paged_KV) {
@@ -780,7 +800,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (seqlenq_ngroups_swapped) {
         int64_t size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size};
         int64_t size_after[] = {batch_size, num_heads_k * max_seqlen_q, head_size};
-        out = out.reshape(size_before).transpose(1, 2).reshape(size_after);
+        // `out` is [batch, num_heads_k, ngroups, head_size] and the kernels wrote it in place;
+        // collapsing the head dims is a pure view.
+        out = out.reshape(size_after);
         q = q.reshape(size_before).transpose(1, 2).reshape(size_after);
         softmax_lse = softmax_lse.reshape({num_heads * max_seqlen_q, batch_size});
     }
