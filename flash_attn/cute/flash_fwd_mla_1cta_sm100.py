@@ -54,7 +54,9 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 
 from quack import copy_utils
 
+from flash_attn.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from flash_attn.cute import utils as fa_utils
+from flash_attn.cute.copy_utils import store_zero_fp32_row
 from flash_attn.cute.utils import get_batch_from_cu_tensor
 from flash_attn.cute.pack_gqa import (
     PackGQA,
@@ -319,12 +321,12 @@ class FlashAttentionMLAForward1CtaSm100:
         self.mma_tiler_QK = (self.cta_tile_m, self.tile_n, self.hdim)
         self.mma_tiler_QvV = (self.cta_tile_m, self.tile_n, self.hdimv // self.num_hdimv_splits)
         self.mma_tiler_PVt = (self.cta_tile_m, self.hdimv // self.num_hdimv_splits, self.tile_n)
-        self.major_mode_Q = tcgen05.OperandMajorMode.K
-        self.major_mode_Qvi = tcgen05.OperandMajorMode.K
-        self.major_mode_K = tcgen05.OperandMajorMode.K
-        self.major_mode_Vi = tcgen05.OperandMajorMode.K
-        self.major_mode_Vti = tcgen05.OperandMajorMode.MN
-        self.major_mode_P = tcgen05.OperandMajorMode.K
+        self.major_mode_Q = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Qvi = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_K = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Vi = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Vti = cute.nvgpu.OperandMajorMode.MN
+        self.major_mode_P = cute.nvgpu.OperandMajorMode.K
         self.operand_source_A = tcgen05.OperandSource.SMEM
         # Only the QK mma can take its A operand (Q) from TMEM; Qv and P stay in SMEM
         # (Qv would need 256 TMEM columns).
@@ -709,7 +711,7 @@ class FlashAttentionMLAForward1CtaSm100:
             else None
         )
 
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+        self.o_layout = LayoutEnum.from_tensor(mO)
 
         # (b, s_q, topk) -> (topk, s_q, b), or (total_q, topk) -> (topk, total_q)
         if const_expr(mIndexTopk is not None):
@@ -762,7 +764,7 @@ class FlashAttentionMLAForward1CtaSm100:
         ]
         tiled_mma_QK, tiled_mma_Qst, tiled_mma_QvV, tiled_mma_PVt = (
             sm100_utils.make_trivial_tiled_mma(
-                dtype_a, major_a, major_b, self.dtype_acc, self.cta_group, mma_tiler[:2],
+                dtype_a, dtype_a, major_a, major_b, self.dtype_acc, self.cta_group, mma_tiler[:2],
                 a_source,
             )
             for _, dtype_a, major_a, major_b, mma_tiler, a_source in _mma_specs
@@ -1139,7 +1141,7 @@ class FlashAttentionMLAForward1CtaSm100:
         )
 
         # ==== Allocate SMEM ====
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # ==== TMEM stuff ====
@@ -1147,7 +1149,7 @@ class FlashAttentionMLAForward1CtaSm100:
             barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.TmemPtr),
             num_threads=self.num_mma_threads + self.num_softmax_threads + self.num_epilogue_threads,
         )
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
@@ -1231,9 +1233,9 @@ class FlashAttentionMLAForward1CtaSm100:
         )
         # fmt: on
 
-        sO_empty_mbar_ptr = storage.sO_empty_mbar_ptr
-        staging_mbar_ptr = storage.staging_mbar_ptr
-        sK_free_mbar_ptr = storage.sK_free_mbar_ptr
+        sO_empty_mbar_ptr = storage.sO_empty_mbar_ptr.ptr
+        staging_mbar_ptr = storage.staging_mbar_ptr.ptr
+        sK_free_mbar_ptr = storage.sK_free_mbar_ptr.ptr
         if warp_idx == 0:
             cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
             if const_expr(self.has_qk):
@@ -3210,11 +3212,8 @@ class FlashAttentionMLAForward1CtaSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = self._n_block_range(block_info, seqlen, m_block, split_idx)
             num_n_blocks = n_block_max - n_block_min
-            # Split-kv: this split's slice of the n_block range can be empty (the
-            # per-split count is rounded up, so empties are the trailing splits).
-            # Every warp role skips the whole tile body together, which keeps all
-            # pipeline phases and raw-mbar phase counters consistent; the epilogue
-            # still writes LSE = -inf so the combine kernel can ignore this split.
+            # Every role skips KV work and pipeline handoffs for an empty split.
+            # Only the epilogue publishes its partial results.
             has_work = block_info.has_kv_work(n_block_min, n_block_max)
             if has_work:
 
@@ -3295,10 +3294,11 @@ class FlashAttentionMLAForward1CtaSm100:
                 row_sum = row_sum0 + row_sum1
                 LN2 = math.log(2.0)
 
-                # Both threads of a row need row_max once the sink rescales row_sum.
-                row_max = 0.0
+                # Both threads of a row need the maximum when folding in the sink.
+                row_max_log2 = Float32(0.0)
+                output_correction = Float32(1.0)
                 if const_expr(mLSE is not None or learnable_sink is not None):
-                    row_max = sRowMax[tidx % self.cta_tile_m, 0]
+                    row_max_log2 = sRowMax[tidx % self.cta_tile_m, 0] * softmax_scale_log2_eff
                 if const_expr(learnable_sink is not None):
                     # Only the first split owns the sink column (as in flash_fwd_sm100).
                     if const_expr(not self.is_split_kv) or split_idx == 0:
@@ -3311,11 +3311,10 @@ class FlashAttentionMLAForward1CtaSm100:
                             # padded heads (sparse) get -inf: no sink
                             qhead_per_kvhead_valid=self.qhead_per_kvhead_valid,
                         )
-                        row_max, row_sum = apply_learnable_sink(
-                            row_max,
+                        row_max_log2, row_sum, output_correction = apply_learnable_sink(
+                            row_max_log2,
                             row_sum,
                             sink_val,
-                            softmax_scale_log2_eff,
                             max_offset=self.max_offset,
                             empty_row_sum=float(2**self.max_offset),
                         )
@@ -3326,7 +3325,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 # fp8: dequantize O by v_descale here (never in the running rescale,
                 # and never in LSE -- LSE is a function of the dequantized scores only).
                 scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
-                scale = scale * v_descale
+                scale = scale * output_correction * v_descale
                 # seqlen_k == 0 with TMA KV: the fully masked dummy block still loaded a KV tile, and
                 # P = 0 times a NaN V row is NaN (scaling by 0 would keep it): write zeros instead.
                 zero_O = seqlen.seqlen_k == 0 if const_expr(not self.use_cpasync_load_KV) else False
@@ -3335,13 +3334,9 @@ class FlashAttentionMLAForward1CtaSm100:
 
                 # compute and store lse to gmem
                 if const_expr(mLSE is not None):
-                    # row_sum carries the fp8 2^max_offset pre-scale; subtract it here
-                    # (O needs no correction -- it cancels in O / row_sum).
+                    # The fp8 2^max_offset pre-scale cancels in O / row_sum but not in LSE.
                     lse = (
-                        (
-                            row_max * softmax_scale_log2_eff
-                            + (cute.math.log2(row_sum, fastmath=True) - self.max_offset)
-                        )
+                        (row_max_log2 + (cute.math.log2(row_sum, fastmath=True) - self.max_offset))
                         * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
@@ -3410,17 +3405,46 @@ class FlashAttentionMLAForward1CtaSm100:
                 consumer_state_O0.advance()
                 consumer_state_O1.advance()
             else:
-                # Empty split: no O to reduce, but the combine kernel keys off LSE, so
-                # this split must be marked dead. O_partial is left unwritten (combine
-                # never reads a split whose LSE is -inf).
-                if const_expr(mLSE is not None):
-                    self.store_lse(
-                        mLSE, seqlen, head_idx, batch_idx, split_idx, m_block, tidx,
-                        -Float32.inf,
+                if const_expr(self.is_split_kv and mLSE is not None):
+                    self.store_empty_split(
+                        mO, mLSE, learnable_sink, seqlen, head_idx, batch_idx, split_idx, m_block, tidx
                     )
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
+
+    @cute.jit
+    def store_empty_split(
+        self,
+        mO: cute.Tensor,
+        mLSE: cute.Tensor,
+        learnable_sink: Optional[cute.Tensor],
+        seqlen: SeqlenInfoQK,
+        head_idx: Int32,
+        batch_idx: Int32,
+        split_idx: Int32,
+        m_block: Int32,
+        tidx: Int32,
+    ) -> None:
+        """Store partial results for a tile with no KV work.
+
+        On split 0 with a sink, one thread per valid row writes zero output and
+        the sink logit as LSE. Other empty splits write only an LSE of -inf.
+        """
+        lse = -Float32.inf
+        if const_expr(learnable_sink is not None):
+            if split_idx == 0 and tidx < self.cta_tile_m:
+                packed_row = m_block * self.cta_tile_m + tidx
+                q_pos = packed_row // self.qhead_per_kvhead if const_expr(self.pack_gqa) else packed_row
+                if q_pos < seqlen.seqlen_q and self.is_valid_qhead_row(packed_row):
+                    lse = load_learnable_sink(
+                        learnable_sink, head_idx, packed_row, self.qhead_per_kvhead, self.pack_gqa,
+                        qhead_per_kvhead_valid=self.qhead_per_kvhead_valid,
+                    )
+                    mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
+                    row = (packed_row % self.qhead_per_kvhead, q_pos) if const_expr(self.pack_gqa) else q_pos
+                    store_zero_fp32_row(mO_cur[row, None])
+        self.store_lse(mLSE, seqlen, head_idx, batch_idx, split_idx, m_block, tidx, lse)
 
     @cute.jit
     def store_lse(

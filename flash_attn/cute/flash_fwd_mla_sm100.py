@@ -18,6 +18,7 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 
 from quack import copy_utils
 
+from flash_attn.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
 from flash_attn.cute.pack_gqa import (
     pack_gqa_layout,
     make_packgqa_tiled_tma_atom,
@@ -27,6 +28,7 @@ from flash_attn.cute.pack_gqa import (
 from flash_attn.cute.config import mla_2cta_pads_dense_qheads, sparse_mla_qhead_tile
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute import utils as fa_utils
+from flash_attn.cute import copy_utils as fa_copy_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.mask import AttentionMask
@@ -497,10 +499,10 @@ class FlashAttentionMLAForwardSm100:
 
         topk_length_dynamic = mIndexTopk.shape[0] if mIndexTopk is not None else None
 
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
-        self.p_layout = cutlass.utils.LayoutEnum.ROW_MAJOR
+        self.o_layout = LayoutEnum.from_tensor(mO)
+        self.p_layout = LayoutEnum.ROW_MAJOR
         if const_expr(self.store_P):
-            assert cutlass.utils.LayoutEnum.from_tensor(mP) == self.p_layout
+            assert LayoutEnum.from_tensor(mP) == self.p_layout
 
         mO_og = mO
         mP_og = mP
@@ -645,9 +647,7 @@ class FlashAttentionMLAForwardSm100:
             # TODO: add asserts
             mP_tma = mP_og if const_expr(self.ragged_tma_O) else mP_valid
             if const_expr(self.ragged_tma_O):
-                mP_tma = copy_utils.create_ragged_tensor_for_tma(
-                    mP_tma, ragged_dim=0, ptr_shift=True
-                )
+                mP_tma = fa_copy_utils.create_ragged_tensor_for_tma_store(mP_tma, ragged_dim=0)
             tma_atom_P, tma_tensor_P = make_tiled_tma_atom_fn(
                 tma_store_op, mP_tma, cute.select(sP_layout_out, mode=[0, 1]), self.tile_P
             )
@@ -669,9 +669,7 @@ class FlashAttentionMLAForwardSm100:
         if const_expr(self.use_tma_O):
             mO_tma = mO_og if const_expr(self.ragged_tma_O) else mO_valid
             if const_expr(self.ragged_tma_O):
-                mO_tma = copy_utils.create_ragged_tensor_for_tma(
-                    mO_tma, ragged_dim=0, ptr_shift=True
-                )
+                mO_tma = fa_copy_utils.create_ragged_tensor_for_tma_store(mO_tma, ragged_dim=0)
 
             tma_atom_O, tma_tensor_O = make_tiled_tma_atom_fn(
                 tma_store_op, mO_tma, cute.select(sO_layout, mode=[0, 1]), self.epi_tile
@@ -883,7 +881,7 @@ class FlashAttentionMLAForwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
 
         # ==== Allocate SMEM ====
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # ==== TMEM stuff ====
@@ -891,7 +889,7 @@ class FlashAttentionMLAForwardSm100:
             barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.TmemPtr),
             num_threads=self.num_mma_threads + self.num_softmax_threads + self.num_epilogue_threads,
         )
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
@@ -977,7 +975,7 @@ class FlashAttentionMLAForwardSm100:
 
         sO_empty_mbar_ptr = None
         if const_expr(self.use_tma_O and self.overlap_sO_sV):
-            sO_empty_mbar_ptr = storage.sO_empty_mbar_ptr
+            sO_empty_mbar_ptr = storage.sO_empty_mbar_ptr.ptr
             if warp_idx == 0:
                 cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
 
@@ -3135,9 +3133,10 @@ class FlashAttentionMLAForwardSm100:
             row_sum1 = sRowSum[tidx % self.cta_tile_m, 1]
             row_sum = row_sum0 + row_sum1
 
-            row_max = 0.0
+            row_max_log2 = Float32(0.0)
+            output_correction = Float32(1.0)
             if const_expr(mLSE is not None or learnable_sink is not None):
-                row_max = sRowMax[tidx % self.cta_tile_m, 0]
+                row_max_log2 = sRowMax[tidx % self.cta_tile_m, 0] * softmax_scale_log2
             if const_expr(learnable_sink is not None):
                 sink_val = load_learnable_sink(
                     learnable_sink,
@@ -3147,10 +3146,13 @@ class FlashAttentionMLAForwardSm100:
                     self.pack_gqa,
                     self.qhead_per_kvhead_valid if const_expr(self.pad_qheads) else None,
                 )
-                row_max, row_sum = apply_learnable_sink(row_max, row_sum, sink_val, softmax_scale_log2)
+                row_max_log2, row_sum, output_correction = apply_learnable_sink(
+                    row_max_log2, row_sum, sink_val
+                )
 
             acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
             scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+            scale = scale * output_correction
             # seqlen_k == 0 with TMA KV: the fully masked dummy block still loaded a KV tile, and
             # P = 0 times a NaN V row is NaN (scaling by 0 would keep it): write zeros instead.
             zero_O = seqlen.seqlen_k == 0 if const_expr(self.use_tma_KV) else False
@@ -3176,8 +3178,7 @@ class FlashAttentionMLAForwardSm100:
                 if tidx < self.cta_tile_m:
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True))
-                        * LN2
+                        (row_max_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )

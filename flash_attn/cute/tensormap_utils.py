@@ -7,7 +7,7 @@ past the end then arrive zero-filled from a bounded footprint (#3071).
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.utils import TensorMapManager, TensorMapUpdateMode
+from flash_attn.cute.compat import TensorMapManager, TensorMapUpdateMode
 
 
 @cute.jit

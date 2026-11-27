@@ -16,13 +16,12 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
-import cutlass.utils as utils_basic
-from cutlass.base_dsl.arch import Arch
-from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import Arch, BaseDSL
 
 from quack import copy_utils
 from quack import layout_utils
 
+from flash_attn.cute.compat import SmemAllocator, get_smem_capacity_in_bytes
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
@@ -172,7 +171,7 @@ class FlashAttentionForwardBase:
         )
         smem_usage = smem_usage_QV + smem_usage_K
         # TODO: sm86 and sm89
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
+        smem_capacity = get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
             return False
         # Check if twice the block size is divisible by the number of threads
@@ -253,7 +252,7 @@ class FlashAttentionForwardBase:
         async_copy_elems = universal_copy_bits // self.dtype.width
         # atom_async_copy: async copy atom for QKV load
         atom_async_copy = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
             self.dtype,
             num_bits_per_copy=universal_copy_bits,
         )
@@ -653,8 +652,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
+
+        learnable_sink: optional per-head attention-sink logit (shape (num_head,)),
+        folded into the softmax denominator as an extra column, i.e.
+        row_sum += exp(sink[head] - row_max). None reproduces the previous behavior exactly.
         """
-        assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(
             *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
@@ -739,6 +741,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             softmax_scale,
             window_size_left,
             window_size_right,
+            learnable_sink,
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
@@ -780,6 +783,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         softmax_scale: Optional[Float32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        learnable_sink: Optional[cute.Tensor],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -872,7 +876,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             # Get shared memory buffer
             # ///////////////////////////////////////////////////////////////////////////////
-            smem = cutlass.utils.SmemAllocator()
+            smem = SmemAllocator()
             storage = smem.allocate(SharedStorage)
             sQ = storage.sQ.get_tensor(sQ_layout)
             sK = storage.sK.get_tensor(sK_layout)
@@ -1130,7 +1134,21 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 # TODO: local
 
             # normalize acc_O by row_sum and calculate the lse
-            row_scale = softmax.finalize()
+            sink_val = None
+            if const_expr(learnable_sink is not None):
+                if const_expr(not self.pack_gqa):
+                    # Every row in this CTA shares the same Q-head (num_head), so a single
+                    # scalar sink value broadcasts to all rows in Softmax.finalize.
+                    sink_val = Float32(learnable_sink[num_head])
+                else:  # Each thread might have a different sink value due to different q_head
+                    sink_val = cute.make_rmem_tensor_like(softmax.row_max, Float32)
+                    cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+                    tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma_qk.partition_C(cS))
+                    for r in cutlass.range(cute.size(sink_val), unroll_full=True):
+                        row = m_block * self.tile_m + tScS_mn[r][0]
+                        q_head_idx = row % self.qhead_per_kvhead + num_head * self.qhead_per_kvhead
+                        sink_val[r] = Float32(learnable_sink[q_head_idx])
+            row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
 
             # ///////////////////////////////////////////////////////////////////////////////

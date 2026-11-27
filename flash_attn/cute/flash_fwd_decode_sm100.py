@@ -375,6 +375,7 @@ class _SwapABCore:
         qk_b_major = OperandMajorMode.K
         tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
             self.dtype,
+            self.dtype,
             qk_a_major,
             qk_b_major,
             self.qk_acc_dtype,
@@ -386,6 +387,7 @@ class _SwapABCore:
         pv_a_major = OperandMajorMode.MN
         pv_b_major = OperandMajorMode.MN
         tiled_mma_pv = sm100_utils.make_trivial_tiled_mma(
+            self.dtype,
             self.dtype,
             pv_a_major,
             pv_b_major,
