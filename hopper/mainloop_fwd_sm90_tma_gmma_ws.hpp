@@ -857,6 +857,7 @@ struct CollectiveMainloopFwdSm90 {
         // TMA store on O first, call TMA multicast load on V, before CTA 1 can finishing TMA store on O.
         // if (thread_idx == 0) { printf("Producer: main load, before barrier_O, work_idx = %d\n", work_idx);}
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
+        __syncwarp();
         // if (thread_idx == 0) { printf("Producer: main load, after barrier_O\n");}
 
         if constexpr (!Transpose_V && !IntraWGOverlap) {
@@ -904,6 +905,7 @@ struct CollectiveMainloopFwdSm90 {
         // If we don't wait for barrier_O here, when using Cluster, CTA0 might exit early and CTA1 will
         // try to arrive on barrier_O of CTA0, causing "unspecified launch failure".
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
+        __syncwarp();
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         // Issue the epilogue waits
         // TODO: check if this should be called by 1 thread or more
@@ -1558,6 +1560,7 @@ struct CollectiveMainloopFwdSm90 {
         // and the main attention are not the same. We want to make sure the consumers
         // have finished reading all smem_k and smem_v for the previous iteration.
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
+        __syncwarp();
         if (should_load_KV) { load_K_new(n_block, smem_pipe_write); }
         // if (thread_idx == 0) { printf("Producer: Done loading K, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
         if (should_load_KV) { load_V_new(n_block, smem_pipe_write); }
