@@ -4,8 +4,11 @@ from dataclasses import asdict, astuple, replace
 from unittest import mock
 
 import pytest
+import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from flash_attn.cute import config as config_module
+from flash_attn.cute import interface
 from flash_attn.cute.config import (
     SM100_SMEM_BYTES,
     FwdConfig,
@@ -42,6 +45,121 @@ def make_inputs(*, pack_gqa: bool | None = None, **changes) -> FwdHeuristicInput
     return _BASE_INPUTS._replace(pack_gqa=pack_gqa, **changes)
 
 
+@pytest.mark.parametrize("arch", [80, 121])
+@pytest.mark.parametrize("d,dv", [(25, 32), (32, 25)])
+def test_paged_kv_rejects_partial_copy_vector(arch, d, dv):
+    inputs = make_inputs(device_arch=arch, page_size=16, head_dim=d, head_dim_v=dv)
+    with pytest.raises(ValueError, match="head dimensions divisible by 8"):
+        select_fwd_config(inputs)
+
+
+def identity_score_mod(scores, batch, head, q_idx, kv_idx, seqlen_info, aux_tensors, *, aux_scalars=()):
+    return scores
+
+
+def keep_mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors):
+    return q_idx >= 0
+
+
+@pytest.mark.parametrize(
+    ("arch", "paged", "score_mod", "use_aux_tensors", "kwargs", "reject"),
+    [
+        pytest.param(120, True, identity_score_mod, True, {}, True, id="sm120-paged-aux"),
+        pytest.param(121, True, identity_score_mod, True, {}, True, id="sm121-paged-aux"),
+        pytest.param(120, False, identity_score_mod, True, {}, False, id="dense-aux"),
+        pytest.param(
+            120, True, identity_score_mod, False, {"aux_scalars": (1.0,)}, False,
+            id="paged-scalar-only",
+        ),
+        pytest.param(
+            120, True, None, True, {"softcap": 5.0, "mask_mod": keep_mask}, False,
+            id="paged-softcap-and-mask-aux",
+        ),
+    ],
+)
+def test_sm12x_paged_score_mod_aux_tensors(
+    monkeypatch, arch, paged, score_mod, use_aux_tensors, kwargs, reject
+):
+    class CacheHit:
+        def __contains__(self, key):
+            return True
+
+    # Exercise host admission only: FakeTensorMode never launches, and a cache hit skips compile.
+    monkeypatch.setenv("FLASH_ATTENTION_NUM_SMS", "128")
+    monkeypatch.setattr(interface._flash_attn_fwd, "compile_cache", CacheHit())
+    with FakeTensorMode():
+        q = torch.empty((1, 64, 1, 64), dtype=torch.bfloat16)
+        kv = torch.empty((1, 64, 1, 64), dtype=torch.bfloat16)
+        page_table = torch.zeros((1, 1), dtype=torch.int32) if paged else None
+        aux_tensors = [torch.empty((64,), dtype=torch.float32)] if use_aux_tensors else None
+        outcome = (
+            pytest.raises(NotImplementedError, match="SM12x paged KV.*score_mod.*aux_tensors")
+            if reject else nullcontext()
+        )
+        with outcome:
+            interface._flash_attn_fwd(
+                q, kv, kv, _arch=arch, page_table=page_table, score_mod=score_mod,
+                aux_tensors=aux_tensors, **kwargs,
+            )
+
+
+@pytest.mark.parametrize("arch", [86, 89])
+@pytest.mark.parametrize("dtype", ["torch.float16", "torch.bfloat16"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm86_sm89_hd256_fits_shared_memory(arch, dtype, causal):
+    inputs = make_inputs(device_arch=arch, dtype=dtype, causal=causal, **_HD256)
+    config = select_fwd_config(inputs)
+    # Q, K and V each occupy 64 x 256 x 2 bytes.
+    assert (config.tile_m, config.tile_n) == (64, 64)
+    validate_fwd_config(config, inputs)
+    with pytest.raises(ValueError, match="shared memory"):
+        select_fwd_config(inputs._replace(requested_tile_m=128))
+    with pytest.raises(ValueError, match="shared memory"):
+        validate_fwd_config(replace(config, tile_n=128), inputs)
+
+
+@pytest.mark.parametrize("arch", [86, 89, 120, 121])
+def test_asymmetric_hd256_paged_kv_fits_shared_memory(arch):
+    inputs = make_inputs(device_arch=arch, head_dim=256, head_dim_v=128, page_size=32)
+    config = select_fwd_config(inputs)
+    # 128x64 needs 112 KiB for Q/K/V; 64x64 needs 80 KiB.
+    assert (config.tile_m, config.tile_n) == (64, 64)
+    # A narrower N tile lets the caller keep 128 Q rows.
+    explicit = select_fwd_config(inputs._replace(requested_tile_m=128, requested_tile_n=32))
+    assert (explicit.tile_m, explicit.tile_n) == (128, 32)
+
+
+@pytest.mark.parametrize(("d", "block_n"), [(256, 128), (128, 96)])
+def test_varlen_sparse_fits_shared_memory_without_splitting_q_block(d, block_n):
+    inputs = make_inputs(
+        device_arch=120, head_dim=d, head_dim_v=128, has_cu_seqlens_q=True,
+        use_block_sparsity=True, sparse_q_block_size=128, sparse_kv_block_size=block_n,
+    )
+    config = select_fwd_config(inputs)
+    assert config.tile_m == 128
+    assert block_n % config.tile_n == 0
+    validate_fwd_config(config, inputs)
+
+
+@pytest.mark.parametrize("arch", [89, 120])
+def test_explicit_tile_rejects_shared_memory_overflow_after_padding(arch):
+    inputs = make_inputs(device_arch=arch, head_dim=248, head_dim_v=120, page_size=32)
+    config = select_fwd_config(inputs._replace(requested_tile_m=64, requested_tile_n=48))
+    # Raw widths would fit, but 256/128 padded widths need 100 KiB at 128x48.
+    with pytest.raises(ValueError, match="needs 102400 bytes of shared memory"):
+        validate_fwd_config(replace(config, tile_m=128), inputs)
+    with pytest.raises(ValueError, match="needs 102400 bytes of shared memory"):
+        select_fwd_config(inputs._replace(requested_tile_m=128, requested_tile_n=48))
+
+
+def test_explicit_tile_rejects_shared_memory_overflow_from_epilogue():
+    inputs = make_inputs(device_arch=86, head_dim=64, head_dim_v=256)
+    config = select_fwd_config(inputs)
+    # 256x64 fits the Q/K/V buffers in 72 KiB, but O needs 128 KiB.
+    with pytest.raises(ValueError, match="needs 131072 bytes of shared memory"):
+        validate_fwd_config(replace(config, tile_m=256), inputs)
+
+
 @pytest.mark.parametrize("arch", [120, 121])
 @pytest.mark.parametrize("dtype", ["torch.float16", "torch.bfloat16"])
 @pytest.mark.parametrize(("d", "dv", "causal", "tile"), [
@@ -60,6 +178,14 @@ def test_sm12x_fwd_tile(arch, dtype, d, dv, causal, tile):
 def test_every_architecture_selects_a_valid_default(device_arch, causal):
     inputs = make_inputs(device_arch=device_arch, causal=causal)
     validate_fwd_config(select_fwd_config(inputs), inputs)
+
+
+@pytest.mark.parametrize("device_arch", [80, 86, 89, 90, 100, 110, 120])
+@pytest.mark.parametrize("page_size", [16, 52, 128])
+def test_paged_kv_config(device_arch, page_size):
+    inputs = make_inputs(device_arch=device_arch, page_size=page_size)
+    config = select_fwd_config(inputs)
+    validate_fwd_config(config, inputs)
 
 
 @pytest.mark.parametrize(
@@ -114,6 +240,7 @@ def test_pack_gqa_resolves_before_dependent_policy(changes, pack_gqa, expected):
         ({"max_seqlen_q": 1, "disable_s_ping_pong": True, **_HD128}, {"use_s_ping_pong": False}),
         ({"device_arch": 90, "head_dim": 96, "head_dim_v": 96, "requested_tile_m": 128},
          {"tile_m": 128, "mma_pv_is_rs": True, "intra_wg_overlap": True}),
+        ({"device_arch": 120, **_HD256}, {"tile_m": 64, "tile_n": 64}),
     ],
 )
 def test_selection_policy(changes, expected):
@@ -227,7 +354,6 @@ def test_split_selection(changes, expected_splits, expected_tile_n):
     [
         # Selection-time rejections.
         ({"device_arch": 70}, {}, "Unsupported forward architecture family SM7"),
-        ({"device_arch": 120, "page_size": 128}, {}, "SM120 forward does not support"),
         ({"device_arch": 120, "requested_num_splits": 3}, {}, "SM120 forward only supports num_s"),
         ({"head_dim": 72, "head_dim_v": 72, "page_size": 64}, {}, "head dimensions divisible"),
         # Geometry and architecture.

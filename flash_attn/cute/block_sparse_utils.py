@@ -443,7 +443,6 @@ def consume_block_sparse_loads(
     score_mod_fn,
     O_should_accumulate,
     mask_mod,
-    fastdiv_mods,
     intra_wg_overlap: cutlass.Constexpr,
     warp_scheduler_barrier_sync: Callable,
     warp_scheduler_barrier_arrive: Callable,
@@ -488,7 +487,6 @@ def consume_block_sparse_loads(
                     mask_fn,
                     mask_mod=mask_mod,
                     mask_seqlen=True,
-                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
                 ),
                 is_first_n_block=True,
             )
@@ -559,7 +557,6 @@ def consume_block_sparse_loads(
                     mask_fn,
                     mask_mod=mask_mod,
                     mask_seqlen=True,
-                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
                 ),
                 score_mod_fn=score_mod_fn,
                 is_first_block=True,
@@ -1778,7 +1775,6 @@ def consume_block_sparse_mma_bwd_sm90(
     q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
     aux_data: AuxData = AuxData(),
-    fastdiv_mods=(None, None),
 ):
     """SM90 backward block sparse MMA consumption with separate partial/full loops.
 
@@ -1811,7 +1807,6 @@ def consume_block_sparse_mma_bwd_sm90(
         mask_local=is_local,
         mask_mod=mask_mod,
         aux_data=aux_data,
-        fastdiv_mods=fastdiv_mods,
     )
 
     mask_fn_full = partial(
@@ -1824,7 +1819,6 @@ def consume_block_sparse_mma_bwd_sm90(
         mask_causal=is_causal,
         mask_local=is_local,
         aux_data=aux_data,
-        fastdiv_mods=fastdiv_mods,
     )
 
     for iter_idx in cutlass.range(curr_q_cnt * q_subtile_factor, unroll=1):
