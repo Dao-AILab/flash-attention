@@ -302,6 +302,8 @@ class BlockSparsityKernel:
                         lane_masked = reduction_buffer[lane_id, 1] != Int8(0)
                     has_unmasked = cute.arch.vote_any_sync(lane_unmasked)
                     has_masked = cute.arch.vote_any_sync(lane_masked)
+                # Warp 0 has read all flags: the next n_block may overwrite reduction_buffer.
+                cute.arch.sync_threads()
 
             # Only thread 0 updates the output arrays (common to both paths)
             if tidx == 0:
