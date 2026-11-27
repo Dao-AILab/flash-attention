@@ -1155,7 +1155,8 @@ class FlashAttentionBackwardSm90:
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
-            qhead_per_kvhead=self.qhead_per_kvhead,
+            # Pack-GQA factor: the backward does not pack GQA, head_idx is the Q head
+            qhead_per_kvhead=1,
             transpose_indices=self.SdP_swapAB,
         )
 
@@ -1199,7 +1200,8 @@ class FlashAttentionBackwardSm90:
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
-            qhead_per_kvhead=self.qhead_per_kvhead,
+            # Pack-GQA factor: the backward does not pack GQA, head_idx is the Q head
+            qhead_per_kvhead=1,
             transpose_indices=self.SdP_swapAB,
         )
 
