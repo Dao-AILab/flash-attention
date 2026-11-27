@@ -212,7 +212,7 @@ def _layer_norm_fwd_1pass_kernel(
     HAS_B1: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     X += row * stride_x_row
     Y += row * stride_y_row
     if HAS_RESIDUAL:
@@ -529,7 +529,7 @@ def _layer_norm_bwd_kernel(
     RECOMPUTE_OUTPUT: tl.constexpr,
 ):
     # Map the program id to the elements of X, DX, and DY it should compute.
-    row_block_id = tl.program_id(0)
+    row_block_id = tl.program_id(0).to(tl.int64)
     row_start = row_block_id * rows_per_program
     # Do not early exit if row_start >= M, because we need to write DW and DB
     cols = tl.arange(0, BLOCK_N)
