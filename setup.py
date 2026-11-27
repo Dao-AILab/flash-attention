@@ -1,6 +1,7 @@
 # Copyright (c) 2023, Tri Dao.
 
 import sys
+import copy
 import functools
 import importlib.util
 import warnings
@@ -232,7 +233,7 @@ def rename_cpp_to_cu(cpp_files, generated_rdna_bfloat16_override=None):
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"]
+    allowed_archs = ["native", "gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201", "gfx1250"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -570,6 +571,13 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
         check_if_rocm_home_none("flash_attn")
         cc_flag = [f"--offload-arch={arch}" for arch in kernel_targets]
+        # Match CK's configure-time target definition in both compiler passes.
+        ck_target_ids = ",".join(f"0x{arch[3:]}" for arch in kernel_targets)
+        ck_framework_flags = [f"-DCK_CMAKE_GPU_TARGET_IDS={ck_target_ids}"]
+        # CK's unified framework does not yet support gfx1250 (see CK CMakeLists.txt).
+        if "gfx1250" in kernel_targets:
+            ck_framework_flags += ["-DUSE_NEW_UNIFIED_FRAMEWORK=0"]
+        cc_flag += ck_framework_flags
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -650,7 +658,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
         extra_compile_args = {
-            "cxx": ["-O3", "-std=c++20"] + generator_flag + maybe_hipify_v2_flag,
+            "cxx": ["-O3", "-std=c++20"] + ck_framework_flags + generator_flag + maybe_hipify_v2_flag,
             "nvcc": cc_flag + generator_flag + maybe_hipify_v2_flag,
         }
 
@@ -778,6 +786,42 @@ class NinjaBuildExtension(BuildExtension):
             os.environ["MAX_JOBS"] = str(max_jobs)
 
         super().__init__(*args, **kwargs)
+
+    def build_extension(self, ext) -> None:
+        # Match CK's per-instance scheduling options (fmha_fwd_source_flags.cmake).
+        # LSE-producing pingpong instances must keep the default scheduling mode.
+        ck_expert_sources = re.compile(
+            r"^fmha_fwd_d(64|128|192)_(fp16|bf16)_.*_qr_tdm_"
+            r"(sched|pingpong_.*_nlse)(_.*)?_gfx125\.(cu|hip)$"
+        )
+        expert_sources = sorted(
+            source for source in ext.sources
+            if IS_ROCM and ROCM_BACKEND == "ck"
+            and ck_expert_sources.match(Path(source).name)
+        )
+        if expert_sources:
+            # BuildExtension has configured the HIP compiler before this hook.
+            # Keep this group's objects and Ninja cache separate from sources
+            # that use the default scheduling mode.
+            expert_args = copy.deepcopy(ext.extra_compile_args)
+            expert_args["nvcc"] += ["-mllvm", "-amdgpu-expert-scheduling-mode"]
+            expert_objects = self.compiler.compile(
+                expert_sources,
+                output_dir=os.path.join(self.build_temp, ext.name, "ck_expert"),
+                macros=ext.define_macros + [(name,) for name in ext.undef_macros],
+                include_dirs=ext.include_dirs,
+                debug=self.debug,
+                extra_postargs=expert_args,
+                depends=ext.depends,
+            )
+            # Preserve the extension's source list for packaging. Let setuptools
+            # compile the remaining sources and link both groups together.
+            ext = copy.copy(ext)
+            ext.sources = [source for source in ext.sources if source not in expert_sources]
+            ext.extra_objects = list(ext.extra_objects or []) + expert_objects
+            # Relink when an expert object changes, including non-Ninja builds.
+            ext.depends = list(ext.depends or []) + expert_objects
+        super().build_extension(ext)
 
     def build_extensions(self) -> None:
         original_spawn = None
