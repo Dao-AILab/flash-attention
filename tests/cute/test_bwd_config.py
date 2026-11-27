@@ -10,6 +10,7 @@ from flash_attn.cute.config import (
     bwd_pack_gqa_heuristic,
     bwd_q_subtile_factor,
     config_kv_subtile_factor,
+    fit_sm90_bwd_tile_to_block_sparsity,
     select_bwd_config,
     select_bwd_fold,
     validate_bwd_config,
@@ -122,6 +123,13 @@ def legacy_bwd_policy(inputs: BwdHeuristicInputs) -> dict:
         )
     elif arch // 10 == 9:
         legacy = legacy_sm90_tile(head_dim, head_dim_v, causal, local, sparse_q)
+        if inputs.use_block_sparsity and block_size is not None:
+            # Not part of the frozen policy: the tile now follows an explicit sparse block size.
+            fields = {_CONFIG_FIELDS[k]: v for k, v in legacy.items()}
+            fields = fit_sm90_bwd_tile_to_block_sparsity(
+                dict(fields, num_threads=384), head_dim, head_dim_v, *block_size
+            )
+            legacy = {k: fields[_CONFIG_FIELDS[k]] for k in legacy}
         legacy.update(
             V_in_regs=inputs.requested_V_in_regs,
             num_threads=384,
