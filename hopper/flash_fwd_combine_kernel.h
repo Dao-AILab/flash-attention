@@ -227,7 +227,7 @@ public:
 
         static dim3 get_grid_shape(SchedulerArguments const& args) {
             unsigned int num_blocks_k = cute::ceil_div(args.dv, kBlockK);
-            unsigned int num_blocks_m = cute::ceil_div(args.seqlen_q * args.num_heads, kBlockM);
+            unsigned int num_blocks_m = cute::ceil_div(static_cast<int64_t>(args.seqlen_q) * args.num_heads, Int<kBlockM>{});
             return {num_blocks_m, num_blocks_k, static_cast<unsigned int>(args.b)};
         }
 
@@ -317,17 +317,17 @@ public:
 
             switch (choose_scheduling_algo(args)) {
             case SchedulingAlgo::STANDARD: {
-                unsigned int num_blocks_m = cute::ceil_div(args.seqlen_q * args.num_heads, kBlockM);
+                unsigned int num_blocks_m = cute::ceil_div(static_cast<int64_t>(args.seqlen_q) * args.num_heads, Int<kBlockM>{});
                 return {num_blocks_m, num_blocks_k, static_cast<unsigned int>(args.b)};
             }
             case SchedulingAlgo::LINEARIZE_M_AND_BATCH: {
                 // rough worst case upper bound on the number of blocks required
                 // (assuming each batch has an additional partial block)
-                unsigned int num_blocks_m = cute::ceil_div(args.total_q * args.num_heads, kBlockM) + args.b;
+                unsigned int num_blocks_m = cute::ceil_div(static_cast<int64_t>(args.total_q) * args.num_heads, Int<kBlockM>{}) + args.b;
                 return {num_blocks_m, num_blocks_k, 1};
             }}
 
-            unsigned int num_blocks_m = cute::ceil_div(args.total_q * args.num_heads, kBlockM) + args.b;
+            unsigned int num_blocks_m = cute::ceil_div(static_cast<int64_t>(args.total_q) * args.num_heads, Int<kBlockM>{}) + args.b;
             return {num_blocks_m, num_blocks_k, 1};
         }
 
@@ -354,8 +354,8 @@ public:
                     auto get_num_m_blocks = [&](int bidb) {
                         if (bidb >= params.b) return 0;
                         if (params.prepare_seqlen_q_ptr) {
-                            int length = params.prepare_seqlen_q_ptr[bidb] * (!params.pack_gqa ? params.num_heads : params.num_heads_kv);
-                            return cute::ceil_div(length, Int<kBlockM>{});
+                            int64_t length = static_cast<int64_t>(params.prepare_seqlen_q_ptr[bidb]) * (!params.pack_gqa ? params.num_heads : params.num_heads_kv);
+                            return static_cast<int>(cute::ceil_div(length, Int<kBlockM>{}));
                         } else {
                             // bidb is the virtual (scheduling) batch. When batches are
                             // sorted, remap to the actual batch so the per-virtual-batch
@@ -364,7 +364,7 @@ public:
                             int const actual_bidb = params.varlen_batch_idx_ptr
                                 ? params.varlen_batch_idx_ptr[bidb] : bidb;
                             flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{actual_bidb, 0, params.cu_seqlens_q, params.seqused_q};
-                            return cute::ceil_div(seqlen_info.seqlen * params.num_heads, Int<kBlockM>{});
+                            return static_cast<int>(cute::ceil_div(static_cast<int64_t>(seqlen_info.seqlen) * params.num_heads, Int<kBlockM>{}));
                         }
                     };
 
@@ -458,9 +458,9 @@ public:
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
-        int max_idx = seqlen * get<2>(params.shape_LSE_partial);
+        int64_t max_idx = static_cast<int64_t>(seqlen) * get<2>(params.shape_LSE_partial);
 
-        if (m_block >= cute::ceil_div(max_idx, Int<kBlockM>{})) { return; }
+        if (static_cast<int64_t>(m_block) >= cute::ceil_div(max_idx, Int<kBlockM>{})) { return; }
 
         int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[maybe_virtual_batch] : get<1>(params.shape_LSE_partial);
         if (num_splits <= 1) { return; }
