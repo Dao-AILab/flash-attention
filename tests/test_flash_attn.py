@@ -2967,6 +2967,56 @@ def test_flash_attn_kvcache_splitkv_large_accum(seqlen_q, num_splits, free_gib):
     torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
 
 
+class _RawDeviceFloats:
+    """Expose n floats at a device address as a tensor (to read just past a tensor's end)."""
+
+    def __init__(self, ptr, n):
+        self.__cuda_array_interface__ = {
+            "shape": (n,),
+            "typestr": "<f4",
+            "data": (ptr, False),
+            "version": 2,
+        }
+
+
+@pytest.mark.parametrize("seqlen_q", [1, 7, 16])
+def test_flash_attn_kvcache_splitkv_combine_lse_oob(seqlen_q):
+    # Regression test for #3190. The split-KV combine kernel launches
+    # ceil(b * h * seqlen_q / kBlockM) blocks, but the non-unpadded_lse path stored all kBlockM
+    # rows of softmax_lse in the last block. For head dim 32, kBlockM = 16
+    # (flash_fwd_launch_template.h), so when b * h * seqlen_q is not a multiple of 16 it wrote
+    # 16 - (b * h * seqlen_q % 16) floats past the end of softmax_lse, which has exactly
+    # b * h * seqlen_q floats. Those out-of-range stores are all +inf.
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    b, h, d, seqlen_k, num_splits, k_block_m = 1, 1, 32, 64, 2, 16
+    sentinel = 12345.0
+
+    q = torch.randn(b, seqlen_q, h, d, device=device, dtype=dtype)
+    k = torch.randn(b, seqlen_k, h, d, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+
+    # The caching allocator serves small tensors from 512-byte blocks. Fill freed blocks with a
+    # sentinel so the tail of the block backing softmax_lse has a known value: the buggy kernel
+    # overwrites it with +inf, while the fixed kernel leaves it untouched.
+    blocks = [torch.full((128,), sentinel, device=device) for _ in range(256)]
+    del blocks
+
+    out, lse = flash_attn_with_kvcache(q, k, v, num_splits=num_splits, return_softmax_lse=True)
+    torch.cuda.synchronize()
+
+    n = lse.numel()
+    assert n == b * h * seqlen_q
+    n_over = (-n) % k_block_m  # rows the buggy kernel writes past the end
+    read_len = n + k_block_m
+    raw = torch.as_tensor(_RawDeviceFloats(lse.data_ptr(), read_len), device=device)
+    tail = raw[n : n + n_over].tolist()
+    assert all(x == sentinel for x in tail), (
+        f"softmax_lse written past its end (seqlen_q={seqlen_q}): expected {n_over} "
+        f"sentinel floats after index {n}, got {tail}"
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [64, 128])
 def test_flash_attn_varlen_paged_kv_lse_empty_blocks(d, dtype):
