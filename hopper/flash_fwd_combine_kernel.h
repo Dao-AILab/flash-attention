@@ -456,6 +456,7 @@ public:
         int const batch = params.varlen_batch_idx_ptr ? params.varlen_batch_idx_ptr[maybe_virtual_batch] : maybe_virtual_batch;
         
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
+        bool const is_varlen = Varlen && params.cu_seqlens;
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
         int max_idx = seqlen * get<2>(params.shape_LSE_partial);
@@ -470,7 +471,7 @@ public:
         // Step 1: load LSE_partial from gmem -> smem
         Tensor mLSEpartial = make_tensor(make_gmem_ptr(params.ptr_LSE_partial + offset * get<0>(params.stride_LSE_partial)),
                                          select<1, 0, 2, 3>(params.shape_LSE_partial),
-                                         select<1, 0, 2, 3>(params.stride_LSE_partial))(_, _, _, !Varlen ? batch : 0);  // (num_splits, seqlen, head)
+                                         select<1, 0, 2, 3>(params.stride_LSE_partial))(_, _, _, !is_varlen ? batch : 0);  // (num_splits, seqlen, head)
         Tensor mLSEpartial_copy = cute::tiled_divide(mLSEpartial, Shape<_1, Int<kGmemElemsPerLoadLSE>>{});
         GmemTiledCopyLSE gmem_tiled_copy_LSE;
         auto gmem_thr_copy_LSE = gmem_tiled_copy_LSE.get_thread_slice(thread_idx);
@@ -521,7 +522,7 @@ public:
         // Repeat the partitioning with identity layouts
         Tensor tOcO = gmem_thr_copy_O_partial.partition_D(cO);
         Tensor mOpartial = make_tensor(make_gmem_ptr(params.ptr_O_partial + offset * get<0>(params.stride_O_partial)),
-                                       params.shape_O_partial, params.stride_O_partial)(_, _, _, _, !Varlen ? batch : 0);  // (seqlen, d, num_splits, head)
+                                       params.shape_O_partial, params.stride_O_partial)(_, _, _, _, !is_varlen ? batch : 0);  // (seqlen, d, num_splits, head)
 
         // Precompute these values to avoid recomputing them in the loop
         Tensor tOmidx = make_tensor<int>(make_shape(size<1>(tOcO)));
@@ -635,7 +636,7 @@ public:
         // Step 5: store final LSE back to gmem
         if (k_block == 0) {
             auto shape_LSE = select<0, 2, 3>(params.shape_LSE_partial);
-            Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE + offset * get<0>(params.stride_LSE)), shape_LSE, params.stride_LSE)(_, _, !Varlen ? batch : 0);
+            Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE + offset * get<0>(params.stride_LSE)), shape_LSE, params.stride_LSE)(_, _, !is_varlen ? batch : 0);
             #pragma unroll
             for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
                 if (get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {  // Only the thread responsible for s=0 writes to gmem
@@ -703,7 +704,7 @@ public:
         flash::convert_type_out(tOrO, rO);
         auto shape_O = make_shape(get<0>(params.shape_O_partial), get<1>(params.shape_O_partial) - k_block * kBlockK, get<3>(params.shape_O_partial), get<4>(params.shape_O_partial));
         Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset * get<0>(params.stride_O) + k_block * kBlockK * get<1>(params.stride_O)),
-                                shape_O, params.stride_O)(_, _, _, !Varlen ? batch : 0);
+                                shape_O, params.stride_O)(_, _, _, !is_varlen ? batch : 0);
         Tensor mO_copy = cute::tiled_divide(mO, Shape<_1, Int<kGmemElemsPerLoad>>{});
         GmemTiledCopy gmem_tiled_copy_O;
         auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);

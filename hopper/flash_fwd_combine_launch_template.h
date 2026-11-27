@@ -24,18 +24,19 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
     using CombineKernel = flash::FlashAttnFwdCombine<TileShape_MK, kLogMaxSplits, 256 /*kNThreads*/, 1 /*AlignmentLSE*/,
                                                      IsEvenK, Varlen, Element, ElementPartial, ArchTag>;
 
+    bool const is_varlen_q = params.cu_seqlens_q;
     typename CombineKernel::Arguments args {
         params.b,
         static_cast<ElementPartial const*>(params.oaccum_ptr),
-        {!Varlen ? params.seqlen_q : params.total_q, params.dv, params.num_splits, params.h, !Varlen ? params.b : 1},  // shape_O_partial
-        {params.oaccum_row_stride, _1{}, params.oaccum_split_stride, params.oaccum_head_stride, !Varlen ? params.oaccum_batch_stride : 0},  // stride_O_partial
+        {!is_varlen_q ? params.seqlen_q : params.total_q, params.dv, params.num_splits, params.h, !is_varlen_q ? params.b : 1},  // shape_O_partial
+        {params.oaccum_row_stride, _1{}, params.oaccum_split_stride, params.oaccum_head_stride, !is_varlen_q ? params.oaccum_batch_stride : 0},  // stride_O_partial
         static_cast<float*>(params.softmax_lseaccum_ptr),
-        {!Varlen ? params.seqlen_q : params.total_q, params.num_splits, params.h, !Varlen ? params.b : 1},  // shape_LSE_partial
-        {_1{}, params.lseaccum_split_stride, params.lseaccum_head_stride, !Varlen ? params.lseaccum_batch_stride : 0},  // stride_LSE_partial
+        {!is_varlen_q ? params.seqlen_q : params.total_q, params.num_splits, params.h, !is_varlen_q ? params.b : 1},  // shape_LSE_partial
+        {_1{}, params.lseaccum_split_stride, params.lseaccum_head_stride, !is_varlen_q ? params.lseaccum_batch_stride : 0},  // stride_LSE_partial
         static_cast<Element*>(params.o_ptr),
-        {params.o_row_stride, _1{}, params.o_head_stride, !Varlen ? params.o_batch_stride : 0},  // stride_O
+        {params.o_row_stride, _1{}, params.o_head_stride, !is_varlen_q ? params.o_batch_stride : 0},  // stride_O
         static_cast<float*>(params.softmax_lse_ptr),
-        {_1{}, !Varlen ? params.seqlen_q : params.total_q, !Varlen ? params.h * params.seqlen_q : 0},  // stride_LSE
+        {_1{}, !is_varlen_q ? params.seqlen_q : params.total_q, !is_varlen_q ? params.h * params.seqlen_q : 0},  // stride_LSE
         params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.varlen_batch_idx_ptr, params.tile_count_semaphore
     };
 
