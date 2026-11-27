@@ -1335,6 +1335,27 @@ class SwapABPolicy:
     def seqlen_k_capacity(self, inputs: FwdHeuristicInputs) -> int:
         return inputs.max_seqlen_k if inputs.seqlen_k_capacity is None else inputs.seqlen_k_capacity
 
+    def window_seqlen_k(self, inputs: FwdHeuristicInputs) -> int:
+        """KV tokens a query can read: the capacity, or under a left window at most the
+        window_size_left + 1 keys that end at the query, plus one KV block because the window need
+        not start on a block boundary. No key follows the query, so the right side adds none.
+
+        Splits divide only the window's blocks (BlockInfo.get_n_block_min_max), so a count planned
+        for the capacity cuts a 1K window over a 16K cache into near-empty splits plus a combine.
+        """
+        capacity = self.seqlen_k_capacity(inputs)
+        if not inputs.local or inputs.window_size_left is None:
+            return capacity
+        return min(capacity, max(inputs.window_size_left, 0) + 1 + self.tile_n)
+
+    def short_window(self, inputs: FwdHeuristicInputs) -> bool:
+        """A left window that spans at most split_min_blocks KV blocks (window_seqlen_k)."""
+        return (
+            inputs.local
+            and inputs.window_size_left is not None
+            and self.window_seqlen_k(inputs) <= self.split_min_blocks * self.tile_n
+        )
+
     def slower_than_standard(self, inputs: FwdHeuristicInputs) -> bool:
         """Measured SwapAB losses that automatic selection avoids; see short_kv_max_tokens."""
         return (
@@ -1349,26 +1370,49 @@ class SwapABPolicy:
         Lengths vary per sequence with varlen Q or seqused_k (the SwapAB tile scheduler reads the
         counts for dense Q too), but only a capacity of per_sequence_min_capacity tokens leaves
         room for the counts to pay for the prepare launch.
+
+        A short window (short_window) keeps a static count of 1 (the batch fills the CTA target):
+        the counts of its long sequences would be 1 too, after a prepare launch and before a
+        combine.
         """
         lengths_vary = inputs.is_varlen_q or inputs.has_seqused_k
-        return lengths_vary and self.seqlen_k_capacity(inputs) >= self.per_sequence_min_capacity
+        if not (lengths_vary and self.seqlen_k_capacity(inputs) >= self.per_sequence_min_capacity):
+            return False
+        return not (self.short_window(inputs) and self.static_num_splits(inputs) == 1)
 
     def needs_split_metadata(self, inputs: FwdHeuristicInputs, num_splits: int) -> bool:
         """Whether SwapAB prepares per-sequence split counts and launches split-major."""
         return num_splits > 1 and self.per_sequence_splits(inputs)
 
     def select_num_splits(self, inputs: FwdHeuristicInputs) -> int:
-        """Automatic split count; with per-sequence splits, the cap of the per-sequence counts."""
-        seqlen_k = self.seqlen_k_capacity(inputs)
+        """Automatic split count; with per-sequence splits, the cap of the per-sequence counts
+        (the capacity's; split_counts_see_window says when the counts follow a window)."""
         bh = inputs.batch_size * inputs.num_heads_kv
         # An empty batch has no tiles to split, as in num_splits_heuristic.
         if bh == 0:
             return 1
         if self.per_sequence_splits(inputs):
             grid_splits = ceil_div(self.grid_ctas_per_sm * inputs.num_sms, bh)
-            return max(1, min(self.max_splits, ceil_div(seqlen_k, self.tile_n), grid_splits))
+            capacity_blocks = ceil_div(self.seqlen_k_capacity(inputs), self.tile_n)
+            return max(1, min(self.max_splits, capacity_blocks, grid_splits))
+        return self.static_num_splits(inputs)
+
+    def static_num_splits(self, inputs: FwdHeuristicInputs) -> int:
+        """The static count: the largest power of two up to the CTA target, at most max_splits, at
+        least min_tokens_per_split of capacity per split, and no more splits than the KV blocks a
+        query can read (window_seqlen_k), so a window takes no empty splits."""
+        bh = inputs.batch_size * inputs.num_heads_kv
+        if bh == 0:
+            return 1
         pow2_splits = 1 << (max(1, self.static_target_ctas(inputs) // bh).bit_length() - 1)
-        return min(pow2_splits, self.max_splits, max(1, seqlen_k // self.min_tokens_per_split))
+        capacity = self.seqlen_k_capacity(inputs)
+        window_blocks = ceil_div(self.window_seqlen_k(inputs), self.tile_n)
+        return min(
+            pow2_splits,
+            self.max_splits,
+            max(1, capacity // self.min_tokens_per_split),
+            max(1, window_blocks),
+        )
 
     def split_policy(self, head_dim: int) -> dict:
         """Split-rule options of prepare_scheduler.num_splits_for_sequence for SwapAB decode.
@@ -1469,6 +1513,18 @@ def needs_split_metadata(config: FwdConfig, inputs: FwdHeuristicInputs) -> bool:
         and not inputs.has_caller_scheduler_metadata
         and not inputs.disable_scheduler_metadata
     )
+
+
+def split_counts_see_window(config: FwdConfig, inputs: FwdHeuristicInputs) -> bool:
+    """Whether the prepare kernel counts only a local window's KV blocks per sequence.
+
+    SwapAB does for short windows only (SwapABPolicy.short_window): past split_min_blocks blocks,
+    its floor of split_min_blocks blocks per split would leave the few long sequences of a ragged
+    batch fewer, longer splits than full-length counts give (B200: up to 11% slower).
+    """
+    if not inputs.local:
+        return False
+    return not config.use_swapab or SWAPAB.short_window(inputs)
 
 
 class TunedSm100Overrides(NamedTuple):

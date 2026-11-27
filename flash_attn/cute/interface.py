@@ -36,6 +36,7 @@ from flash_attn.cute.config import (
     sparse_mla_qhead_tile,
     SWAPAB,
     needs_split_metadata,
+    split_counts_see_window,
     validate_bwd_config,
     validate_fwd_config,
     validate_mla_fwd_config,
@@ -959,6 +960,7 @@ def _flash_attn_fwd(
     mla_1cta_kb64 = mla_kernel == "1cta_kb64"
     use_swapab = mla_kernel is None and config.use_swapab
     prepare_split_metadata = mla_kernel is None and needs_split_metadata(config, inputs)
+    count_window = prepare_split_metadata and split_counts_see_window(config, inputs)
     use_dynamic_varlen = (
         mla_kernel is None and config.use_dynamic_varlen and scheduler_metadata is None
     )
@@ -1118,6 +1120,8 @@ def _flash_attn_fwd(
             cluster_shape_m=cluster_shape_m,
             total_q=total_q if cu_seqlens_q is not None else None,
             use_clc_scheduler=config.use_clc_scheduler,
+            window_size_left=window_size_left if count_window else None,
+            window_size_right=window_size_right if count_window else None,
             **(SWAPAB.split_policy(head_dim) if use_swapab else {}),
         )
 
@@ -4388,6 +4392,10 @@ def _get_scheduler_metadata(
     use_clc_scheduler: bool = False,
     ctas_per_sm: int = 1,
     min_blocks_floor: Optional[Tuple[int, int]] = None,
+    # Local window sides as the kernels get them (clamped): the split counts then count only the
+    # KV blocks the window leaves. None for global or causal attention.
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
 ) -> SchedulerMetadataTensorsTorch:
     device = None
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
@@ -4464,6 +4472,8 @@ def _get_scheduler_metadata(
             zfill_padded_output,
             ctas_per_sm,
             min_blocks_floor,
+            window_size_left is not None,
+            window_size_right is not None,
         )
 
         if _needs_compile(_get_scheduler_metadata.compile_cache, cache_key):
@@ -4529,6 +4539,8 @@ def _get_scheduler_metadata(
                 virtual_batch_idx_cute,
                 num_nheads_in_l2_cute,
                 n_blocks_per_split,
+                window_size_left,
+                window_size_right,
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             )
@@ -4552,6 +4564,8 @@ def _get_scheduler_metadata(
                 virtual_batch_idx,
                 num_nheads_in_l2,
                 n_blocks_per_split,
+                window_size_left,
+                window_size_right,
             )
     else:
         num_m_blocks = None
@@ -4685,6 +4699,11 @@ def get_scheduler_metadata(
         causal, window_size_left, window_size_right
     )
 
+    # Clamp the window as the forward does: a side past the longest sequence masks nothing.
+    kernel_window_left, kernel_window_right = _clamp_local_window(
+        local, window_size_left, window_size_right, max_seqlen_q, max_seqlen_k
+    )
+
     # Caller-built metadata serves the standard kernel; SwapAB builds its own.
     config = select_fwd_config(
         _get_fwd_inputs(
@@ -4733,4 +4752,6 @@ def get_scheduler_metadata(
         seqlen_k_per_split=seqlen_k_per_split,
         zfill_padded_output=True,
         use_clc_scheduler=config.use_clc_scheduler,
+        window_size_left=kernel_window_left if local else None,
+        window_size_right=kernel_window_right if local else None,
     )
