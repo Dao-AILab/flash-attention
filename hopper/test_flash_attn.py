@@ -1097,6 +1097,40 @@ def test_flash_attn_kvcache_empty_page_table(
     assert torch.isposinf(lse).all().item()
 
 
+@pytest.mark.skipif(DISABLE_VARLEN or DISABLE_HDIM64, reason="Requires varlen and head dimension 64")
+@pytest.mark.parametrize("batch_size", [1, 32, 993])
+@pytest.mark.parametrize("lengths", ["empty_k", "empty_q", "mixed"])
+@pytest.mark.parametrize("num_splits", [1, 8] if not DISABLE_SPLIT else [1])
+@pytest.mark.parametrize("causal,window_size", [(False, (-1, -1)), (True, (-1, -1))]
+                         + ([(False, (64, 0))] if not DISABLE_LOCAL else []))
+def test_scheduler_metadata_empty_sequences(batch_size, lengths, num_splits, causal, window_size):
+    device = "cuda"
+    q_len = 0 if lengths == "empty_q" else 2
+    cu_seqlens_q = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * q_len
+    cache_seqlens = torch.tensor(
+        [0 if lengths == "empty_k" else (0, 1, 257, 1024)[i % 4]
+         for i in range(batch_size)], device=device, dtype=torch.int32,
+    )
+    metadata = get_scheduler_metadata(
+        batch_size, 2, 1024, 4, 2, 64, cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q, causal=causal, window_size=window_size,
+        num_splits=num_splits,
+    )
+    batch_rounded = (batch_size + 3) // 4 * 4
+    splits = metadata[:batch_size]
+    m_blocks = metadata[batch_rounded:batch_rounded + batch_size]
+    if window_size == (-1, -1):
+        # Sorted scheduler metadata is indexed by virtual, not original, batch.
+        batch_idx = metadata[2 * batch_rounded:2 * batch_rounded + batch_size].long()
+        torch.testing.assert_close(batch_idx.sort().values, torch.arange(batch_size, device=device))
+        cache_seqlens = cache_seqlens[batch_idx]
+    assert ((splits >= 1) & (splits <= num_splits)).all().item()
+    assert (splits[cache_seqlens == 0] == 1).all().item()
+    assert (m_blocks == (0 if q_len == 0 else 1)).all().item()
+    if num_splits == 1 or batch_size > 992:
+        assert (splits == 1).all().item()
+
+
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref):
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
     k_cache_paged = torch.randn(
