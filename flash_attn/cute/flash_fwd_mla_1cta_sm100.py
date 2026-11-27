@@ -1237,12 +1237,13 @@ class FlashAttentionMLAForward1CtaSm100:
         staging_mbar_ptr = storage.staging_mbar_ptr.ptr
         sK_free_mbar_ptr = storage.sK_free_mbar_ptr.ptr
         if warp_idx == 0:
-            cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
-            if const_expr(self.has_qk):
-                cute.arch.mbarrier_init(staging_mbar_ptr, 1)
-            if const_expr(self.cpasync_staging_sync):
-                # every cp.async load thread arrives once per tile
-                cute.arch.mbarrier_init(sK_free_mbar_ptr, self.num_cpasync_load_threads)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
+                if const_expr(self.has_qk):
+                    cute.arch.mbarrier_init(staging_mbar_ptr, 1)
+                if const_expr(self.cpasync_staging_sync):
+                    # every cp.async load thread arrives once per tile
+                    cute.arch.mbarrier_init(sK_free_mbar_ptr, self.num_cpasync_load_threads)
 
         pipeline.pipeline_init_arrive(cluster_shape_mn=cta_layout_vmnk, is_relaxed=True)
 

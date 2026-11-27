@@ -977,7 +977,8 @@ class FlashAttentionMLAForwardSm100:
         if const_expr(self.use_tma_O and self.overlap_sO_sV):
             sO_empty_mbar_ptr = storage.sO_empty_mbar_ptr.ptr
             if warp_idx == 0:
-                cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
 
         pipeline.pipeline_init_arrive(cluster_shape_mn=cta_layout_vmnk, is_relaxed=True)
 
