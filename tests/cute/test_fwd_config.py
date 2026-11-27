@@ -4,8 +4,11 @@ from dataclasses import asdict, astuple, replace
 from unittest import mock
 
 import pytest
+import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from flash_attn.cute import config as config_module
+from flash_attn.cute import interface
 from flash_attn.cute.config import (
     SM100_SMEM_BYTES,
     FwdConfig,
@@ -50,6 +53,56 @@ def test_paged_kv_rejects_partial_copy_vector(arch, d, dv):
         select_fwd_config(inputs)
 
 
+def identity_score_mod(scores, batch, head, q_idx, kv_idx, seqlen_info, aux_tensors, *, aux_scalars=()):
+    return scores
+
+
+def keep_mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors):
+    return q_idx >= 0
+
+
+@pytest.mark.parametrize(
+    ("arch", "paged", "score_mod", "use_aux_tensors", "kwargs", "reject"),
+    [
+        pytest.param(120, True, identity_score_mod, True, {}, True, id="sm120-paged-aux"),
+        pytest.param(121, True, identity_score_mod, True, {}, True, id="sm121-paged-aux"),
+        pytest.param(120, False, identity_score_mod, True, {}, False, id="dense-aux"),
+        pytest.param(
+            120, True, identity_score_mod, False, {"aux_scalars": (1.0,)}, False,
+            id="paged-scalar-only",
+        ),
+        pytest.param(
+            120, True, None, True, {"softcap": 5.0, "mask_mod": keep_mask}, False,
+            id="paged-softcap-and-mask-aux",
+        ),
+    ],
+)
+def test_sm12x_paged_score_mod_aux_tensors(
+    monkeypatch, arch, paged, score_mod, use_aux_tensors, kwargs, reject
+):
+    class CacheHit:
+        def __contains__(self, key):
+            return True
+
+    # Exercise host admission only: FakeTensorMode never launches, and a cache hit skips compile.
+    monkeypatch.setenv("FLASH_ATTENTION_NUM_SMS", "128")
+    monkeypatch.setattr(interface._flash_attn_fwd, "compile_cache", CacheHit())
+    with FakeTensorMode():
+        q = torch.empty((1, 64, 1, 64), dtype=torch.bfloat16)
+        kv = torch.empty((1, 64, 1, 64), dtype=torch.bfloat16)
+        page_table = torch.zeros((1, 1), dtype=torch.int32) if paged else None
+        aux_tensors = [torch.empty((64,), dtype=torch.float32)] if use_aux_tensors else None
+        outcome = (
+            pytest.raises(NotImplementedError, match="SM12x paged KV.*score_mod.*aux_tensors")
+            if reject else nullcontext()
+        )
+        with outcome:
+            interface._flash_attn_fwd(
+                q, kv, kv, _arch=arch, page_table=page_table, score_mod=score_mod,
+                aux_tensors=aux_tensors, **kwargs,
+            )
+
+
 @pytest.mark.parametrize("arch", [86, 89])
 @pytest.mark.parametrize("dtype", ["torch.float16", "torch.bfloat16"])
 @pytest.mark.parametrize("causal", [False, True])
@@ -74,6 +127,17 @@ def test_asymmetric_hd256_paged_kv_fits_shared_memory(arch):
     # A narrower N tile lets the caller keep 128 Q rows.
     explicit = select_fwd_config(inputs._replace(requested_tile_m=128, requested_tile_n=32))
     assert (explicit.tile_m, explicit.tile_n) == (128, 32)
+
+
+def test_varlen_sparse_fits_shared_memory_without_splitting_q_block():
+    inputs = make_inputs(
+        device_arch=120, head_dim=256, head_dim_v=128, has_cu_seqlens_q=True,
+        use_block_sparsity=True, sparse_q_block_size=128, sparse_kv_block_size=128,
+    )
+    config = select_fwd_config(inputs)
+    assert config.tile_m == 128
+    assert 128 % config.tile_n == 0
+    validate_fwd_config(config, inputs)
 
 
 @pytest.mark.parametrize("arch", [89, 120])

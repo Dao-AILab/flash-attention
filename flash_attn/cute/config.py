@@ -721,12 +721,31 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
         tile_m, tile_n = fit_tile_to_block_sparsity(
             tile_m, tile_n, inputs.sparse_q_block_size, inputs.sparse_kv_block_size
         )
+    # Flattened varlen metadata has one entry per Q tile and cannot split a Q block.
+    fixed_sparse_m = (
+        inputs.device_capacity in (8, 12)
+        and inputs.has_cu_seqlens_q
+        and inputs.sparse_q_block_size in (64, 128)
+        and inputs.sparse_kv_block_size is not None
+    )
+    if fixed_sparse_m:
+        tile_m = inputs.sparse_q_block_size
     if (
         inputs.device_arch in _SM80_FWD_99KIB_ARCHS
         and sm80_fwd_smem_bytes(inputs, tile_m=tile_m, tile_n=tile_n) > _SM80_FWD_99KIB_SMEM_BYTES
     ):
-        # 64x64 fits up to 256 channels per head. Keep any smaller sparse tile.
-        tile_m, tile_n = min(tile_m, 64), min(tile_n, 64)
+        if fixed_sparse_m:
+            for n in range(tile_n - 16, 0, -16):
+                if (
+                    inputs.sparse_kv_block_size % n == 0
+                    and sm80_fwd_smem_bytes(inputs, tile_m=tile_m, tile_n=n)
+                    <= _SM80_FWD_99KIB_SMEM_BYTES
+                ):
+                    tile_n = n
+                    break
+        else:
+            # 64x64 fits up to 256 channels per head. Keep any smaller sparse tile.
+            tile_m, tile_n = min(tile_m, 64), min(tile_n, 64)
     # Apply requests after fitting the default; validation rejects oversized explicit tiles.
     if inputs.requested_tile_m is not None:
         tile_m = inputs.requested_tile_m
