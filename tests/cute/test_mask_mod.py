@@ -990,7 +990,7 @@ def even_key_mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors):
 @cute.jit
 def record_sparse_mask_keys(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors):
     if q_idx[0] == 0:
-        aux_tensors[0][kv_idx[0]] = cutlass.Int32(1)
+        utils.atomic_add_i32(1, utils.elem_pointer(aux_tensors[0], kv_idx[0]))
     return kv_idx >= 0
 
 

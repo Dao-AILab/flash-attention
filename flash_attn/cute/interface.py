@@ -4000,6 +4000,9 @@ def flash_attn_varlen_func(
         cu_seqlens_k: (batch + 1)       or seqused_k: (batch)
         gather_kv_indices: (total_q, gather_kv_length) or
                            (batch, seqlen_q, gather_kv_length)
+        block_sparse_tensors: for flattened SM8x/SM12x metadata, automatic tile selection
+            supports 64- or 128-row Q blocks. For other supported sizes, pass a config
+            with tile_m equal to the declared Q block size.
         page_table: (batch, max_num_pages_per_seq)
     
     Return:
