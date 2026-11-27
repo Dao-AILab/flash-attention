@@ -1945,11 +1945,14 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
     if capacity not in (10, 11):
         if inputs.device_arch in (86, 89):
             # SM80 forward uses one stage and separate, 1024-byte-aligned Q, K, V buffers.
-            smem_bytes = sum(round_up(size, 1024) for size in (
-                config.tile_m * inputs.head_dim_padded * 2,
-                config.tile_n * inputs.head_dim_padded * 2,
-                config.tile_n * inputs.head_dim_v_padded * 2,
-            ))
+            smem_bytes = sum(
+                round_up(size, 1024)
+                for size in (
+                    config.tile_m * inputs.head_dim_padded * 2,
+                    config.tile_n * inputs.head_dim_padded * 2,
+                    config.tile_n * inputs.head_dim_v_padded * 2,
+                )
+            )
             if smem_bytes > 99 * 1024:
                 raise ValueError(
                     f"SM{inputs.device_arch} forward needs {smem_bytes} bytes of shared memory; "

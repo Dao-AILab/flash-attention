@@ -569,7 +569,10 @@ class FlashAttentionBackwardSm90:
             softmax_scale_log2 = LOG2_E
 
         fastdiv_mods = None
-        if const_expr(aux_data.tensors is not None and (self.score_mod is not None or self.score_mod_bwd is not None)):
+        if const_expr(
+            aux_data.tensors is not None
+            and (self.score_mod is not None or self.score_mod_bwd is not None)
+        ):
             seqlen_q = cute.size(mQ.shape[0])
             seqlen_k = cute.size(mK.shape[0])
             seqlen_q_divmod = FastDivmodDivisorV2(seqlen_q)

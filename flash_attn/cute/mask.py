@@ -257,7 +257,9 @@ class AttentionMask:
                             aux_data,
                         )
                         cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
-                        acc_S_mn[r, col] = acc_S_mn[r, col] if (cond & valid) else -cutlass.Float32.inf
+                        acc_S_mn[r, col] = (
+                            acc_S_mn[r, col] if (cond & valid) else -cutlass.Float32.inf
+                        )
 
         else:  # Causal or local
             if const_expr(not self.swap_AB):
