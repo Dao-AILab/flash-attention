@@ -147,7 +147,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                              make_stride(params.dq_row_stride, _1{}));
     Tensor gdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dq_accum_ptr) + row_offset_dq_accum),
                                   Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                  make_stride(params.h * params.d_rounded, _1{}));
+                                  make_stride(dq_accum_row_stride, _1{}));
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                               Shape<Int<kBlockM>>{}, Stride<_1>{});
     Tensor gdPsum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dsoftmax_sum) + row_offset_dpsum),
@@ -312,7 +312,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     // We'll advance gdQ and gdQaccum before the 1st read/write.
     tdQgdQ.data() = tdQgdQ.data() + kBlockM * params.dq_row_stride;
-    tdQgdQaccum.data() = tdQgdQaccum.data() + kBlockM * params.h * params.d_rounded;
+    tdQgdQaccum.data() = tdQgdQaccum.data() + kBlockM * dq_accum_row_stride;
 
     int m_block = m_block_max - 1;
     int m_block_min = (!Is_causal && !Is_local)
@@ -596,7 +596,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // if (cute::thread0()) { print(dS); }
 
         Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
-        tdQgdQaccum.data() = tdQgdQaccum.data() + (-int(kBlockM * params.h * params.d_rounded));
+        tdQgdQaccum.data() = tdQgdQaccum.data() + (-kBlockM * dq_accum_row_stride);
         if (Is_first || Seq_parallel) {
             clear(acc_dq);
         } else {
@@ -614,7 +614,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             tQsQ.data() = tQsQ.data() + sQ_offset;
             tSsQ.data() = tSsQ.data() + sQ_offset;
             // Advance gQ
-            tQgQ.data() = tQgQ.data() + (-int(kBlockM * params.q_row_stride));
+            tQgQ.data() = tQgQ.data() + (-kBlockM * params.q_row_stride);
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ);
             FLASH_NAMESPACE::cp_async_fence();
         }
@@ -641,9 +641,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         if (m_block > m_block_min) {
             // Advance gdO
-            tdOgdO.data() = tdOgdO.data() + (-int(kBlockM * params.do_row_stride));
+            tdOgdO.data() = tdOgdO.data() + (-kBlockM * params.do_row_stride);
             if (Is_first) {
-                tdOgO.data() = tdOgO.data() + (-int(kBlockM * params.o_row_stride));
+                tdOgO.data() = tdOgO.data() + (-kBlockM * params.o_row_stride);
                 FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgdO, tdOrdO, tQcQ, tQpQ);
                 FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgO, tdOrO, tQcQ, tQpQ);
             } else {
@@ -695,7 +695,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         if (!Double_buffer && m_block > m_block_min) {
             __syncthreads();
             // Advance gQ
-            tQgQ.data() = tQgQ.data() + (-int(kBlockM * params.q_row_stride));
+            tQgQ.data() = tQgQ.data() + (-kBlockM * params.q_row_stride);
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ);
             FLASH_NAMESPACE::cp_async_fence();
         }
@@ -710,7 +710,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             __syncthreads();
             Tensor tdQrdQ = make_tensor<Element>(shape(tdQgdQ));
             cute::copy(gmem_tiled_copy_dQ, tdQsdQ, tdQrdQ);
-            tdQgdQ.data() = tdQgdQ.data() + (-int(kBlockM * params.dq_row_stride));
+            tdQgdQ.data() = tdQgdQ.data() + (-kBlockM * params.dq_row_stride);
             Tensor cdQ = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
             Tensor tdQcdQ = gmem_thr_copy_dQ.partition_D(cdQ);
             #pragma unroll
