@@ -148,8 +148,8 @@ def test_hd256_varlen_epilogue(seqlens, causal):
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] not in (10, 11),
-    reason="SM100/SM110-only test",
+    or torch.cuda.get_device_capability()[0] not in (9, 10, 11),
+    reason="requires SM90/SM100/SM110 backward",
 )
 @pytest.mark.parametrize("mode", ("plain", "causal", "local"))
 @pytest.mark.parametrize("num_heads_q", (2, 8))
@@ -192,15 +192,47 @@ def test_varlen_backward_ignores_nan_padded_q_or_do(mode, num_heads_q, head_dim,
     assert torch.isfinite(dq_nan).all()
     assert torch.isfinite(dk_nan).all()
     assert torch.isfinite(dv_nan).all()
-    torch.testing.assert_close(dq_nan, dq_zero, rtol=0, atol=0)
+    if torch.cuda.get_device_capability()[0] == 9:
+        # SM90's non-deterministic dQ reduction can vary even on repeated clean inputs.
+        torch.testing.assert_close(dq_nan, dq_zero, rtol=1e-2, atol=2e-3)
+    else:
+        torch.testing.assert_close(dq_nan, dq_zero, rtol=0, atol=0)
     torch.testing.assert_close(dk_nan, dk_zero, rtol=1e-2, atol=2e-3)
     torch.testing.assert_close(dv_nan, dv_zero, rtol=1e-2, atol=2e-3)
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="requires SM90 backward",
+)
+@pytest.mark.parametrize("num_heads_q", (2, 8))
+def test_sm90_varlen_backward_deterministic_query_tail(num_heads_q):
+    torch.manual_seed(1234)
+    first, second, dim = 129, 193, 128
+    cu = torch.tensor((0, first, first + second), device="cuda", dtype=torch.int32)
+    q, k, v = [
+        torch.randn(first + second, heads, dim, device="cuda", dtype=torch.bfloat16)
+        for heads in (num_heads_q, 2, 2)
+    ]
+    kwargs = dict(
+        cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=second, max_seqlen_k=second, causal=True,
+    )
+    out, lse = flash_attn_varlen_func(q, k, v, return_lse=True, **kwargs)
+    dout = torch.randn_like(out)
+    reference = _flash_attn_bwd(q, k, v, out, dout, lse, deterministic=True, **kwargs)
+
+    q_nan, dout_nan = q.clone(), dout.clone()
+    q_nan[first:] = float("nan")
+    dout_nan[first:] = float("nan")
+    gradients = _flash_attn_bwd(q_nan, k, v, out, dout_nan, lse, deterministic=True, **kwargs)
+    for actual, expected in zip(gradients[:3], reference[:3]):
+        torch.testing.assert_close(actual[:first], expected[:first], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] not in (10, 11),
-    reason="SM100/SM110-only test",
+    or torch.cuda.get_device_capability()[0] not in (9, 10, 11),
+    reason="requires SM90/SM100/SM110 backward",
 )
 @pytest.mark.parametrize("packed", (False, True))
 @pytest.mark.parametrize("num_heads_q", (2, 8))

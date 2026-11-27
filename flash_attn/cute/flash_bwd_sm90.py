@@ -441,13 +441,11 @@ class FlashAttentionBackwardSm90:
         self.num_producer_threads = 32
 
         self._setup_attributes()
-        # Bound the K/V loads by the logical seqlen_k (see below); decided here because the
-        # shared storage needs descriptor slots for it.
+        # Bound the TMA loads by the sequence's logical extents.
+        self.ragged_q_tma = mCuSeqlensQ is not None or mSeqUsedQ is not None
         self.ragged_kv_tma = mCuSeqlensK is not None or mSeqUsedK is not None
-        if const_expr(self.ragged_kv_tma):
-            assert tensormap_workspace is not None, (
-                "ragged K/V TMA loads need a tensormap workspace"
-            )
+        if const_expr(self.ragged_kv_tma or self.ragged_q_tma):
+            assert tensormap_workspace is not None, "ragged TMA loads need a tensormap workspace"
         SharedStorage = self._get_shared_storage_cls()
 
         self.tma_copy_bytes = {
@@ -593,7 +591,9 @@ class FlashAttentionBackwardSm90:
             tma_tensor_V,
             mK_gmem,
             mV_gmem,
-            tensormap_workspace if const_expr(self.ragged_kv_tma) else None,
+            mQ if const_expr(self.ragged_q_tma) else None,
+            mdO if const_expr(self.ragged_q_tma) else None,
+            tensormap_workspace,
             tma_tensor_dO,
             tma_tensor_dK if const_expr(self.qhead_per_kvhead == 1) else mdK,
             tma_tensor_dV if const_expr(self.qhead_per_kvhead == 1) else mdV,
@@ -651,7 +651,9 @@ class FlashAttentionBackwardSm90:
         mV: cute.Tensor,
         mK_gmem: Optional[cute.Tensor],  # gmem K/V behind tma_atom_K/V (ragged K/V only)
         mV_gmem: Optional[cute.Tensor],
-        tensormap_workspace: Optional[cute.Tensor],  # (num_ctas, 2, 16) Int64 (ragged K/V only)
+        mQ_gmem: Optional[cute.Tensor],
+        mdO_gmem: Optional[cute.Tensor],
+        tensormap_workspace: Optional[cute.Tensor],
         mdO: cute.Tensor,
         mdK: cute.Tensor,
         mdV: cute.Tensor,
@@ -790,6 +792,8 @@ class FlashAttentionBackwardSm90:
                     mV,
                     mK_gmem,
                     mV_gmem,
+                    mQ_gmem,
+                    mdO_gmem,
                     tensormap_workspace,
                     mdO,
                     mLSE,
@@ -883,6 +887,8 @@ class FlashAttentionBackwardSm90:
         mV: cute.Tensor,
         mK_gmem: Optional[cute.Tensor],
         mV_gmem: Optional[cute.Tensor],
+        mQ_gmem: Optional[cute.Tensor],
+        mdO_gmem: Optional[cute.Tensor],
         tensormap_workspace: Optional[cute.Tensor],
         mdO: cute.Tensor,
         mLSE: cute.Tensor,
@@ -916,8 +922,14 @@ class FlashAttentionBackwardSm90:
             )
             tensormap_manager = None
             tensormap_gmem = ()
-            desc_ptrs = (None, None)
-            if const_expr(self.ragged_kv_tma):
+            kv_desc_ptrs, q_desc_ptrs = (None, None), (None, None)
+            if const_expr(self.ragged_q_tma):
+                # Finish the preceding launch before initializing descriptor workspace.
+                cute.arch.griddepcontrol_wait()
+            if const_expr(self.ragged_kv_tma or self.ragged_q_tma):
+                kv_atoms = (tma_atom_K, tma_atom_V) if const_expr(self.ragged_kv_tma) else ()
+                q_atoms = (tma_atom_Q, tma_atom_dO) if const_expr(self.ragged_q_tma) else ()
+                atoms = kv_atoms + q_atoms
                 tensormap_manager = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
                 bidx, bidy, bidz = cute.arch.block_idx()
                 gdx, gdy, _ = cute.arch.grid_dim()
@@ -929,43 +941,50 @@ class FlashAttentionBackwardSm90:
                     tensormap_manager.get_tensormap_ptr(
                         tensormap_workspace[(cta_linear_idx, i, None)].iterator
                     )
-                    for i in range(2)
+                    for i in range(len(atoms))
                 )
                 desc_ptrs = tuple(
                     tensormap_manager.get_tensormap_ptr(p, cute.AddressSpace.generic)
                     for p in tensormap_gmem
                 )
-                for atom, gmem_ptr in zip((tma_atom_K, tma_atom_V), tensormap_gmem):
+                if const_expr(self.ragged_kv_tma):
+                    kv_desc_ptrs = desc_ptrs[:2]
+                if const_expr(self.ragged_q_tma):
+                    q_desc_ptrs = desc_ptrs[-2:]
+                for atom, gmem_ptr in zip(atoms, tensormap_gmem):
                     tensormap_manager.init_tensormap_from_atom(atom, gmem_ptr, 0)
                 tensormap_manager.fence_tensormap_initialization()
-            # The K/V extent depends on the batch only: rewrite the descriptors when it changes.
-            kv_desc_batch_idx = Int32(-1)
+            desc_batch_idx = Int32(-1)
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 n_block, head_idx, batch_idx, _ = work_tile.tile_idx
                 seqlen = SeqlenInfoCls(batch_idx)
-                if const_expr(self.ragged_kv_tma) and batch_idx != kv_desc_batch_idx:
-                    # Shrink the rows extent (mode 0) of K and V to this sequence's end: packed
-                    # layouts count absolute rows, dense layouts per-batch rows. Extents >= 1.
-                    kv_desc_batch_idx = batch_idx
-                    kv_rows_end = (
-                        seqlen.offset_k + seqlen.seqlen_k
-                        if const_expr(seqlen.has_cu_seqlens_k)
-                        else seqlen.seqlen_k
-                    )
-                    kv_rows_end = cutlass.max(kv_rows_end, 1)
+                if (
+                    const_expr(self.ragged_kv_tma or self.ragged_q_tma)
+                    and batch_idx != desc_batch_idx
+                ):
+                    desc_batch_idx = batch_idx
+                    kv_sources = ()
+                    q_sources = ()
+                    if const_expr(self.ragged_kv_tma):
+                        kv_end = cutlass.max(seqlen.offset_k + seqlen.seqlen_k, 1)
+                        kv_sources = ((mK_gmem, kv_end), (mV_gmem, kv_end))
+                    if const_expr(self.ragged_q_tma):
+                        # Zero P and dS cannot suppress NaNs in Q and dO during the dK/dV GEMMs.
+                        q_end = cutlass.max(seqlen.offset_q + seqlen.seqlen_q, 1)
+                        q_sources = ((mQ_gmem, q_end), (mdO_gmem, q_end))
                     bounded = []
-                    for t in (mK_gmem, mV_gmem):
+                    for t, rows_end in kv_sources + q_sources:
                         shape = list(t.shape)
-                        shape[0] = kv_rows_end
+                        shape[0] = rows_end
                         bounded.append(
                             cute.make_tensor(
                                 t.iterator, cute.make_layout(tuple(shape), stride=t.stride)
                             )
                         )
                     tensormap_manager.update_tensormap(
-                        tuple(bounded), (tma_atom_K, tma_atom_V), tensormap_gmem, 0, (None, None)
+                        tuple(bounded), atoms, tensormap_gmem, 0, (None,) * len(atoms)
                     )
                     for p in tensormap_gmem:
                         tensormap_manager.fence_tensormap_update(p)
@@ -1005,7 +1024,7 @@ class FlashAttentionBackwardSm90:
                     gK,
                     sK,
                     single_stage=True,
-                    **({"tma_desc_ptr": desc_ptrs[0]} if const_expr(self.ragged_kv_tma) else {}),
+                    **({"tma_desc_ptr": kv_desc_ptrs[0]} if const_expr(self.ragged_kv_tma) else {}),
                 )
                 load_V, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_V,
@@ -1014,14 +1033,24 @@ class FlashAttentionBackwardSm90:
                     gV,
                     sV,
                     single_stage=True,
-                    **({"tma_desc_ptr": desc_ptrs[1]} if const_expr(self.ragged_kv_tma) else {}),
+                    **({"tma_desc_ptr": kv_desc_ptrs[1]} if const_expr(self.ragged_kv_tma) else {}),
                 )
                 load_Q, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_Q, 0, cute.make_layout(1), gQ, sQ
+                    tma_atom_Q,
+                    0,
+                    cute.make_layout(1),
+                    gQ,
+                    sQ,
+                    **({"tma_desc_ptr": q_desc_ptrs[0]} if const_expr(self.ragged_q_tma) else {}),
                 )
                 load_Q = copy_utils.tma_producer_copy_fn(load_Q, pipeline_Q)
                 load_dO, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_dO, 0, cute.make_layout(1), gdO, sdO
+                    tma_atom_dO,
+                    0,
+                    cute.make_layout(1),
+                    gdO,
+                    sdO,
+                    **({"tma_desc_ptr": q_desc_ptrs[1]} if const_expr(self.ragged_q_tma) else {}),
                 )
                 load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
                 load_LSE = copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE)
@@ -1057,7 +1086,8 @@ class FlashAttentionBackwardSm90:
                         load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
                         load_Q(first_m_block, producer_state=producer_state_Q)
                         # Wait for bwd preprocess to finish writing LSE and dPsum
-                        cute.arch.griddepcontrol_wait()
+                        if const_expr(not self.ragged_q_tma):
+                            cute.arch.griddepcontrol_wait()
                         load_LSE(first_m_block, producer_state=producer_state_Q)
                         producer_state_dO_cur = (
                             producer_state_dO
