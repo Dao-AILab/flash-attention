@@ -472,7 +472,9 @@ struct Rotary {
                         if (rotate) {
                             apply_rotary_contiguous(rK_left, rK_right, tRrCosCont(_, m, k), tRrSinCont(_, m, k));
                         }
-                        cute::copy(tiled_copy_k, rK_left, gK_cur_copy(_, col_idx_left));
+                        if (col_idx_left * kGmemElemsPerLoad < max_k) {
+                            cute::copy(tiled_copy_k, rK_left, gK_cur_copy(_, col_idx_left));
+                        }
                         if (col_idx_right * kGmemElemsPerLoad < max_k) {
                             cute::copy(tiled_copy_k, rK_right, gK_cur_copy(_, col_idx_right));
                         }
