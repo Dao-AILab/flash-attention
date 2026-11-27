@@ -129,14 +129,15 @@ def test_asymmetric_hd256_paged_kv_fits_shared_memory(arch):
     assert (explicit.tile_m, explicit.tile_n) == (128, 32)
 
 
-def test_varlen_sparse_fits_shared_memory_without_splitting_q_block():
+@pytest.mark.parametrize(("d", "block_n"), [(256, 128), (128, 96)])
+def test_varlen_sparse_fits_shared_memory_without_splitting_q_block(d, block_n):
     inputs = make_inputs(
-        device_arch=120, head_dim=256, head_dim_v=128, has_cu_seqlens_q=True,
-        use_block_sparsity=True, sparse_q_block_size=128, sparse_kv_block_size=128,
+        device_arch=120, head_dim=d, head_dim_v=128, has_cu_seqlens_q=True,
+        use_block_sparsity=True, sparse_q_block_size=128, sparse_kv_block_size=block_n,
     )
     config = select_fwd_config(inputs)
     assert config.tile_m == 128
-    assert 128 % config.tile_n == 0
+    assert block_n % config.tile_n == 0
     validate_fwd_config(config, inputs)
 
 

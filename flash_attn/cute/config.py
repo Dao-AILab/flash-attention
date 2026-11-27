@@ -746,6 +746,9 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
         else:
             # 64x64 fits up to 256 channels per head. Keep any smaller sparse tile.
             tile_m, tile_n = min(tile_m, 64), min(tile_n, 64)
+    if inputs.device_capacity in (8, 12) and inputs.sparse_kv_block_size is not None:
+        # Every selected logical KV block must contain whole kernel tiles.
+        tile_n = math.gcd(tile_n, inputs.sparse_kv_block_size)
     # Apply requests after fitting the default; validation rejects oversized explicit tiles.
     if inputs.requested_tile_m is not None:
         tile_m = inputs.requested_tile_m
