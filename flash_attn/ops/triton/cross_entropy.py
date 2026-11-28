@@ -36,6 +36,7 @@ def cross_entropy_fwd_kernel(
     class_start_idx,  # Useful for tensor parallel when each rank only has a subset of classes
     n_cols,  # shapes
     logits_row_stride,  # strides
+    labels_row_stride,
     BLOCK_SIZE: tl.constexpr,
     HAS_SMOOTHING: tl.constexpr,
     # if SPLIT (e.g. tensor parallel), don't include the LSE in the loss since it's not the final LSE
@@ -63,7 +64,7 @@ def cross_entropy_fwd_kernel(
         tl.store(lse_ptr + row_idx, lse)
     else:
         lse = tl.load(lse_ptr + row_idx)
-    label_idx = tl.load(labels_ptr + row_idx)
+    label_idx = tl.load(labels_ptr + row_idx.to(tl.int64) * labels_row_stride)
     if label_idx == ignore_index:
         loss = 0.0
         z_loss = 0.0
@@ -117,6 +118,7 @@ def cross_entropy_bwd_kernel(
     logits_row_stride,  # strides
     dlogits_row_stride,
     dloss_row_stride,
+    labels_row_stride,
     BLOCK_SIZE: tl.constexpr,
     HAS_SMOOTHING: tl.constexpr,
 ):
@@ -125,7 +127,7 @@ def cross_entropy_bwd_kernel(
     logits_ptr = logits_ptr + row_idx * logits_row_stride.to(tl.int64)
     dlogits_ptr = dlogits_ptr + row_idx * dlogits_row_stride.to(tl.int64)
     col_offsets = col_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    label_idx = tl.load(labels_ptr + row_idx)
+    label_idx = tl.load(labels_ptr + row_idx.to(tl.int64) * labels_row_stride)
     if label_idx != ignore_index:
         dloss = tl.load(dloss_ptr + row_idx * dloss_row_stride)
     else:
@@ -208,6 +210,7 @@ class CrossEntropyLoss(torch.autograd.Function):
                 class_start_idx,
                 n_cols,  # shapes
                 logits.stride(0),  # strides
+                labels.stride(0),
                 BLOCK_SIZE=BLOCK_SIZE,  # constants
                 SPLIT=world_size > 1,
                 PRECOMPUTED_LSE=use_precomputed_lse,
@@ -283,6 +286,7 @@ class CrossEntropyLoss(torch.autograd.Function):
                 logits.stride(0),  # strides
                 dlogits.stride(0),
                 grad_losses.stride(0),
+                labels.stride(0),
                 BLOCK_SIZE=BLOCK_SIZE,  # constants
                 num_warps=num_warps,
             )
