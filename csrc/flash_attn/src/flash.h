@@ -144,6 +144,10 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+    // Set by every forward path that does this transpose (seqlenq_ngroups_swapped above is only set by the
+    // varlen path, where it also selects the LSE layout): the rows of q are the query heads of a single query
+    // at the last key position, so masking and rotary use that position for every row.
+    bool q_heads_as_rows;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

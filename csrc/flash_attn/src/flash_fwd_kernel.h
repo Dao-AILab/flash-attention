@@ -91,7 +91,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
-    if (Is_causal || Is_local) {
+    // With q_heads_as_rows every row is the last query, which sees every key up to actual_seqlen_k.
+    if (Is_causal || (Is_local && !params.q_heads_as_rows)) {
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
         // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
@@ -294,7 +295,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope, params.q_heads_as_rows);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -534,12 +535,20 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
-    const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
+    // With q_heads_as_rows and a left window, every row is the last query, so split only the blocks inside its window:
+    // the splits start at the window's first block and cover at most (window_size_left + kBlockN) / kBlockN + 1
+    // blocks (see set_params_splitkv). Other calls split the whole [0, seqlen_k) range as before.
+    const bool split_window = Is_local && params.q_heads_as_rows;
+    const int n_block_window_min = !split_window ? 0 : std::max(0, (binfo.actual_seqlen_k - 1 - params.window_size_left) / kBlockN);
+    const int n_blocks_to_split = !split_window
+        ? cute::ceil_div(params.seqlen_k, kBlockN)
+        : std::min(cute::ceil_div(params.seqlen_k, kBlockN), (params.window_size_left + kBlockN) / kBlockN + 1);
+    const int n_blocks_per_split = (n_blocks_to_split + num_n_splits - 1) / num_n_splits;
     const int n_block_min = !Is_local
         ? n_split_idx * n_blocks_per_split
-        : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
-    int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
-    if (Is_causal || Is_local) {
+        : std::max(n_block_window_min + n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+    int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), n_block_window_min + (n_split_idx + 1) * n_blocks_per_split);
+    if (Is_causal || (Is_local && !params.q_heads_as_rows)) {
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
     }
@@ -800,21 +809,23 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
                                            binfo.actual_seqlen_q - m_block * kBlockM);
     } else {
-        const index_t row_offset_cossin = (binfo.seqlen_k_cache + (params.leftpad_k == nullptr ? 0 : params.leftpad_k[bidb]) + (Is_causal || Is_local ? m_block * kBlockM : 0)) * (params.rotary_dim / 2);
         // If not causal, all the queries get the same the cos/sin, taken at location seqlen_k_cache.
         // We do this by setting the row stride of gCos / gSin to 0.
+        // The same holds when the rows are the query heads of one query (q_heads_as_rows, only set without causal).
+        const bool rotary_per_row = Is_causal || (Is_local && !params.q_heads_as_rows);
+        const index_t row_offset_cossin = (binfo.seqlen_k_cache + (params.leftpad_k == nullptr ? 0 : params.leftpad_k[bidb]) + (rotary_per_row ? m_block * kBlockM : 0)) * (params.rotary_dim / 2);
         Tensor gCos = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
                                   Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
-                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
+                                  make_stride(rotary_per_row ? params.rotary_dim / 2 : 0, _1{}));
         Tensor gSin = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
                                   Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
-                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
+                                  make_stride(rotary_per_row ? params.rotary_dim / 2 : 0, _1{}));
         Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
                                   Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
+                                  make_stride(rotary_per_row ? params.rotary_dim / 2 : 0, _1{}));
         Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
                                   Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
+                                  make_stride(rotary_per_row ? params.rotary_dim / 2 : 0, _1{}));
         Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
         Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
         Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
@@ -848,7 +859,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
     const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope, params.q_heads_as_rows);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.

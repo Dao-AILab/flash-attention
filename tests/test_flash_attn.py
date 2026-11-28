@@ -2532,7 +2532,8 @@ def test_flash_attn_varlen_paged_kv_num_splits(dtype):
     from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
 
     device = "cuda"
-    num_heads, num_heads_k, head_dim = 4, 2, 64
+    # MHA, so that seqlen_q == 1 does not take the GQA head swap (which supports num_splits > 1 with paged KV).
+    num_heads, num_heads_k, head_dim = 2, 2, 64
     page_block_size = 256
     scale = head_dim ** -0.5
 
@@ -2582,6 +2583,58 @@ def test_flash_attn_varlen_paged_kv_num_splits(dtype):
 
     with pytest.raises(RuntimeError, match="num_splits > 1 is not supported"):
         _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("paged_kv_block_size", [None, 256])
+@pytest.mark.parametrize("num_splits", [0, 1, 3])
+@pytest.mark.parametrize("window_left", [0, 15, 300])
+@pytest.mark.parametrize("nheads,nheads_k", [(8, 2), (6, 1), (4, 4)])
+@pytest.mark.parametrize("d", [64, 128, 256])
+def test_flash_attn_kvcache_local_decode(d, nheads, nheads_k, window_left, num_splits, paged_kv_block_size, dtype):
+    """seqlen_q == 1 with a sliding window, as transformers calls it (window (w, w), causal=True).
+    With GQA this takes the head swap: every query head of a KV head must see the same window, for every split."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size, seqlen_k = 3, 1000
+    cache_seqlens = torch.tensor([seqlen_k, 517, 17], dtype=torch.int32, device=device)
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+    if paged_kv_block_size is None:
+        k_cache = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+        v_cache = torch.randn_like(k_cache)
+        block_table = None
+        k_ref, v_ref = k_cache, v_cache
+    else:
+        nblocks = math.ceil(seqlen_k / paged_kv_block_size)
+        k_cache = torch.randn(batch_size * nblocks, paged_kv_block_size, nheads_k, d, device=device, dtype=dtype)
+        v_cache = torch.randn_like(k_cache)
+        block_table = rearrange(
+            torch.randperm(batch_size * nblocks, dtype=torch.int32, device=device), "(b n) -> b n", b=batch_size
+        )
+        k_ref, v_ref = [
+            rearrange(c[block_table.flatten()], "(b n) p h d -> b (n p) h d", b=batch_size)[:, :seqlen_k]
+            for c in (k_cache, v_cache)
+        ]
+    key_padding_mask = torch.arange(seqlen_k, device=device)[None] < cache_seqlens[:, None]
+    window_size = (window_left, window_left)
+    out, lse = flash_attn_with_kvcache(
+        q, k_cache, v_cache, cache_seqlens=cache_seqlens, block_table=block_table, causal=True,
+        window_size=window_size, num_splits=num_splits, return_softmax_lse=True,
+    )
+    out_ref, _ = attention_ref(q, k_ref, v_ref, None, key_padding_mask, causal=True, window_size=window_size)
+    out_pt, _ = attention_ref(
+        q, k_ref, v_ref, None, key_padding_mask, causal=True, window_size=window_size, upcast=False, reorder_ops=True
+    )
+    assert torch.isfinite(out).all()
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
+    # The query is at key cache_seqlens - 1 and sees the window_left keys before it.
+    pos = torch.arange(seqlen_k, device=device)[None]
+    in_window = key_padding_mask & (pos >= cache_seqlens[:, None] - 1 - window_left)
+    scores = torch.einsum(
+        "bhd,bshd->bhs", q[:, 0].float(), repeat(k_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k).float()
+    ) * d ** -0.5
+    lse_ref = scores.masked_fill(~in_window[:, None], float("-inf")).logsumexp(-1)
+    assert (lse[:, :, 0] - lse_ref).abs().max().item() <= 1e-3
 
 
 @pytest.mark.parametrize("dtype", [torch.float16])
