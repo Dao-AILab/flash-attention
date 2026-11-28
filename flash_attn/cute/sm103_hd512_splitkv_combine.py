@@ -84,16 +84,46 @@ class BlackwellHd512SplitKVCombine:
         ):
             raise ValueError("SM103 hd512 combine requires contiguous inner dimensions")
 
-        self.kernel(
-            mOPartial,
-            mLSEPartial,
-            mO,
-            mNumSplitsDynamic,
-        ).launch(
-            grid=(self.head_dim // self.dimensions_per_cta, self.num_heads, batch),
-            block=[self.num_threads, 1, 1],
-            stream=stream,
-        )
+        if cutlass.const_expr(splits == 1):
+            self.single_split_kernel(mOPartial, mLSEPartial, mO, mNumSplitsDynamic).launch(
+                grid=(1, self.num_heads, batch), block=[self.num_threads, 1, 1], stream=stream
+            )
+        else:
+            self.kernel(
+                mOPartial,
+                mLSEPartial,
+                mO,
+                mNumSplitsDynamic,
+            ).launch(
+                grid=(self.head_dim // self.dimensions_per_cta, self.num_heads, batch),
+                block=[self.num_threads, 1, 1],
+                stream=stream,
+            )
+
+    @staticmethod
+    @cute.kernel
+    def single_split_kernel(
+        mOPartial: cute.Tensor,
+        mLSEPartial: cute.Tensor,
+        mO: cute.Tensor,
+        mNumSplitsDynamic: cute.Tensor,
+    ):
+        _, head, batch = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        out = cute.local_tile(mO[batch, head, None], (4,), (tidx,))
+        result = cute.make_rmem_tensor((4,), BFloat16)
+        if mNumSplitsDynamic[batch] > 0:
+            # A single finite LSE has normalized weight one. Keep NaN for a
+            # nonfinite live LSE, and the original +0 accumulator for signed zero.
+            lse = mLSEPartial[0, batch, head]
+            src = cute.local_tile(mOPartial[0, batch, head, None], (4,), (tidx,))
+            values = cute.make_rmem_tensor((4,), Float32)
+            cute.autovec_copy(src, values)
+            result.store((values.load() + (lse - lse)).to(BFloat16))
+        else:
+            # Device validity can change on graph replay. Do not read either partial.
+            result.fill(0.0)
+        cute.autovec_copy(result, out)
 
     @staticmethod
     @cute.kernel

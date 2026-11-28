@@ -223,3 +223,41 @@ def test_sm103_hd512_splitkv_graph_empty_tail_mutation(batch):
             _poison_outputs(case)
             graph.replay()
             _assert_result(case, lengths, reference)
+
+
+@pytest.mark.parametrize("batch", [32, 64])
+def test_sm103_hd512_single_split_combine_graph(batch):
+    from flash_attn.cute.sm103_hd512_splitkv_combine import run_sm103_hd512_splitkv_combine
+
+    # Include BF16 rounding ties, signed zero, and nonfinite live data. Inactive
+    # rows have both scratch tensors poisoned, even when the graph was captured live.
+    vals = torch.tensor(
+        [-0.0, 0.0, 1 + 2**-8, 1 + 3 * 2**-8, -0.25, math.inf, -math.inf, math.nan],
+        dtype=torch.float32, device="cuda",
+    )
+    partial = vals.repeat(1, batch, 32, 64)
+    lse = torch.empty(1, 32, batch, device="cuda", dtype=torch.float32).transpose(1, 2)
+    valid = torch.ones(batch, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(partial[0], dtype=torch.bfloat16)
+    lse.zero_()
+    run_sm103_hd512_splitkv_combine(partial, lse, out, valid)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_sm103_hd512_splitkv_combine(partial, lse, out, valid)
+    rows = torch.arange(batch, device="cuda")
+    for live in (rows >= 0, rows % 2 != 0, rows < 0, rows % 2 == 0):
+        valid.copy_(live)
+        partial.view(-1, 8).copy_(vals)
+        lse.fill_(-32.0)
+        for head, value in enumerate([math.nan, math.inf, -math.inf, 0.0]):
+            lse[:, :, head] = value
+        partial[0, ~live] = math.nan
+        lse[0, ~live] = math.nan
+        expected = (partial[0] + 0.0).to(torch.bfloat16)
+        expected.masked_fill_(~torch.isfinite(lse[0, :, :, None]), math.nan)
+        expected[~live] = 0.0
+        out.fill_(-123.0)
+        graph.replay()
+        finite_or_inf = ~expected.isnan()
+        assert torch.equal(out.isnan(), expected.isnan())
+        assert torch.equal(out.view(torch.int16)[finite_or_inf], expected.view(torch.int16)[finite_or_inf])
