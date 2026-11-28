@@ -25,6 +25,8 @@ _DECODE = FwdHeuristicInputs(
 )
 # Varlen Q decode (cu_seqlens_q, host max_seqlen_q=1) over paged KV with used lengths.
 _VARLEN_PAGED = dict(has_cu_seqlens_q=True, total_q=3, has_seqused_k=True, page_size=128)
+# Varlen verify rows of 4 query tokens over paged KV with used lengths (2 KV heads).
+_TOKENS = dict(has_cu_seqlens_q=True, max_seqlen_q=4, has_seqused_k=True, page_size=128)
 
 
 def decode(**changes) -> FwdHeuristicInputs:
@@ -67,6 +69,38 @@ def test_admitted_decode_selects_swapab(changes):
     assert select_fwd_config(inputs._replace(requested_use_swapab=True)) == config
 
 
+# Verify rows (token mode): N holds npo2(query heads per KV head) x npo2(max_seqlen_q) columns;
+# head dim 256 takes 128-token KV blocks.
+@pytest.mark.parametrize(
+    ("changes", "tile_m", "tile_n"),
+    [
+        # 6 query heads per KV head, 1 + 3 drafts: 8 x 4.
+        ({"num_heads": 12, **_VARLEN_PAGED, "total_q": 12, "max_seqlen_q": 4}, 32, 256),
+        ({"num_heads": 12, **_VARLEN_PAGED, "total_q": 12, "max_seqlen_q": 4, "head_dim": 256,
+          "head_dim_v": 256}, 32, 128),
+        # Dense Q of 4 tokens per sequence.
+        ({"num_heads": 12, "total_q": 16, "max_seqlen_q": 4}, 32, 256),
+        ({**_VARLEN_PAGED, "total_q": 9, "max_seqlen_q": 3}, 16, 256),
+        ({"num_heads": 2, **_VARLEN_PAGED, "total_q": 96, "max_seqlen_q": 32}, 32, 256),
+        # Each column's token reaches modifiers as q_idx and centers its local window.
+        ({**_VARLEN_PAGED, "total_q": 9, "max_seqlen_q": 3, "local": True,
+          "window_size_left": 31, "has_score_mod": True, "has_mask_mod": True}, 16, 256),
+    ],
+)
+def test_admitted_verify_rows_select_swapab(changes, tile_m, tile_n):
+    config = select_fwd_config(decode(**changes)._replace(requested_use_swapab=True))
+
+    assert config.use_swapab and (config.tile_m, config.tile_n) == (tile_m, tile_n)
+
+
+def test_verify_rows_over_32_columns_take_the_standard_kernel():
+    """6 query heads per KV head at 1 + 4 drafts need 8 x 8 = 64 columns."""
+    inputs = decode(**{**_VARLEN_PAGED, "num_heads": 12, "total_q": 15, "max_seqlen_q": 5})
+
+    assert SWAPAB.rejection(inputs) == "query heads x query tokens per KV head over 32 columns"
+    assert not select_fwd_config(inputs._replace(requested_use_swapab=True)).use_swapab
+
+
 # Problems the SwapAB kernel cannot run, with the rejection reason.
 _UNSUPPORTED = [
     ({"has_cu_seqlens_k": True}, "cu_seqlens_k"),
@@ -80,14 +114,15 @@ _UNSUPPORTED = [
     ({"device_arch": 90}, "SM100 or SM103"),
     ({"device_arch": 110}, "SM100 or SM103"),
     ({"requires_grad": True}, "training"),
-    ({"total_q": 8, "max_seqlen_q": 2}, "single query token"),
-    ({**_VARLEN_PAGED, "max_seqlen_q": 2}, "max_seqlen_q == 1"),
+    # 4 query heads x 16 tokens (9 tokens round up to 16) is 64 columns.
+    ({"total_q": 4 * 16, "max_seqlen_q": 16}, "over 32 columns"),
+    ({**_VARLEN_PAGED, "max_seqlen_q": 9}, "over 32 columns"),
     # A tensor (device) max_seqlen_q is no host bound.
-    ({**_VARLEN_PAGED, "has_max_seqlen_q_hint": False}, "max_seqlen_q == 1"),
-    ({"dtype": "torch.float8_e4m3fn"}, "dtype"),
+    ({**_VARLEN_PAGED, "has_max_seqlen_q_hint": False}, "needs a host max_seqlen_q"),
+    ({"dtype": "torch.float32"}, "dtype"),
     ({"mxfp8_path": "qk"}, "MXFP8 block scales"),
     ({"head_dim": 192, "head_dim_v": 128}, "head dimensions"),
-    ({"num_heads": 66, "num_heads_kv": 2}, "GQA ratio"),
+    ({"num_heads": 66, "num_heads_kv": 2}, "over 32 columns"),
     ({"page_size": 64}, "page size must be a multiple of 128"),
 ]
 # Selection requests that keep the selector off SwapAB.
@@ -139,6 +174,12 @@ def test_explicit_swapab_config_for_unsupported_problem_raises(changes, match):
         # A large page table hides the real lengths: its capacity keeps SwapAB.
         ({"batch_size": 256, "total_q": 256, "max_seqlen_k": 512, "seqlen_k_capacity": 262144,
           "has_seqused_k": True, "page_size": 128}, True),
+        # Token mode (4 tokens per row) at short KV: any batch at 512, 128+ (batch * KV heads) at 2K.
+        ({"batch_size": 1, "total_q": 4, "max_seqlen_q": 4, "max_seqlen_k": 512}, False),
+        ({"batch_size": 64, "total_q": 256, "max_seqlen_q": 4, "max_seqlen_k": 2048}, False),
+        # Fewer CTAs or longer KV keep token mode.
+        ({"batch_size": 63, "total_q": 252, "max_seqlen_q": 4, "max_seqlen_k": 2048}, True),
+        ({"batch_size": 64, "total_q": 256, "max_seqlen_q": 4, "max_seqlen_k": 2049}, True),
     ],
 )
 def test_automatic_selection_skips_measured_swapab_losses(changes, use_swapab):
@@ -233,6 +274,15 @@ def test_split_count_bounds():
         ({"max_seqlen_k": 262144}, False, 8),
         # One split needs no counts.
         ({"has_seqused_k": True, "max_seqlen_k": 262144, "requested_num_splits": 1}, False, 1),
+        # Token rows at batch x KV heads 33-64, where the static count is 1 split, take counts
+        # from 8K; 32 (2 static splits), 66 and 128 (over 64) and decode rows keep the static count.
+        (_TOKENS | {"batch_size": 32, "total_q": 128, "max_seqlen_k": 8192}, True, 19),
+        (_TOKENS | {"batch_size": 32, "total_q": 128, "max_seqlen_k": 8191}, False, 1),
+        (_TOKENS | {"batch_size": 16, "total_q": 64, "max_seqlen_k": 8192}, False, 2),
+        (_TOKENS | {"batch_size": 33, "total_q": 132, "max_seqlen_k": 8192}, False, 1),
+        (_TOKENS | {"batch_size": 64, "total_q": 256, "max_seqlen_k": 8192}, False, 1),
+        (_TOKENS | {"batch_size": 32, "total_q": 32, "max_seqlen_q": 1, "max_seqlen_k": 8192},
+         False, 1),
     ],
 )
 def test_per_sequence_splits(changes, per_sequence, num_splits):

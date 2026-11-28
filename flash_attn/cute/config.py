@@ -61,8 +61,9 @@ class FwdConfig:
     overlap_sO_sQ and kv_stage are the SM100 forward SMEM layout (see
     sm100_fwd_smem_bytes); other architectures carry False and 0.
     use_swapab selects the SM100/SM103 SwapAB decode kernel (flash_fwd_decode_sm100.py), where
-    tile_m is the query-head tile and only num_splits is tunable; see SwapABPolicy.config. The
-    SwapAB kernel sizes its own SMEM stages, so its configs carry the neutral layout.
+    tile_m is the query heads x query tokens per CTA and only num_splits is tunable; see
+    SwapABPolicy.config. The SwapAB kernel sizes its own SMEM stages, so its configs carry the
+    neutral layout.
     use_dynamic_varlen runs SM100 varlen on DynamicPersistentVarlenScheduler with a semaphore the
     interface allocates. validate_fwd_config rejects this flag with caller scheduler metadata.
     A caller-provided tile_count_semaphore selects the same scheduler through
@@ -1245,12 +1246,17 @@ class SwapABPolicy:
     """Shapes, admission, and split policy of the SM100/SM103 SwapAB decode kernel
     (flash_fwd_decode_sm100.py). The selector, validation, and interface use SWAPAB."""
 
-    # Kernel shapes. Each 256-token KV block is two 128-row MMA subtiles, and pages are resolved
-    # per subtile, so a page holds a whole number of subtiles. One lane owns one query head in
-    # the softmax and correction warpgroups.
+    # Kernel shapes. Each KV block (select_tile_n tokens) is one or two 128-row MMA subtiles, and
+    # pages are resolved per subtile, so a page holds a whole number of subtiles. One lane owns one
+    # column (a query head of one query token) in the softmax and correction warpgroups.
     tile_n: int = 256
+    # Rows of 2+ query tokens at head dim 256 take 128-token KV blocks. GB300 sweep at 4 tokens per
+    # row (fp8 and bf16, batch x KV heads >= 128, KV 8K-128K, equal and spread lengths): 2-5% less
+    # time at the median, at most 1.4% more. Head dim 64 took 15-23% more at 128, fp8 head dim 128
+    # 13% more. Decode keeps tile_n, the tile its split targets were fitted with.
+    token_hd256_tile_n: int = 128
     page_multiple: int = 128
-    max_qhead_per_kvhead: int = 32
+    max_columns: int = 32
     # Split policy. Decode is bandwidth bound and DRAM saturates with roughly this many CTAs
     # (hd64 moves fewer bytes per tile, so it needs more); more splits only add per-CTA fixed
     # cost and combine work. Fitted on B200 within 2% of the best split on average over a
@@ -1277,6 +1283,16 @@ class SwapABPolicy:
     # costs (~1.5-2.5 us on B300; 256-token pages with a tight page table measured 1.2-1.7x slower
     # at <= 8K tokens and within ~2% at 32K+).
     per_sequence_min_capacity: int = 32768
+    # Token rows (2+ query tokens) whose static count is 1 split at batch * KV heads <=
+    # token_per_sequence_max_heads take per-sequence counts from token_per_sequence_min_capacity:
+    # that grid leaves over half of the SMs idle. GB300 sweep at 4 tokens per row (fp8 hd128/256
+    # and bf16 hd256, batch x KV heads 48 and 64, KV 8K-16K): per-sequence counts took 0.66-1.01x
+    # the time of 1 split on rows of one length and 0.39-0.65x on rows spread 0.25x-1.75x of the
+    # mean length. At 96 they took 1.12x (up to 1.30x) on rows of one length but 0.73x on spread
+    # rows; at 128+, up to 1.36x on rows of one length. The band keeps only what won on both.
+    # 33-47 and 65-95 were not timed.
+    token_per_sequence_min_capacity: int = 8192
+    token_per_sequence_max_heads: int = 64
     # Automatic selection keeps the standard kernel for many short sequences at head dims <= 128:
     # at most short_kv_max_tokens of KV capacity (two KV blocks, so per-CTA fixed cost dominates)
     # and at least short_kv_min_heads (batch * KV heads) CTAs without splitting.
@@ -1288,14 +1304,48 @@ class SwapABPolicy:
     # lengths, so large (vLLM-style) page tables never take this rule.
     short_kv_max_tokens: int = 512
     short_kv_min_heads: int = 512
+    # Token mode (rows of 2+ query tokens) keeps the standard kernel at short KV capacity: at most
+    # token_short_kv_max_tokens, or token_mid_kv_max_tokens with at least token_mid_kv_min_heads
+    # (batch * KV heads). Source: GB300 CUDA-graph sweep at 4 tokens per row (fp8 and bf16, causal,
+    # num_splits=0, 128-token pages, the head configs above, batch 1-256, KV 512-128K, rows of one
+    # length): SwapAB was 1.13x slower at the median (fp8 and bf16) on the 77 such shapes (bf16
+    # 24/4 hd256: 0.87x). Elsewhere it was 0.97x / 1.00x, up to 1.24x / 1.43x slower.
+    # Rows spread 0.25x-1.75x of the mean length favor SwapAB (KV 8K-128K: 0.92x at the median at
+    # batch x KV heads >= 128, 0.76x (fp8) and 0.86x (bf16) below; 26 MTP-3 rows, 24/4 hd256,
+    # 27k-107k: 0.79x). bf16 32/4 hd64 keeps SwapAB at KV 8K+: 1.18x on rows of one length at
+    # batch x KV heads >= 128, but 1.00x on spread rows. Selection sees only the capacity, so the
+    # rule stops at 2K. A vLLM-style page table (max_model_len wide) puts the capacity far above
+    # the real lengths, so its calls never take the rule.
+    token_short_kv_max_tokens: int = 512
+    token_mid_kv_max_tokens: int = 2048
+    token_mid_kv_min_heads: int = 128
 
     def supports_head_dims(self, head_dim: int, head_dim_v: int) -> bool:
         """Tested and benchmarked head dims. Adding a shape needs tests and a decode benchmark."""
         return {head_dim, head_dim_v} <= {64, 96, 128} or (head_dim, head_dim_v) == (256, 256)
 
-    def tile_hq(self, qhead_per_kvhead: int) -> int:
+    def heads_tile(self, qhead_per_kvhead: int) -> int:
         """Query heads per CTA: the next power of two, so one head block covers the group."""
         return 1 << (qhead_per_kvhead - 1).bit_length()
+
+    def tokens_tile(self, inputs: FwdHeuristicInputs) -> int:
+        """Query tokens per CTA: the next power of two of the longest row (1 for decode).
+
+        Example: varlen verify rows of 1 + 3 drafts (max_seqlen_q 4) at 6 query heads per KV
+        head take 4 tokens x 8 heads = 32 columns; 5 tokens would take 8 x 8 = 64.
+        """
+        if inputs.has_cu_seqlens_q:
+            max_tokens = inputs.max_seqlen_q
+        else:
+            max_tokens = inputs.total_q // max(inputs.batch_size, 1)
+        return 1 << (max(max_tokens, 1) - 1).bit_length()
+
+    def select_tile_n(self, inputs: FwdHeuristicInputs) -> int:
+        """KV tokens per block: token_hd256_tile_n for rows of 2+ query tokens at head dim 256, else
+        tile_n."""
+        if self.tokens_tile(inputs) > 1 and inputs.head_dim == 256:
+            return self.token_hd256_tile_n
+        return self.tile_n
 
     def target_ctas(self, head_dim: int) -> int:
         return self.hd64_target_ctas if head_dim == 64 else self.default_target_ctas
@@ -1332,12 +1382,13 @@ class SwapABPolicy:
     def rejection(self, inputs: FwdHeuristicInputs) -> str | None:
         """Why the SwapAB decode kernel cannot run this problem, or None when it can.
 
-        SwapAB is inference with one query token per sequence: dense Q of seqlen 1, or varlen Q
-        (cu_seqlens_q) with a host max_seqlen_q of 1. A new forward option needs a
-        FwdHeuristicInputs fact that is rejected here, unless SwapAB supports it. The split
-        count's grid limit is grid_rejection.
+        SwapAB is inference with up to max_columns (query head, query token) pairs per KV head
+        and row: dense Q, or varlen Q (cu_seqlens_q) with a host max_seqlen_q. A new forward
+        option needs a FwdHeuristicInputs fact that is rejected here, unless SwapAB supports it.
+        The split count's grid limit is grid_rejection.
         """
         is_dense_q = not inputs.has_cu_seqlens_q
+        columns = self.heads_tile(inputs.qhead_per_kvhead) * self.tokens_tile(inputs)
         unsupported = {
             "cu_seqlens_k": inputs.has_cu_seqlens_k,
             "seqused_q": inputs.has_seqused_q,
@@ -1350,13 +1401,16 @@ class SwapABPolicy:
             # B200 (SM100) and B300 (SM103) share the tcgen05/TMEM features and SMEM capacity used.
             "architecture must be SM100 or SM103": inputs.device_arch not in (100, 103),
             "training": inputs.requires_grad,
-            "varlen Q needs max_seqlen_q == 1": not is_dense_q
-            and not (inputs.has_max_seqlen_q_hint and inputs.max_seqlen_q == 1),
-            "single query token per sequence": is_dense_q and inputs.total_q != inputs.batch_size,
-            "dtype": inputs.dtype not in ("torch.float16", "torch.bfloat16"),
+            # A tensor max_seqlen_q gives no host bound for the token tile.
+            "varlen Q needs a host max_seqlen_q": not is_dense_q
+            and not inputs.has_max_seqlen_q_hint,
+            f"query heads x query tokens per KV head over {self.max_columns} columns": (
+                columns > self.max_columns
+            ),
+            "dtype": inputs.dtype
+            not in ("torch.float16", "torch.bfloat16", "torch.float8_e4m3fn", "torch.float8_e5m2"),
             "MXFP8 block scales": inputs.mxfp8_path is not None,
             "head dimensions": not self.supports_head_dims(inputs.head_dim, inputs.head_dim_v),
-            "GQA ratio": inputs.qhead_per_kvhead > self.max_qhead_per_kvhead,
             f"page size must be a multiple of {self.page_multiple}": (
                 inputs.page_size is not None and inputs.page_size % self.page_multiple != 0
             ),
@@ -1384,22 +1438,40 @@ class SwapABPolicy:
         return inputs.max_seqlen_k if inputs.seqlen_k_capacity is None else inputs.seqlen_k_capacity
 
     def slower_than_standard(self, inputs: FwdHeuristicInputs) -> bool:
-        """Measured SwapAB losses that automatic selection avoids; see short_kv_max_tokens."""
-        return (
+        """Measured SwapAB losses that automatic selection avoids; see short_kv_max_tokens and
+        token_short_kv_max_tokens."""
+        capacity = self.seqlen_k_capacity(inputs)
+        bh = inputs.batch_size * inputs.num_heads_kv
+        short_decode = (
             max(inputs.head_dim, inputs.head_dim_v) <= 128
-            and self.seqlen_k_capacity(inputs) <= self.short_kv_max_tokens
-            and inputs.batch_size * inputs.num_heads_kv >= self.short_kv_min_heads
+            and capacity <= self.short_kv_max_tokens
+            and bh >= self.short_kv_min_heads
         )
+        short_token_rows = self.tokens_tile(inputs) > 1 and (
+            capacity <= self.token_short_kv_max_tokens
+            or (capacity <= self.token_mid_kv_max_tokens and bh >= self.token_mid_kv_min_heads)
+        )
+        return short_decode or short_token_rows
 
     def per_sequence_splits(self, inputs: FwdHeuristicInputs) -> bool:
         """Whether SwapAB takes per-sequence split counts from the prepare-scheduler kernel.
 
         Lengths vary per sequence with varlen Q or seqused_k (the SwapAB tile scheduler reads the
         counts for dense Q too), but only a capacity of per_sequence_min_capacity tokens leaves
-        room for the counts to pay for the prepare launch.
+        room for the counts to pay for the prepare launch; see token_per_sequence_min_capacity
+        for token rows.
         """
         lengths_vary = inputs.is_varlen_q or inputs.has_seqused_k
-        return lengths_vary and self.seqlen_k_capacity(inputs) >= self.per_sequence_min_capacity
+        bh = inputs.batch_size * inputs.num_heads_kv
+        one_static_split = 2 * bh > self.static_target_ctas(inputs)
+        min_capacity = self.per_sequence_min_capacity
+        if (
+            self.tokens_tile(inputs) > 1
+            and one_static_split
+            and bh <= self.token_per_sequence_max_heads
+        ):
+            min_capacity = self.token_per_sequence_min_capacity
+        return lengths_vary and self.seqlen_k_capacity(inputs) >= min_capacity
 
     def needs_split_metadata(self, inputs: FwdHeuristicInputs, num_splits: int) -> bool:
         """Whether SwapAB prepares per-sequence split counts and launches split-major."""
@@ -1407,6 +1479,11 @@ class SwapABPolicy:
 
     def select_num_splits(self, inputs: FwdHeuristicInputs) -> int:
         """Automatic split count; with per-sequence splits, the cap of the per-sequence counts."""
+        # Token rows keep this policy from 32K of capacity. GB300 sweep at 4 tokens per row (fp8
+        # and bf16, 32K-128K): at batch x KV heads >= 128, 1 split was 2% faster at the median on
+        # rows of one length, but 10-19% slower (up to 1.8x) on rows spread 0.25x-1.75x of the
+        # mean, where per-sequence counts balance the work; below 128, 4 splits took 1.4x (equal)
+        # and 1.7x (spread) its time at the median. Selection cannot see the lengths.
         seqlen_k = self.seqlen_k_capacity(inputs)
         bh = inputs.batch_size * inputs.num_heads_kv
         # An empty batch has no tiles to split, as in num_splits_heuristic.
@@ -1414,7 +1491,8 @@ class SwapABPolicy:
             return 1
         if self.per_sequence_splits(inputs):
             grid_splits = ceil_div(self.grid_ctas_per_sm * inputs.num_sms, bh)
-            return max(1, min(self.max_splits, ceil_div(seqlen_k, self.tile_n), grid_splits))
+            kv_blocks = ceil_div(seqlen_k, self.select_tile_n(inputs))
+            return max(1, min(self.max_splits, kv_blocks, grid_splits))
         pow2_splits = 1 << (max(1, self.static_target_ctas(inputs) // bh).bit_length() - 1)
         return min(pow2_splits, self.max_splits, max(1, seqlen_k // self.min_tokens_per_split))
 
@@ -1432,12 +1510,13 @@ class SwapABPolicy:
         )
 
     def config(self, inputs: FwdHeuristicInputs, num_splits: int) -> FwdConfig:
-        """The one SwapAB config for a problem: a power-of-two query-head tile covering the GQA
-        group, a 256-token KV tile, and no standard-kernel scheduling features."""
+        """The one SwapAB config for a problem: power-of-two query-head and query-token tiles
+        covering the GQA group and the longest row, select_tile_n's KV tile, and no
+        standard-kernel scheduling features."""
         return FwdConfig(
             device_capacity=inputs.device_capacity,
-            tile_m=self.tile_hq(inputs.qhead_per_kvhead),
-            tile_n=self.tile_n,
+            tile_m=self.heads_tile(inputs.qhead_per_kvhead) * self.tokens_tile(inputs),
+            tile_n=self.select_tile_n(inputs),
             mma_pv_is_rs=False,
             intra_wg_overlap=False,
             q_stage=1,
@@ -1803,7 +1882,7 @@ def derive_fwd_config(base: FwdConfig, inputs: FwdHeuristicInputs, **changes) ->
     )
     if config.use_swapab:
         # registers=None: the SwapAB kernel owns its fixed per-role budgets (64/120/208 at
-        # tile_hq=32) and its SMEM stages; it keeps hardware exp2.
+        # tile_m=32) and its SMEM stages; it keeps hardware exp2.
         derived = dict(
             registers=None,
             ex2_emu_freq=0,

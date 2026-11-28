@@ -1,14 +1,22 @@
-# SM100 swap-AB single-token decode, adapted from NVIDIA CUTLASS gqa_decode_opt
+# SM100 swap-AB decode, adapted from NVIDIA CUTLASS gqa_decode_opt
 # (examples/python/CuTeDSL/cute_ext/blackwell/attention/gqa_decode_opt.py).
 # It computes S^T = K Q^T and O^T = V^T P^T, so KV tokens fill the 128-row MMA M dimension
-# and the query heads of one KV head fill the small N dimension.
+# and the query heads of one KV head fill the small N dimension. Token mode (tokens_tile > 1,
+# e.g. MTP verify rows) puts a row's query tokens in N too, so the row's KV is read once:
+#
+#   column = head + heads_tile * token          qpk 6, 4 tokens: heads_tile 8, 32 columns
 #
 # Core contract: Q is (B,H,Dqk), K is (B,S,Hkv,Dqk), V is (B,S,Hkv,Dv), O is (splits,B,H,Dv),
-# optional LSE is (splits,B,H) fp32 natural log. Empty splits write O=0 and, when requested, LSE=-inf.
+# optional LSE is (splits,B,H) fp32 natural log. Token mode adds a query-token mode: Q is
+# (B,Sq,H,Dqk), O (splits,B,Sq,H,Dv), LSE (splits,B,H,Sq); varlen Q is B = 1 with rows at
+# cu_seqlens_q. Empty splits write O=0 and, when requested, LSE=-inf.
 # The caller launches the shared FA4 combine if splits>1. With per-sequence split counts (from the
 # prepare-scheduler kernel), split CTAs past their sequence's count exit without writing.
 # One CTA = 16 warps: 0 QK MMA, 1 PV MMA, 2 K/V load + final statistics,
-# 3 Q load + O store, WGs 1/2 alternating softmax, WG3 O correction.
+# 3 Q load + O store, WGs 1/2 alternating softmax, WG3 O correction (and the O store in token mode).
+# FP8 (e4m3 or e5m2) Q/K/V run both MMAs in their dtype with the standard kernel's tensorwise
+# descales, and P is cast to that dtype scaled by 2^max_offset (Note [Low Precision Scaling] in
+# flash_fwd_sm100.py).
 
 import math
 from functools import partial
@@ -27,10 +35,10 @@ from quack import copy_utils
 
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.config import FwdConfig
+from flash_attn.cute.config import SWAPAB, FwdConfig
 from flash_attn.cute.compat import SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
+from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, FlashAttentionForwardSm100
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100SwapAB
 from flash_attn.cute.pipeline import NamedBarrier
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, TileSchedulerArguments
@@ -209,21 +217,25 @@ def load_kv_stage(
     return kv_state, pipeline_kv.producer_try_acquire(kv_state)
 
 
-def gemm_view(mX, order, head_idx=None, qhead_per_kvhead=None, num_heads_kv=None):
+def gemm_view(mX, order, head_idx=None, qhead_per_kvhead=None, num_heads_kv=None, seqlen_idx=None):
     """mX with its modes permuted to order and the (kv head, batch) modes 2 and 3 grouped.
 
     With head_idx, the head mode is first split into (qhead_per_kvhead, num_heads_kv) as in
     pack_gqa_layout, so order indexes (qhead_per_kvhead, mode 0, ..., num_heads_kv, ...).
+    With seqlen_idx too, qhead_per_kvhead folds into that mode as (qhead_per_kvhead, seqlen).
     """
     if head_idx is not None:
-        mX = cute.flatten(pack_gqa_layout(mX, qhead_per_kvhead, num_heads_kv, head_idx))
+        if seqlen_idx is None:
+            mX = cute.flatten(pack_gqa_layout(mX, qhead_per_kvhead, num_heads_kv, head_idx))
+        else:
+            mX = pack_gqa_layout(mX, qhead_per_kvhead, num_heads_kv, head_idx, seqlen_idx)
     return cute.group_modes(select_modes(mX, order), 2, 4)
 
 
 class _SwapABCore:
     def __init__(
         self,
-        tile_hq,
+        tile_cols,
         tile_n,
         head_dim,
         dtype,
@@ -232,13 +244,19 @@ class _SwapABCore:
         is_local=False,
         *,
         head_dim_v,
+        tokens_tile=1,
+        is_causal=False,
     ):
-        self.tile_hq = tile_hq
+        # MMA N columns per CTA: heads_tile query heads of one KV head x tokens_tile query tokens.
+        self.tile_cols = tile_cols
         self.tile_n = tile_n
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
         self.dtype = dtype
         self.qk_acc_dtype = cutlass.Float32
+        # FP8 P = exp2(S - M + max_offset) <= 2^8, below the e4m3 and e5m2 maxima (448, 57344); the
+        # running max is exact.
+        self.max_offset = 8 if dtype.width == 8 else 0
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.mask_vec_size = getattr(mask_mod, "__vec_size__", 1)
@@ -246,15 +264,21 @@ class _SwapABCore:
             "mask_mod __vec_size__ must divide 32 or be a multiple of 32"
         )
         self.is_local = is_local
-        self.check_empty_rows = score_mod is not None or mask_mod is not None or is_local
+        self.apply_score_mods = score_mod is not None or mask_mod is not None or is_local
+        self.tokens_tile = tokens_tile
+        self.heads_tile = tile_cols // tokens_tile
+        # Causal token j of a row sees keys up to seqlen_k - seqlen_q + j, so a split may hide all
+        # of a column's keys, as masking can.
+        self.causal_tokens = is_causal and tokens_tile > 1
+        self.check_empty_rows = self.apply_score_mods or self.causal_tokens
 
         assert head_dim > 0 and head_dim % 16 == 0
         assert self.head_dim_v > 0 and self.head_dim_v % 16 == 0
-        assert tile_hq in (1, 2, 4, 8, 16, 32)
+        assert tile_cols in (1, 2, 4, 8, 16, 32) and tile_cols % tokens_tile == 0
         assert tile_n > 0 and tile_n % 128 == 0 and tile_n <= 256
 
     def make_shared_storage(self, sQ_layout, sK_layout, sP_layout):
-        tile_hq_mma = self.mma_tiler[1]
+        tile_cols_mma = self.mma_tiler[1]
 
         @cute.struct
         class SharedStorage:
@@ -264,11 +288,11 @@ class _SwapABCore:
             mbar_p: cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages_p]
             mbar_o: cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages_o]
             tmem_holding_buf: Int32
-            # Per-head running max for softmax/correction; split stats later publish 1/L here.
-            sRowMax: cute.struct.Align[cute.struct.MemRange[Float32, tile_hq_mma], 128]
+            # Per-column running max for softmax/correction; split stats later publish 1/L here.
+            sRowMax: cute.struct.Align[cute.struct.MemRange[Float32, tile_cols_mma], 128]
             # Per-warp row sums from the correction WG for the split statistics.
             sRowSumWarp: cute.struct.Align[
-                cute.struct.MemRange[Float32, WARPS_PER_WG * self.tile_hq], 128
+                cute.struct.MemRange[Float32, WARPS_PER_WG * self.tile_cols], 128
             ]
             sP: cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(sP_layout)], 1024]
             sQ: cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(sQ_layout)], 1024]
@@ -306,11 +330,13 @@ class _SwapABCore:
     def __call__(
         self,
         problem_size: Tuple[Int32, Int32, Int32, Int32],
-        mQ: cute.Tensor,  # (batch, num_heads, head_dim), head_dim contiguous
+        mQ: cute.Tensor,  # (batch, num_heads, head_dim), head_dim contiguous; token mode below
         mK: cute.Tensor,  # (batch, seqlen_k, num_heads_kv, head_dim), head_dim contiguous
         mV: cute.Tensor,  # (batch, seqlen_k, num_heads_kv, head_dim_v), last dim contiguous
         mO_partial: cute.Tensor,  # (num_splits, batch, num_heads, head_dim_v)
         mLSE_partial: cute.Tensor | None,  # (num_splits, batch, num_heads), natural log
+        # Token mode: Q (batch, seqlen_q, ...), O (num_splits, batch, seqlen_q, ...), and LSE
+        # (num_splits, batch, num_heads, seqlen_q).
         mSeqUsedK: cute.Tensor | None,  # (batch,) int32: KV tokens actually used per sequence
         softmax_scale: Float32,
         stream: cuda.CUstream,
@@ -321,6 +347,7 @@ class _SwapABCore:
         mCuSeqlensQ: cute.Tensor | None = None,
         mNumSplitsDynamic: cute.Tensor | None = None,  # (batch,) int32: splits per sequence
         tensormap_workspace: cute.Tensor | None = None,  # (num_ctas, 16) Int64 (ragged V only)
+        descale_tensors: DescaleTensors | None = None,  # FP8: (batch, num_heads_kv) fp32 each
     ):
         hdim = self.head_dim
         hdim_v = self.head_dim_v
@@ -329,7 +356,7 @@ class _SwapABCore:
             softmax_scale, self.score_mod
         )
         qhead_per_kvhead = num_heads // num_heads_kv
-        tile_hq = self.tile_hq
+        tile_cols = self.tile_cols
         tile_n = self.tile_n
 
         # GEMM views over the FA layouts with the real strides (so e.g. a KV cache slice works
@@ -340,26 +367,35 @@ class _SwapABCore:
         mK_qk = gemm_view(mK, [1, 3, 2, 0])  # (seqlen_k, d, (h_kv, b))
         mVt_pv = gemm_view(mV, [3, 1, 2, 0])  # (d_v, seqlen_k, (h_kv, b))
         gqa = (qhead_per_kvhead, num_heads_kv)
-        mQ_qk = gemm_view(mQ, [0, 3, 2, 1], 1, *gqa)  # (qpk, d, (h_kv, b))
-        # (d_v, qpk, (h_kv, b), ns)
-        mO_partial_tma = gemm_view(mO_partial, [4, 0, 3, 2, 1], 2, *gqa)
-        mLSE_partial_fwd = None
-        if cutlass.const_expr(mLSE_partial is not None):
-            # (ns, qpk, (h_kv, b))
-            mLSE_partial_fwd = gemm_view(mLSE_partial, [1, 0, 3, 2], 2, *gqa)
+        # Token mode stores O and LSE per column from registers (attn_cta): raw layouts.
+        mO_partial_tma = None
+        mLSE_partial_fwd = mLSE_partial
+        if const_expr(self.tokens_tile > 1):
+            # ((qpk, s), d, (h_kv, b)): the row's query tokens join its query heads in N.
+            mQ_qk = gemm_view(mQ, [1, 3, 2, 0], 2, *gqa, seqlen_idx=1)
+        else:
+            mQ_qk = gemm_view(mQ, [0, 3, 2, 1], 1, *gqa)  # (qpk, d, (h_kv, b))
+            # (d_v, qpk, (h_kv, b), ns)
+            mO_partial_tma = gemm_view(mO_partial, [4, 0, 3, 2, 1], 2, *gqa)
+            if cutlass.const_expr(mLSE_partial is not None):
+                # (ns, qpk, (h_kv, b))
+                mLSE_partial_fwd = gemm_view(mLSE_partial, [1, 0, 3, 2], 2, *gqa)
 
         # MMA tile: M is always 128 (even for head_dim 64) so S and O use the canonical TMEM
         # accumulator layout. The K-step is 64 for both GEMMs so that a K tile (128 tokens x 64 dims)
         # and a V^T tile (128 dims x 64 tokens) have the same size and can share one SMEM ring.
         tile_m = 128
-        tile_hq_mma = max(MMA_N_MIN, tile_hq)
+        # tcgen05 takes an MN-major 8-bit B operand (P^T in the PV MMA) only with N % 16 == 0, so
+        # FP8 tiles of up to 8 columns pad N to 16. A K-major P^T store keeps N = 8 but measured no
+        # faster.
+        tile_cols_mma = max(2 * MMA_N_MIN if self.dtype.width == 8 else MMA_N_MIN, tile_cols)
         tile_k = 64
-        assert tile_hq_mma % tile_hq == 0
+        assert tile_cols_mma % tile_cols == 0
         num_s_subtiles = cute.ceil_div(tile_n, tile_m)
         num_k_tiles = cute.ceil_div(hdim, tile_k)
         num_d_tiles = cute.ceil_div(hdim_v, tile_m)
         num_pv_k_tiles = cute.ceil_div(tile_n, tile_k)
-        self.mma_tiler = (tile_m, tile_hq_mma, tile_k)
+        self.mma_tiler = (tile_m, tile_cols_mma, tile_k)
         self.subtile_counts = (num_s_subtiles, num_k_tiles, num_d_tiles, num_pv_k_tiles)
 
         # Pipeline depths. S: 4 TMEM score buffers, P: 4 SMEM buffers, O: 2 TMEM slots (even / odd
@@ -400,16 +436,16 @@ class _SwapABCore:
             tiled_mma_qk, self.mma_tiler, self.dtype, self.num_stages_q
         )
         sP_layout = sm100_utils.make_smem_layout_b(
-            tiled_mma_pv, (None, tile_hq_mma, tile_n), self.dtype, self.num_stages_p
+            tiled_mma_pv, (None, tile_cols_mma, tile_n), self.dtype, self.num_stages_p
         )
         sO_layout_atom = tcgen05.make_smem_layout_atom(
-            tcgen05.mma.SmemLayoutAtomKind.MN_SW128, mO_partial_tma.element_type
+            tcgen05.mma.SmemLayoutAtomKind.MN_SW128, mO_partial.element_type
         )
 
         # O staging tile uses the output dtype and reuses the K/V ring SMEM at the end.
-        O_shape = (num_d_tiles * tile_m, tile_hq_mma)
+        O_shape = (num_d_tiles * tile_m, tile_cols_mma)
         sO_layout = cute.tile_to_shape(sO_layout_atom, O_shape, order=(1, 0))
-        sO_layout = cute.flat_divide(sO_layout, (tile_m, tile_hq_mma))
+        sO_layout = cute.flat_divide(sO_layout, (tile_m, tile_cols_mma))
 
         sK_layout = self.plan_kv_ring(tiled_mma_qk, sQ_layout, sP_layout)
         sVt_layout = sm100_utils.make_smem_layout_a(
@@ -422,17 +458,23 @@ class _SwapABCore:
         vt_stage_bytes = cute.size_in_bytes(self.dtype, cute.select(sVt_layout, mode=[0, 1, 2]))
         assert vt_stage_bytes == k_stage_bytes
         assert cute.size_in_bytes(self.dtype, sVt_layout) <= ring_bytes
-        o_bytes = cute.size_in_bytes(mO_partial_tma.element_type, sO_layout)
+        o_bytes = cute.size_in_bytes(mO_partial.element_type, sO_layout)
         assert o_bytes <= ring_bytes
 
         # TMA atoms; the returned coordinate tensors replace the GEMM views in the kernel.
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
         cluster_shape_vmnk = (1, 1, 1, 1)
+        # Token mode tiles N by (heads, tokens) mode, so one TMA box packs the row's tokens. MMA
+        # padding columns (tile_cols_mma > tile_cols) load further tokens, which are never stored.
+        q_tma_tiler = self.mma_tiler
+        if const_expr(self.tokens_tile > 1):
+            self.q_tokens = tile_cols_mma // self.heads_tile
+            q_tma_tiler = (tile_m, (self.heads_tile, self.q_tokens), tile_k)
         tma_atom_Q, mQ_tma = cute.nvgpu.make_tiled_tma_atom_B(
             tma_load_op,
             mQ_qk,
             cute.select(sQ_layout, mode=[0, 1, 2]),
-            self.mma_tiler,
+            q_tma_tiler,
             tiled_mma_qk,
             cluster_shape_vmnk,
         )
@@ -463,17 +505,20 @@ class _SwapABCore:
         )
         if const_expr(self.ragged_tma_V):
             assert tensormap_workspace is not None, "ragged V TMA loads need a tensormap workspace"
-        tma_atom_O, mO_tma = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            mO_partial_tma,
-            cute.select(sO_layout, mode=[0, 1]),
-            (tile_m, tile_hq_mma),
-        )
+        tma_atom_O, mO_tma = None, None
+        if const_expr(mO_partial_tma is not None):
+            tma_atom_O, mO_tma = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                mO_partial_tma,
+                cute.select(sO_layout, mode=[0, 1]),
+                (tile_m, tile_cols_mma),
+            )
 
-        # Shared tile scheduler: one tile per (split, KV head, sequence); tile_hq covers every
+        # Shared tile scheduler: one tile per (split, KV head, sequence); tile_cols covers every
         # query head of a KV head (adapter-asserted). With per-sequence split counts it packs
         # the sequence's count into the split index and launches split-major.
         self.num_splits_dynamic = mNumSplitsDynamic is not None
+        total_q = mQ.shape[0] if const_expr(self.tokens_tile == 1) else mQ.shape[0] * mQ.shape[1]
         tile_sched_args = TileSchedulerArguments(
             1,
             num_heads_kv,
@@ -482,8 +527,8 @@ class _SwapABCore:
             problem_size[3],
             hdim,
             hdim_v,
-            mQ.shape[0],
-            tile_shape_mn=(tile_hq, tile_n),
+            total_q,
+            tile_shape_mn=(tile_cols, tile_n),
             mCuSeqlensQ=mCuSeqlensQ,
             qhead_per_kvhead_packgqa=qhead_per_kvhead,
             element_size=self.dtype.width // 8,
@@ -523,6 +568,7 @@ class _SwapABCore:
             tile_sched_params,
             mVt_pv if const_expr(self.ragged_tma_V) else None,
             tensormap_workspace if const_expr(self.ragged_tma_V) else None,
+            descale_tensors,
         ).launch(
             grid=grid,
             block=(NUM_WG * WG_SIZE, 1, 1),
@@ -544,8 +590,8 @@ class _SwapABCore:
         mK: cute.Tensor,
         tma_atom_V: cute.CopyAtom,
         mV: cute.Tensor,
-        tma_atom_O: cute.CopyAtom,
-        mO_partial_tma: cute.Tensor,
+        tma_atom_O: cute.CopyAtom | None,
+        mO_partial_tma: cute.Tensor | None,
         mO_partial_raw: cute.Tensor,  # direct stores; mO_partial_tma holds TMA coordinates
         mLSE_partial: cute.Tensor | None,
         mSeqUsedK: cute.Tensor | None,
@@ -566,6 +612,7 @@ class _SwapABCore:
         tile_sched_params: SingleTileScheduler.Params,
         mV_gmem: cute.Tensor | None,
         tensormap_workspace: cute.Tensor | None,
+        descale_tensors: DescaleTensors | None,
     ):
         if const_expr(self.num_splits_dynamic):
             cute.arch.griddepcontrol_wait()  # the split counts
@@ -581,9 +628,11 @@ class _SwapABCore:
             is_valid = is_valid & ((split_idx & 0xFFFF) < num_splits_seq)
         _b, _h, num_heads_kv, seqlen_k = problem_size
         bh_idx = batch_idx * num_heads_kv + kv_head_idx
+        # Dense token-mode rows hold seqlen_q tokens; varlen rows read theirs from cu_seqlens_q.
+        seqlen_q_static = 1 if const_expr(self.tokens_tile == 1) else mO_partial_raw.shape[2]
         seqlen_info = SeqlenInfoQK.create(
             batch_idx=batch_idx,
-            seqlen_q_static=1,
+            seqlen_q_static=seqlen_q_static,
             seqlen_k_static=seqlen_k,
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedK=mSeqUsedK,
@@ -622,6 +671,7 @@ class _SwapABCore:
                 tile_sched_params.num_splits,
                 mV_gmem,
                 tensormap_workspace,
+                descale_tensors,
             )
 
     @cute.jit
@@ -634,8 +684,8 @@ class _SwapABCore:
         mK: cute.Tensor,
         tma_atom_V: cute.CopyAtom,
         mV: cute.Tensor,
-        tma_atom_O: cute.CopyAtom,
-        mO_partial_tma: cute.Tensor,
+        tma_atom_O: cute.CopyAtom | None,
+        mO_partial_tma: cute.Tensor | None,
         mO_partial_raw: cute.Tensor,
         mLSE_partial: cute.Tensor | None,
         softmax_scale_log2: Float32,
@@ -657,6 +707,7 @@ class _SwapABCore:
         num_splits: Int32,
         mV_gmem: cute.Tensor | None,
         tensormap_workspace: cute.Tensor | None,
+        descale_tensors: DescaleTensors | None,
     ):
         """One split CTA: its contiguous KV block range (BlockInfo) of sequence bh_idx."""
         # Warp roles (see header): WG0 = MMA + TMA warps, WG1 / WG2 = softmax for even / odd KV blocks,
@@ -676,14 +727,15 @@ class _SwapABCore:
         hdim_v = self.head_dim_v
         _b, num_heads, num_heads_kv, _ = problem_size
         tile_n = self.tile_n
-        tile_hq = self.tile_hq
+        tile_cols = self.tile_cols
         qhead_per_kvhead = num_heads // num_heads_kv
         seqlen_k = seqlen_info.seqlen_k
         # This split's KV blocks are [n_block_min, n_block_max). With per-sequence split counts
         # the scheduler packed the count into split_idx's high 16 bits.
         packed_splits = self.num_splits_dynamic
+        # tile_m = the token tile, so a local window's right edge reaches the last token's keys.
         block_info = BlockInfo(
-            tile_m=1,
+            tile_m=self.tokens_tile,
             tile_n=tile_n,
             is_causal=False,
             is_local=self.is_local,
@@ -700,19 +752,40 @@ class _SwapABCore:
         split_id = split_idx
         if const_expr(packed_splits):
             split_id = split_idx & 0xFFFF
-        # Q, O and LSE rows: the sequence index, or with varlen Q the token of the sequence
-        # (max_seqlen_q == 1, host-checked). A sequence without a query token takes the empty-split
-        # path, and its out-of-range row fails the direct-store guards.
-        num_q_rows = mO_partial_raw.shape[1]
-        q_row = bh_idx // num_heads_kv
-        if const_expr(seqlen_info.has_cu_seqlens_q):
-            has_q = seqlen_info.seqlen_q > 0
-            q_row = seqlen_info.offset_q if has_q else num_q_rows
-            num_n_blocks = num_n_blocks if has_q else Int32(0)
-        q_bh_idx = q_row * num_heads_kv + bh_idx % num_heads_kv
+        seqlen_q = seqlen_info.seqlen_q
+        if const_expr(self.tokens_tile > 1):
+            # Token mode: the row is tokens q_start .. q_start + seqlen_q - 1 of Q batch entry
+            # q_batch (varlen Q is one entry). A row without tokens takes the empty-split path.
+            kv_head_idx = bh_idx % num_heads_kv
+            q_start = seqlen_info.offset_q
+            q_batch = 0 if const_expr(seqlen_info.has_cu_seqlens_q) else bh_idx // num_heads_kv
+            num_n_blocks = num_n_blocks if seqlen_q > 0 else Int32(0)
+            q_bh_idx = q_batch * num_heads_kv + kv_head_idx
+        else:
+            # Q, O and LSE rows: the sequence index, or with varlen Q the token of the sequence
+            # (max_seqlen_q == 1, host-checked). A sequence without a query token takes the
+            # empty-split path, and its out-of-range row fails the direct-store guards.
+            num_q_rows = mO_partial_raw.shape[1]
+            q_row = bh_idx // num_heads_kv
+            if const_expr(seqlen_info.has_cu_seqlens_q):
+                has_q = seqlen_q > 0
+                q_row = seqlen_info.offset_q if has_q else num_q_rows
+                num_n_blocks = num_n_blocks if has_q else Int32(0)
+            q_bh_idx = q_row * num_heads_kv + bh_idx % num_heads_kv
+
+        # FP8 descales of this sequence and KV head: q and k fold into the softmax scale, v scales
+        # the final O.
+        qk_descale, v_descale = FlashAttentionForwardSm100._load_effective_descales(
+            descale_tensors, bh_idx // num_heads_kv, bh_idx % num_heads_kv
+        )
+        if const_expr(descale_tensors is not None):
+            if const_expr(self.score_mod is None):
+                softmax_scale_log2 = softmax_scale_log2 * qk_descale
+            else:
+                softmax_scale = softmax_scale * qk_descale
 
         mma_tiler = self.mma_tiler
-        tile_m, tile_hq_mma, tile_k = self.mma_tiler
+        tile_m, tile_cols_mma, tile_k = self.mma_tiler
         num_s_subtiles, num_k_tiles, num_d_tiles, num_pv_k_tiles = self.subtile_counts
 
         mma_kq_instr_shape_k = cute.size(tiled_mma_qk.shape_mnk, mode=[2])
@@ -720,10 +793,10 @@ class _SwapABCore:
         qk_k_blocks = tile_k // mma_kq_instr_shape_k
         pv_k_blocks = tile_k // mma_vp_instr_shape_k
 
-        # The 32-head tile needs redistribution for its softmax / correction row state.
+        # The 32-column tile needs redistribution for its softmax / correction row state.
         # O-tail size alone does not capture the row-vector state or compiler liveness.
         # Keep sufficient registers in the MMA / load warps as well.
-        setmaxreg = tile_hq > 16
+        setmaxreg = tile_cols > 16
         # Per-thread setmaxnreg targets: 64 + 2 * 120 + 208 = 512 = 64K registers / 128 threads.
         num_regs_mma_load, num_regs_softmax, num_regs_correction = 64, 120, 208
 
@@ -731,7 +804,8 @@ class _SwapABCore:
 
         if warp_idx == load_kv_warp_id:
             for tma_atom in (tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_O):
-                cpasync.prefetch_descriptor(tma_atom)
+                if const_expr(tma_atom is not None):
+                    cpasync.prefetch_descriptor(tma_atom)
 
         storage = SmemAllocator().allocate(self.shared_storage)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
@@ -754,25 +828,25 @@ class _SwapABCore:
         # column 0 instead of the allocator's pointer, which holds only because the kernel allocates
         # every column: keep num_tmem_cols at the maximum.
         acc_shape = thr_mma_qk.partition_shape_C(mma_tiler[:2])
-        num_s_cols = self.num_stages_s * num_s_subtiles * tile_hq_mma
-        num_l_cols = self.num_stages_l * tile_hq_mma
-        num_o_cols = self.num_stages_o * num_d_tiles * tile_hq_mma
+        num_s_cols = self.num_stages_s * num_s_subtiles * tile_cols_mma
+        num_l_cols = self.num_stages_l * tile_cols_mma
+        num_o_cols = self.num_stages_o * num_d_tiles * tile_cols_mma
         num_tmem_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
         assert num_s_cols + num_l_cols + num_o_cols <= num_tmem_cols
-        # ((tile_m, tile_hq_mma), 1, 1, subtile, stage)
+        # ((tile_m, tile_cols_mma), 1, 1, subtile, stage)
         tStS = thr_mma_qk.make_fragment_C(
             cute.append(cute.append(acc_shape, num_s_subtiles), self.num_stages_s)
         )
         tLtL = thr_mma_qk.make_fragment_C(cute.append(acc_shape, self.num_stages_l))
         tLtL = cute.make_tensor(tStS.iterator + num_s_cols, tLtL.layout)
-        # ((tile_m, tile_hq_mma), 1, 1, d tile, slot)
+        # ((tile_m, tile_cols_mma), 1, 1, d tile, slot)
         tOtO = thr_mma_pv.make_fragment_C(
             cute.append(cute.append(acc_shape, num_d_tiles), self.num_stages_o)
         )
         tOtO = cute.make_tensor(tStS.iterator + num_s_cols + num_l_cols, tOtO.layout)
 
         tLtL_0 = tLtL[(None, None), 0, 0, 0]
-        t2r_rep = tcgen05.Repetition(tile_hq)
+        t2r_rep = tcgen05.Repetition(tile_cols)
         t2r_atom = cute.make_copy_atom(
             tcgen05.Ld32x32bOp(t2r_rep, tcgen05.Pack.NONE), self.qk_acc_dtype
         )
@@ -790,16 +864,16 @@ class _SwapABCore:
         thr_r2s_O = tiled_r2s_O.get_slice(thr_in_wg)
         vec_layout = thr_t2r.partition_D(tLtL_0).layout
         vec_size = cute.cosize(vec_layout)
-        assert vec_size == tile_hq_mma
-        assert vec_layout.shape == ((tile_hq, 1), 1, tile_hq_mma // tile_hq)
+        assert vec_size == tile_cols_mma
+        assert vec_layout.shape == ((tile_cols, 1), 1, tile_cols_mma // tile_cols)
 
         sRowMax = storage.sRowMax.get_tensor(vec_layout)
         sRowSumWarp = storage.sRowSumWarp.get_tensor(
-            cute.make_layout(shape=(WARPS_PER_WG, tile_hq), stride=(tile_hq, 1))
+            cute.make_layout(shape=(WARPS_PER_WG, tile_cols), stride=(tile_cols, 1))
         )
-        lane_owns_head = lane_idx < tile_hq
+        lane_owns_column = lane_idx < tile_cols
         if warp_idx == load_q_store_o_warp_id:
-            if lane_owns_head:
+            if lane_owns_column:
                 sRowMax[lane_idx] = -Float32.inf
 
         # The KV ring carries K two blocks ahead of V: K(j) is loaded together with V(j - 2).
@@ -836,11 +910,17 @@ class _SwapABCore:
                 cute.arch.mbarrier_init(mbar_q_full, 1)
                 cute.arch.mbarrier_init_fence()
                 cute.arch.mbarrier_arrive_and_expect_tx(mbar_q_full, q_tx_bytes)
-            # Q: all query heads of this KV head, loaded once, one 64-dim chunk per stage. Only
+            # Q: all columns of this KV head, loaded once, one 64-dim chunk per stage. Only
             # warp 3 initializes and produces this barrier, so the load starts before the
             # CTA-wide prologue barrier; warp 0 waits on it only after that barrier.
             if not is_empty_split:
-                gQ = cute.local_tile(mQ, (tile_hq_mma, tile_k), (0, None, q_bh_idx))
+                if const_expr(self.tokens_tile > 1):
+                    # The row's first token is an unaligned coordinate in the tokens mode.
+                    mQ_row = cute.domain_offset(((0, q_start), 0, 0), mQ)
+                    q_tile = ((self.heads_tile, self.q_tokens), tile_k)
+                    gQ = cute.local_tile(mQ_row, q_tile, ((0, 0), None, q_bh_idx))
+                else:
+                    gQ = cute.local_tile(mQ, (tile_cols_mma, tile_k), (0, None, q_bh_idx))
                 load_Q, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_Q, 0, cute.make_layout(1), thr_mma_qk.partition_B(gQ), sQ
                 )
@@ -902,34 +982,49 @@ class _SwapABCore:
         if is_empty_split:
             if wg_idx == correction_wg_id:
                 bar_max_done.arrive()
-                if lane_idx < tile_hq:
+                if lane_idx < tile_cols:
                     sRowSumWarp[wg_warp_idx, lane_idx] = Float32(0.0)
                 bar_sum_done.arrive()
-            for o_idx in cutlass.range(thread_id, hdim_v * tile_hq, NUM_WG * WG_SIZE):
-                head = o_idx // hdim_v
-                if head < qhead_per_kvhead and q_row < num_q_rows:
-                    global_head = (bh_idx % num_heads_kv) * qhead_per_kvhead + head
-                    mO_partial_raw[split_id, q_row, global_head, o_idx % hdim_v] = (
-                        mO_partial_raw.element_type(0.0)
-                    )
+            for o_idx in cutlass.range(thread_id, hdim_v * tile_cols, NUM_WG * WG_SIZE):
+                if const_expr(self.tokens_tile > 1):
+                    column = o_idx // hdim_v
+                    head, token = column % self.heads_tile, column // self.heads_tile
+                    if head < qhead_per_kvhead and token < seqlen_q:
+                        global_head = kv_head_idx * qhead_per_kvhead + head
+                        o_coord = (split_id, q_batch, q_start + token, global_head, o_idx % hdim_v)
+                        mO_partial_raw[o_coord] = mO_partial_raw.element_type(0.0)
+                else:
+                    head = o_idx // hdim_v
+                    if head < qhead_per_kvhead and q_row < num_q_rows:
+                        global_head = (bh_idx % num_heads_kv) * qhead_per_kvhead + head
+                        mO_partial_raw[split_id, q_row, global_head, o_idx % hdim_v] = (
+                            mO_partial_raw.element_type(0.0)
+                        )
 
         elif warp_idx == load_q_store_o_warp_id:
             if cutlass.const_expr(setmaxreg):
                 cute.arch.setmaxregister_decrease(num_regs_mma_load)
 
             # Wait until the correction WG has staged the final O, then TMA-store this split's partial.
-            bar_o_done.arrive_and_wait()
-            for dm in cutlass.range_constexpr(num_d_tiles):
-                gO = cute.local_tile(
-                    mO_partial_tma, (tile_m, tile_hq_mma), (dm, 0, q_bh_idx, split_id)
-                )
-                store_O, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_O, 0, cute.make_layout(1), sO[None, None, dm, 0], gO, single_stage=True
-                )
-                store_O()
-            cute.arch.cp_async_bulk_commit_group()
-            # The ring SMEM must stay valid until the bulk store has read it.
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            # In token mode the correction WG stores O itself.
+            if const_expr(self.tokens_tile == 1):
+                bar_o_done.arrive_and_wait()
+                for dm in cutlass.range_constexpr(num_d_tiles):
+                    gO = cute.local_tile(
+                        mO_partial_tma, (tile_m, tile_cols_mma), (dm, 0, q_bh_idx, split_id)
+                    )
+                    store_O, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_O,
+                        0,
+                        cute.make_layout(1),
+                        sO[None, None, dm, 0],
+                        gO,
+                        single_stage=True,
+                    )
+                    store_O()
+                cute.arch.cp_async_bulk_commit_group()
+                # The ring SMEM must stay valid until the bulk store has read it.
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
 
         elif warp_idx == load_kv_warp_id:
             if cutlass.const_expr(setmaxreg):
@@ -1171,12 +1266,12 @@ class _SwapABCore:
                 cute.arch.setmaxregister_decrease(num_regs_softmax)
 
             # Softmax WGs. Each thread owns one token row of each 128-token sub-tile, i.e. 2 rows of the
-            # block, and tile_hq query-head columns.
+            # block, and its tile_cols columns.
 
             tStS_0 = tStS[(None, None), 0, 0, None, 0]
-            t2r_rep_S = tcgen05.Repetition(tile_hq)
-            if cutlass.const_expr(tile_hq_mma == tile_hq):
-                t2r_rep_S = tcgen05.Repetition(tile_hq * num_s_subtiles)
+            t2r_rep_S = tcgen05.Repetition(tile_cols)
+            if cutlass.const_expr(tile_cols_mma == tile_cols):
+                t2r_rep_S = tcgen05.Repetition(tile_cols * num_s_subtiles)
             t2r_atom_S = cute.make_copy_atom(
                 tcgen05.Ld32x32bOp(t2r_rep_S, tcgen05.Pack.NONE),
                 self.qk_acc_dtype,
@@ -1186,20 +1281,20 @@ class _SwapABCore:
             thr_t2r_S = tiled_t2r_S.get_slice(thr_in_wg)
             thr_r2s_P = tiled_r2s_P.get_slice(thr_in_wg)
             tSrS_layout = thr_t2r_S.partition_D(tStS_0).layout
-            assert cute.cosize(tSrS_layout) == tile_hq_mma * num_s_subtiles
+            assert cute.cosize(tSrS_layout) == tile_cols_mma * num_s_subtiles
 
             tSrP_layout = cute.make_layout(
                 (*vec_layout.shape, num_s_subtiles),
                 stride=(*vec_layout.stride, vec_size),
             )
             scores_layout = cute.make_layout(
-                shape=(tile_hq, num_s_subtiles),
+                shape=(tile_cols, num_s_subtiles),
                 stride=(1, vec_size),
             )
             # (token row, head, subtile) -> one P stage's logical (head, token) index, head + N * token.
             sP_view_layout = cute.make_layout(
-                shape=(tile_m, tile_hq_mma, num_s_subtiles),
-                stride=(tile_hq_mma, 1, tile_m * tile_hq_mma),
+                shape=(tile_m, tile_cols_mma, num_s_subtiles),
+                stride=(tile_cols_mma, 1, tile_m * tile_cols_mma),
             )
 
             tSrS = cute.make_rmem_tensor(tSrS_layout, self.qk_acc_dtype)
@@ -1244,20 +1339,27 @@ class _SwapABCore:
                     if thr_in_wg + sm * tile_m >= valid_rows:
                         scores_r[None, sm].fill(-Float32.inf)
 
-                if cutlass.const_expr(self.check_empty_rows):
+                if cutlass.const_expr(self.apply_score_mods):
                     batch_idx = bh_idx // num_heads_kv
                     # score_mod runs on one score per call: a register column holds one KV token
-                    # across tile_hq heads, not the consecutive tokens of one head that the
+                    # across tile_cols columns, not the consecutive tokens of one head that the
                     # shared helper's vector chunks assume.
                     score_tiles = cute.zipped_divide(scores_r, (1, 1))
                     for sm in cutlass.range_constexpr(num_s_subtiles):
                         kv_idx = (s + n_block_min) * tile_n + thr_in_wg + sm * tile_m
-                        # (q, kv) coordinate of this thread's token; the decode query is q = 0.
+                        # (q, kv) coordinate of this thread's key; q is each column's token,
+                        # passed as constant_q_idx.
                         tScS = cute.domain_offset((0, kv_idx), cute.make_identity_tensor((1, 1)))
-                        for gi in cutlass.range_constexpr(tile_hq):
+                        for gi in cutlass.range_constexpr(tile_cols):
+                            head, token = gi % self.heads_tile, gi // self.heads_tile
+                            # A token past the row's end scores no key: modifiers would see a
+                            # q_idx outside the row.
+                            keys_in_row = seqlen_k
+                            if cutlass.const_expr(self.tokens_tile > 1):
+                                keys_in_row = seqlen_k if token < seqlen_q else Int32(0)
                             value = -Float32.inf
-                            if gi < qhead_per_kvhead and kv_idx < seqlen_k:
-                                global_head = (bh_idx % num_heads_kv) * qhead_per_kvhead + gi
+                            if head < qhead_per_kvhead and kv_idx < keys_in_row:
+                                global_head = (bh_idx % num_heads_kv) * qhead_per_kvhead + head
                                 if cutlass.const_expr(self.score_mod is not None):
                                     apply_score_mod_inner(
                                         score_tiles[None, (gi, sm)],
@@ -1271,15 +1373,19 @@ class _SwapABCore:
                                         aux_data,
                                         None,  # the guard keeps indices in bounds: no wrapping
                                         seqlen_info,
-                                        constant_q_idx=0,
+                                        constant_q_idx=token,
                                     )
                                 value = scores_r[gi, sm]
                                 keep = cutlass.Boolean(True)
                                 if cutlass.const_expr(self.is_local):
+                                    # The window is around the token's own position.
+                                    last_key = seqlen_k - 1
+                                    if cutlass.const_expr(self.tokens_tile > 1):
+                                        last_key = seqlen_k - seqlen_q + token
                                     if cutlass.const_expr(window_size_left is not None):
-                                        keep &= kv_idx >= seqlen_k - 1 - window_size_left
+                                        keep &= kv_idx >= last_key - window_size_left
                                     if cutlass.const_expr(window_size_right is not None):
-                                        keep &= kv_idx <= seqlen_k - 1 + window_size_right
+                                        keep &= kv_idx <= last_key + window_size_right
                                 if cutlass.const_expr(self.mask_mod is not None):
                                     # Build fresh SSA values per score: a callback that indexes
                                     # (b[0]) an SSA value shared across dynamic regions fails IR
@@ -1289,7 +1395,7 @@ class _SwapABCore:
                                         self.mask_vec_size,
                                         scalar_to_ssa(batch_idx, Int32),
                                         scalar_to_ssa(global_head, Int32),
-                                        scalar_to_ssa(Int32(0), Int32),
+                                        scalar_to_ssa(Int32(token), Int32),
                                         kv_idx,
                                         seqlen_k,
                                         seqlen_info,
@@ -1298,18 +1404,33 @@ class _SwapABCore:
                                 value = value if keep else -Float32.inf
                             scores_r[gi, sm] = value
 
+                # Causal token j sees keys up to seqlen_k - seqlen_q + j: only the last
+                # seqlen_q - 1 keys hide from some tokens, so a CTA-uniform branch skips the
+                # other blocks. It runs after score_mod, which could lift a masked score.
+                # Causal handling costs ~2% of a 32-column verify call at 256-token KV blocks
+                # (~180 B more register spills).
+                if cutlass.const_expr(self.causal_tokens):
+                    if valid_rows < tile_n + seqlen_q - 1:
+                        for sm in cutlass.range_constexpr(num_s_subtiles):
+                            # This row's key is hidden from tokens j < hidden_tokens.
+                            hidden_tokens = thr_in_wg + sm * tile_m - valid_rows + seqlen_q
+                            if hidden_tokens > 0:
+                                for gi in cutlass.range_constexpr(tile_cols):
+                                    if gi // self.heads_tile < hidden_tokens:
+                                        scores_r[gi, sm] = -Float32.inf
+
                 scores = scores_r.load()
                 row_max_valid.store(
                     scores.reduce(
                         cute.ReductionOp.MAX,
                         -Float32.inf,
                         (None, 0),
-                    ).reshape((tile_hq,))
+                    ).reshape((tile_cols,))
                 )
 
-                # Block max per head: reduce over this warp's rows; lane h then holds the max of head h.
+                # Block max per column: reduce over this warp's rows; lane c then holds column c's max.
                 lane_max = -Float32.inf
-                for j in cutlass.range_constexpr(tile_hq):
+                for j in cutlass.range_constexpr(tile_cols):
                     row_max_r[j] = warp_reduce_max(row_max_r[j])
                     if j == lane_idx:
                         lane_max = row_max_r[j]
@@ -1320,7 +1441,7 @@ class _SwapABCore:
                 # bar_max_turn: take -> wait for correction to read M(j-1) -> atomic max -> publish -> pass.
                 bar_max_turn.arrive_and_wait_w_index(phase)
                 bar_max_empty.arrive_and_wait()
-                if lane_owns_head:
+                if lane_owns_column:
                     sRowMax_ptr = sRowMax.iterator + sRowMax.layout(lane_idx)
                     smem_atomic_max(sRowMax_ptr, lane_max)
 
@@ -1328,18 +1449,28 @@ class _SwapABCore:
                 cute.autovec_copy(sRowMax, row_max_r)
                 bar_max_turn.arrive_w_index(phase ^ 1)
 
-                # P = exp2(S * scale * log2(e) - M(j)) in bf16 / fp16 into SMEM for the PV MMA.
+                # P = exp2(S * scale * log2(e) - M(j) + max_offset) in the input dtype into SMEM for
+                # the PV MMA.
                 pipeline_p.producer_acquire(p_state, p_token)
 
-                if cutlass.const_expr(self.check_empty_rows):
+                if cutlass.const_expr(self.apply_score_mods):
                     # Only the local exponent bias is zeroed; shared final maxima stay -inf.
-                    for gi in cutlass.range_constexpr(tile_hq):
+                    for gi in cutlass.range_constexpr(tile_cols):
                         if row_max_valid[gi] == -Float32.inf:
                             row_max_valid[gi] = Float32(0.0)
-                row_max_tile = row_max_valid.load().reshape((tile_hq, 1))
+                elif cutlass.const_expr(self.check_empty_rows):
+                    # Causal tokens alone leave a column no key only in a split whose first
+                    # block holds fewer than seqlen_q keys.
+                    if (s == 0) & (valid_rows < seqlen_q):
+                        for gi in cutlass.range_constexpr(tile_cols):
+                            if row_max_valid[gi] == -Float32.inf:
+                                row_max_valid[gi] = Float32(0.0)
+                row_max_tile = row_max_valid.load().reshape((tile_cols, 1))
+                if cutlass.const_expr(self.max_offset != 0):
+                    row_max_tile = row_max_tile - Float32(self.max_offset)
                 probs = exp2_fast(softmax_scale_log2 * scores - row_max_tile)
 
-                if cutlass.const_expr(tile_hq < tile_hq_mma):
+                if cutlass.const_expr(tile_cols < tile_cols_mma):
                     tSrP.fill(self.dtype(0))
 
                 probs_r.store(probs.to(self.dtype))
@@ -1349,14 +1480,14 @@ class _SwapABCore:
                 pipeline_p.producer_commit(p_state)
                 p_state.advance()
 
-                # This WG's TMEM mailbox carries this thread's two-token sums per head, not P.
+                # This WG's TMEM mailbox carries this thread's two-token sums per column, not P.
                 # Cross-thread reduction runs once in the correction tail.
                 row_sum_valid.store(
                     probs.reduce(
                         cute.ReductionOp.ADD,
                         Float32(0.0),
                         (None, 0),
-                    ).reshape((tile_hq,))
+                    ).reshape((tile_cols,))
                 )
 
                 bar_sum_empty.arrive_and_wait_w_index(phase)
@@ -1372,7 +1503,7 @@ class _SwapABCore:
             if cutlass.const_expr(setmaxreg):
                 cute.arch.setmaxregister_increase(num_regs_correction)
 
-            # Correction WG. Thread t owns TMEM lane t (one head_dim_v row of O, all heads) and keeps one
+            # Correction WG. Thread t owns TMEM lane t (one head_dim_v row of O, all columns) and keeps one
             # row-sum accumulator per O slot.
             l_slot_shape = (*vec_layout.shape, self.num_stages_o)
             l_slot_stride = (*vec_layout.stride, vec_size)
@@ -1406,7 +1537,7 @@ class _SwapABCore:
                 if not (preload_idx == 1 and num_n_blocks == 1):
                     bar_max_full.arrive_and_wait_unaligned()
                     row_max_prev = Float32(0.0)
-                    if lane_owns_head:
+                    if lane_owns_column:
                         row_max_prev = sRowMax[lane_idx]
                     bar_max_empty.arrive()
 
@@ -1428,17 +1559,19 @@ class _SwapABCore:
                 if s == num_n_blocks - self.num_stages_o - 1:
                     bar_max_done.arrive()
                 row_max_cur = Float32(0.0)
-                if lane_owns_head:
+                if lane_owns_column:
                     row_max_cur = sRowMax[lane_idx]
                 bar_max_empty.arrive()
 
                 pipeline_o.consumer_wait(o_state, pipeline_o.consumer_try_wait(o_state))
 
                 acc_scale_lane = exp2_fast(row_max_prev2 - row_max_cur)
-                if cutlass.const_expr(self.check_empty_rows):
+                # This loop runs only with 3+ blocks, and every token sees the first block's keys,
+                # so only modifiers can leave a column empty here.
+                if cutlass.const_expr(self.apply_score_mods):
                     if row_max_prev2 == -Float32.inf and row_max_cur == -Float32.inf:
                         acc_scale_lane = Float32(1.0)
-                for gi in cutlass.range_constexpr(tile_hq):
+                for gi in cutlass.range_constexpr(tile_cols):
                     acc_scale[gi] = cute.arch.shuffle_sync(acc_scale_lane, gi)
 
                 for dm in cutlass.range_constexpr(num_d_tiles):
@@ -1470,7 +1603,7 @@ class _SwapABCore:
             if cutlass.const_expr(self.check_empty_rows):
                 if row_max_prev2 == -Float32.inf and row_max_prev == -Float32.inf:
                     acc_scale_lane = Float32(1.0)
-            for gi in cutlass.range_constexpr(tile_hq):
+            for gi in cutlass.range_constexpr(tile_cols):
                 acc_scale[gi] = cute.arch.shuffle_sync(acc_scale_lane, gi)
 
             tail_phase = num_n_blocks % self.num_stages_o
@@ -1498,7 +1631,7 @@ class _SwapABCore:
                     )
 
             # Sum the row sums across the 32 lanes, then per warp into SMEM for the split-stats warp.
-            for gi in cutlass.range_constexpr(tile_hq):
+            for gi in cutlass.range_constexpr(tile_cols):
                 row_sum_final[gi] = cute.arch.warp_reduction_sum(row_sum_final[gi])
                 if lane_idx == 0:
                     sRowSumWarp[wg_warp_idx, gi] = row_sum_final[gi]
@@ -1535,27 +1668,57 @@ class _SwapABCore:
             tOrO_tail1 = tOrO_tail1.reshape((vec_size, num_d_tiles))
             tOrO_final = tOrO_tail1 + acc_scale.load().reshape((vec_size, 1)) * tOrO_tail0
             tOrO_final *= tLrL.load().reshape((vec_size, 1))
-            if cutlass.const_expr(self.check_empty_rows):
-                # Select real zeros for fully masked heads, never rely on 0 * NaN.
-                normalized = cute.make_rmem_tensor(
-                    cute.make_layout((vec_size, num_d_tiles)), self.qk_acc_dtype
-                )
-                normalized.store(tOrO_final)
-                for gi in cutlass.range_constexpr(tile_hq):
-                    if tLrL[gi] == Float32(0.0):
+            if cutlass.const_expr(descale_tensors is not None):
+                tOrO_final *= v_descale
+            if const_expr(self.tokens_tile > 1):
+                # Store each column straight to global memory: a TMA box cannot stop at a ragged
+                # row's end. Thread t holds O row t of each d tile, so a warp's store of one
+                # column is 32 consecutive elements.
+                tOrO_out = cute.make_rmem_tensor(cute.make_layout((vec_size, num_d_tiles)), o_dtype)
+                tOrO_out.store(tOrO_final.to(o_dtype))
+                for column in cutlass.range_constexpr(tile_cols):
+                    head, token = column % self.heads_tile, column // self.heads_tile
+                    if head < qhead_per_kvhead and token < seqlen_q:
+                        global_head = kv_head_idx * qhead_per_kvhead + head
                         for dm in cutlass.range_constexpr(num_d_tiles):
-                            normalized[gi, dm] = Float32(0.0)
-                tOrO_final = normalized.load()
-            tOsO = thr_r2s_O.partition_D(sO[None, None, None, 0])
-            tOsO.store(tOrO_final.to(o_dtype).reshape(tOsO.shape))
+                            dv_idx = dm * tile_m + thr_in_wg
+                            if dv_idx < hdim_v:
+                                value = tOrO_out[column, dm]
+                                if cutlass.const_expr(self.check_empty_rows):
+                                    # A select, never 0 * O: an empty column's O may be NaN.
+                                    if tLrL[column] == Float32(0.0):
+                                        value = o_dtype(0.0)
+                                o_coord = (split_id, q_batch, q_start + token, global_head, dv_idx)
+                                mO_partial_raw[o_coord] = value
+            else:
+                if cutlass.const_expr(self.check_empty_rows):
+                    # Select real zeros for fully masked heads, never rely on 0 * NaN.
+                    normalized = cute.make_rmem_tensor(
+                        cute.make_layout((vec_size, num_d_tiles)), self.qk_acc_dtype
+                    )
+                    normalized.store(tOrO_final)
+                    for gi in cutlass.range_constexpr(tile_cols):
+                        if tLrL[gi] == Float32(0.0):
+                            for dm in cutlass.range_constexpr(num_d_tiles):
+                                normalized[gi, dm] = Float32(0.0)
+                    tOrO_final = normalized.load()
+                tOsO = thr_r2s_O.partition_D(sO[None, None, None, 0])
+                tOsO.store(tOrO_final.to(o_dtype).reshape(tOsO.shape))
 
-            cute.arch.fence_view_async_shared()
-            bar_o_done.arrive()
+                cute.arch.fence_view_async_shared()
+                bar_o_done.arrive()
 
         # After its loads, warp 2 normalizes this split's statistics, not other CTAs'.
         if warp_idx == split_stats_warp_id:
+            mLSE_split = mLSE_partial
+            token_columns = None
+            if const_expr(self.tokens_tile > 1 and mLSE_partial is not None):
+                # This row's (heads, tokens) block of the (ns, b, h, s) LSE.
+                lse_start = (split_id, q_batch, kv_head_idx * qhead_per_kvhead, q_start)
+                mLSE_split = cute.domain_offset(lse_start, mLSE_partial)[0, 0, None, None]
+                token_columns = (self.heads_tile, qhead_per_kvhead, seqlen_q)
             self.store_split_stats(
-                tile_hq,
+                tile_cols,
                 (split_id, q_bh_idx),
                 lane_idx,
                 is_empty_split,
@@ -1564,7 +1727,9 @@ class _SwapABCore:
                 bar_stats_ready,
                 sRowMax,
                 sRowSumWarp,
-                mLSE_partial,
+                mLSE_split,
+                max_offset=self.max_offset,
+                token_columns=token_columns,
             )
 
         # Free TMEM once every role is done with it.
@@ -1574,7 +1739,7 @@ class _SwapABCore:
     @staticmethod
     @cute.jit
     def store_split_stats(
-        tile_hq: int,
+        tile_cols: int,
         block_idx: Tuple[Int32, Int32],
         lane_idx: Int32,
         is_empty_split: cutlass.Boolean,
@@ -1584,18 +1749,26 @@ class _SwapABCore:
         sRowMax: cute.Tensor,
         sRowSumWarp: cute.Tensor,
         mLSE_partial: cute.Tensor | None,
+        max_offset: cutlass.Constexpr[int] = 0,
+        token_columns: Tuple[int, Int32, Int32] | None = None,
     ):
+        """Publish 1/L per column in sRowMax and write this split's LSE.
+
+        token_columns = (heads_tile, qhead_per_kvhead, seqlen_q) in token mode, where lane c is
+        query head c % heads_tile of token c // heads_tile and mLSE_partial is the row's
+        (heads, tokens) LSE block.
+        """
         split_id, bh_idx = block_idx
-        lane_owns_head = lane_idx < tile_hq
+        lane_owns_column = lane_idx < tile_cols
         row_max_lane = -Float32.inf
 
         cute.arch.fence_acq_rel_cta()
         bar_max_done.arrive_and_wait()
-        if lane_owns_head:
+        if lane_owns_column:
             row_max_lane = sRowMax[lane_idx]
 
         bar_sum_done.arrive_and_wait()
-        if lane_owns_head:
+        if lane_owns_column:
             row_sum_w01 = sRowSumWarp[0, lane_idx] + sRowSumWarp[1, lane_idx]
             row_sum_w23 = sRowSumWarp[2, lane_idx] + sRowSumWarp[3, lane_idx]
             row_sum = row_sum_w01 + row_sum_w23
@@ -1603,13 +1776,16 @@ class _SwapABCore:
             if row_sum > Float32(0.0):
                 inv_sum = cute.arch.rcp_approx(row_sum)
             sRowMax[lane_idx] = inv_sum
-            if cutlass.const_expr(mLSE_partial is not None):
+            if cutlass.const_expr(mLSE_partial is not None and token_columns is not None):
+                heads_tile, qhead_per_kvhead, seqlen_q = token_columns
+                head, token = lane_idx % heads_tile, lane_idx // heads_tile
+                if head < qhead_per_kvhead and token < seqlen_q:
+                    mLSE_partial[head, token] = _SwapABCore.split_lse(
+                        row_max_lane, row_sum, max_offset
+                    )
+            elif cutlass.const_expr(mLSE_partial is not None):
                 if lane_idx < mLSE_partial.shape[1]:
-                    lse = -Float32.inf
-                    if row_sum > Float32(0.0):
-                        lse = (row_max_lane + cute.math.log2(row_sum, fastmath=True)) * math.log(
-                            2.0
-                        )
+                    lse = _SwapABCore.split_lse(row_max_lane, row_sum, max_offset)
                     num_heads_kv = mLSE_partial.shape[2][0]
                     bh_coord = (bh_idx % num_heads_kv, bh_idx // num_heads_kv)
                     if bh_coord[1] < mLSE_partial.shape[2][1]:
@@ -1622,9 +1798,22 @@ class _SwapABCore:
         if not is_empty_split:
             bar_stats_ready.arrive()
 
+    @staticmethod
+    @cute.jit
+    def split_lse(row_max: Float32, row_sum: Float32, max_offset: cutlass.Constexpr[int]):
+        """Natural-log LSE of one column from its log2-domain max and row sum; -inf if empty."""
+        lse = -Float32.inf
+        if row_sum > Float32(0.0):
+            log2_sum = cute.math.log2(row_sum, fastmath=True)
+            if cutlass.const_expr(max_offset != 0):
+                log2_sum -= Float32(max_offset)
+            lse = (row_max + log2_sum) * math.log(2.0)
+        return lse
+
 
 class FlashAttentionForwardSm100SwapAB:
-    """Standard forward ABI for single-query inference; interface owns allocation and combine.
+    """Standard forward ABI for inference decode and short query rows (token mode); interface
+    owns allocation and combine.
 
     The swap-AB mainloop (_SwapABCore) is private. Split outputs are normalized FP32 O and natural-log
     LSE; the single-split case writes directly to the input-dtype output tensor.
@@ -1658,24 +1847,27 @@ class FlashAttentionForwardSm100SwapAB:
         assert seqlen_k_per_split is None and q_subtile_factor == kv_subtile_factor == 1
         self.head_dim = head_dim
         self.head_dim_v = head_dim if head_dim_v is None else head_dim_v
-        # For one query at the end of seqused_k, causal and noncausal bounds agree.
         # pack_gqa does not alter the external tensor ABI: the core packs heads itself.
         self.is_split_kv = config.num_splits > 1
         self.is_varlen_q = is_varlen_q
         self.is_local = is_local
         self.score_mod = score_mod
         self.mask_mod = mask_mod
-        self.tile_hq = config.tile_m
+        self.tile_cols = config.tile_m
         self.tile_n = config.tile_n
+        # tile_m = heads tile x tokens tile (SwapABPolicy.config); one token is decode, where
+        # one query at the end of seqused_k makes causal and noncausal agree.
+        self.tokens_tile = config.tile_m // SWAPAB.heads_tile(qhead_per_kvhead)
+        self.is_causal = is_causal
 
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,  # (b, 1, h, d)
+        mQ: cute.Tensor,  # (b, s, h, d), varlen (total_q, h, d)
         mK: cute.Tensor,  # (b, s_k, h_k, d)
         mV: cute.Tensor,  # (b, s_k, h_k, d)
-        mO: cute.Tensor,  # split: out_partial (ns, b, 1, h, d) fp32 ; else out (b, 1, h, d)
-        mLSE: Optional[cute.Tensor],  # split: lse_partial (ns, b, h, 1) ; else lse (b, h, 1) | None
+        mO: cute.Tensor,  # split: out_partial (ns, b, s, h, d) fp32 ; else out (b, s, h, d)
+        mLSE: Optional[cute.Tensor],  # split: lse_partial (ns, b, h, s) ; else lse (b, h, s) | None
         softmax_scale: Float32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
@@ -1706,7 +1898,6 @@ class FlashAttentionForwardSm100SwapAB:
             mCuSeqlensK,
             mSeqUsedQ,
             learnable_sink,
-            descale_tensors,
             blocksparse_tensors,
             tile_count_semaphore,
             virtual_batch_idx_ptr,
@@ -1718,10 +1909,17 @@ class FlashAttentionForwardSm100SwapAB:
             assert value is None, "swap-AB adapter: unsupported argument"
         assert len(mQ.shape) == (3 if self.is_varlen_q else 4)
         assert len(mK.shape) == 4 and len(mV.shape) == 4
-        assert mQ.element_type in (cutlass.Float16, cutlass.BFloat16)
+        assert mQ.element_type in (
+            cutlass.Float16,
+            cutlass.BFloat16,
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E5M2,
+        )
         assert mQ.element_type == mK.element_type == mV.element_type
+        is_fp8 = mQ.element_type.width == 8
+        assert descale_tensors is None or is_fp8
         if const_expr(not self.is_split_kv):
-            assert mO.element_type == mQ.element_type
+            assert mO.element_type == (cutlass.BFloat16 if is_fp8 else mQ.element_type)
             assert num_splits_dynamic_ptr is None
         if const_expr(mLSE is not None):
             assert mLSE.element_type == Float32
@@ -1732,11 +1930,31 @@ class FlashAttentionForwardSm100SwapAB:
         num_heads_kv, seqlen_k = mK.shape[2], mK.shape[1]
         if const_expr(mPageTable is not None):
             seqlen_k = mPageTable.shape[1] * mK.shape[1]
-        # The core takes Q as (rows, h, d), O as (ns, rows, h, d) and LSE as (ns, rows, h), where
-        # rows are sequences, or tokens with varlen Q. A missing split mode (one split, or the
-        # dense seqlen_q mode of extent 1, host-checked) becomes a split mode of extent 1.
+        # Decode: the core takes Q as (rows, h, d), O as (ns, rows, h, d) and LSE as (ns, rows, h),
+        # where rows are sequences, or tokens with varlen Q. A missing split mode (one split, or
+        # the dense seqlen_q mode of extent 1, host-checked) becomes a split mode of extent 1.
+        # Token mode: Q (b, s, h, d), O (ns, b, s, h, d), LSE (ns, b, h, s), where varlen Q is
+        # one batch entry of total_q tokens.
         mLSE_core = None
-        if const_expr(self.is_varlen_q):
+        if const_expr(self.tokens_tile > 1 and self.is_varlen_q):
+            mQ_core = cute.prepend_ones(mQ, up_to_rank=4)  # (total_q, h, d)
+            if const_expr(self.is_split_kv):
+                # out_partial (ns, total_q, h, d), lse_partial (ns, h, total_q)
+                mO_core = select_modes(cute.prepend_ones(mO, up_to_rank=5), [1, 0, 2, 3, 4])
+                mLSE_core = select_modes(cute.prepend_ones(mLSE, up_to_rank=4), [1, 0, 2, 3])
+            else:
+                mO_core = cute.prepend_ones(mO, up_to_rank=5)  # out (total_q, h, d)
+                if const_expr(mLSE is not None):
+                    mLSE_core = cute.prepend_ones(mLSE, up_to_rank=4)  # lse (h, total_q)
+        elif const_expr(self.tokens_tile > 1):
+            mQ_core = mQ
+            if const_expr(self.is_split_kv):
+                mO_core, mLSE_core = mO, mLSE
+            else:
+                mO_core = cute.prepend_ones(mO, up_to_rank=5)  # out (b, s, h, d)
+                if const_expr(mLSE is not None):
+                    mLSE_core = cute.prepend_ones(mLSE, up_to_rank=4)  # lse (b, h, s)
+        elif const_expr(self.is_varlen_q):
             mQ_core = mQ  # (total_q, h, d)
             if const_expr(self.is_split_kv):
                 mO_core = mO  # out_partial (ns, total_q, h, d)
@@ -1757,7 +1975,7 @@ class FlashAttentionForwardSm100SwapAB:
         if const_expr(self.is_split_kv):
             assert mO_core.element_type == Float32 and mLSE_core is not None
         core = _SwapABCore(
-            self.tile_hq,
+            self.tile_cols,
             self.tile_n,
             self.head_dim,
             mQ.element_type,
@@ -1765,6 +1983,8 @@ class FlashAttentionForwardSm100SwapAB:
             mask_mod=self.mask_mod,
             is_local=self.is_local,
             head_dim_v=self.head_dim_v,
+            tokens_tile=self.tokens_tile,
+            is_causal=self.is_causal,
         )
         problem_size = (batch, num_heads, num_heads_kv, seqlen_k)
         # Stock conventions carried through: window sizes as resolved by
@@ -1787,4 +2007,5 @@ class FlashAttentionForwardSm100SwapAB:
             mCuSeqlensQ,
             num_splits_dynamic_ptr,
             tensormap_workspace,
+            descale_tensors,
         )

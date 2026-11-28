@@ -2586,9 +2586,9 @@ class FlashAttentionForwardSm100:
             return head_idx
         return head_idx // self.qhead_per_kvhead
 
+    @staticmethod
     @cute.jit
     def _load_effective_descales(
-        self,
         descale_tensors: Optional[DescaleTensors],
         batch_idx: Int32,
         kv_head_idx: Int32,

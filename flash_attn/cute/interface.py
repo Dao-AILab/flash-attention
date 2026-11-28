@@ -1104,7 +1104,8 @@ def _flash_attn_fwd(
             tile_n=config.tile_n,
             headdim_v=head_dim_v,
             pack_gqa=config.pack_gqa,
-            # SwapAB's single query needs no causal L2 head swizzle.
+            # SwapAB splits all of a row's keys (it masks causal query tokens itself) and needs
+            # no L2 head swizzle.
             causal=causal and not use_swapab,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
