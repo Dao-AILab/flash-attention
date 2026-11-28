@@ -922,7 +922,7 @@ def combine_state_dicts_tp(state_dicts: List[Dict[str, torch.Tensor]], config: G
         combine_qkv_headdim(state_dicts, state_dict, f"transformer.layers.{i}.mixer.Wqkv.bias")
         combine_dim(state_dicts, state_dict, f"transformer.layers.{i}.mixer.out_proj.weight", -1)
         mlp_combine_fn(state_dicts, state_dict, f"transformer.layers.{i}.mlp.fc1.weight")
-        combine_dim(state_dicts, state_dict, f"transformer.layers.{i}.mlp.fc1.bias", 0)
+        mlp_combine_fn(state_dicts, state_dict, f"transformer.layers.{i}.mlp.fc1.bias")
         combine_dim(state_dicts, state_dict, f"transformer.layers.{i}.mlp.fc2.weight", -1)
     return state_dict
 

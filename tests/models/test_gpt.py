@@ -450,21 +450,31 @@ def test_gpt2_speculative_decoding(model_name, optimized, cg):
 
 
 @pytest.mark.parametrize(
-    "n_heads_q_kv",
+    "n_heads_q_kv, activation_function",
     [
-        (8, 8),  # Regular attention
-        (8, 4),  # GQA
-        (8, 2),  # MQA
+        ((8, 8), "gelu_new"),  # Regular attention
+        ((8, 4), "gelu_new"),  # GQA
+        ((8, 2), "gelu_new"),  # One KV head per rank
+        ((8, 4), "swiglu"),
     ],
 )
-def test_gpt2_shard_unshard(n_heads_q_kv):
+def test_gpt2_shard_unshard(n_heads_q_kv, activation_function):
     world_size = 2
 
-    config = GPT2Config.from_pretrained("gpt2")
-    config.vocab_size = 1024
-    config.n_head, config.n_head_kv = n_heads_q_kv
+    config = GPT2Config(
+        n_layer=1,
+        n_embd=128,
+        n_inner=256,
+        n_head=n_heads_q_kv[0],
+        n_head_kv=n_heads_q_kv[1],
+        vocab_size=1024,
+        activation_function=activation_function,
+    )
     model = GPTLMHeadModel(config, device="cuda", dtype=torch.float16)
     state_dict = model.state_dict()
+    # A zero-initialized bias would hide permutations between gate and value shards.
+    bias = state_dict["transformer.layers.0.mlp.fc1.bias"]
+    bias.copy_(torch.arange(bias.numel(), device=bias.device))
     shards = [
         # NOTE: Shallow copy as `state_dict` is modified in-place
         shard_state_dict_tp(dict(state_dict), config, world_size, rank)
@@ -472,7 +482,5 @@ def test_gpt2_shard_unshard(n_heads_q_kv):
     ]
     state_dict2 = combine_state_dicts_tp(shards, config)
     assert state_dict2.keys() == state_dict.keys()
-    for k in state_dict.keys():
-        ref = state_dict[k]
-        new = state_dict[k]
-        assert torch.allclose(ref, new, atol=0.0, rtol=0.0)
+    for key, ref in state_dict.items():
+        assert torch.equal(ref, state_dict2[key]), key
